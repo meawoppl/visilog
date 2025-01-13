@@ -54,3 +54,30 @@ pub fn shallow_clone_and_cache(
 
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn test_shallow_clone_and_cache() {
+        let repo_url = "https://github.com/meawoppl/visilog.git";
+        let commit_hash = "60bd3f99969512ac131e07880149d52f4a9cf303";
+        let subdir = "src";
+        let cache_dir = "test_cache";
+
+        initialize_cache_dir(cache_dir);
+
+        match shallow_clone_and_cache(repo_url, commit_hash, subdir) {
+            Ok(_) => {
+                let cache_path = format!("{}/{}_{}_{}", cache_dir, repo_url.replace("/", "_"), commit_hash, subdir.replace("/", "_"));
+                assert!(Path::new(&cache_path).exists());
+                fs::remove_dir_all(cache_dir).unwrap();
+            },
+            Err(e) => panic!("Error: {}", e),
+        }
+    }
+}
