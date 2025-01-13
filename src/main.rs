@@ -250,15 +250,5 @@ mod tests {
         net_declaration.parse("wire z").unwrap();
     }
 
-    #[test]
-    fn test_binary_expression_from_string() {
-        for expr in ALL_BINARY_EXPRESSIONS {
-            assert!(
-                binary_expression_from_string(expr).is_some(),
-                "Binary expression {} failed to parse",
-                expr
-            );
-        }
-        assert_eq!(binary_expression_from_string("nonexistent"), None);
-    }
+
 }

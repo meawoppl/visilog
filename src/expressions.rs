@@ -34,6 +34,29 @@ pub enum VerilogBinaryExpression {
     ArithmeticShiftRight,
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum ReductionOperator {
+    ReductionAnd,
+    ReductionNand,
+    ReductionOr,
+    ReductionNor,
+    ReductionXor,
+    ReductionXnor,
+}
+
+
+pub fn reduction_operator_from_string(input: &str) -> Option<ReductionOperator> { 
+    match input {
+    "&" => Some(ReductionOperator::ReductionAnd),
+    "~&" => Some(ReductionOperator::ReductionNand),
+    "|" => Some(ReductionOperator::ReductionOr),
+    "~|" => Some(ReductionOperator::ReductionNor),
+    "^" => Some(ReductionOperator::ReductionXor),
+    "~^" | "^~" => Some(ReductionOperator::ReductionXnor),
+    _ => None,
+    }   
+}
+
 pub fn binary_expression_from_string(input: &str) -> Option<VerilogBinaryExpression> {
     match input {
         "{}" => Some(VerilogBinaryExpression::Concatenation),
@@ -58,12 +81,6 @@ pub fn binary_expression_from_string(input: &str) -> Option<VerilogBinaryExpress
         "|" => Some(VerilogBinaryExpression::BitwiseInclusiveOr),
         "^" => Some(VerilogBinaryExpression::BitwiseExclusiveOr),
         "^~" | "~^" => Some(VerilogBinaryExpression::BitwiseEquivalence),
-        "&" => Some(VerilogBinaryExpression::ReductionAnd),
-        "~&" => Some(VerilogBinaryExpression::ReductionNand),
-        "|" => Some(VerilogBinaryExpression::ReductionOr),
-        "~|" => Some(VerilogBinaryExpression::ReductionNor),
-        "^" => Some(VerilogBinaryExpression::ReductionXor),
-        "~^" | "^~" => Some(VerilogBinaryExpression::ReductionXnor),
         "<<" => Some(VerilogBinaryExpression::ShiftLeft),
         ">>" => Some(VerilogBinaryExpression::ShiftRight),
         "<<<" => Some(VerilogBinaryExpression::ArithmeticShiftLeft),
@@ -97,9 +114,7 @@ pub const ALL_BINARY_EXPRESSIONS: &[&str] = &[
     "^~",
     "~^",
     "&",
-    "~&",
     "|",
-    "~|",
     "^",
     "~^",
     "^~",
@@ -149,6 +164,30 @@ mod tests {
         assert_eq!(binary_expression_from_string(">>"), Some(VerilogBinaryExpression::ShiftRight));
         assert_eq!(binary_expression_from_string("<<<"), Some(VerilogBinaryExpression::ArithmeticShiftLeft));
         assert_eq!(binary_expression_from_string(">>>"), Some(VerilogBinaryExpression::ArithmeticShiftRight));
+        assert_eq!(binary_expression_from_string("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_reduction_operator_from_string() {
+        assert_eq!(reduction_operator_from_string("&"), Some(ReductionOperator::ReductionAnd));
+        assert_eq!(reduction_operator_from_string("~&"), Some(ReductionOperator::ReductionNand));
+        assert_eq!(reduction_operator_from_string("|"), Some(ReductionOperator::ReductionOr));
+        assert_eq!(reduction_operator_from_string("~|"), Some(ReductionOperator::ReductionNor));
+        assert_eq!(reduction_operator_from_string("^"), Some(ReductionOperator::ReductionXor));
+        assert_eq!(reduction_operator_from_string("~^"), Some(ReductionOperator::ReductionXnor));
+        assert_eq!(reduction_operator_from_string("^~"), Some(ReductionOperator::ReductionXnor));
+        assert_eq!(reduction_operator_from_string("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_all_binary_expression_from_string() {
+        for expr in ALL_BINARY_EXPRESSIONS {
+            assert!(
+                binary_expression_from_string(expr).is_some(),
+                "Binary expression {} failed to parse",
+                expr
+            );
+        }
         assert_eq!(binary_expression_from_string("nonexistent"), None);
     }
 }
