@@ -104,11 +104,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_identifier() {
-        assert_eq!(parse_identifier("my_module"), Ok(("", "my_module")));
-        assert_eq!(parse_identifier("_my_module"), Ok(("", "_my_module")));
-        assert_eq!(parse_identifier("my_module1"), Ok(("", "my_module1")));
-        assert!(parse_identifier("1my_module").is_err());
+    fn test_parse_identifier_valid_first_characters() {
+        let valid_identifiers = [
+            "my_module", "_my_module", "My_Module", "_My_Module",
+            "my_module1", "My_Module1", "_my_module1", "_My_Module1"
+        ];
+        for id_str in &valid_identifiers {
+            assert!(
+                parse_identifier(id_str).is_ok(),
+                "Valid identifier {} failed to parse",
+                id_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_identifier_invalid_first_characters() {
+        let invalid_identifiers = ["1my_module", "$my_module", "1My_Module", "$My_Module"];
+        for id_str in &invalid_identifiers {
+            assert!(
+                parse_identifier(id_str).is_err(),
+                "Invalid identifier {} should not parse",
+                id_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_identifier_mixed_valid_invalid_first_characters() {
+        let mixed_identifiers = [
+            "my_module$", "my_module1$", "My_Module$", "My_Module1$",
+            "_my_module$", "_my_module1$", "_My_Module$", "_My_Module1$"
+        ];
+        for id_str in &mixed_identifiers {
+            assert!(
+                parse_identifier(id_str).is_ok(),
+                "Mixed identifier {} failed to parse",
+                id_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_identifier_length() {
+        let valid_identifier = "a".repeat(1024);
+        assert!(
+            parse_identifier(&valid_identifier).is_ok(),
+            "Valid identifier of length 1024 failed to parse"
+        );
+
+        let invalid_identifier = "a".repeat(1025);
+        assert!(
+            parse_identifier(&invalid_identifier).is_err(),
+            "Invalid identifier of length 1025 should not parse"
+        );
     }
 
     #[test]
