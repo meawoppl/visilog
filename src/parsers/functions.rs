@@ -138,4 +138,43 @@ mod tests {
         assert_eq!(function_call.identifier, "my_function");
         assert_eq!(function_call.arguments, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
+
+    #[test]
+    fn test_parse_function_declaration_with_range() {
+        let input = r#"
+            function [7:0] sum;
+                input [7:0] a, b;
+                begin
+                    sum = a + b;
+                end
+            endfunction
+        "#;
+        let result = parse_function_declaration(input);
+        assert!(result.is_ok());
+        let (_, function) = result.unwrap();
+        assert_eq!(function.identifier, "sum");
+        assert_eq!(function.range_or_type, Some(RangeOrType::Range(7, 0)));
+        assert_eq!(function.items.len(), 1);
+        assert_eq!(function.items[0], FunctionItemDeclaration::InputDeclaration("a".to_string()));
+        assert_eq!(function.statement.trim(), "begin\n                    sum = a + b;\n                end");
+    }
+
+    #[test]
+    fn test_parse_function_declaration_with_input() {
+        let input = r#"
+            function [7:0] sum (input [7:0] a, b);
+                begin
+                    sum = a + b;
+                end
+            endfunction
+        "#;
+        let result = parse_function_declaration(input);
+        assert!(result.is_ok());
+        let (_, function) = result.unwrap();
+        assert_eq!(function.identifier, "sum");
+        assert_eq!(function.range_or_type, Some(RangeOrType::Range(7, 0)));
+        assert_eq!(function.items.len(), 1);
+        assert_eq!(function.items[0], FunctionItemDeclaration::InputDeclaration("a".to_string()));
+        assert_eq!(function.statement.trim(), "begin\n                    sum = a + b;\n                end");
+    }
 }
