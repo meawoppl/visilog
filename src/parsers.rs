@@ -172,12 +172,39 @@ mod tests {
 
     #[test]
     fn test_identifiers() {
+        // Tests for valid first characters (letters and underscores), covering both uppercase and lowercase letters
         assert!(identifier("var_a").is_ok());
+        assert!(identifier("_var_a").is_ok());
+        assert!(identifier("Var_A").is_ok());
+        assert!(identifier("_Var_A").is_ok());
+        assert!(identifier("var_a1").is_ok());
+        assert!(identifier("Var_A1").is_ok());
+        assert!(identifier("_var_a1").is_ok());
+        assert!(identifier("_Var_A1").is_ok());
+
+        // Tests for invalid first characters (digits and dollar signs)
+        assert!(identifier("1var_a").is_err());
         assert!(identifier("$var_a").is_err());
-        assert!(identifier("v$ar_a").is_ok());
-        assert!(identifier("2var").is_err());
-        assert!(identifier("var23_g").is_ok());
-        assert!(identifier("23").is_err());
+        assert!(identifier("1Var_A").is_err());
+        assert!(identifier("$Var_A").is_err());
+
+        // Tests for mixed valid and invalid first characters
+        assert!(identifier("var_a$").is_ok());
+        assert!(identifier("var_a1$").is_ok());
+        assert!(identifier("Var_A$").is_ok());
+        assert!(identifier("Var_A1$").is_ok());
+        assert!(identifier("_var_a$").is_ok());
+        assert!(identifier("_var_a1$").is_ok());
+        assert!(identifier("_Var_A$").is_ok());
+        assert!(identifier("_Var_A1$").is_ok());
+
+        // Tests for identifiers with a length of up to 1024 characters
+        let valid_identifier = "a".repeat(1024);
+        assert!(identifier(&valid_identifier).is_ok());
+
+        // Tests for identifiers exceeding 1024 characters
+        let invalid_identifier = "a".repeat(1025);
+        assert!(identifier(&invalid_identifier).is_err());
     }
 
     #[test]

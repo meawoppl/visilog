@@ -105,10 +105,39 @@ mod tests {
 
     #[test]
     fn test_parse_identifier() {
+        // Tests for valid first characters (letters and underscores), covering both uppercase and lowercase letters
         assert_eq!(parse_identifier("my_module"), Ok(("", "my_module")));
         assert_eq!(parse_identifier("_my_module"), Ok(("", "_my_module")));
+        assert_eq!(parse_identifier("My_Module"), Ok(("", "My_Module")));
+        assert_eq!(parse_identifier("_My_Module"), Ok(("", "_My_Module")));
         assert_eq!(parse_identifier("my_module1"), Ok(("", "my_module1")));
+        assert_eq!(parse_identifier("My_Module1"), Ok(("", "My_Module1")));
+        assert_eq!(parse_identifier("_my_module1"), Ok(("", "_my_module1")));
+        assert_eq!(parse_identifier("_My_Module1"), Ok(("", "_My_Module1")));
+
+        // Tests for invalid first characters (digits and dollar signs)
         assert!(parse_identifier("1my_module").is_err());
+        assert!(parse_identifier("$my_module").is_err());
+        assert!(parse_identifier("1My_Module").is_err());
+        assert!(parse_identifier("$My_Module").is_err());
+
+        // Tests for mixed valid and invalid first characters
+        assert!(parse_identifier("my_module$").is_ok());
+        assert!(parse_identifier("my_module1$").is_ok());
+        assert!(parse_identifier("My_Module$").is_ok());
+        assert!(parse_identifier("My_Module1$").is_ok());
+        assert!(parse_identifier("_my_module$").is_ok());
+        assert!(parse_identifier("_my_module1$").is_ok());
+        assert!(parse_identifier("_My_Module$").is_ok());
+        assert!(parse_identifier("_My_Module1$").is_ok());
+
+        // Tests for identifiers with a length of up to 1024 characters
+        let valid_identifier = "a".repeat(1024);
+        assert!(parse_identifier(&valid_identifier).is_ok());
+
+        // Tests for identifiers exceeding 1024 characters
+        let invalid_identifier = "a".repeat(1025);
+        assert!(parse_identifier(&invalid_identifier).is_err());
     }
 
     #[test]
