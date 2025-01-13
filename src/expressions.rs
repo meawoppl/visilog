@@ -22,12 +22,6 @@ pub enum VerilogBinaryExpression {
     BitwiseInclusiveOr,
     BitwiseExclusiveOr,
     BitwiseEquivalence,
-    ReductionAnd,
-    ReductionNand,
-    ReductionOr,
-    ReductionNor,
-    ReductionXor,
-    ReductionXnor,
     ShiftLeft,
     ShiftRight,
     ArithmeticShiftLeft,
@@ -153,13 +147,6 @@ mod tests {
         assert_eq!(binary_expression_from_string("^"), Some(VerilogBinaryExpression::BitwiseExclusiveOr));
         assert_eq!(binary_expression_from_string("^~"), Some(VerilogBinaryExpression::BitwiseEquivalence));
         assert_eq!(binary_expression_from_string("~^"), Some(VerilogBinaryExpression::BitwiseEquivalence));
-        assert_eq!(binary_expression_from_string("&"), Some(VerilogBinaryExpression::ReductionAnd));
-        assert_eq!(binary_expression_from_string("~&"), Some(VerilogBinaryExpression::ReductionNand));
-        assert_eq!(binary_expression_from_string("|"), Some(VerilogBinaryExpression::ReductionOr));
-        assert_eq!(binary_expression_from_string("~|"), Some(VerilogBinaryExpression::ReductionNor));
-        assert_eq!(binary_expression_from_string("^"), Some(VerilogBinaryExpression::ReductionXor));
-        assert_eq!(binary_expression_from_string("~^"), Some(VerilogBinaryExpression::ReductionXnor));
-        assert_eq!(binary_expression_from_string("^~"), Some(VerilogBinaryExpression::ReductionXnor));
         assert_eq!(binary_expression_from_string("<<"), Some(VerilogBinaryExpression::ShiftLeft));
         assert_eq!(binary_expression_from_string(">>"), Some(VerilogBinaryExpression::ShiftRight));
         assert_eq!(binary_expression_from_string("<<<"), Some(VerilogBinaryExpression::ArithmeticShiftLeft));
