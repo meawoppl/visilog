@@ -90,10 +90,11 @@ fn sized_const(input: &str) -> IResult<&str, (&str, VerilogBaseType, &str)> {
 }
 
 fn identifier(input: &str) -> IResult<&str, &str> {
-    recognize(tuple((
-        alt((alpha1, tag("_"))), // Start with alpha, '_', or '$'
-        take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '$'), // Alphanumeric, '_', or '$'
-    )))(input)
+    let first_char = alt((nom::character::complete::alpha1, tag("_")));
+    let rest_chars = take_while(|c: char| c.is_alphanumeric() || c == '_');
+    map(pair(first_char, rest_chars), |(first, rest): (&str, &str)| {
+        format!("{}{}", first, rest)
+    })(input)
 }
 
 fn identifier_list(input: &str) -> IResult<&str, Vec<&str>> {
