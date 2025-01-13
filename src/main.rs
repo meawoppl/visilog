@@ -1,6 +1,9 @@
 mod keywords;
 mod register;
 
+mod expressions;
+
+
 use keywords::VerilogKeyword;
 use nom::{
     branch::alt,
@@ -18,7 +21,6 @@ use nom::{
 use nom::character::complete::multispace0;
 
 use crate::keywords::keyword_from_string;
-use crate::register::Register;
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
@@ -250,6 +252,8 @@ mod tests {
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
     }
+
+
 }
 
 fn main() {
