@@ -18,6 +18,7 @@ use nom::{
 use nom::character::complete::multispace0;
 
 use crate::keywords::keyword_from_string;
+use crate::register::Register;
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
@@ -253,4 +254,10 @@ mod tests {
 
 fn main() {
     println!("Hello, world!");
+
+    let reg = Register::new(4, vec![0, 1, 2, 3]);
+    println!("Binary: {}", reg.to_binary());
+    println!("Hex: {}", reg.to_hex());
+    println!("Decimal: {}", reg.to_decimal());
+    println!("Octal: {}", reg.to_octal());
 }
