@@ -89,14 +89,22 @@ fn sized_const(input: &str) -> IResult<&str, (&str, VerilogBaseType, &str)> {
     ))(input)
 }
 
-fn identifier(input: &str) -> IResult<&str, &str> {
-    recognize(tuple((
-        alt((alpha1, tag("_"))), // Start with alpha, '_', or '$'
-        take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '$'), // Alphanumeric, '_', or '$'
-    )))(input)
+fn identifier(input: &str) -> IResult<&str, String> {
+    let (input, id) = recognize(tuple((
+        alt((alpha1, tag("_"))), // Start with alpha or '_'
+        take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '$'), // Alphanumeric, '_', or '$'
+    )))(input)?;
+
+    let full_id = format!("{}{}", input, id);
+    if full_id.len() > 1024 {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::TooLarge)))
+    } else {
+        Ok((input, full_id))
+    }
+
 }
 
-fn identifier_list(input: &str) -> IResult<&str, Vec<&str>> {
+fn identifier_list(input: &str) -> IResult<&str, Vec<String>> {
     separated_list1(ws(char(',')), ws(identifier))(input)
 }
 
@@ -159,7 +167,7 @@ fn net_type(input: &str) -> IResult<&str, NetType> {
     ))(input)
 }
 
-fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, Vec<&str>)> {
+fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, Vec<String>)> {
     tuple((net_type, ws(opt(range)), ws(identifier_list)))(input)
 }
 
@@ -204,11 +212,23 @@ mod tests {
             "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$"
         ];
         for id_str in &mixed_identifiers {
+            let result = identifier(id_str);
+            
             assert!(
-                identifier(id_str).is_ok(),
+                result.is_ok(),
                 "Mixed identifier {} failed to parse",
                 id_str
             );
+
+            let unwrapped = result.unwrap();
+
+            assert!(
+                unwrapped.0.is_empty(),
+                "Mixed identifier {} failed to fully parse",
+                id_str
+            );
+
+            assert_eq!(unwrapped.1, id_str.to_string());
         }
     }
 
@@ -281,14 +301,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_identifier_list() {
         identifier_list.parse("a").unwrap();
         identifier_list.parse("a, b, c").unwrap();
     }
 
     #[test]
-    #[ignore]
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
     }
