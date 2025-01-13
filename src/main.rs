@@ -1,5 +1,6 @@
 mod keywords;
 mod register;
+mod download; // P66d9
 
 use keywords::VerilogKeyword;
 use nom::{
@@ -18,6 +19,7 @@ use nom::{
 use nom::character::complete::multispace0;
 
 use crate::keywords::keyword_from_string;
+use crate::download::{get_file, is_cached}; // P5f65
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
