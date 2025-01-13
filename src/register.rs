@@ -53,24 +53,6 @@ impl Register {
         decimal_value.to_string()
     }
 
-    pub fn to_octal(&self) -> String {
-        let mut octal_string = String::new();
-        for chunk in self.values.chunks(3) {
-            let mut octal_value = 0;
-            for (i, &v) in chunk.iter().enumerate() {
-                octal_value |= match v {
-                    0 => 0,
-                    1 => 1 << (2 - i),
-                    2 => 2 << (2 - i),
-                    3 => 3 << (2 - i),
-                    _ => panic!("Invalid value"),
-                };
-            }
-            octal_string.push_str(&format!("{:o}", octal_value));
-        }
-        octal_string
-    }
-
     pub fn from_binary(input: &str) -> Self {
         let values = input
             .chars()
@@ -109,16 +91,6 @@ impl Register {
         Register { values }
     }
 
-    pub fn from_octal(input: &str) -> Self {
-        let values = input
-            .chars()
-            .flat_map(|c| {
-                let octal_value = c.to_digit(8).expect("Invalid character in octal input");
-                (0..3).rev().map(move |i| ((octal_value >> i) & 1) as u8)
-            })
-            .collect();
-        Register { values }
-    }
 
     /// Returns a reference to the raw values of the register.
     pub fn get_raw(&self) -> &Vec<u8> {
@@ -138,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_register_to_hex() {
-        let reg = Register::new(4, vec![0, 1, 2, 3]);
+        let reg = Register::new(4, vec![0, 0, 1, 1]);
         assert_eq!(reg.to_hex(), "3");
     }
 
@@ -148,11 +120,6 @@ mod tests {
         assert_eq!(reg.to_decimal(), "6");
     }
 
-    #[test]
-    fn test_register_to_octal() {
-        let reg = Register::new(4, vec![0, 1, 1, 0]);
-        assert_eq!(reg.to_octal(), "3");
-    }
 
     #[test]
     fn test_register_from_binary() {
@@ -172,9 +139,4 @@ mod tests {
         assert_eq!(reg.get_raw(), &vec![1, 1, 0]);
     }
 
-    #[test]
-    fn test_register_from_octal() {
-        let reg = Register::from_octal("3");
-        assert_eq!(reg.get_raw(), &vec![0, 1, 1]);
-    }
 }
