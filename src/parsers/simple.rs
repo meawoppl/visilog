@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_ws() {
-        let parser = ws(tag("abc"));
+        let mut parser = ws(tag("abc"));
         assert_eq!(parser("   abc   "), Ok(("", "abc")));
         assert_eq!(parser("\tabc\t"), Ok(("", "abc")));
         assert_eq!(parser("abc"), Ok(("", "abc")));
