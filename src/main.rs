@@ -1,8 +1,8 @@
 mod keywords;
 mod register;
+mod modules;
 
 mod expressions;
-
 
 use keywords::VerilogKeyword;
 use nom::{
@@ -21,6 +21,7 @@ use nom::{
 use nom::character::complete::multispace0;
 
 use crate::keywords::keyword_from_string;
+use crate::modules::{parse_module_declaration, VerilogModule};
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
@@ -278,6 +279,25 @@ mod tests {
 
         let reg_oct = register::Register::from_octal("3");
         assert_eq!(reg_oct.get_raw(), &vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn test_parse_module_declaration() {
+        let input = r#"
+            module my_module (
+                input wire a,
+                output wire b
+            );
+            endmodule
+        "#;
+        let result = parse_module_declaration(input);
+        assert!(result.is_ok());
+        let (remaining, module) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(module.name, "my_module");
+        assert_eq!(module.ports.len(), 2);
+        assert_eq!(module.ports[0].name, "a");
+        assert_eq!(module.ports[1].name, "b");
     }
 }
 
