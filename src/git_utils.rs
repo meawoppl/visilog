@@ -29,12 +29,12 @@ pub fn shallow_clone_and_cache(repo_url: &str, commit_hash: &str, subdir: &str) 
     let subdir_oid = subdir_entry.id();
     let subdir_tree = repo.find_tree(subdir_oid)?;
 
-    fs::create_dir_all(&cache_path)?;
+    fs::create_dir_all(&cache_path).map_err(|e| git2::Error::from_str(&e.to_string()))?;
     for entry in subdir_tree.iter() {
         let entry_path = format!("{}/{}", cache_path, entry.name().unwrap());
         if entry.kind() == Some(git2::ObjectType::Blob) {
             let blob = repo.find_blob(entry.id())?;
-            fs::write(entry_path, blob.content())?;
+            fs::write(entry_path, blob.content()).map_err(|e| git2::Error::from_str(&e.to_string()))?;
         }
     }
 
