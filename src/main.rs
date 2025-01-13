@@ -167,6 +167,38 @@ fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, V
     tuple((net_type, ws(opt(range)), ws(identifier_list)))(input)
 }
 
+// P5b98
+fn primary(input: &str) -> IResult<&str, &str> {
+    alt((identifier, sized_const))(input)
+}
+
+// Pbbc8
+fn unary_expression(input: &str) -> IResult<&str, &str> {
+    alt((
+        map(tuple((alt((tag("!"), tag("~"), tag("&"), tag("|"), tag("^"))), primary)), |(_, expr)| expr),
+        primary,
+    ))(input)
+}
+
+// P1376
+fn binary_expression(input: &str) -> IResult<&str, &str> {
+    map(
+        tuple((unary_expression, opt(tuple((alt((tag("+"), tag("-"), tag("*"), tag("/"), tag("%"), tag("=="), tag("!="), tag("<"), tag(">"), tag("<="), tag(">="))), unary_expression))))),
+        |(left, opt_right)| {
+            if let Some((op, right)) = opt_right {
+                format!("{} {} {}", left, op, right)
+            } else {
+                left.to_string()
+            }
+        },
+    )(input)
+}
+
+// Ped59
+fn expression(input: &str) -> IResult<&str, &str> {
+    binary_expression(input)
+}
+
 #[cfg(test)]
 mod tests {
     use nom::Parser;
@@ -246,5 +278,30 @@ mod tests {
     #[test]
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
+    }
+
+    // Pfa5a
+    #[test]
+    fn test_primary() {
+        assert!(primary("var_a").is_ok());
+        assert!(primary("3'b010").is_ok());
+    }
+
+    #[test]
+    fn test_unary_expression() {
+        assert!(unary_expression("!var_a").is_ok());
+        assert!(unary_expression("~3'b010").is_ok());
+    }
+
+    #[test]
+    fn test_binary_expression() {
+        assert!(binary_expression("var_a + var_b").is_ok());
+        assert!(binary_expression("3'b010 * 3'b011").is_ok());
+    }
+
+    #[test]
+    fn test_expression() {
+        assert!(expression("var_a + var_b * var_c").is_ok());
+        assert!(expression("3'b010 * 3'b011 + 3'b100").is_ok());
     }
 }
