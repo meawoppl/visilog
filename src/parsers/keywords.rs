@@ -1,3 +1,12 @@
+use nom::{
+    bytes::complete::take_while,
+    character::complete::alpha1,
+    combinator::{map, recognize},
+    sequence::tuple,
+    IResult,
+};
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum VerilogKeyword {
     AcceptOn,
     Alias,
@@ -370,17 +379,40 @@ pub const ALL_KEYWORDS: &[&str] = &[
     "within",
 ];
 
+fn keyword(input: &str) -> IResult<&str, VerilogKeyword> {
+    map(
+        recognize(tuple((
+            alpha1,
+            take_while(|c: char| c.is_alphanumeric() || c == '_'),
+        ))),
+        |kw| keyword_from_string(kw).unwrap(), // Map the matched word to the enum
+    )(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nom::Parser;
 
     #[test]
     fn test_keyword_from_string() {
-        assert_eq!(keyword_from_string("accept_on"), Some(VerilogKeyword::AcceptOn));
+        assert_eq!(
+            keyword_from_string("accept_on"),
+            Some(VerilogKeyword::AcceptOn)
+        );
         assert_eq!(keyword_from_string("alias"), Some(VerilogKeyword::Alias));
-        assert_eq!(keyword_from_string("always_comb"), Some(VerilogKeyword::AlwaysComb));
-        assert_eq!(keyword_from_string("always_ff"), Some(VerilogKeyword::AlwaysFf));
-        assert_eq!(keyword_from_string("always_latch"), Some(VerilogKeyword::AlwaysLatch));
+        assert_eq!(
+            keyword_from_string("always_comb"),
+            Some(VerilogKeyword::AlwaysComb)
+        );
+        assert_eq!(
+            keyword_from_string("always_ff"),
+            Some(VerilogKeyword::AlwaysFf)
+        );
+        assert_eq!(
+            keyword_from_string("always_latch"),
+            Some(VerilogKeyword::AlwaysLatch)
+        );
         assert_eq!(keyword_from_string("assert"), Some(VerilogKeyword::Assert));
         assert_eq!(keyword_from_string("assume"), Some(VerilogKeyword::Assume));
         assert_eq!(keyword_from_string("before"), Some(VerilogKeyword::Before));
@@ -390,110 +422,293 @@ mod tests {
         assert_eq!(keyword_from_string("bit"), Some(VerilogKeyword::Bit));
         assert_eq!(keyword_from_string("break"), Some(VerilogKeyword::Break));
         assert_eq!(keyword_from_string("byte"), Some(VerilogKeyword::Byte));
-        assert_eq!(keyword_from_string("chandle"), Some(VerilogKeyword::Chandle));
-        assert_eq!(keyword_from_string("checker"), Some(VerilogKeyword::Checker));
+        assert_eq!(
+            keyword_from_string("chandle"),
+            Some(VerilogKeyword::Chandle)
+        );
+        assert_eq!(
+            keyword_from_string("checker"),
+            Some(VerilogKeyword::Checker)
+        );
         assert_eq!(keyword_from_string("class"), Some(VerilogKeyword::Class));
-        assert_eq!(keyword_from_string("clocking"), Some(VerilogKeyword::Clocking));
+        assert_eq!(
+            keyword_from_string("clocking"),
+            Some(VerilogKeyword::Clocking)
+        );
         assert_eq!(keyword_from_string("const"), Some(VerilogKeyword::Const));
-        assert_eq!(keyword_from_string("constraint"), Some(VerilogKeyword::Constraint));
-        assert_eq!(keyword_from_string("context"), Some(VerilogKeyword::Context));
-        assert_eq!(keyword_from_string("continue"), Some(VerilogKeyword::Continue));
+        assert_eq!(
+            keyword_from_string("constraint"),
+            Some(VerilogKeyword::Constraint)
+        );
+        assert_eq!(
+            keyword_from_string("context"),
+            Some(VerilogKeyword::Context)
+        );
+        assert_eq!(
+            keyword_from_string("continue"),
+            Some(VerilogKeyword::Continue)
+        );
         assert_eq!(keyword_from_string("cover"), Some(VerilogKeyword::Cover));
-        assert_eq!(keyword_from_string("covergroup"), Some(VerilogKeyword::Covergroup));
-        assert_eq!(keyword_from_string("coverpoint"), Some(VerilogKeyword::Coverpoint));
+        assert_eq!(
+            keyword_from_string("covergroup"),
+            Some(VerilogKeyword::Covergroup)
+        );
+        assert_eq!(
+            keyword_from_string("coverpoint"),
+            Some(VerilogKeyword::Coverpoint)
+        );
         assert_eq!(keyword_from_string("cross"), Some(VerilogKeyword::Cross));
         assert_eq!(keyword_from_string("dist"), Some(VerilogKeyword::Dist));
         assert_eq!(keyword_from_string("do"), Some(VerilogKeyword::Do));
-        assert_eq!(keyword_from_string("endchecker"), Some(VerilogKeyword::Endchecker));
-        assert_eq!(keyword_from_string("endclass"), Some(VerilogKeyword::Endclass));
-        assert_eq!(keyword_from_string("endclocking"), Some(VerilogKeyword::Endclocking));
-        assert_eq!(keyword_from_string("endgroup"), Some(VerilogKeyword::Endgroup));
-        assert_eq!(keyword_from_string("endinterface"), Some(VerilogKeyword::Endinterface));
-        assert_eq!(keyword_from_string("endpackage"), Some(VerilogKeyword::Endpackage));
-        assert_eq!(keyword_from_string("endprogram"), Some(VerilogKeyword::Endprogram));
-        assert_eq!(keyword_from_string("endproperty"), Some(VerilogKeyword::Endproperty));
-        assert_eq!(keyword_from_string("endsequence"), Some(VerilogKeyword::Endsequence));
+        assert_eq!(
+            keyword_from_string("endchecker"),
+            Some(VerilogKeyword::Endchecker)
+        );
+        assert_eq!(
+            keyword_from_string("endclass"),
+            Some(VerilogKeyword::Endclass)
+        );
+        assert_eq!(
+            keyword_from_string("endclocking"),
+            Some(VerilogKeyword::Endclocking)
+        );
+        assert_eq!(
+            keyword_from_string("endgroup"),
+            Some(VerilogKeyword::Endgroup)
+        );
+        assert_eq!(
+            keyword_from_string("endinterface"),
+            Some(VerilogKeyword::Endinterface)
+        );
+        assert_eq!(
+            keyword_from_string("endpackage"),
+            Some(VerilogKeyword::Endpackage)
+        );
+        assert_eq!(
+            keyword_from_string("endprogram"),
+            Some(VerilogKeyword::Endprogram)
+        );
+        assert_eq!(
+            keyword_from_string("endproperty"),
+            Some(VerilogKeyword::Endproperty)
+        );
+        assert_eq!(
+            keyword_from_string("endsequence"),
+            Some(VerilogKeyword::Endsequence)
+        );
         assert_eq!(keyword_from_string("enum"), Some(VerilogKeyword::Enum));
-        assert_eq!(keyword_from_string("eventually"), Some(VerilogKeyword::Eventually));
+        assert_eq!(
+            keyword_from_string("eventually"),
+            Some(VerilogKeyword::Eventually)
+        );
         assert_eq!(keyword_from_string("expect"), Some(VerilogKeyword::Expect));
         assert_eq!(keyword_from_string("export"), Some(VerilogKeyword::Export));
-        assert_eq!(keyword_from_string("extends"), Some(VerilogKeyword::Extends));
+        assert_eq!(
+            keyword_from_string("extends"),
+            Some(VerilogKeyword::Extends)
+        );
         assert_eq!(keyword_from_string("extern"), Some(VerilogKeyword::Extern));
         assert_eq!(keyword_from_string("final"), Some(VerilogKeyword::Final));
-        assert_eq!(keyword_from_string("first_match"), Some(VerilogKeyword::FirstMatch));
-        assert_eq!(keyword_from_string("foreach"), Some(VerilogKeyword::Foreach));
-        assert_eq!(keyword_from_string("forkjoin"), Some(VerilogKeyword::Forkjoin));
+        assert_eq!(
+            keyword_from_string("first_match"),
+            Some(VerilogKeyword::FirstMatch)
+        );
+        assert_eq!(
+            keyword_from_string("foreach"),
+            Some(VerilogKeyword::Foreach)
+        );
+        assert_eq!(
+            keyword_from_string("forkjoin"),
+            Some(VerilogKeyword::Forkjoin)
+        );
         assert_eq!(keyword_from_string("global"), Some(VerilogKeyword::Global));
         assert_eq!(keyword_from_string("iff"), Some(VerilogKeyword::Iff));
-        assert_eq!(keyword_from_string("ignore_bins"), Some(VerilogKeyword::IgnoreBins));
-        assert_eq!(keyword_from_string("illegal_bins"), Some(VerilogKeyword::IllegalBins));
-        assert_eq!(keyword_from_string("implies"), Some(VerilogKeyword::Implies));
+        assert_eq!(
+            keyword_from_string("ignore_bins"),
+            Some(VerilogKeyword::IgnoreBins)
+        );
+        assert_eq!(
+            keyword_from_string("illegal_bins"),
+            Some(VerilogKeyword::IllegalBins)
+        );
+        assert_eq!(
+            keyword_from_string("implies"),
+            Some(VerilogKeyword::Implies)
+        );
         assert_eq!(keyword_from_string("import"), Some(VerilogKeyword::Import));
         assert_eq!(keyword_from_string("inside"), Some(VerilogKeyword::Inside));
         assert_eq!(keyword_from_string("int"), Some(VerilogKeyword::Int));
-        assert_eq!(keyword_from_string("interface"), Some(VerilogKeyword::Interface));
-        assert_eq!(keyword_from_string("intersect"), Some(VerilogKeyword::Intersect));
-        assert_eq!(keyword_from_string("join_any"), Some(VerilogKeyword::JoinAny));
-        assert_eq!(keyword_from_string("join_none"), Some(VerilogKeyword::JoinNone));
+        assert_eq!(
+            keyword_from_string("interface"),
+            Some(VerilogKeyword::Interface)
+        );
+        assert_eq!(
+            keyword_from_string("intersect"),
+            Some(VerilogKeyword::Intersect)
+        );
+        assert_eq!(
+            keyword_from_string("join_any"),
+            Some(VerilogKeyword::JoinAny)
+        );
+        assert_eq!(
+            keyword_from_string("join_none"),
+            Some(VerilogKeyword::JoinNone)
+        );
         assert_eq!(keyword_from_string("let"), Some(VerilogKeyword::Let));
         assert_eq!(keyword_from_string("local"), Some(VerilogKeyword::Local));
         assert_eq!(keyword_from_string("logic"), Some(VerilogKeyword::Logic));
-        assert_eq!(keyword_from_string("longint"), Some(VerilogKeyword::Longint));
-        assert_eq!(keyword_from_string("matches"), Some(VerilogKeyword::Matches));
-        assert_eq!(keyword_from_string("modport"), Some(VerilogKeyword::Modport));
+        assert_eq!(
+            keyword_from_string("longint"),
+            Some(VerilogKeyword::Longint)
+        );
+        assert_eq!(
+            keyword_from_string("matches"),
+            Some(VerilogKeyword::Matches)
+        );
+        assert_eq!(
+            keyword_from_string("modport"),
+            Some(VerilogKeyword::Modport)
+        );
         assert_eq!(keyword_from_string("new"), Some(VerilogKeyword::New));
-        assert_eq!(keyword_from_string("nexttime"), Some(VerilogKeyword::Nexttime));
+        assert_eq!(
+            keyword_from_string("nexttime"),
+            Some(VerilogKeyword::Nexttime)
+        );
         assert_eq!(keyword_from_string("null"), Some(VerilogKeyword::Null));
-        assert_eq!(keyword_from_string("package"), Some(VerilogKeyword::Package));
+        assert_eq!(
+            keyword_from_string("package"),
+            Some(VerilogKeyword::Package)
+        );
         assert_eq!(keyword_from_string("packed"), Some(VerilogKeyword::Packed));
-        assert_eq!(keyword_from_string("priority"), Some(VerilogKeyword::Priority));
-        assert_eq!(keyword_from_string("program"), Some(VerilogKeyword::Program));
-        assert_eq!(keyword_from_string("property"), Some(VerilogKeyword::Property));
-        assert_eq!(keyword_from_string("protected"), Some(VerilogKeyword::Protected));
+        assert_eq!(
+            keyword_from_string("priority"),
+            Some(VerilogKeyword::Priority)
+        );
+        assert_eq!(
+            keyword_from_string("program"),
+            Some(VerilogKeyword::Program)
+        );
+        assert_eq!(
+            keyword_from_string("property"),
+            Some(VerilogKeyword::Property)
+        );
+        assert_eq!(
+            keyword_from_string("protected"),
+            Some(VerilogKeyword::Protected)
+        );
         assert_eq!(keyword_from_string("pure"), Some(VerilogKeyword::Pure));
         assert_eq!(keyword_from_string("rand"), Some(VerilogKeyword::Rand));
         assert_eq!(keyword_from_string("randc"), Some(VerilogKeyword::Randc));
-        assert_eq!(keyword_from_string("randcase"), Some(VerilogKeyword::Randcase));
-        assert_eq!(keyword_from_string("randsequence"), Some(VerilogKeyword::Randsequence));
+        assert_eq!(
+            keyword_from_string("randcase"),
+            Some(VerilogKeyword::Randcase)
+        );
+        assert_eq!(
+            keyword_from_string("randsequence"),
+            Some(VerilogKeyword::Randsequence)
+        );
         assert_eq!(keyword_from_string("ref"), Some(VerilogKeyword::Ref));
-        assert_eq!(keyword_from_string("reject_on"), Some(VerilogKeyword::RejectOn));
-        assert_eq!(keyword_from_string("restrict"), Some(VerilogKeyword::Restrict));
+        assert_eq!(
+            keyword_from_string("reject_on"),
+            Some(VerilogKeyword::RejectOn)
+        );
+        assert_eq!(
+            keyword_from_string("restrict"),
+            Some(VerilogKeyword::Restrict)
+        );
         assert_eq!(keyword_from_string("return"), Some(VerilogKeyword::Return));
-        assert_eq!(keyword_from_string("s_always"), Some(VerilogKeyword::SAlways));
-        assert_eq!(keyword_from_string("s_eventually"), Some(VerilogKeyword::SEventually));
-        assert_eq!(keyword_from_string("s_nexttime"), Some(VerilogKeyword::SNexttime));
+        assert_eq!(
+            keyword_from_string("s_always"),
+            Some(VerilogKeyword::SAlways)
+        );
+        assert_eq!(
+            keyword_from_string("s_eventually"),
+            Some(VerilogKeyword::SEventually)
+        );
+        assert_eq!(
+            keyword_from_string("s_nexttime"),
+            Some(VerilogKeyword::SNexttime)
+        );
         assert_eq!(keyword_from_string("s_until"), Some(VerilogKeyword::SUntil));
-        assert_eq!(keyword_from_string("s_until_with"), Some(VerilogKeyword::SUntilWith));
-        assert_eq!(keyword_from_string("sequence"), Some(VerilogKeyword::Sequence));
-        assert_eq!(keyword_from_string("shortint"), Some(VerilogKeyword::Shortint));
-        assert_eq!(keyword_from_string("shortreal"), Some(VerilogKeyword::Shortreal));
+        assert_eq!(
+            keyword_from_string("s_until_with"),
+            Some(VerilogKeyword::SUntilWith)
+        );
+        assert_eq!(
+            keyword_from_string("sequence"),
+            Some(VerilogKeyword::Sequence)
+        );
+        assert_eq!(
+            keyword_from_string("shortint"),
+            Some(VerilogKeyword::Shortint)
+        );
+        assert_eq!(
+            keyword_from_string("shortreal"),
+            Some(VerilogKeyword::Shortreal)
+        );
         assert_eq!(keyword_from_string("solve"), Some(VerilogKeyword::Solve));
         assert_eq!(keyword_from_string("static"), Some(VerilogKeyword::Static));
         assert_eq!(keyword_from_string("string"), Some(VerilogKeyword::String));
         assert_eq!(keyword_from_string("strong"), Some(VerilogKeyword::Strong));
         assert_eq!(keyword_from_string("struct"), Some(VerilogKeyword::Struct));
         assert_eq!(keyword_from_string("super"), Some(VerilogKeyword::Super));
-        assert_eq!(keyword_from_string("sync_accept_on"), Some(VerilogKeyword::SyncAcceptOn));
-        assert_eq!(keyword_from_string("sync_reject_on"), Some(VerilogKeyword::SyncRejectOn));
+        assert_eq!(
+            keyword_from_string("sync_accept_on"),
+            Some(VerilogKeyword::SyncAcceptOn)
+        );
+        assert_eq!(
+            keyword_from_string("sync_reject_on"),
+            Some(VerilogKeyword::SyncRejectOn)
+        );
         assert_eq!(keyword_from_string("tagged"), Some(VerilogKeyword::Tagged));
         assert_eq!(keyword_from_string("this"), Some(VerilogKeyword::This));
-        assert_eq!(keyword_from_string("throughout"), Some(VerilogKeyword::Throughout));
-        assert_eq!(keyword_from_string("timeprecision"), Some(VerilogKeyword::Timeprecision));
-        assert_eq!(keyword_from_string("timeunit"), Some(VerilogKeyword::Timeunit));
+        assert_eq!(
+            keyword_from_string("throughout"),
+            Some(VerilogKeyword::Throughout)
+        );
+        assert_eq!(
+            keyword_from_string("timeprecision"),
+            Some(VerilogKeyword::Timeprecision)
+        );
+        assert_eq!(
+            keyword_from_string("timeunit"),
+            Some(VerilogKeyword::Timeunit)
+        );
         assert_eq!(keyword_from_string("type"), Some(VerilogKeyword::Type));
-        assert_eq!(keyword_from_string("typedef"), Some(VerilogKeyword::Typedef));
+        assert_eq!(
+            keyword_from_string("typedef"),
+            Some(VerilogKeyword::Typedef)
+        );
         assert_eq!(keyword_from_string("union"), Some(VerilogKeyword::Union));
         assert_eq!(keyword_from_string("unique"), Some(VerilogKeyword::Unique));
-        assert_eq!(keyword_from_string("unique0"), Some(VerilogKeyword::Unique0));
+        assert_eq!(
+            keyword_from_string("unique0"),
+            Some(VerilogKeyword::Unique0)
+        );
         assert_eq!(keyword_from_string("until"), Some(VerilogKeyword::Until));
-        assert_eq!(keyword_from_string("until_with"), Some(VerilogKeyword::UntilWith));
-        assert_eq!(keyword_from_string("untypted"), Some(VerilogKeyword::Untypted));
+        assert_eq!(
+            keyword_from_string("until_with"),
+            Some(VerilogKeyword::UntilWith)
+        );
+        assert_eq!(
+            keyword_from_string("untypted"),
+            Some(VerilogKeyword::Untypted)
+        );
         assert_eq!(keyword_from_string("var"), Some(VerilogKeyword::Var));
-        assert_eq!(keyword_from_string("virtual"), Some(VerilogKeyword::Virtual));
+        assert_eq!(
+            keyword_from_string("virtual"),
+            Some(VerilogKeyword::Virtual)
+        );
         assert_eq!(keyword_from_string("void"), Some(VerilogKeyword::Void));
-        assert_eq!(keyword_from_string("wait_order"), Some(VerilogKeyword::WaitOrder));
+        assert_eq!(
+            keyword_from_string("wait_order"),
+            Some(VerilogKeyword::WaitOrder)
+        );
         assert_eq!(keyword_from_string("weak"), Some(VerilogKeyword::Weak));
-        assert_eq!(keyword_from_string("wildcard"), Some(VerilogKeyword::Wildcard));
+        assert_eq!(
+            keyword_from_string("wildcard"),
+            Some(VerilogKeyword::Wildcard)
+        );
         assert_eq!(keyword_from_string("with"), Some(VerilogKeyword::With));
         assert_eq!(keyword_from_string("within"), Some(VerilogKeyword::Within));
         assert_eq!(keyword_from_string("nonexistent"), None);

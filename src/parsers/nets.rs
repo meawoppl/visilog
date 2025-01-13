@@ -1,3 +1,7 @@
+use nom::{combinator::opt, sequence::tuple, IResult};
+
+use super::{identifier::identifier_list, simple::{range, ws}};
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum NetType {
     Supply0,
@@ -13,27 +17,29 @@ pub enum NetType {
 }
 
 pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {
-    use nom::{
-        branch::alt,
-        bytes::complete::tag,
-        combinator::value,
-    };
+    use nom::{branch::alt, bytes::complete::tag, combinator::value};
 
     alt((
         value(NetType::Wire, tag("wire")),
         value(NetType::WireAnd, tag("wand")),
         value(NetType::WireOr, tag("wor")),
-        value(NetType::Tri, tag("tri")),
         value(NetType::TriAnd, tag("triand")),
         value(NetType::TriOr, tag("trior")),
+        value(NetType::Tri, tag("tri")),
         value(NetType::Supply0, tag("supply0")),
         value(NetType::Supply1, tag("supply1")),
     ))(input)
 }
 
+fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, Vec<String>)> {
+    tuple((net_type, ws(opt(range)), ws(identifier_list)))(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use nom::Parser;
 
     #[test]
     fn test_net_type() {
@@ -46,5 +52,10 @@ mod tests {
         assert_eq!(net_type("supply0"), Ok(("", NetType::Supply0)));
         assert_eq!(net_type("supply1"), Ok(("", NetType::Supply1)));
         assert!(net_type("invalid").is_err());
+    }
+
+    #[test]
+    fn test_net_declaration() {
+        net_declaration.parse("wire z").unwrap();
     }
 }
