@@ -4,6 +4,7 @@ mod tests {
 
     use super::*;
     use crate::keywords::ALL_KEYWORDS;
+    use crate::nets::parse_wire_statement;
 
     #[test]
     fn test_identifiers() {
@@ -79,5 +80,42 @@ mod tests {
     #[ignore]
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
+    }
+
+    #[test]
+    fn test_parse_wire_statement() {
+        assert_eq!(
+            parse_wire_statement("wire a;"),
+            Ok((
+                "",
+                Net {
+                    net_type: NetType::Wire,
+                    range: None,
+                    names: vec!["a".to_string()],
+                }
+            ))
+        );
+        assert_eq!(
+            parse_wire_statement("wire [7:0] b;"),
+            Ok((
+                "",
+                Net {
+                    net_type: NetType::Wire,
+                    range: Some((7, 0)),
+                    names: vec!["b".to_string()],
+                }
+            ))
+        );
+        assert_eq!(
+            parse_wire_statement("wire a, b, c;"),
+            Ok((
+                "",
+                Net {
+                    net_type: NetType::Wire,
+                    range: None,
+                    names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                }
+            ))
+        );
     }
 }

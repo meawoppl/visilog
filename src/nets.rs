@@ -60,6 +60,10 @@ fn parse_net(input: &str) -> IResult<&str, Net> {
     Ok((input, Net { net_type, range, names: names.into_iter().map(String::from).collect() }))
 }
 
+fn parse_wire_statement(input: &str) -> IResult<&str, Net> {
+    parse_net(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +114,43 @@ mod tests {
         );
         assert_eq!(
             parse_net("wire a, b, c;"),
+            Ok((
+                "",
+                Net {
+                    net_type: NetType::Wire,
+                    range: None,
+                    names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_wire_statement() {
+        assert_eq!(
+            parse_wire_statement("wire a;"),
+            Ok((
+                "",
+                Net {
+                    net_type: NetType::Wire,
+                    range: None,
+                    names: vec!["a".to_string()],
+                }
+            ))
+        );
+        assert_eq!(
+            parse_wire_statement("wire [7:0] b;"),
+            Ok((
+                "",
+                Net {
+                    net_type: NetType::Wire,
+                    range: Some((7, 0)),
+                    names: vec!["b".to_string()],
+                }
+            ))
+        );
+        assert_eq!(
+            parse_wire_statement("wire a, b, c;"),
             Ok((
                 "",
                 Net {
