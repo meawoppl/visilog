@@ -21,7 +21,7 @@ impl Register {
             .collect()
     }
 
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(&self) -> Option<String> {
         let mut hex_string = String::new();
         for chunk in self.values.chunks(4) {
             let mut hex_value = 0;
@@ -29,28 +29,43 @@ impl Register {
                 hex_value |= match v {
                     0 => 0,
                     1 => 1 << (3 - i),
-                    2 => 2 << (3 - i),
-                    3 => 3 << (3 - i),
+                    2 | 3 => return None,
                     _ => panic!("Invalid value"),
                 };
             }
             hex_string.push_str(&format!("{:X}", hex_value));
         }
-        hex_string
+        Some(hex_string)
     }
 
-    pub fn to_decimal(&self) -> String {
+    pub fn to_decimal(&self) -> Option<String> {
         let mut decimal_value = 0;
         for &v in &self.values {
             decimal_value = decimal_value * 2 + match v {
                 0 => 0,
                 1 => 1,
-                2 => panic!("Cannot convert unknown (x) to decimal"),
-                3 => panic!("Cannot convert high impedance (z) to decimal"),
+                2 | 3 => return None,
                 _ => panic!("Invalid value"),
             };
         }
-        decimal_value.to_string()
+        Some(decimal_value.to_string())
+    }
+
+    pub fn to_octal(&self) -> Option<String> {
+        let mut octal_string = String::new();
+        for chunk in self.values.chunks(3) {
+            let mut octal_value = 0;
+            for (i, &v) in chunk.iter().enumerate() {
+                octal_value |= match v {
+                    0 => 0,
+                    1 => 1 << (2 - i),
+                    2 | 3 => return None,
+                    _ => panic!("Invalid value"),
+                };
+            }
+            octal_string.push_str(&format!("{:o}", octal_value));
+        }
+        Some(octal_string)
     }
 
     pub fn from_binary(input: &str) -> Self {
@@ -91,6 +106,16 @@ impl Register {
         Register { values }
     }
 
+    pub fn from_octal(input: &str) -> Self {
+        let values = input
+            .chars()
+            .flat_map(|c| {
+                let octal_value = c.to_digit(8).expect("Invalid character in octal input");
+                (0..3).rev().map(move |i| ((octal_value >> i) & 1) as u8)
+            })
+            .collect();
+        Register { values }
+    }
 
     /// Returns a reference to the raw values of the register.
     pub fn get_raw(&self) -> &Vec<u8> {
@@ -111,15 +136,20 @@ mod tests {
     #[test]
     fn test_register_to_hex() {
         let reg = Register::new(4, vec![0, 0, 1, 1]);
-        assert_eq!(reg.to_hex(), "3");
+        assert_eq!(reg.to_hex(), Some("3".to_string()));
     }
 
     #[test]
     fn test_register_to_decimal() {
         let reg = Register::new(4, vec![0, 1, 1, 0]);
-        assert_eq!(reg.to_decimal(), "6");
+        assert_eq!(reg.to_decimal(), Some("6".to_string()));
     }
 
+    #[test]
+    fn test_register_to_octal() {
+        let reg = Register::new(3, vec![0, 1, 1]);
+        assert_eq!(reg.to_octal(), Some("3".to_string()));
+    }
 
     #[test]
     fn test_register_from_binary() {
@@ -139,4 +169,36 @@ mod tests {
         assert_eq!(reg.get_raw(), &vec![1, 1, 0]);
     }
 
+    #[test]
+    fn test_register_from_octal() {
+        let reg = Register::from_octal("3");
+        assert_eq!(reg.get_raw(), &vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn test_register_to_hex_with_xz() {
+        let reg = Register::new(4, vec![0, 1, 2, 3]);
+        assert_eq!(reg.to_hex(), None);
+    }
+
+    #[test]
+    fn test_register_to_decimal_with_xz() {
+        let reg = Register::new(4, vec![0, 1, 2, 3]);
+        assert_eq!(reg.to_decimal(), None);
+    }
+
+    #[test]
+    fn test_register_parsers() {
+        let reg_bin = Register::from_binary("01xz");
+        assert_eq!(reg_bin.get_raw(), &vec![0, 1, 2, 3]);
+
+        let reg_hex = Register::from_hex("3");
+        assert_eq!(reg_hex.get_raw(), &vec![0, 0, 1, 1]);
+
+        let reg_dec = Register::from_decimal("6");
+        assert_eq!(reg_dec.get_raw(), &vec![1, 1, 0]);
+
+        let reg_oct = Register::from_octal("3");
+        assert_eq!(reg_oct.get_raw(), &vec![0, 1, 1]);
+    }
 }

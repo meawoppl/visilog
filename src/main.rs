@@ -253,7 +253,32 @@ mod tests {
         net_declaration.parse("wire z").unwrap();
     }
 
+    #[test]
+    fn test_register_to_hex_with_xz() {
+        let reg = register::Register::new(4, vec![0, 1, 2, 3]);
+        assert_eq!(reg.to_hex(), None);
+    }
 
+    #[test]
+    fn test_register_to_decimal_with_xz() {
+        let reg = register::Register::new(4, vec![0, 1, 2, 3]);
+        assert_eq!(reg.to_decimal(), None);
+    }
+
+    #[test]
+    fn test_register_parsers() {
+        let reg_bin = register::Register::from_binary("01xz");
+        assert_eq!(reg_bin.get_raw(), &vec![0, 1, 2, 3]);
+
+        let reg_hex = register::Register::from_hex("3");
+        assert_eq!(reg_hex.get_raw(), &vec![0, 0, 1, 1]);
+
+        let reg_dec = register::Register::from_decimal("6");
+        assert_eq!(reg_dec.get_raw(), &vec![1, 1, 0]);
+
+        let reg_oct = register::Register::from_octal("3");
+        assert_eq!(reg_oct.get_raw(), &vec![0, 1, 1]);
+    }
 }
 
 fn main() {
