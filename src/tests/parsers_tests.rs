@@ -4,6 +4,7 @@ mod tests {
 
     use super::*;
     use crate::keywords::ALL_KEYWORDS;
+    use crate::parsers::parse_verilog_string;
 
     #[test]
     fn test_identifiers() {
@@ -79,5 +80,16 @@ mod tests {
     #[ignore]
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
+    }
+
+    #[test]
+    fn test_parse_verilog_string() {
+        assert_eq!(parse_verilog_string("\"Hello, World!\""), Ok(("", "Hello, World!".to_string())));
+        assert_eq!(parse_verilog_string("\"Line1\\nLine2\""), Ok(("", "Line1\nLine2".to_string())));
+        assert_eq!(parse_verilog_string("\"Tab\\tCharacter\""), Ok(("", "Tab\tCharacter".to_string())));
+        assert_eq!(parse_verilog_string("\"Backslash\\\\Character\""), Ok(("", "Backslash\\Character".to_string())));
+        assert_eq!(parse_verilog_string("\"DoubleQuote\\\"Character\""), Ok(("", "DoubleQuote\"Character".to_string())));
+        assert_eq!(parse_verilog_string("\"Octal\\101Character\""), Ok(("", "OctalACharacter".to_string())));
+        assert_eq!(parse_verilog_string("\"Percent%%Character\""), Ok(("", "Percent%Character".to_string())));
     }
 }
