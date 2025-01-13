@@ -41,12 +41,13 @@ impl Register {
     pub fn to_decimal(&self) -> Option<String> {
         let mut decimal_value = 0;
         for &v in &self.values {
-            decimal_value = decimal_value * 2 + match v {
-                0 => 0,
-                1 => 1,
-                2 | 3 => return None,
-                _ => panic!("Invalid value"),
-            };
+            decimal_value = decimal_value * 2
+                + match v {
+                    0 => 0,
+                    1 => 1,
+                    2 | 3 => return None,
+                    _ => panic!("Invalid value"),
+                };
         }
         Some(decimal_value.to_string())
     }
