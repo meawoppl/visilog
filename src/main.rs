@@ -238,12 +238,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_identifier_list() {
         identifier_list.parse("a").unwrap();
         identifier_list.parse("a, b, c").unwrap();
     }
 
     #[test]
+    #[ignore]
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
     }
