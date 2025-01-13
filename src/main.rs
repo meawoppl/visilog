@@ -248,3 +248,7 @@ mod tests {
         net_declaration.parse("wire z").unwrap();
     }
 }
+
+fn main() {
+    println!("Hello, world!");
+}
