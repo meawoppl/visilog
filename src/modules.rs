@@ -104,40 +104,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_identifier() {
-        // Tests for valid first characters (letters and underscores), covering both uppercase and lowercase letters
-        assert_eq!(parse_identifier("my_module"), Ok(("", "my_module")));
-        assert_eq!(parse_identifier("_my_module"), Ok(("", "_my_module")));
-        assert_eq!(parse_identifier("My_Module"), Ok(("", "My_Module")));
-        assert_eq!(parse_identifier("_My_Module"), Ok(("", "_My_Module")));
-        assert_eq!(parse_identifier("my_module1"), Ok(("", "my_module1")));
-        assert_eq!(parse_identifier("My_Module1"), Ok(("", "My_Module1")));
-        assert_eq!(parse_identifier("_my_module1"), Ok(("", "_my_module1")));
-        assert_eq!(parse_identifier("_My_Module1"), Ok(("", "_My_Module1")));
+    fn test_parse_identifier_valid_first_characters() {
+        let valid_identifiers = [
+            "my_module", "_my_module", "My_Module", "_My_Module",
+            "my_module1", "My_Module1", "_my_module1", "_My_Module1"
+        ];
+        for identifier in &valid_identifiers {
+            assert!(
+                parse_identifier(identifier).is_ok(),
+                "Valid identifier {} failed to parse",
+                identifier
+            );
+        }
+    }
 
-        // Tests for invalid first characters (digits and dollar signs)
-        assert!(parse_identifier("1my_module").is_err());
-        assert!(parse_identifier("$my_module").is_err());
-        assert!(parse_identifier("1My_Module").is_err());
-        assert!(parse_identifier("$My_Module").is_err());
+    #[test]
+    fn test_parse_identifier_invalid_first_characters() {
+        let invalid_identifiers = ["1my_module", "$my_module", "1My_Module", "$My_Module"];
+        for identifier in &invalid_identifiers {
+            assert!(
+                parse_identifier(identifier).is_err(),
+                "Invalid identifier {} should not parse",
+                identifier
+            );
+        }
+    }
 
-        // Tests for mixed valid and invalid first characters
-        assert!(parse_identifier("my_module$").is_ok());
-        assert!(parse_identifier("my_module1$").is_ok());
-        assert!(parse_identifier("My_Module$").is_ok());
-        assert!(parse_identifier("My_Module1$").is_ok());
-        assert!(parse_identifier("_my_module$").is_ok());
-        assert!(parse_identifier("_my_module1$").is_ok());
-        assert!(parse_identifier("_My_Module$").is_ok());
-        assert!(parse_identifier("_My_Module1$").is_ok());
+    #[test]
+    fn test_parse_identifier_mixed_valid_invalid_first_characters() {
+        let mixed_identifiers = [
+            "my_module$", "my_module1$", "My_Module$", "My_Module1$",
+            "_my_module$", "_my_module1$", "_My_Module$", "_My_Module1$"
+        ];
+        for identifier in &mixed_identifiers {
+            assert!(
+                parse_identifier(identifier).is_ok(),
+                "Mixed identifier {} failed to parse",
+                identifier
+            );
+        }
+    }
 
-        // Tests for identifiers with a length of up to 1024 characters
+    #[test]
+    fn test_parse_identifier_length() {
         let valid_identifier = "a".repeat(1024);
-        assert!(parse_identifier(&valid_identifier).is_ok());
+        assert!(
+            parse_identifier(&valid_identifier).is_ok(),
+            "Valid identifier of length 1024 failed to parse"
+        );
 
-        // Tests for identifiers exceeding 1024 characters
         let invalid_identifier = "a".repeat(1025);
-        assert!(parse_identifier(&invalid_identifier).is_err());
+        assert!(
+            parse_identifier(&invalid_identifier).is_err(),
+            "Invalid identifier of length 1025 should not parse"
+        );
     }
 
     #[test]

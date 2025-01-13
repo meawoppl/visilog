@@ -171,40 +171,60 @@ mod tests {
     use crate::keywords::ALL_KEYWORDS;
 
     #[test]
-    fn test_identifiers() {
-        // Tests for valid first characters (letters and underscores), covering both uppercase and lowercase letters
-        assert!(identifier("var_a").is_ok());
-        assert!(identifier("_var_a").is_ok());
-        assert!(identifier("Var_A").is_ok());
-        assert!(identifier("_Var_A").is_ok());
-        assert!(identifier("var_a1").is_ok());
-        assert!(identifier("Var_A1").is_ok());
-        assert!(identifier("_var_a1").is_ok());
-        assert!(identifier("_Var_A1").is_ok());
+    fn test_identifiers_valid_first_characters() {
+        let valid_identifiers = [
+            "var_a", "_var_a", "Var_A", "_Var_A",
+            "var_a1", "Var_A1", "_var_a1", "_Var_A1"
+        ];
+        for identifier in &valid_identifiers {
+            assert!(
+                identifier(identifier).is_ok(),
+                "Valid identifier {} failed to parse",
+                identifier
+            );
+        }
+    }
 
-        // Tests for invalid first characters (digits and dollar signs)
-        assert!(identifier("1var_a").is_err());
-        assert!(identifier("$var_a").is_err());
-        assert!(identifier("1Var_A").is_err());
-        assert!(identifier("$Var_A").is_err());
+    #[test]
+    fn test_identifiers_invalid_first_characters() {
+        let invalid_identifiers = ["1var_a", "$var_a", "1Var_A", "$Var_A"];
+        for identifier in &invalid_identifiers {
+            assert!(
+                identifier(identifier).is_err(),
+                "Invalid identifier {} should not parse",
+                identifier
+            );
+        }
+    }
 
-        // Tests for mixed valid and invalid first characters
-        assert!(identifier("var_a$").is_ok());
-        assert!(identifier("var_a1$").is_ok());
-        assert!(identifier("Var_A$").is_ok());
-        assert!(identifier("Var_A1$").is_ok());
-        assert!(identifier("_var_a$").is_ok());
-        assert!(identifier("_var_a1$").is_ok());
-        assert!(identifier("_Var_A$").is_ok());
-        assert!(identifier("_Var_A1$").is_ok());
+    #[test]
+    fn test_identifiers_mixed_valid_invalid_first_characters() {
+        let mixed_identifiers = [
+            "var_a$", "var_a1$", "Var_A$", "Var_A1$",
+            "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$"
+        ];
+        for identifier in &mixed_identifiers {
+            assert!(
+                identifier(identifier).is_ok(),
+                "Mixed identifier {} failed to parse",
+                identifier
+            );
+        }
+    }
 
-        // Tests for identifiers with a length of up to 1024 characters
+    #[test]
+    fn test_identifiers_length() {
         let valid_identifier = "a".repeat(1024);
-        assert!(identifier(&valid_identifier).is_ok());
+        assert!(
+            identifier(&valid_identifier).is_ok(),
+            "Valid identifier of length 1024 failed to parse"
+        );
 
-        // Tests for identifiers exceeding 1024 characters
         let invalid_identifier = "a".repeat(1025);
-        assert!(identifier(&invalid_identifier).is_err());
+        assert!(
+            identifier(&invalid_identifier).is_err(),
+            "Invalid identifier of length 1025 should not parse"
+        );
     }
 
     #[test]
