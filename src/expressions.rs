@@ -26,6 +26,7 @@ pub enum VerilogBinaryExpression {
     ShiftRight,
     ArithmeticShiftLeft,
     ArithmeticShiftRight,
+    FunctionCall, // Added FunctionCall variant
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -78,7 +79,13 @@ pub fn binary_expression_from_string(input: &str) -> Option<VerilogBinaryExpress
         ">>" => Some(VerilogBinaryExpression::ShiftRight),
         "<<<" => Some(VerilogBinaryExpression::ArithmeticShiftLeft),
         ">>>" => Some(VerilogBinaryExpression::ArithmeticShiftRight),
-        _ => None,
+        _ => {
+            if let Ok((_, function_call)) = crate::parsers::functions::parse_function_call(input) {
+                Some(VerilogBinaryExpression::FunctionCall)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -200,6 +207,10 @@ mod tests {
         assert_eq!(
             binary_expression_from_string(">>>"),
             Some(VerilogBinaryExpression::ArithmeticShiftRight)
+        );
+        assert_eq!(
+            binary_expression_from_string("my_function(a, b, c)"),
+            Some(VerilogBinaryExpression::FunctionCall)
         );
         assert_eq!(binary_expression_from_string("nonexistent"), None);
     }
