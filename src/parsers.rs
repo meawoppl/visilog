@@ -1,3 +1,5 @@
+mod string;
+
 use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_until, take_while},
@@ -14,6 +16,8 @@ use nom::{
 use nom::character::complete::multispace0;
 
 use crate::keywords::{keyword_from_string, VerilogKeyword};
+
+pub use string::parse_verilog_string;
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
