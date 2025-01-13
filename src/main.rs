@@ -1,5 +1,6 @@
 mod keywords;
 mod register;
+mod expressions;
 
 use keywords::VerilogKeyword;
 use nom::{
@@ -18,6 +19,7 @@ use nom::{
 use nom::character::complete::multispace0;
 
 use crate::keywords::keyword_from_string;
+use crate::expressions::{binary_expression_from_string, ALL_BINARY_EXPRESSIONS};
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
@@ -246,5 +248,17 @@ mod tests {
     #[test]
     fn test_net_declaration() {
         net_declaration.parse("wire z").unwrap();
+    }
+
+    #[test]
+    fn test_binary_expression_from_string() {
+        for expr in ALL_BINARY_EXPRESSIONS {
+            assert!(
+                binary_expression_from_string(expr).is_some(),
+                "Binary expression {} failed to parse",
+                expr
+            );
+        }
+        assert_eq!(binary_expression_from_string("nonexistent"), None);
     }
 }
