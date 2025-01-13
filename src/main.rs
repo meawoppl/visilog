@@ -1,15 +1,13 @@
-mod keywords;
 mod register;
 mod expressions;
 mod parsers;
-mod utils;
 mod git_utils;
 
-use crate::keywords::VerilogKeyword;
+use crate::parsers::keywords::VerilogKeyword;
 use crate::register::Register;
 use crate::expressions::{VerilogBinaryExpression, ReductionOperator};
 use crate::parsers::*;
-use crate::utils::*;
+use crate::parsers::nets::net_type;
 use crate::git_utils::shallow_clone_and_cache;
 
 fn main() {

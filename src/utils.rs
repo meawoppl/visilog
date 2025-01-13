@@ -131,34 +131,6 @@ where
     delimited(multispace0, inner, multispace0)
 }
 
-// NOTE(meawoppl) - what fraction of these are used?
-#[derive(Debug, PartialEq, Clone)]
-pub enum NetType {
-    Supply0,
-    Supply1,
-    Tri,
-    Tri0,
-    Tri1,
-    TriAnd,
-    TriOr,
-    Wire,
-    WireAnd,
-    WireOr,
-}
-
-fn net_type(input: &str) -> IResult<&str, NetType> {
-    alt((
-        value(NetType::Wire, tag("wire")),
-        value(NetType::WireAnd, tag("wand")),
-        value(NetType::WireOr, tag("wor")),
-        value(NetType::Tri, tag("tri")),
-        value(NetType::TriAnd, tag("triand")),
-        value(NetType::TriOr, tag("trior")),
-        value(NetType::Supply0, tag("supply0")),
-        value(NetType::Supply1, tag("supply1")),
-    ))(input)
-}
-
 fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, Vec<&str>)> {
     tuple((net_type, ws(opt(range)), ws(identifier_list)))(input)
 }
