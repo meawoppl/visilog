@@ -240,7 +240,6 @@ mod tests {
     #[test]
     fn test_identifier_list() {
         identifier_list.parse("a").unwrap();
-
         identifier_list.parse("a, b, c").unwrap();
     }
 
