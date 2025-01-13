@@ -176,11 +176,11 @@ mod tests {
             "var_a", "_var_a", "Var_A", "_Var_A",
             "var_a1", "Var_A1", "_var_a1", "_Var_A1"
         ];
-        for identifier in &valid_identifiers {
+        for id_str in &valid_identifiers {
             assert!(
-                identifier(identifier).is_ok(),
+                identifier(id_str).is_ok(),
                 "Valid identifier {} failed to parse",
-                identifier
+                id_str
             );
         }
     }
@@ -188,11 +188,11 @@ mod tests {
     #[test]
     fn test_identifiers_invalid_first_characters() {
         let invalid_identifiers = ["1var_a", "$var_a", "1Var_A", "$Var_A"];
-        for identifier in &invalid_identifiers {
+        for id_str in &invalid_identifiers {
             assert!(
-                identifier(identifier).is_err(),
+                identifier(id_str).is_err(),
                 "Invalid identifier {} should not parse",
-                identifier
+                id_str
             );
         }
     }
@@ -203,11 +203,11 @@ mod tests {
             "var_a$", "var_a1$", "Var_A$", "Var_A1$",
             "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$"
         ];
-        for identifier in &mixed_identifiers {
+        for id_str in &mixed_identifiers {
             assert!(
-                identifier(identifier).is_ok(),
+                identifier(id_str).is_ok(),
                 "Mixed identifier {} failed to parse",
-                identifier
+                id_str
             );
         }
     }

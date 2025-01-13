@@ -109,11 +109,11 @@ mod tests {
             "my_module", "_my_module", "My_Module", "_My_Module",
             "my_module1", "My_Module1", "_my_module1", "_My_Module1"
         ];
-        for identifier in &valid_identifiers {
+        for id_str in &valid_identifiers {
             assert!(
-                parse_identifier(identifier).is_ok(),
+                parse_identifier(id_str).is_ok(),
                 "Valid identifier {} failed to parse",
-                identifier
+                id_str
             );
         }
     }
@@ -121,11 +121,11 @@ mod tests {
     #[test]
     fn test_parse_identifier_invalid_first_characters() {
         let invalid_identifiers = ["1my_module", "$my_module", "1My_Module", "$My_Module"];
-        for identifier in &invalid_identifiers {
+        for id_str in &invalid_identifiers {
             assert!(
-                parse_identifier(identifier).is_err(),
+                parse_identifier(id_str).is_err(),
                 "Invalid identifier {} should not parse",
-                identifier
+                id_str
             );
         }
     }
@@ -136,11 +136,11 @@ mod tests {
             "my_module$", "my_module1$", "My_Module$", "My_Module1$",
             "_my_module$", "_my_module1$", "_My_Module$", "_My_Module1$"
         ];
-        for identifier in &mixed_identifiers {
+        for id_str in &mixed_identifiers {
             assert!(
-                parse_identifier(identifier).is_ok(),
+                parse_identifier(id_str).is_ok(),
                 "Mixed identifier {} failed to parse",
-                identifier
+                id_str
             );
         }
     }
