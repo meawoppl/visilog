@@ -13,7 +13,7 @@ use nom::{
 
 use nom::character::complete::multispace0;
 
-use crate::keywords::keyword_from_string;
+use crate::keywords::{keyword_from_string, VerilogKeyword};
 
 #[derive(Debug, PartialEq)]
 enum VerilogBaseType {
