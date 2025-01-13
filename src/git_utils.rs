@@ -66,7 +66,7 @@ mod tests {
     fn test_shallow_clone_and_cache() {
         let repo_url = "https://github.com/meawoppl/visilog.git";
         let commit_hash = "60bd3f99969512ac131e07880149d52f4a9cf303";
-        let subdir = "/";
+        let subdir = "src";
         let cache_dir = "test_cache";
 
         initialize_cache_dir(cache_dir);
