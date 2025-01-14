@@ -1,6 +1,9 @@
 use nom::{combinator::opt, sequence::tuple, IResult};
 
-use super::{identifier::identifier_list, simple::{range, ws}};
+use super::{
+    identifier::identifier_list,
+    simple::{range, ws},
+};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum NetType {

@@ -1,4 +1,10 @@
-use nom::{branch::alt, character::complete::one_of, combinator::map, sequence::{preceded, tuple}, IResult};
+use nom::{
+    branch::alt,
+    character::complete::one_of,
+    combinator::map,
+    sequence::{preceded, tuple},
+    IResult,
+};
 
 use super::numbers::{decimal, hexadecimal};
 use nom::character::complete::char;

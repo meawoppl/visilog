@@ -1,4 +1,12 @@
-use nom::{branch::alt, bytes::complete::{tag, take_while}, character::complete::{alpha1, char}, combinator::recognize, multi::separated_list1, sequence::tuple, IResult};
+use nom::{
+    branch::alt,
+    bytes::complete::{tag, take_while},
+    character::complete::{alpha1, char},
+    combinator::recognize,
+    multi::separated_list1,
+    sequence::tuple,
+    IResult,
+};
 
 use super::simple::ws;
 
@@ -10,29 +18,28 @@ fn identifier(input: &str) -> IResult<&str, String> {
 
     let full_id = format!("{}{}", input, id);
     if full_id.len() > 1024 {
-        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::TooLarge)))
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )))
     } else {
         Ok((input, full_id))
     }
-
 }
 
 pub fn identifier_list(input: &str) -> IResult<&str, Vec<String>> {
     separated_list1(ws(char(',')), ws(identifier))(input)
 }
 
-
 mod tests {
     use nom::Parser;
 
     use super::*;
 
-
     #[test]
     fn test_identifiers_valid_first_characters() {
         let valid_identifiers = [
-            "var_a", "_var_a", "Var_A", "_Var_A",
-            "var_a1", "Var_A1", "_var_a1", "_Var_A1"
+            "var_a", "_var_a", "Var_A", "_Var_A", "var_a1", "Var_A1", "_var_a1", "_Var_A1",
         ];
         for id_str in &valid_identifiers {
             assert!(
@@ -58,12 +65,11 @@ mod tests {
     #[test]
     fn test_identifiers_mixed_valid_invalid_first_characters() {
         let mixed_identifiers = [
-            "var_a$", "var_a1$", "Var_A$", "Var_A1$",
-            "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$"
+            "var_a$", "var_a1$", "Var_A$", "Var_A1$", "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$",
         ];
         for id_str in &mixed_identifiers {
             let result = identifier(id_str);
-            
+
             assert!(
                 result.is_ok(),
                 "Mixed identifier {} failed to parse",
@@ -96,7 +102,6 @@ mod tests {
             "Invalid identifier of length 1025 should not parse"
         );
     }
-
 
     #[test]
     fn test_identifier_list() {
