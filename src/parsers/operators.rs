@@ -1,5 +1,25 @@
 #[derive(Clone, PartialEq, Debug)]
-pub enum VerilogBinaryExpression {
+pub enum UnaryOperator {
+    Positive,
+    Negative,
+    LogicalNegation,
+    BitwiseNegation,
+}
+
+pub fn unary_operator_from_string(input: &str) -> Option<UnaryOperator> {
+    match input {
+        "+" => Some(UnaryOperator::Positive),
+        "-" => Some(UnaryOperator::Negative),
+        "~" => Some(UnaryOperator::BitwiseNegation),
+        "!" => Some(UnaryOperator::LogicalNegation),
+        _ => None,
+    }
+}
+
+pub const ALL_UNARY_OPERATORS: &[&str] = &["+", "-", "!", "~"];
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum BinaryOperator {
     Concatenation,
     Addition,
     Subtraction,
@@ -50,34 +70,34 @@ pub fn reduction_operator_from_string(input: &str) -> Option<ReductionOperator> 
     }
 }
 
-pub fn binary_expression_from_string(input: &str) -> Option<VerilogBinaryExpression> {
+pub fn binary_expression_from_string(input: &str) -> Option<BinaryOperator> {
     match input {
-        "{}" => Some(VerilogBinaryExpression::Concatenation),
-        "+" => Some(VerilogBinaryExpression::Addition),
-        "-" => Some(VerilogBinaryExpression::Subtraction),
-        "*" => Some(VerilogBinaryExpression::Multiplication),
-        "/" => Some(VerilogBinaryExpression::Division),
-        "%" => Some(VerilogBinaryExpression::Modulus),
-        ">" => Some(VerilogBinaryExpression::GreaterThan),
-        ">=" => Some(VerilogBinaryExpression::GreaterThanOrEqual),
-        "<" => Some(VerilogBinaryExpression::LessThan),
-        "<=" => Some(VerilogBinaryExpression::LessThanOrEqual),
-        "!" => Some(VerilogBinaryExpression::LogicalNegation),
-        "&&" => Some(VerilogBinaryExpression::LogicalAnd),
-        "||" => Some(VerilogBinaryExpression::LogicalOr),
-        "==" => Some(VerilogBinaryExpression::LogicalEquality),
-        "!=" => Some(VerilogBinaryExpression::LogicalInequality),
-        "===" => Some(VerilogBinaryExpression::CaseEquality),
-        "!==" => Some(VerilogBinaryExpression::CaseInequality),
-        "~" => Some(VerilogBinaryExpression::BitwiseNegation),
-        "&" => Some(VerilogBinaryExpression::BitwiseAnd),
-        "|" => Some(VerilogBinaryExpression::BitwiseInclusiveOr),
-        "^" => Some(VerilogBinaryExpression::BitwiseExclusiveOr),
-        "^~" | "~^" => Some(VerilogBinaryExpression::BitwiseEquivalence),
-        "<<" => Some(VerilogBinaryExpression::ShiftLeft),
-        ">>" => Some(VerilogBinaryExpression::ShiftRight),
-        "<<<" => Some(VerilogBinaryExpression::ArithmeticShiftLeft),
-        ">>>" => Some(VerilogBinaryExpression::ArithmeticShiftRight),
+        "{}" => Some(BinaryOperator::Concatenation),
+        "+" => Some(BinaryOperator::Addition),
+        "-" => Some(BinaryOperator::Subtraction),
+        "*" => Some(BinaryOperator::Multiplication),
+        "/" => Some(BinaryOperator::Division),
+        "%" => Some(BinaryOperator::Modulus),
+        ">" => Some(BinaryOperator::GreaterThan),
+        ">=" => Some(BinaryOperator::GreaterThanOrEqual),
+        "<" => Some(BinaryOperator::LessThan),
+        "<=" => Some(BinaryOperator::LessThanOrEqual),
+        "!" => Some(BinaryOperator::LogicalNegation),
+        "&&" => Some(BinaryOperator::LogicalAnd),
+        "||" => Some(BinaryOperator::LogicalOr),
+        "==" => Some(BinaryOperator::LogicalEquality),
+        "!=" => Some(BinaryOperator::LogicalInequality),
+        "===" => Some(BinaryOperator::CaseEquality),
+        "!==" => Some(BinaryOperator::CaseInequality),
+        "~" => Some(BinaryOperator::BitwiseNegation),
+        "&" => Some(BinaryOperator::BitwiseAnd),
+        "|" => Some(BinaryOperator::BitwiseInclusiveOr),
+        "^" => Some(BinaryOperator::BitwiseExclusiveOr),
+        "^~" | "~^" => Some(BinaryOperator::BitwiseEquivalence),
+        "<<" => Some(BinaryOperator::ShiftLeft),
+        ">>" => Some(BinaryOperator::ShiftRight),
+        "<<<" => Some(BinaryOperator::ArithmeticShiftLeft),
+        ">>>" => Some(BinaryOperator::ArithmeticShiftRight),
         _ => None,
     }
 }
@@ -95,111 +115,111 @@ mod tests {
     fn test_binary_expression_from_string() {
         assert_eq!(
             binary_expression_from_string("{}"),
-            Some(VerilogBinaryExpression::Concatenation)
+            Some(BinaryOperator::Concatenation)
         );
         assert_eq!(
             binary_expression_from_string("+"),
-            Some(VerilogBinaryExpression::Addition)
+            Some(BinaryOperator::Addition)
         );
         assert_eq!(
             binary_expression_from_string("-"),
-            Some(VerilogBinaryExpression::Subtraction)
+            Some(BinaryOperator::Subtraction)
         );
         assert_eq!(
             binary_expression_from_string("*"),
-            Some(VerilogBinaryExpression::Multiplication)
+            Some(BinaryOperator::Multiplication)
         );
         assert_eq!(
             binary_expression_from_string("/"),
-            Some(VerilogBinaryExpression::Division)
+            Some(BinaryOperator::Division)
         );
         assert_eq!(
             binary_expression_from_string("%"),
-            Some(VerilogBinaryExpression::Modulus)
+            Some(BinaryOperator::Modulus)
         );
         assert_eq!(
             binary_expression_from_string(">"),
-            Some(VerilogBinaryExpression::GreaterThan)
+            Some(BinaryOperator::GreaterThan)
         );
         assert_eq!(
             binary_expression_from_string(">="),
-            Some(VerilogBinaryExpression::GreaterThanOrEqual)
+            Some(BinaryOperator::GreaterThanOrEqual)
         );
         assert_eq!(
             binary_expression_from_string("<"),
-            Some(VerilogBinaryExpression::LessThan)
+            Some(BinaryOperator::LessThan)
         );
         assert_eq!(
             binary_expression_from_string("<="),
-            Some(VerilogBinaryExpression::LessThanOrEqual)
+            Some(BinaryOperator::LessThanOrEqual)
         );
         assert_eq!(
             binary_expression_from_string("!"),
-            Some(VerilogBinaryExpression::LogicalNegation)
+            Some(BinaryOperator::LogicalNegation)
         );
         assert_eq!(
             binary_expression_from_string("&&"),
-            Some(VerilogBinaryExpression::LogicalAnd)
+            Some(BinaryOperator::LogicalAnd)
         );
         assert_eq!(
             binary_expression_from_string("||"),
-            Some(VerilogBinaryExpression::LogicalOr)
+            Some(BinaryOperator::LogicalOr)
         );
         assert_eq!(
             binary_expression_from_string("=="),
-            Some(VerilogBinaryExpression::LogicalEquality)
+            Some(BinaryOperator::LogicalEquality)
         );
         assert_eq!(
             binary_expression_from_string("!="),
-            Some(VerilogBinaryExpression::LogicalInequality)
+            Some(BinaryOperator::LogicalInequality)
         );
         assert_eq!(
             binary_expression_from_string("==="),
-            Some(VerilogBinaryExpression::CaseEquality)
+            Some(BinaryOperator::CaseEquality)
         );
         assert_eq!(
             binary_expression_from_string("!=="),
-            Some(VerilogBinaryExpression::CaseInequality)
+            Some(BinaryOperator::CaseInequality)
         );
         assert_eq!(
             binary_expression_from_string("~"),
-            Some(VerilogBinaryExpression::BitwiseNegation)
+            Some(BinaryOperator::BitwiseNegation)
         );
         assert_eq!(
             binary_expression_from_string("&"),
-            Some(VerilogBinaryExpression::BitwiseAnd)
+            Some(BinaryOperator::BitwiseAnd)
         );
         assert_eq!(
             binary_expression_from_string("|"),
-            Some(VerilogBinaryExpression::BitwiseInclusiveOr)
+            Some(BinaryOperator::BitwiseInclusiveOr)
         );
         assert_eq!(
             binary_expression_from_string("^"),
-            Some(VerilogBinaryExpression::BitwiseExclusiveOr)
+            Some(BinaryOperator::BitwiseExclusiveOr)
         );
         assert_eq!(
             binary_expression_from_string("^~"),
-            Some(VerilogBinaryExpression::BitwiseEquivalence)
+            Some(BinaryOperator::BitwiseEquivalence)
         );
         assert_eq!(
             binary_expression_from_string("~^"),
-            Some(VerilogBinaryExpression::BitwiseEquivalence)
+            Some(BinaryOperator::BitwiseEquivalence)
         );
         assert_eq!(
             binary_expression_from_string("<<"),
-            Some(VerilogBinaryExpression::ShiftLeft)
+            Some(BinaryOperator::ShiftLeft)
         );
         assert_eq!(
             binary_expression_from_string(">>"),
-            Some(VerilogBinaryExpression::ShiftRight)
+            Some(BinaryOperator::ShiftRight)
         );
         assert_eq!(
             binary_expression_from_string("<<<"),
-            Some(VerilogBinaryExpression::ArithmeticShiftLeft)
+            Some(BinaryOperator::ArithmeticShiftLeft)
         );
         assert_eq!(
             binary_expression_from_string(">>>"),
-            Some(VerilogBinaryExpression::ArithmeticShiftRight)
+            Some(BinaryOperator::ArithmeticShiftRight)
         );
         assert_eq!(binary_expression_from_string("nonexistent"), None);
     }
@@ -247,5 +267,26 @@ mod tests {
             );
         }
         assert_eq!(binary_expression_from_string("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_unary_operator_from_string() {
+        assert_eq!(unary_operator_from_string("+"), Some(UnaryOperator::Positive));
+        assert_eq!(unary_operator_from_string("-"), Some(UnaryOperator::Negative));
+        assert_eq!(unary_operator_from_string("~"), Some(UnaryOperator::BitwiseNegation));
+        assert_eq!(unary_operator_from_string("!"), Some(UnaryOperator::LogicalNegation));
+        assert_eq!(unary_operator_from_string("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_all_unary_operator_from_string() {
+        for op in ALL_UNARY_OPERATORS {
+            assert!(
+                unary_operator_from_string(op).is_some(),
+                "Unary operator {} failed to parse",
+                op
+            );
+        }
+        assert_eq!(unary_operator_from_string("nonexistent"), None);
     }
 }

@@ -28,8 +28,15 @@ fn parse_dimensions(input: &str) -> IResult<&str, (i64, i64)> {
     delimited(
         char('['),
         pair(
-            map(take_while(|c: char| c.is_digit(10)), |s: &str| s.parse::<i64>().unwrap()),
-            preceded(char(':'), map(take_while(|c: char| c.is_digit(10)), |s: &str| s.parse::<i64>().unwrap())),
+            map(take_while(|c: char| c.is_digit(10)), |s: &str| {
+                s.parse::<i64>().unwrap()
+            }),
+            preceded(
+                char(':'),
+                map(take_while(|c: char| c.is_digit(10)), |s: &str| {
+                    s.parse::<i64>().unwrap()
+                }),
+            ),
         ),
         char(']'),
     )(input)
