@@ -4,8 +4,6 @@ mod parsers;
 mod register;
 
 use crate::git_utils::shallow_clone_and_cache;
-use crate::parsers::keywords::VerilogKeyword;
-use crate::parsers::nets::net_type;
 
 fn main() {
     println!("Hello, world!");

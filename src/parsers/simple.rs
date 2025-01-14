@@ -54,9 +54,8 @@ pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use nom::Parser;
-
     use super::*;
+    use nom::Parser;
 
     #[test]
     fn test_comments() {
@@ -102,15 +101,24 @@ mod tests {
 
     #[test]
     fn test_single_line_comment() {
-        assert_eq!(single_line_comment("// This is a comment\nabc"), Ok(("\nabc", "")));
+        assert_eq!(
+            single_line_comment("// This is a comment\nabc"),
+            Ok(("\nabc", ""))
+        );
         assert_eq!(single_line_comment("// This is a comment"), Ok(("", "")));
         assert!(single_line_comment("This is not a comment").is_err());
     }
 
     #[test]
     fn test_multi_line_comment() {
-        assert_eq!(multi_line_comment("/* This is a comment */abc"), Ok(("abc", " This is a comment ")));
-        assert_eq!(multi_line_comment("/* This is a comment */"), Ok(("", " This is a comment ")));
+        assert_eq!(
+            multi_line_comment("/* This is a comment */abc"),
+            Ok(("abc", " This is a comment "))
+        );
+        assert_eq!(
+            multi_line_comment("/* This is a comment */"),
+            Ok(("", " This is a comment "))
+        );
         assert!(multi_line_comment("This is not a comment").is_err());
     }
 

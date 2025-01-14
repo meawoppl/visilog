@@ -1,13 +1,12 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while_m_n},
-    character::complete::{char, none_of, one_of},
-    combinator::{map, map_res, opt, value},
+    bytes::complete::take_while_m_n,
+    character::complete::{char, none_of},
+    combinator::{map_res, value},
     multi::many0,
     sequence::{delimited, preceded},
     IResult,
 };
-
 
 fn parse_escape_sequence(input: &str) -> IResult<&str, char> {
     preceded(

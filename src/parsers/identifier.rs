@@ -1,45 +1,59 @@
-use nom::{branch::alt, bytes::complete::{tag, take_while}, character::complete::{alpha1, char}, combinator::recognize, multi::separated_list1, sequence::tuple, IResult};
+use nom::{
+    branch::alt,
+    bytes::complete::{tag, take, take_while, take_while_m_n},
+    character::complete::{alpha1, char},
+    combinator::{map_res, recognize},
+    multi::separated_list1,
+    sequence::tuple,
+    IResult,
+};
 
 use super::simple::ws;
 
 pub fn identifier(input: &str) -> IResult<&str, String> {
-    let (input, id) = recognize(tuple((
-        alt((alpha1, tag("_"))), // Start with alpha or '_'
-        take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '$'), // Alphanumeric, '_', or '$'
-    )))(input)?;
-
-    let full_id = format!("{}{}", input, id);
-    if full_id.len() > 1024 {
-        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::TooLarge)))
-    } else {
-        Ok((input, full_id))
-    }
-
+    map_res(
+        tuple((
+            alt((alpha1, tag("_"))),
+            take_while_m_n(0, 1024, |c: char| {
+                c.is_alphanumeric() || c == '_' || c == '$'
+            }),
+        )),
+        |(leading, rest): (&str, &str)| {
+            let full_id = format!("{}{}", leading, rest);
+            if full_id.len() > 1024 {
+                Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                )))
+            } else {
+                Ok(full_id)
+            }
+        },
+    )(input)
 }
 
 pub fn identifier_list(input: &str) -> IResult<&str, Vec<String>> {
     separated_list1(ws(char(',')), ws(identifier))(input)
 }
 
-
 mod tests {
-    use nom::Parser;
-
     use super::*;
-
+    use nom::Parser;
 
     #[test]
     fn test_identifiers_valid_first_characters() {
         let valid_identifiers = [
-            "var_a", "_var_a", "Var_A", "_Var_A",
-            "var_a1", "Var_A1", "_var_a1", "_Var_A1"
+            "var_a", "_var_a", "Var_A", "_Var_A", "var_a1", "Var_A1", "_var_a1", "_Var_A1",
         ];
         for id_str in &valid_identifiers {
+            let parsed = identifier(id_str);
             assert!(
-                identifier(id_str).is_ok(),
+                parsed.is_ok(),
                 "Valid identifier {} failed to parse",
                 id_str
             );
+
+            assert_eq!(parsed.unwrap().1, id_str.to_string());
         }
     }
 
@@ -58,12 +72,11 @@ mod tests {
     #[test]
     fn test_identifiers_mixed_valid_invalid_first_characters() {
         let mixed_identifiers = [
-            "var_a$", "var_a1$", "Var_A$", "Var_A1$",
-            "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$"
+            "var_a$", "var_a1$", "Var_A$", "Var_A1$", "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$",
         ];
         for id_str in &mixed_identifiers {
             let result = identifier(id_str);
-            
+
             assert!(
                 result.is_ok(),
                 "Mixed identifier {} failed to parse",
@@ -97,10 +110,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_identifier_list_single() {
+        let result = identifier_list.parse("a").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(result.1, vec!["a".to_string()]);
+    }
 
     #[test]
-    fn test_identifier_list() {
-        identifier_list.parse("a").unwrap();
-        identifier_list.parse("a, b, c").unwrap();
+    fn test_identifier_list_double() {
+        let result = identifier_list.parse("a,b").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(result.1, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_identifier_list_multiple() {
+        let result = identifier_list.parse("a, b, c").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(
+            result.1,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_identifier_list_with_whitespace() {
+        let result = identifier_list.parse(" a , b , c ").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(
+            result.1,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_identifier_list_with_invalid_identifier() {
+        let result = identifier_list.parse("a, 1b, c");
+        // This should only parse the first identifier here...
+        assert!(result.is_ok());
+        let (rest, identifiers) = result.unwrap();
+        assert_eq!(rest, ", 1b, c");
+        assert_eq!(identifiers, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_identifier_list_empty() {
+        let result = identifier_list.parse("");
+        assert!(result.is_err(), "Empty identifier list should not parse");
     }
 }

@@ -55,7 +55,6 @@ pub fn shallow_clone_and_cache(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,10 +72,16 @@ mod tests {
 
         match shallow_clone_and_cache(repo_url, commit_hash, subdir) {
             Ok(_) => {
-                let cache_path = format!("{}/{}_{}_{}", cache_dir, repo_url.replace("/", "_"), commit_hash, subdir.replace("/", "_"));
+                let cache_path = format!(
+                    "{}/{}_{}_{}",
+                    cache_dir,
+                    repo_url.replace("/", "_"),
+                    commit_hash,
+                    subdir.replace("/", "_")
+                );
                 assert!(Path::new(&cache_path).exists());
                 fs::remove_dir_all(cache_dir).unwrap();
-            },
+            }
             Err(e) => panic!("Error: {}", e),
         }
     }
