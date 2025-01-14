@@ -7,3 +7,4 @@ pub mod string;
 pub mod identifier;
 pub mod register;
 pub mod functions;
+pub mod expressions;
