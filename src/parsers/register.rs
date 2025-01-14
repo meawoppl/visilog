@@ -3,8 +3,7 @@ use nom::{
     bytes::complete::{tag, take_while},
     character::complete::{alpha1, char, multispace0},
     combinator::{map, opt, recognize},
-    multi::separated_list0,
-    sequence::{delimited, pair, preceded, tuple},
+    sequence::{delimited, pair, preceded},
     IResult,
 };
 

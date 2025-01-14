@@ -54,9 +54,8 @@ pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use nom::Parser;
-
     use super::*;
+    use nom::Parser;
 
     #[test]
     fn test_comments() {

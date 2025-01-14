@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod identifier;
+pub mod integer;
 pub mod keywords;
 pub mod nets;
 pub mod numbers;
