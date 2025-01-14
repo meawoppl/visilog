@@ -6,3 +6,4 @@ pub mod simple;
 pub mod string;
 pub mod identifier;
 pub mod register;
+pub mod integer;

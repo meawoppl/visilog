@@ -2,7 +2,7 @@ use nom::{branch::alt, bytes::complete::{tag, take_while}, character::complete::
 
 use super::simple::ws;
 
-fn identifier(input: &str) -> IResult<&str, String> {
+pub fn identifier(input: &str) -> IResult<&str, String> {
     let (input, id) = recognize(tuple((
         alt((alpha1, tag("_"))), // Start with alpha or '_'
         take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '$'), // Alphanumeric, '_', or '$'
