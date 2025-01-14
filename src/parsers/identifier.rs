@@ -1,8 +1,8 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take, take_while, take_while_m_n},
+    bytes::complete::{tag, take_while_m_n},
     character::complete::{alpha1, char},
-    combinator::{map_res, recognize},
+    combinator::{map_res},
     multi::separated_list1,
     sequence::tuple,
     IResult,
