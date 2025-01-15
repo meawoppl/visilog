@@ -1,9 +1,29 @@
+trait Precedence {
+    fn precedence(&self) -> u8;
+}
+
+// NOTE
+//  7  -->   ! ~                      highest precedence (unary operators)
+//  6  -->   * / %
+//  5  -->   + -                     (binary add/subtract)
+//  4  -->   << >> <<< >>>
+//  3  -->   < <= > >=
+//  2  -->   == != === !==
+//  1  -->   & ^~ | && ||
+//  0  -->   ?: (ternary operator)    lowest precedence
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum UnaryOperator {
     Positive,
     Negative,
     LogicalNegation,
     BitwiseNegation,
+}
+
+impl Precedence for UnaryOperator {
+    fn precedence(&self) -> u8 {
+        return 7;
+    }
 }
 
 pub fn unary_operator_from_string(input: &str) -> Option<UnaryOperator> {
@@ -20,40 +40,75 @@ pub const ALL_UNARY_OPERATORS: &[&str] = &["+", "-", "!", "~"];
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum BinaryOperator {
-    Concatenation,
     Addition,
-    Subtraction,
-    Multiplication,
+    ArithmeticShiftLeft,
+    ArithmeticShiftRight,
+    BitwiseAnd,
+    BitwiseEquivalence,
+    BitwiseExclusiveOr,
+    BitwiseInclusiveOr,
+    CaseEquality,
+    CaseInequality,
+    Concatenation,
     Division,
-    Modulus,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
     LessThanOrEqual,
-    LogicalNegation,
     LogicalAnd,
-    LogicalOr,
     LogicalEquality,
     LogicalInequality,
-    CaseEquality,
-    CaseInequality,
-    BitwiseNegation,
-    BitwiseAnd,
-    BitwiseInclusiveOr,
-    BitwiseExclusiveOr,
-    BitwiseEquivalence,
+    LogicalOr,
+    Modulus,
+    Multiplication,
     ShiftLeft,
     ShiftRight,
-    ArithmeticShiftLeft,
-    ArithmeticShiftRight,
+    Subtraction,
+}
+
+impl Precedence for BinaryOperator {
+    fn precedence(&self) -> u8 {
+        // NOTE(meawoppl) - Empty comment lines are to keep the precedence values aligned
+        match self {
+            BinaryOperator::Concatenation => 6,
+            BinaryOperator::Division => 6,
+            BinaryOperator::Modulus => 6,
+            BinaryOperator::Multiplication => 6,
+            //
+            BinaryOperator::Addition => 5,
+            BinaryOperator::Subtraction => 5,
+            //
+            BinaryOperator::ArithmeticShiftLeft => 4,
+            BinaryOperator::ArithmeticShiftRight => 4,
+            BinaryOperator::ShiftLeft => 4,
+            BinaryOperator::ShiftRight => 4,
+            //
+            BinaryOperator::GreaterThan => 3,
+            BinaryOperator::GreaterThanOrEqual => 3,
+            BinaryOperator::LessThan => 3,
+            BinaryOperator::LessThanOrEqual => 3,
+            //
+            BinaryOperator::CaseEquality => 2,
+            BinaryOperator::CaseInequality => 2,
+            BinaryOperator::LogicalEquality => 2,
+            BinaryOperator::LogicalInequality => 2,
+            //
+            BinaryOperator::BitwiseAnd => 1,
+            BinaryOperator::BitwiseEquivalence => 1,
+            BinaryOperator::BitwiseExclusiveOr => 1,
+            BinaryOperator::BitwiseInclusiveOr => 1,
+            BinaryOperator::LogicalAnd => 1,
+            BinaryOperator::LogicalOr => 1,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum ReductionOperator {
     ReductionAnd,
     ReductionNand,
-    ReductionOr,
     ReductionNor,
+    ReductionOr,
     ReductionXor,
     ReductionXnor,
 }
@@ -82,14 +137,12 @@ pub fn binary_expression_from_string(input: &str) -> Option<BinaryOperator> {
         ">=" => Some(BinaryOperator::GreaterThanOrEqual),
         "<" => Some(BinaryOperator::LessThan),
         "<=" => Some(BinaryOperator::LessThanOrEqual),
-        "!" => Some(BinaryOperator::LogicalNegation),
         "&&" => Some(BinaryOperator::LogicalAnd),
         "||" => Some(BinaryOperator::LogicalOr),
         "==" => Some(BinaryOperator::LogicalEquality),
         "!=" => Some(BinaryOperator::LogicalInequality),
         "===" => Some(BinaryOperator::CaseEquality),
         "!==" => Some(BinaryOperator::CaseInequality),
-        "~" => Some(BinaryOperator::BitwiseNegation),
         "&" => Some(BinaryOperator::BitwiseAnd),
         "|" => Some(BinaryOperator::BitwiseInclusiveOr),
         "^" => Some(BinaryOperator::BitwiseExclusiveOr),
@@ -103,8 +156,8 @@ pub fn binary_expression_from_string(input: &str) -> Option<BinaryOperator> {
 }
 
 pub const ALL_BINARY_EXPRESSIONS: &[&str] = &[
-    "{}", "+", "-", "*", "/", "%", ">", ">=", "<", "<=", "!", "&&", "||", "==", "!=", "===", "!==",
-    "~", "&", "|", "^", "^~", "~^", "&", "|", "^", "~^", "^~", "<<", ">>", "<<<", ">>>",
+    "{}", "+", "-", "*", "/", "%", ">", ">=", "<", "<=", "&&", "||", "==", "!=", "===", "!==", "&",
+    "|", "^", "^~", "~^", "&", "|", "^", "~^", "^~", "<<", ">>", "<<<", ">>>",
 ];
 
 #[cfg(test)]
@@ -154,10 +207,6 @@ mod tests {
             Some(BinaryOperator::LessThanOrEqual)
         );
         assert_eq!(
-            binary_expression_from_string("!"),
-            Some(BinaryOperator::LogicalNegation)
-        );
-        assert_eq!(
             binary_expression_from_string("&&"),
             Some(BinaryOperator::LogicalAnd)
         );
@@ -180,10 +229,6 @@ mod tests {
         assert_eq!(
             binary_expression_from_string("!=="),
             Some(BinaryOperator::CaseInequality)
-        );
-        assert_eq!(
-            binary_expression_from_string("~"),
-            Some(BinaryOperator::BitwiseNegation)
         );
         assert_eq!(
             binary_expression_from_string("&"),
@@ -271,10 +316,22 @@ mod tests {
 
     #[test]
     fn test_unary_operator_from_string() {
-        assert_eq!(unary_operator_from_string("+"), Some(UnaryOperator::Positive));
-        assert_eq!(unary_operator_from_string("-"), Some(UnaryOperator::Negative));
-        assert_eq!(unary_operator_from_string("~"), Some(UnaryOperator::BitwiseNegation));
-        assert_eq!(unary_operator_from_string("!"), Some(UnaryOperator::LogicalNegation));
+        assert_eq!(
+            unary_operator_from_string("+"),
+            Some(UnaryOperator::Positive)
+        );
+        assert_eq!(
+            unary_operator_from_string("-"),
+            Some(UnaryOperator::Negative)
+        );
+        assert_eq!(
+            unary_operator_from_string("~"),
+            Some(UnaryOperator::BitwiseNegation)
+        );
+        assert_eq!(
+            unary_operator_from_string("!"),
+            Some(UnaryOperator::LogicalNegation)
+        );
         assert_eq!(unary_operator_from_string("nonexistent"), None);
     }
 

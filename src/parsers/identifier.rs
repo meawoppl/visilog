@@ -2,7 +2,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while_m_n},
     character::complete::{alpha1, char},
-    combinator::{map_res},
+    combinator::map_res,
     multi::separated_list1,
     sequence::tuple,
     IResult,
