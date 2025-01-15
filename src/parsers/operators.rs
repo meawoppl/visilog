@@ -104,7 +104,7 @@ impl Precedence for BinaryOperator {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub enum ReductionOperator {
+pub enum UnaryReductionOperator {
     ReductionAnd,
     ReductionNand,
     ReductionNor,
@@ -113,14 +113,14 @@ pub enum ReductionOperator {
     ReductionXnor,
 }
 
-pub fn reduction_operator_from_string(input: &str) -> Option<ReductionOperator> {
+pub fn reduction_operator_from_string(input: &str) -> Option<UnaryReductionOperator> {
     match input {
-        "&" => Some(ReductionOperator::ReductionAnd),
-        "~&" => Some(ReductionOperator::ReductionNand),
-        "|" => Some(ReductionOperator::ReductionOr),
-        "~|" => Some(ReductionOperator::ReductionNor),
-        "^" => Some(ReductionOperator::ReductionXor),
-        "~^" | "^~" => Some(ReductionOperator::ReductionXnor),
+        "&" => Some(UnaryReductionOperator::ReductionAnd),
+        "~&" => Some(UnaryReductionOperator::ReductionNand),
+        "|" => Some(UnaryReductionOperator::ReductionOr),
+        "~|" => Some(UnaryReductionOperator::ReductionNor),
+        "^" => Some(UnaryReductionOperator::ReductionXor),
+        "~^" | "^~" => Some(UnaryReductionOperator::ReductionXnor),
         _ => None,
     }
 }
@@ -273,31 +273,31 @@ mod tests {
     fn test_reduction_operator_from_string() {
         assert_eq!(
             reduction_operator_from_string("&"),
-            Some(ReductionOperator::ReductionAnd)
+            Some(UnaryReductionOperator::ReductionAnd)
         );
         assert_eq!(
             reduction_operator_from_string("~&"),
-            Some(ReductionOperator::ReductionNand)
+            Some(UnaryReductionOperator::ReductionNand)
         );
         assert_eq!(
             reduction_operator_from_string("|"),
-            Some(ReductionOperator::ReductionOr)
+            Some(UnaryReductionOperator::ReductionOr)
         );
         assert_eq!(
             reduction_operator_from_string("~|"),
-            Some(ReductionOperator::ReductionNor)
+            Some(UnaryReductionOperator::ReductionNor)
         );
         assert_eq!(
             reduction_operator_from_string("^"),
-            Some(ReductionOperator::ReductionXor)
+            Some(UnaryReductionOperator::ReductionXor)
         );
         assert_eq!(
             reduction_operator_from_string("~^"),
-            Some(ReductionOperator::ReductionXnor)
+            Some(UnaryReductionOperator::ReductionXnor)
         );
         assert_eq!(
             reduction_operator_from_string("^~"),
-            Some(ReductionOperator::ReductionXnor)
+            Some(UnaryReductionOperator::ReductionXnor)
         );
         assert_eq!(reduction_operator_from_string("nonexistent"), None);
     }
