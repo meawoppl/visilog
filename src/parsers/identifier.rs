@@ -10,7 +10,21 @@ use nom::{
 
 use super::simple::ws;
 
-pub fn identifier(input: &str) -> IResult<&str, String> {
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identifier {
+    pub name: String,
+}
+
+impl Identifier
+{
+    pub fn new(name: String) -> Self {
+        Identifier { name }
+    }
+}
+
+
+pub fn identifier(input: &str) -> IResult<&str, Identifier> {
     map_res(
         tuple((
             alt((alpha1, tag("_"))),
@@ -26,13 +40,13 @@ pub fn identifier(input: &str) -> IResult<&str, String> {
                     nom::error::ErrorKind::TooLarge,
                 )))
             } else {
-                Ok(full_id)
+                Ok(Identifier::new(full_id))
             }
         },
     )(input)
 }
 
-pub fn identifier_list(input: &str) -> IResult<&str, Vec<String>> {
+pub fn identifier_list(input: &str) -> IResult<&str, Vec<Identifier>> {
     separated_list1(ws(char(',')), ws(identifier))(input)
 }
 
@@ -53,7 +67,7 @@ mod tests {
                 id_str
             );
 
-            assert_eq!(parsed.unwrap().1, id_str.to_string());
+            assert_eq!(parsed.unwrap().1.name, id_str.to_string());
         }
     }
 
@@ -91,7 +105,7 @@ mod tests {
                 id_str
             );
 
-            assert_eq!(unwrapped.1, id_str.to_string());
+            assert_eq!(unwrapped.1.name, id_str.to_string());
         }
     }
 
@@ -114,14 +128,16 @@ mod tests {
     fn test_identifier_list_single() {
         let result = identifier_list.parse("a").unwrap();
         assert_eq!(result.0, "");
-        assert_eq!(result.1, vec!["a".to_string()]);
+        assert_eq!(result.1, vec![Identifier::new("a".to_string())]);
     }
 
     #[test]
     fn test_identifier_list_double() {
         let result = identifier_list.parse("a,b").unwrap();
         assert_eq!(result.0, "");
-        assert_eq!(result.1, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(result.1, vec![
+            Identifier::new("a".to_string()), Identifier::new("b".to_string())
+        ]);
     }
 
     #[test]
@@ -130,7 +146,7 @@ mod tests {
         assert_eq!(result.0, "");
         assert_eq!(
             result.1,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            vec![Identifier::new("a".to_string()), Identifier::new("b".to_string()), Identifier::new("c".to_string())]
         );
     }
 
@@ -140,7 +156,7 @@ mod tests {
         assert_eq!(result.0, "");
         assert_eq!(
             result.1,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            vec![Identifier::new("a".to_string()), Identifier::new("b".to_string()), Identifier::new("c".to_string())]
         );
     }
 
@@ -151,7 +167,7 @@ mod tests {
         assert!(result.is_ok());
         let (rest, identifiers) = result.unwrap();
         assert_eq!(rest, ", 1b, c");
-        assert_eq!(identifiers, vec!["a".to_string()]);
+        assert_eq!(identifiers, vec![Identifier::new("a".to_string())]);
     }
 
     #[test]

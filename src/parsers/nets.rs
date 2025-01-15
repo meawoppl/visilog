@@ -1,7 +1,7 @@
 use nom::{combinator::opt, sequence::tuple, IResult};
 
 use super::{
-    identifier::identifier_list,
+    identifier::{identifier_list, Identifier},
     simple::{range, ws},
 };
 
@@ -34,7 +34,7 @@ pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {
     ))(input)
 }
 
-fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, Vec<String>)> {
+fn net_declaration(input: &str) -> IResult<&str, (NetType, Option<(i64, i64)>, Vec<Identifier>)> {
     tuple((net_type, ws(opt(range)), ws(identifier_list)))(input)
 }
 

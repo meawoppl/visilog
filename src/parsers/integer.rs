@@ -1,8 +1,8 @@
 use nom::{bytes::complete::tag, character::complete::space1, sequence::terminated, IResult};
 
-use super::identifier::identifier_list;
+use super::identifier::{identifier_list, Identifier};
 
-fn parse_integer_declaration(input: &str) -> IResult<&str, (&str, Vec<String>)> {
+fn parse_integer_declaration(input: &str) -> IResult<&str, (&str, Vec<Identifier>)> {
     let (input, _) = tag("integer")(input)?;
     let (input, _) = space1(input)?;
     let (input, identifiers) = terminated(identifier_list, tag(";"))(input)?;
@@ -19,8 +19,11 @@ mod tests {
         let result = parse_integer_declaration(input);
         assert!(result.is_ok());
         let (_, (keyword, identifiers)) = result.unwrap();
+
+        let strings: Vec<String> = identifiers.iter().map(|i| i.name.to_string()).collect();
+
         assert_eq!(keyword, "integer");
-        assert_eq!(identifiers, vec!["ident1", "ident2", "ident3"]);
+        assert_eq!(strings, vec!["ident1", "ident2", "ident3"]);
     }
 
     #[test]
