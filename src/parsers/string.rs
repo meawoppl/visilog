@@ -33,3 +33,21 @@ fn parse_string_content(input: &str) -> IResult<&str, String> {
 pub fn parse_verilog_string(input: &str) -> IResult<&str, String> {
     delimited(char('"'), parse_string_content, char('"'))(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_verilog_string() {
+        assert_eq!(parse_verilog_string("\"hello\""), Ok(("", "hello".to_string())));
+        assert_eq!(parse_verilog_string("\"hello\\nworld\""), Ok(("", "hello\nworld".to_string())));
+        assert_eq!(parse_verilog_string("\"hello\\tworld\""), Ok(("", "hello\tworld".to_string())));
+        assert_eq!(parse_verilog_string("\"hello\\\\world\""), Ok(("", "hello\\world".to_string())));
+        assert_eq!(parse_verilog_string("\"hello\\\"world\""), Ok(("", "hello\"world".to_string())));
+        assert_eq!(parse_verilog_string("\"hello\\d123world\""), Ok(("", "hello{world".to_string())));
+        assert_eq!(parse_verilog_string("\"hello%world\""), Ok(("", "hello%world".to_string())));
+        assert_eq!(parse_verilog_string("\"\""), Ok(("", "".to_string())));
+        assert_eq!(parse_verilog_string("\"\\n\\t\\\\\\\"\\d123%\""), Ok(("", "\n\t\\\"{".to_string())));
+    }
+}

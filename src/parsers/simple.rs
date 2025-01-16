@@ -68,6 +68,14 @@ mod tests {
             comment("/* This is a \n multi-line \n comment */"),
             Ok(("", " This is a \n multi-line \n comment "))
         );
+        assert_eq!(
+            comment("// Another single line comment\n"),
+            Ok(("\n", ""))
+        );
+        assert_eq!(
+            comment("/* Another multi-line comment */"),
+            Ok(("", " Another multi-line comment "))
+        );
     }
 
     #[test]
@@ -75,6 +83,8 @@ mod tests {
         assert_eq!(whitespace("   abc"), Ok(("abc", "   ")));
         assert_eq!(whitespace("\t\nabc"), Ok(("abc", "\t\n")));
         assert_eq!(whitespace("abc"), Ok(("abc", "")));
+        assert_eq!(whitespace(" \t\nabc"), Ok(("abc", " \t\n")));
+        assert_eq!(whitespace(" \t\n"), Ok(("", " \t\n")));
     }
 
     #[test]
@@ -83,6 +93,8 @@ mod tests {
         assert_eq!(parser("   abc   "), Ok(("", "abc")));
         assert_eq!(parser("\tabc\t"), Ok(("", "abc")));
         assert_eq!(parser("abc"), Ok(("", "abc")));
+        assert_eq!(parser(" \tabc \t"), Ok(("", "abc")));
+        assert_eq!(parser(" \tabc"), Ok(("", "abc")));
     }
 
     #[test]
@@ -90,6 +102,8 @@ mod tests {
         assert_eq!(raw_pos_int("123abc"), Ok(("abc", 123)));
         assert_eq!(raw_pos_int("0abc"), Ok(("abc", 0)));
         assert!(raw_pos_int("abc").is_err());
+        assert_eq!(raw_pos_int("456def"), Ok(("def", 456)));
+        assert_eq!(raw_pos_int("789ghi"), Ok(("ghi", 789)));
     }
 
     #[test]
@@ -97,6 +111,8 @@ mod tests {
         assert_eq!(sign("+123"), Ok(("123", "+")));
         assert_eq!(sign("-123"), Ok(("123", "-")));
         assert!(sign("123").is_err());
+        assert_eq!(sign("+456"), Ok(("456", "+")));
+        assert_eq!(sign("-789"), Ok(("789", "-")));
     }
 
     #[test]
@@ -107,6 +123,11 @@ mod tests {
         );
         assert_eq!(single_line_comment("// This is a comment"), Ok(("", "")));
         assert!(single_line_comment("This is not a comment").is_err());
+        assert_eq!(
+            single_line_comment("// Another comment\n"),
+            Ok(("\n", ""))
+        );
+        assert_eq!(single_line_comment("// Another comment"), Ok(("", "")));
     }
 
     #[test]
@@ -120,6 +141,14 @@ mod tests {
             Ok(("", " This is a comment "))
         );
         assert!(multi_line_comment("This is not a comment").is_err());
+        assert_eq!(
+            multi_line_comment("/* Another comment */def"),
+            Ok(("def", " Another comment "))
+        );
+        assert_eq!(
+            multi_line_comment("/* Another comment */"),
+            Ok(("", " Another comment "))
+        );
     }
 
     #[test]
@@ -127,5 +156,7 @@ mod tests {
         assert_eq!(range("[1:0]abc"), Ok(("abc", (1, 0))));
         assert_eq!(range("[10:5]abc"), Ok(("abc", (10, 5))));
         assert!(range("abc").is_err());
+        assert_eq!(range("[3:2]def"), Ok(("def", (3, 2))));
+        assert_eq!(range("[8:4]ghi"), Ok(("ghi", (8, 4))));
     }
 }

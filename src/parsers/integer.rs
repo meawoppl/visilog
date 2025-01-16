@@ -24,6 +24,26 @@ mod tests {
 
         assert_eq!(keyword, "integer");
         assert_eq!(strings, vec!["ident1", "ident2", "ident3"]);
+
+        let input = "integer ident4, ident5;";
+        let result = parse_integer_declaration(input);
+        assert!(result.is_ok());
+        let (_, (keyword, identifiers)) = result.unwrap();
+
+        let strings: Vec<String> = identifiers.iter().map(|i| i.name.to_string()).collect();
+
+        assert_eq!(keyword, "integer");
+        assert_eq!(strings, vec!["ident4", "ident5"]);
+
+        let input = "integer ident6;";
+        let result = parse_integer_declaration(input);
+        assert!(result.is_ok());
+        let (_, (keyword, identifiers)) = result.unwrap();
+
+        let strings: Vec<String> = identifiers.iter().map(|i| i.name.to_string()).collect();
+
+        assert_eq!(keyword, "integer");
+        assert_eq!(strings, vec!["ident6"]);
     }
 
     #[test]
@@ -31,11 +51,27 @@ mod tests {
         let input = "integer 123ident;";
         let result = parse_integer_declaration(input);
         assert!(result.is_err());
+
+        let input = "integer ident1, 123ident;";
+        let result = parse_integer_declaration(input);
+        assert!(result.is_err());
+
+        let input = "integer ident1, ident2, 123ident;";
+        let result = parse_integer_declaration(input);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_integer_declaration_missing_semicolon() {
         let input = "integer ident1, ident2, ident3";
+        let result = parse_integer_declaration(input);
+        assert!(result.is_err());
+
+        let input = "integer ident1, ident2";
+        let result = parse_integer_declaration(input);
+        assert!(result.is_err());
+
+        let input = "integer ident1";
         let result = parse_integer_declaration(input);
         assert!(result.is_err());
     }
