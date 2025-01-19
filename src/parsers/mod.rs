@@ -1,3 +1,4 @@
+pub mod base;
 pub mod constants;
 pub mod identifier;
 pub mod integer;
@@ -9,3 +10,4 @@ pub mod register;
 pub mod simple;
 pub mod string;
 pub mod expr;
+pub mod example;

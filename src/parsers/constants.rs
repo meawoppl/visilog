@@ -7,6 +7,7 @@ use nom::{
 };
 
 use super::numbers::{decimal, hexadecimal};
+use super::base::RawToken;
 use nom::character::complete::char;
 
 
@@ -32,7 +33,7 @@ fn const_type_char(input: &str) -> IResult<&str, VerilogBaseType> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct VerilogConstant {
+pub struct VerilogConstant {
     size: Option<usize>,
     base_type: VerilogBaseType,
     value: String,
@@ -45,6 +46,31 @@ impl VerilogConstant {
             base_type,
             value,
         }
+    }
+    pub fn from_int(value: i64) -> Self {
+        VerilogConstant {
+            size: None,
+            base_type: VerilogBaseType::Decimal,
+            value: value.to_string(),
+        }
+    }
+}
+
+impl RawToken for VerilogConstant {
+    fn raw_token(&self) -> String {
+        format!("{}'{}{}",
+             match self.size {
+                Some(size) => size.to_string(),
+                None => "".to_string(),
+             },
+             match self.base_type {
+                VerilogBaseType::Binary => "b",
+                VerilogBaseType::Decimal => "d",
+                VerilogBaseType::Octal => "o",
+                VerilogBaseType::Hexadecimal => "h",
+            },
+            self.value,
+        )
     }
 }
 

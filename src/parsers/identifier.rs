@@ -8,7 +8,7 @@ use nom::{
     IResult,
 };
 
-use super::simple::ws;
+use super::{base::RawToken, simple::ws};
 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +20,12 @@ impl Identifier
 {
     pub fn new(name: String) -> Self {
         Identifier { name }
+    }
+}
+
+impl RawToken for Identifier {
+    fn raw_token(&self) -> String {
+        self.name.clone()
     }
 }
 
