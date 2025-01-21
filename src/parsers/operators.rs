@@ -46,26 +46,23 @@ pub fn unary_operator_from_string(input: &str) -> Option<UnaryOperator> {
     }
 }
 
-
 pub fn unary_operator(input: &str) -> IResult<&str, UnaryOperator> {
     // NOTE(meawoppl) - the alt() call only supports 21 arguments, so we need to split it up
     alt((
-        map(tag("+"), |_|  UnaryOperator::Positive),      
-        map(tag("-"), |_|  UnaryOperator::Negative),
-        map(tag("~"), |_|  UnaryOperator::BitwiseNegation),
-        map(tag("!"), |_|  UnaryOperator::LogicalNegation),
+        map(tag("+"), |_| UnaryOperator::Positive),
+        map(tag("-"), |_| UnaryOperator::Negative),
+        map(tag("~"), |_| UnaryOperator::BitwiseNegation),
+        map(tag("!"), |_| UnaryOperator::LogicalNegation),
         //
-        map(tag("&"), |_|  UnaryOperator::ReductionAnd),
+        map(tag("&"), |_| UnaryOperator::ReductionAnd),
         map(tag("~&"), |_| UnaryOperator::ReductionNand),
-        map(tag("|"), |_|  UnaryOperator::ReductionOr),
+        map(tag("|"), |_| UnaryOperator::ReductionOr),
         map(tag("~|"), |_| UnaryOperator::ReductionNor),
-        map(tag("^"), |_|  UnaryOperator::ReductionXor),
+        map(tag("^"), |_| UnaryOperator::ReductionXor),
         map(tag("~^"), |_| UnaryOperator::ReductionXnor),
         map(tag("^~"), |_| UnaryOperator::ReductionXnor),
     ))(input)
 }
-
-
 
 impl Precedence for UnaryOperator {
     fn precedence(&self) -> u8 {
@@ -90,9 +87,8 @@ impl RawToken for UnaryOperator {
     }
 }
 
-
-
-pub const ALL_UNARY_OPERATORS: &[&str] = &["+", "-", "!", "~", "&","~&","|","~|","^","~^", "^~"];
+pub const ALL_UNARY_OPERATORS: &[&str] =
+    &["+", "-", "!", "~", "&", "~&", "|", "~|", "^", "~^", "^~"];
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum BinaryOperator {
@@ -100,8 +96,9 @@ pub enum BinaryOperator {
     ArithmeticShiftLeft,
     ArithmeticShiftRight,
     BitwiseAnd,
-    BitwiseEquivalence,
-    BitwiseExclusiveOr,
+    BitwiseOr,
+    BitwiseXNor,
+    BitwiseXOr,
     BitwiseInclusiveOr,
     CaseEquality,
     CaseInequality,
@@ -116,6 +113,7 @@ pub enum BinaryOperator {
     LogicalOr,
     Modulus,
     Multiplication,
+    Power,
     ShiftLeft,
     ShiftRight,
     Subtraction,
@@ -127,6 +125,7 @@ impl Precedence for BinaryOperator {
         match self {
             BinaryOperator::Division => 6,
             BinaryOperator::Modulus => 6,
+            BinaryOperator::Power => 6,
             BinaryOperator::Multiplication => 6,
             //
             BinaryOperator::Addition => 5,
@@ -148,8 +147,9 @@ impl Precedence for BinaryOperator {
             BinaryOperator::LogicalInequality => 2,
             //
             BinaryOperator::BitwiseAnd => 1,
-            BinaryOperator::BitwiseEquivalence => 1,
-            BinaryOperator::BitwiseExclusiveOr => 1,
+            BinaryOperator::BitwiseXNor => 1,
+            BinaryOperator::BitwiseXOr => 1,
+            BinaryOperator::BitwiseOr => 1,
             BinaryOperator::BitwiseInclusiveOr => 1,
             BinaryOperator::LogicalAnd => 1,
             BinaryOperator::LogicalOr => 1,
@@ -165,6 +165,7 @@ impl RawToken for BinaryOperator {
             BinaryOperator::Multiplication => "*".to_string(),
             BinaryOperator::Division => "/".to_string(),
             BinaryOperator::Modulus => "%".to_string(),
+            BinaryOperator::Power => "**".to_string(),
             BinaryOperator::GreaterThan => ">".to_string(),
             BinaryOperator::GreaterThanOrEqual => ">=".to_string(),
             BinaryOperator::LessThan => "<".to_string(),
@@ -177,8 +178,9 @@ impl RawToken for BinaryOperator {
             BinaryOperator::CaseInequality => "!==".to_string(),
             BinaryOperator::BitwiseAnd => "&".to_string(),
             BinaryOperator::BitwiseInclusiveOr => "|".to_string(),
-            BinaryOperator::BitwiseExclusiveOr => "^".to_string(),
-            BinaryOperator::BitwiseEquivalence => "^~".to_string(),
+            BinaryOperator::BitwiseOr => "|".to_string(),
+            BinaryOperator::BitwiseXOr => "^".to_string(),
+            BinaryOperator::BitwiseXNor => "^~".to_string(),
             BinaryOperator::ShiftLeft => "<<".to_string(),
             BinaryOperator::ShiftRight => ">>".to_string(),
             BinaryOperator::ArithmeticShiftLeft => "<<<".to_string(),
@@ -205,8 +207,8 @@ pub fn binary_expression_from_string(input: &str) -> Option<BinaryOperator> {
         "!==" => Some(BinaryOperator::CaseInequality),
         "&" => Some(BinaryOperator::BitwiseAnd),
         "|" => Some(BinaryOperator::BitwiseInclusiveOr),
-        "^" => Some(BinaryOperator::BitwiseExclusiveOr),
-        "^~" | "~^" => Some(BinaryOperator::BitwiseEquivalence),
+        "^" => Some(BinaryOperator::BitwiseXOr),
+        "^~" | "~^" => Some(BinaryOperator::BitwiseXNor),
         "<<" => Some(BinaryOperator::ShiftLeft),
         ">>" => Some(BinaryOperator::ShiftRight),
         "<<<" => Some(BinaryOperator::ArithmeticShiftLeft),
@@ -216,16 +218,11 @@ pub fn binary_expression_from_string(input: &str) -> Option<BinaryOperator> {
 }
 
 pub const ALL_BINARY_OPERATORS: &[&str] = &[
-    "+", "-", "*", "/", "%", ">", ">=", "<", "<=", "&&", "||", "==", "!=", "===", "!==", "&",
-    "|", "^", "^~", "~^", "&", "|", "^", "~^", "^~", "<<", ">>", "<<<", ">>>",
+    "+", "-", "*", "/", "%", ">", ">=", "<", "<=", "&&", "||", "==", "!=", "===", "!==", "&", "|",
+    "^", "^~", "~^", "&", "|", "^", "~^", "^~", "<<", ">>", "<<<", ">>>",
 ];
 
-use nom::{
-    branch::alt,
-    bytes::complete::tag,
-    combinator::map,
-    IResult,
-};
+use nom::{branch::alt, bytes::complete::tag, combinator::map, IResult};
 
 use super::base::RawToken;
 
@@ -238,7 +235,6 @@ pub fn binary_operator(input: &str) -> IResult<&str, BinaryOperator> {
         map(tag("*"), |_| BinaryOperator::Multiplication),
         map(tag("/"), |_| BinaryOperator::Division),
         map(tag("%"), |_| BinaryOperator::Modulus),
-
         map(tag("&&"), |_| BinaryOperator::LogicalAnd),
         map(tag("||"), |_| BinaryOperator::LogicalOr),
         map(tag("&"), |_| BinaryOperator::BitwiseAnd),
@@ -250,11 +246,9 @@ pub fn binary_operator(input: &str) -> IResult<&str, BinaryOperator> {
         map(tag("=="), |_| BinaryOperator::LogicalEquality),
         map(tag("!=="), |_| BinaryOperator::CaseInequality),
         map(tag("!="), |_| BinaryOperator::LogicalInequality),
-
-        map(tag("^~"), |_| BinaryOperator::BitwiseEquivalence),
-        map(tag("~^"), |_| BinaryOperator::BitwiseEquivalence),
-        map(tag("^"), |_| BinaryOperator::BitwiseExclusiveOr),
-
+        map(tag("^~"), |_| BinaryOperator::BitwiseXNor),
+        map(tag("~^"), |_| BinaryOperator::BitwiseXNor),
+        map(tag("^"), |_| BinaryOperator::BitwiseXOr),
         map(tag("<<<"), |_| BinaryOperator::ArithmeticShiftLeft),
         map(tag(">>>"), |_| BinaryOperator::ArithmeticShiftRight),
         map(tag("<<"), |_| BinaryOperator::ShiftLeft),
@@ -268,15 +262,12 @@ pub fn binary_operator(input: &str) -> IResult<&str, BinaryOperator> {
     alt((a1, a2))(input)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_binary_expression_from_string() {
-
         assert_eq!(
             binary_expression_from_string("+"),
             Some(BinaryOperator::Addition)
@@ -296,6 +287,10 @@ mod tests {
         assert_eq!(
             binary_expression_from_string("%"),
             Some(BinaryOperator::Modulus)
+        );
+        assert_eq!(
+            binary_expression_from_string("**"),
+            Some(BinaryOperator::Power)
         );
         assert_eq!(
             binary_expression_from_string(">"),
@@ -347,15 +342,15 @@ mod tests {
         );
         assert_eq!(
             binary_expression_from_string("^"),
-            Some(BinaryOperator::BitwiseExclusiveOr)
+            Some(BinaryOperator::BitwiseXOr)
         );
         assert_eq!(
             binary_expression_from_string("^~"),
-            Some(BinaryOperator::BitwiseEquivalence)
+            Some(BinaryOperator::BitwiseXNor)
         );
         assert_eq!(
             binary_expression_from_string("~^"),
-            Some(BinaryOperator::BitwiseEquivalence)
+            Some(BinaryOperator::BitwiseXNor)
         );
         assert_eq!(
             binary_expression_from_string("<<"),
@@ -458,28 +453,58 @@ mod tests {
     fn test_parse_binary_operator() {
         assert_eq!(binary_operator("+"), Ok(("", BinaryOperator::Addition)));
         assert_eq!(binary_operator("-"), Ok(("", BinaryOperator::Subtraction)));
-        assert_eq!(binary_operator("*"), Ok(("", BinaryOperator::Multiplication)));
+        assert_eq!(
+            binary_operator("*"),
+            Ok(("", BinaryOperator::Multiplication))
+        );
         assert_eq!(binary_operator("/"), Ok(("", BinaryOperator::Division)));
         assert_eq!(binary_operator("%"), Ok(("", BinaryOperator::Modulus)));
-        assert_eq!(binary_operator(">="), Ok(("", BinaryOperator::GreaterThanOrEqual)));
+        assert_eq!(
+            binary_operator(">="),
+            Ok(("", BinaryOperator::GreaterThanOrEqual))
+        );
         assert_eq!(binary_operator(">"), Ok(("", BinaryOperator::GreaterThan)));
-        assert_eq!(binary_operator("<="), Ok(("", BinaryOperator::LessThanOrEqual)));
+        assert_eq!(
+            binary_operator("<="),
+            Ok(("", BinaryOperator::LessThanOrEqual))
+        );
         assert_eq!(binary_operator("<"), Ok(("", BinaryOperator::LessThan)));
         assert_eq!(binary_operator("&&"), Ok(("", BinaryOperator::LogicalAnd)));
         assert_eq!(binary_operator("||"), Ok(("", BinaryOperator::LogicalOr)));
-        assert_eq!(binary_operator("=="), Ok(("", BinaryOperator::LogicalEquality)));
-        assert_eq!(binary_operator("!="), Ok(("", BinaryOperator::LogicalInequality)));
-        assert_eq!(binary_operator("==="), Ok(("", BinaryOperator::CaseEquality)));
-        assert_eq!(binary_operator("!=="), Ok(("", BinaryOperator::CaseInequality)));
+        assert_eq!(
+            binary_operator("=="),
+            Ok(("", BinaryOperator::LogicalEquality))
+        );
+        assert_eq!(
+            binary_operator("!="),
+            Ok(("", BinaryOperator::LogicalInequality))
+        );
+        assert_eq!(
+            binary_operator("==="),
+            Ok(("", BinaryOperator::CaseEquality))
+        );
+        assert_eq!(
+            binary_operator("!=="),
+            Ok(("", BinaryOperator::CaseInequality))
+        );
         assert_eq!(binary_operator("&"), Ok(("", BinaryOperator::BitwiseAnd)));
-        assert_eq!(binary_operator("|"), Ok(("", BinaryOperator::BitwiseInclusiveOr)));
-        assert_eq!(binary_operator("^"), Ok(("", BinaryOperator::BitwiseExclusiveOr)));
-        assert_eq!(binary_operator("^~"), Ok(("", BinaryOperator::BitwiseEquivalence)));
-        assert_eq!(binary_operator("~^"), Ok(("", BinaryOperator::BitwiseEquivalence)));
+        assert_eq!(
+            binary_operator("|"),
+            Ok(("", BinaryOperator::BitwiseInclusiveOr))
+        );
+        assert_eq!(binary_operator("^"), Ok(("", BinaryOperator::BitwiseXOr)));
+        assert_eq!(binary_operator("^~"), Ok(("", BinaryOperator::BitwiseXNor)));
+        assert_eq!(binary_operator("~^"), Ok(("", BinaryOperator::BitwiseXNor)));
         assert_eq!(binary_operator("<<"), Ok(("", BinaryOperator::ShiftLeft)));
         assert_eq!(binary_operator(">>"), Ok(("", BinaryOperator::ShiftRight)));
-        assert_eq!(binary_operator("<<<"), Ok(("", BinaryOperator::ArithmeticShiftLeft)));
-        assert_eq!(binary_operator(">>>"), Ok(("", BinaryOperator::ArithmeticShiftRight)));
+        assert_eq!(
+            binary_operator("<<<"),
+            Ok(("", BinaryOperator::ArithmeticShiftLeft))
+        );
+        assert_eq!(
+            binary_operator(">>>"),
+            Ok(("", BinaryOperator::ArithmeticShiftRight))
+        );
         assert!(binary_operator("nonexistent").is_err());
-}
+    }
 }
