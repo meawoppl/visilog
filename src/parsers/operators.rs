@@ -192,6 +192,7 @@ pub fn binary_expression_from_string(input: &str) -> Option<BinaryOperator> {
     match input {
         "+" => Some(BinaryOperator::Addition),
         "-" => Some(BinaryOperator::Subtraction),
+        "**" => Some(BinaryOperator::Power),
         "*" => Some(BinaryOperator::Multiplication),
         "/" => Some(BinaryOperator::Division),
         "%" => Some(BinaryOperator::Modulus),
@@ -232,6 +233,7 @@ pub fn binary_operator(input: &str) -> IResult<&str, BinaryOperator> {
     let a1 = alt((
         map(tag("+"), |_| BinaryOperator::Addition),
         map(tag("-"), |_| BinaryOperator::Subtraction),
+        map(tag("**"), |_| BinaryOperator::Power),
         map(tag("*"), |_| BinaryOperator::Multiplication),
         map(tag("/"), |_| BinaryOperator::Division),
         map(tag("%"), |_| BinaryOperator::Modulus),
