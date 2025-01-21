@@ -1,14 +1,535 @@
-use super::{identifier::Identifier, operators::{BinaryOperator, UnaryOperator}};
+use super::{
+    base::RawToken,
+    constants::{verilog_const, VerilogConstant},
+    identifier::{self, identifier, Identifier},
+    operators::{
+        binary_operator, unary_operator, unary_operator_from_string, BinaryOperator, UnaryOperator,
+    },
+    simple::ws,
+};
+use nom::{combinator::peek, sequence::delimited, Err};
+use nom::{
+    branch::alt,
+    bytes::complete::tag,
+    combinator::{map, map_res},
+    error::ErrorKind,
+    multi::{fold_many0, many0, many1, separated_list1},
+    sequence::{pair, preceded, tuple},
+    IResult,
+};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
-
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Expression {
-    Unparsed(String),
-    // Literal(Literal),
+    Constant(VerilogConstant),
     Identifier(Identifier),
     Unary(UnaryOperator, Box<Expression>),
-    Binary(BinaryOperator, Box<Expression>, Box<Expression>),
+    Binary(Box<Expression>, BinaryOperator, Box<Expression>),
     Conditional(Box<Expression>, Box<Expression>, Box<Expression>), // condition ? true_expr : false_expr
-    Parenthesized(Box<Expression>),
+    Parenthetical(Box<Expression>),
+    Concatenation(Vec<Expression>),
+    FunctionCall(Identifier, Vec<Expression>),
+}
+
+fn parenthetical(input: &str) -> IResult<&str, Expression> {
+    map(
+        delimited(tag("("), ws(verilog_expression), tag(")")),
+        |expr| Expression::Parenthetical(Box::new(expr)),
+    )(input)
+}
+
+
+// TODO(meawoppl) - support the multiplication concatentation operator roughly here
+fn concatenation(input: &str) -> IResult<&str, Expression> {
+    map(
+        delimited(
+            tag("{"),
+            separated_list1(tag(","), ws(verilog_expression)),
+            tag("}"),
+        ),
+        |exprs| Expression::Concatenation(exprs),
+    )(input)
+}
+
+fn fn_call(input: &str) -> IResult<&str, Expression> {
+    let (input, id) = identifier(input)?;
+    let (input, args) = delimited(
+        tag("("),
+        separated_list1(tag(","), ws(verilog_expression)),
+        tag(")"),
+    )(input)?;
+
+    Ok((input, Expression::FunctionCall(id, args)))
+}
+
+fn operand(input: &str) -> IResult<&str, Expression> {
+    // NOTE(meawoppl) 
+    // fn_call has to go before identifier, as function names
+    // are valid identifiers
+    ws(alt((
+        fn_call, 
+        map(identifier, Expression::Identifier),
+        map(verilog_const, Expression::Constant),
+        parenthetical,
+        concatenation,
+    )))(input)
+}
+
+// Alright, this is following table 5-4 in the IEEE 1364-2005 standard
+// Use use the fold_many0() combinator to parse the expression
+// by composing layers of order of operation here. There are 14 layers as a result
+// They are enumerated below with a brief description of the operation(s)
+
+// Layer 1: Unary operators
+fn unary_operator_layer(input: &str) -> IResult<&str, Expression> {
+    alt((
+        map_res(tuple((many1(unary_operator), operand)), |(ops, exp)| {
+            let mut result = exp;
+
+            // These apply right to left somewhat confusingly
+            for op in ops.iter().rev() {
+                result = Expression::Unary(op.clone(), Box::new(result));
+            }
+            Ok::<_, nom::Err<(&str, nom::error::ErrorKind)>>(result)
+        }),
+        operand,
+    ))(input)
+}
+
+// Layer 2: Exponentiation Operator
+fn exp_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = unary_operator_layer(input)?;
+
+    fold_many0(
+        pair(tag("**"), unary_operator_layer),
+        move || init.clone(),
+        |acc, (_, val): (&str, Expression)| {
+            Expression::Binary(Box::new(acc), BinaryOperator::Power, Box::new(val))
+        },
+    )(input)
+}
+
+// Layer 3: Multiplication, Division, Modulus Operators
+fn mul_div_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = exp_layer(input)?;
+
+    fold_many0(
+        pair(alt((tag("*"), tag("/"), tag("%"))), exp_layer),
+        move || init.clone(),
+        |acc, (op, val): (&str, Expression)| {
+            let token = match op {
+                "*" => BinaryOperator::Multiplication,
+                "/" => BinaryOperator::Division,
+                "%" => BinaryOperator::Modulus,
+                _ => unreachable!(),
+            };
+            Expression::Binary(Box::new(acc), token, Box::new(val))
+        },
+    )(input)
+}
+// Layer 4: Addition, Subtraction Operators
+fn add_sub_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = mul_div_layer(input)?;
+
+    fold_many0(
+        pair(alt((tag("+"), tag("-"))), mul_div_layer),
+        move || init.clone(),
+        |acc, (op, val): (&str, Expression)| {
+            let token = match op {
+                "+" => BinaryOperator::Addition,
+                "-" => BinaryOperator::Subtraction,
+                _ => unreachable!(),
+            };
+            Expression::Binary(Box::new(acc), token, Box::new(val))
+        },
+    )(input)
+}
+// Layer 5: Shift Operators
+fn shift_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = add_sub_layer(input)?;
+
+    fold_many0(
+        pair(
+            alt((tag("<<<"), tag(">>>"), tag("<<"), tag(">>"))),
+            add_sub_layer,
+        ),
+        move || init.clone(),
+        |acc, (op, val): (&str, Expression)| {
+            let token = match op {
+                "<<<" => BinaryOperator::ArithmeticShiftLeft,
+                ">>>" => BinaryOperator::ArithmeticShiftRight,
+                "<<" => BinaryOperator::ShiftLeft,
+                ">>" => BinaryOperator::ShiftRight,
+                _ => unreachable!(),
+            };
+            Expression::Binary(Box::new(acc), token, Box::new(val))
+        },
+    )(input)
+}
+// Layer 6: Relational Operators
+fn relational_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = shift_layer(input)?;
+
+    fold_many0(
+        pair(alt((tag("<="), tag("<"), tag(">="), tag(">"))), shift_layer),
+        move || init.clone(),
+        |acc, (op, val): (&str, Expression)| {
+            let token = match op {
+                "<" => BinaryOperator::LessThan,
+                "<=" => BinaryOperator::LessThanOrEqual,
+                ">" => BinaryOperator::GreaterThan,
+                ">=" => BinaryOperator::GreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            Expression::Binary(Box::new(acc), token, Box::new(val))
+        },
+    )(input)
+}
+
+// Layer 7: Equality Operators
+fn equality_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = relational_layer(input)?;
+
+    fold_many0(
+        pair(
+            alt((tag("!=="), tag("==="), tag("=="), tag("!="))),
+            relational_layer,
+        ),
+        move || init.clone(),
+        |acc, (op, val): (&str, Expression)| {
+            let token = match op {
+                "===" => BinaryOperator::CaseEquality,
+                "!==" => BinaryOperator::CaseInequality,
+                "==" => BinaryOperator::LogicalEquality,
+                "!=" => BinaryOperator::LogicalInequality,
+                _ => unreachable!(),
+            };
+            Expression::Binary(Box::new(acc), token, Box::new(val))
+        },
+    )(input)
+}
+
+// Layer 8: Bitwise AND Operator
+fn bitwise_and_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = equality_layer(input)?;
+
+    fold_many0(
+        pair(tag("&"), equality_layer),
+        move || init.clone(),
+        |acc, (_, val): (&str, Expression)| {
+            Expression::Binary(Box::new(acc), BinaryOperator::BitwiseAnd, Box::new(val))
+        },
+    )(input)
+}
+// Layer 9: Bitwise XOR/XNOR Operators
+fn bitwise_xor_xnor_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = bitwise_and_layer(input)?;
+
+    fold_many0(
+        pair(alt((tag("^~"), tag("^"), tag("~^"))), bitwise_and_layer),
+        move || init.clone(),
+        |acc, (op, val): (&str, Expression)| {
+            let token = match op {
+                "^" => BinaryOperator::BitwiseXOr,
+                "~^" => BinaryOperator::BitwiseXNor,
+                "^~" => BinaryOperator::BitwiseXNor,
+                _ => unreachable!(),
+            };
+            Expression::Binary(Box::new(acc), token, Box::new(val))
+        },
+    )(input)
+}
+// Layer 10: Bitwise OR Operator
+fn bitwise_or_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = bitwise_xor_xnor_layer(input)?;
+
+    fold_many0(
+        pair(tag("|"), bitwise_xor_xnor_layer),
+        move || init.clone(),
+        |acc, (_, val): (&str, Expression)| {
+            Expression::Binary(Box::new(acc), BinaryOperator::BitwiseOr, Box::new(val))
+        },
+    )(input)
+}
+// Layer 11: Logical AND Operator
+fn logical_and_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = bitwise_or_layer(input)?;
+
+    fold_many0(
+        pair(tag("&&"), bitwise_or_layer),
+        move || init.clone(),
+        |acc, (_, val): (&str, Expression)| {
+            Expression::Binary(Box::new(acc), BinaryOperator::LogicalAnd, Box::new(val))
+        },
+    )(input)
+}
+// Layer 12: Logical OR Operator
+fn logical_or_layer(input: &str) -> IResult<&str, Expression> {
+    let (input, init) = logical_and_layer(input)?;
+
+    fold_many0(
+        pair(tag("||"), logical_and_layer),
+        move || init.clone(),
+        |acc, (_, val): (&str, Expression)| {
+            Expression::Binary(Box::new(acc), BinaryOperator::LogicalOr, Box::new(val))
+        },
+    )(input)
+}
+
+// Layer 13: Conditional Operator
+fn conditional_layer(input: &str) -> IResult<&str, Expression> {
+    // Slightly hacky way to avoid left recursion
+    // parse an expression (must lead a conditional)
+    // The ensures the recursive call will always have less tokens
+    // than the previous one...
+    let (remaining, init) = logical_or_layer(input)?;
+
+    // Escape path if this is an expression that doesn't have a conditional
+    if remaining.len() == 0 {
+        return Ok((remaining, init));
+    }
+
+    // If we made it here, we -may- have a conditional
+    let is_ternary = peek(ws(tag("?")))(remaining).is_ok();
+
+    // Bail if the next char isn't a ternary operator
+    if !is_ternary {
+        return Ok((remaining, init));
+    }
+
+    // Now can we can recursive sub-descend the remaining bits
+    let (after_ternary, tf_pair) = map_res(
+            tuple((
+                ws(tag("?")),
+                verilog_expression,
+                ws(tag(":")),
+                verilog_expression,
+            )),
+            move |(_, true_expr, _, false_expr)| {
+                Ok::<_, nom::Err<nom::error::Error<&str>>>((true_expr, false_expr))
+            }
+        )
+    (remaining)?;
+
+    if after_ternary.len() < remaining.len() {
+        return Ok((after_ternary, Expression::Conditional(Box::new(init), Box::new(tf_pair.0), Box::new(tf_pair.1))));
+    } else {
+        return Ok((remaining, init))
+    }
+}
+
+// Layer 14: Concatenation Operators
+
+fn verilog_expression(input: &str) -> IResult<&str, Expression> {
+    conditional_layer(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{RngCore, SeedableRng};
+
+    use super::*;
+
+    #[test]
+    fn test_unary_ops() {
+        let expressions = vec![
+            (
+                "--2",
+                Expression::Unary(
+                    UnaryOperator::Negative,
+                    Box::new(Expression::Unary(
+                        UnaryOperator::Negative,
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                    )),
+                ),
+            ),
+            (
+                "++2",
+                Expression::Unary(
+                    UnaryOperator::Positive,
+                    Box::new(Expression::Unary(
+                        UnaryOperator::Positive,
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                    )),
+                ),
+            ),
+            (
+                "+-2",
+                Expression::Unary(
+                    UnaryOperator::Positive,
+                    Box::new(Expression::Unary(
+                        UnaryOperator::Negative,
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                    )),
+                ),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_negation_addition_identifiers() {
+        let expressions = vec![(
+            "-x+y",
+            Expression::Binary(
+                Box::new(Expression::Unary(
+                    UnaryOperator::Negative,
+                    Box::new(Expression::Identifier(Identifier::new("x".to_string()))),
+                )),
+                BinaryOperator::Addition,
+                Box::new(Expression::Identifier(Identifier::new("y".to_string()))),
+            ),
+        )];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_subtract_constants_identifiers() {
+        let expressions = vec![
+            (
+                "1+2",
+                Expression::Binary(
+                    Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                ),
+            ),
+            (
+                "a-b",
+                Expression::Binary(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    BinaryOperator::Subtraction,
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                ),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_subtract_constants_identifiers_whitespace() {
+        let expressions = vec![
+            (
+                "1+2",
+                Expression::Binary(
+                    Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                ),
+            ),
+            (
+                "a-b",
+                Expression::Binary(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    BinaryOperator::Subtraction,
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                ),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            for _ in 0..10 {
+                let mut chars: Vec<char> = expr.chars().collect();
+                for _ in 0..(chars.len() / 2) {
+                    let pos = rng.next_u32() as usize % chars.len();
+                    chars.insert(pos, ' ');
+                }
+                let expr_with_ws: String = chars.into_iter().collect();
+                let result_with_ws = verilog_expression(&expr_with_ws);
+                assert!(
+                    result_with_ws.is_ok(),
+                    "Failed to parse expression with whitespace: {}",
+                    expr_with_ws
+                );
+                let (_, parsed_expr_with_ws) = result_with_ws.unwrap();
+                assert_eq!(
+                    parsed_expr_with_ws, expected,
+                    "Parsed expression with whitespace did not match expected: {}",
+                    expr_with_ws
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_expression() {
+        let expressions = vec![
+            "a",
+            "a + b",
+            "a - b",
+            "a * b",
+            "a ** b",
+            "a / b",
+            "a && b",
+            "a <<< b",
+            "a >>> b",
+            "a == b",
+            "a != b",
+            "a === b",
+            "a !== b",
+            "a << b",
+            "a >> b",
+            "a < b",
+            "a <= b",
+            "a > b",
+            "a >= b",
+            "a || b",
+            "a ** b",
+            "a ~^ b",
+            "a ^ b",
+            "a ^~ b",
+            "a % b",
+            "!a",
+            "a ? b : c",
+            "(a + b)",
+            "{a, b, c}",
+            "identifier",
+            "a + (b * c)",
+            "a ? (b + c) : (d - e)",
+            "{a, {b, c}, d}",
+        ];
+
+        for expr in expressions {
+            let result = verilog_expression(expr);
+            println!("{:?}", result);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+
+            // Remove whitespace and test that parse still works
+            let expr_no_ws = expr.replace(" ", "");
+            let result = verilog_expression(&expr_no_ws);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+        }
+    }
 }
