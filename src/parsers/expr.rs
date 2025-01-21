@@ -7,7 +7,7 @@ use super::{
     },
     simple::ws,
 };
-use nom::Err;
+use nom::{combinator::peek, sequence::delimited, Err};
 use nom::{
     branch::alt,
     bytes::complete::tag,
@@ -32,10 +32,47 @@ pub enum Expression {
     FunctionCall(Identifier, Vec<Expression>),
 }
 
+fn parenthetical(input: &str) -> IResult<&str, Expression> {
+    map(
+        delimited(tag("("), ws(verilog_expression), tag(")")),
+        |expr| Expression::Parenthetical(Box::new(expr)),
+    )(input)
+}
+
+
+// TODO(meawoppl) - support the multiplication concatentation operator roughly here
+fn concatenation(input: &str) -> IResult<&str, Expression> {
+    map(
+        delimited(
+            tag("{"),
+            separated_list1(tag(","), ws(verilog_expression)),
+            tag("}"),
+        ),
+        |exprs| Expression::Concatenation(exprs),
+    )(input)
+}
+
+fn fn_call(input: &str) -> IResult<&str, Expression> {
+    let (input, id) = identifier(input)?;
+    let (input, args) = delimited(
+        tag("("),
+        separated_list1(tag(","), ws(verilog_expression)),
+        tag(")"),
+    )(input)?;
+
+    Ok((input, Expression::FunctionCall(id, args)))
+}
+
 fn operand(input: &str) -> IResult<&str, Expression> {
+    // NOTE(meawoppl) 
+    // fn_call has to go before identifier, as function names
+    // are valid identifiers
     ws(alt((
+        fn_call, 
         map(identifier, Expression::Identifier),
         map(verilog_const, Expression::Constant),
+        parenthetical,
+        concatenation,
     )))(input)
 }
 
@@ -242,47 +279,44 @@ fn logical_or_layer(input: &str) -> IResult<&str, Expression> {
 
 // Layer 13: Conditional Operator
 fn conditional_layer(input: &str) -> IResult<&str, Expression> {
-    alt((
-        logical_or_layer,
-        map_res(
+    // Slightly hacky way to avoid left recursion
+    // parse an expression (must lead a conditional)
+    // The ensures the recursive call will always have less tokens
+    // than the previous one...
+    let (remaining, init) = logical_or_layer(input)?;
+
+    // Escape path if this is an expression that doesn't have a conditional
+    if remaining.len() == 0 {
+        return Ok((remaining, init));
+    }
+
+    // If we made it here, we -may- have a conditional
+    let is_ternary = peek(ws(tag("?")))(remaining).is_ok();
+
+    // Bail if the next char isn't a ternary operator
+    if !is_ternary {
+        return Ok((remaining, init));
+    }
+
+    // Now can we can recursive sub-descend the remaining bits
+    let (after_ternary, tf_pair) = map_res(
             tuple((
-                verilog_expression,
                 ws(tag("?")),
                 verilog_expression,
                 ws(tag(":")),
                 verilog_expression,
             )),
-            move |(condition, _, true_expr, _, false_expr)| {
-                let cond = Expression::Conditional(
-                    Box::new(condition),
-                    Box::new(true_expr),
-                    Box::new(false_expr),
-                );
-                Ok::<_, nom::Err<nom::error::Error<&str>>>(cond)
-            },
-        ),
-    ))(input)
+            move |(_, true_expr, _, false_expr)| {
+                Ok::<_, nom::Err<nom::error::Error<&str>>>((true_expr, false_expr))
+            }
+        )
+    (remaining)?;
 
-    // alt((
-    //     logical_or_layer,
-    //     map_res(
-    //         tuple((
-    //             verilog_expression,
-    //             ws(tag("?")),
-    //             verilog_expression,
-    //             ws(tag(":")),
-    //             verilog_expression,
-    //         )),
-    //         move |(condition, _, true_expr, _, false_expr)| {
-    //             let cond = Expression::Conditional(
-    //                 Box::new(condition),
-    //                 Box::new(true_expr),
-    //                 Box::new(false_expr),
-    //             );
-    //             Ok::<_, nom::Err<nom::error::Error<&str>>>(cond)
-    //         },
-    //     ),
-    // ))(input)
+    if after_ternary.len() < remaining.len() {
+        return Ok((after_ternary, Expression::Conditional(Box::new(init), Box::new(tf_pair.0), Box::new(tf_pair.1))));
+    } else {
+        return Ok((remaining, init))
+    }
 }
 
 // Layer 14: Concatenation Operators
