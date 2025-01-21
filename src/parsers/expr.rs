@@ -532,4 +532,227 @@ mod tests {
             assert!(result.is_ok(), "Failed to parse expression: {}", expr);
         }
     }
+
+    #[test]
+    fn test_function_call() {
+        let expressions = vec![
+            (
+                "blahblah(a, b, c)",
+                Expression::FunctionCall(
+                    Identifier::new("blahblah".to_string()),
+                    vec![
+                        Expression::Identifier(Identifier::new("a".to_string())),
+                        Expression::Identifier(Identifier::new("b".to_string())),
+                        Expression::Identifier(Identifier::new("c".to_string())),
+                    ],
+                ),
+            ),
+            (
+                "foo(1, 2, 3)",
+                Expression::FunctionCall(
+                    Identifier::new("foo".to_string()),
+                    vec![
+                        Expression::Constant(VerilogConstant::from_int(1)),
+                        Expression::Constant(VerilogConstant::from_int(2)),
+                        Expression::Constant(VerilogConstant::from_int(3)),
+                    ],
+                ),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_parenthetical_statements() {
+        let expressions = vec![
+            (
+                "(a + b)",
+                Expression::Parenthetical(Box::new(Expression::Binary(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                ))),
+            ),
+            (
+                "(1 + 2)",
+                Expression::Parenthetical(Box::new(Expression::Binary(
+                    Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                ))),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_ternary_with_parentheses() {
+        let expressions = vec![
+            (
+                "a ? (b ? c : d) : e",
+                Expression::Conditional(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Conditional(
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                    )),
+                    Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                ),
+            ),
+            (
+                "a ? b : (c ? d : e)",
+                Expression::Conditional(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                    Box::new(Expression::Conditional(
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                    )),
+                ),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_concatenation_operator() {
+        let expressions = vec![
+            (
+                "{a, b, c}",
+                Expression::Concatenation(vec![
+                    Expression::Identifier(Identifier::new("a".to_string())),
+                    Expression::Identifier(Identifier::new("b".to_string())),
+                    Expression::Identifier(Identifier::new("c".to_string())),
+                ]),
+            ),
+            (
+                "{1, 2, 3}",
+                Expression::Concatenation(vec![
+                    Expression::Constant(VerilogConstant::from_int(1)),
+                    Expression::Constant(VerilogConstant::from_int(2)),
+                    Expression::Constant(VerilogConstant::from_int(3)),
+                ]),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
+
+    #[test]
+    fn test_additional_cases() {
+        let expressions = vec![
+            (
+                "a + b * c",
+                Expression::Binary(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                        BinaryOperator::Multiplication,
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                    )),
+                ),
+            ),
+            (
+                "a * b + c",
+                Expression::Binary(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::Multiplication,
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                    )),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                ),
+            ),
+            (
+                "a && b || c",
+                Expression::Binary(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::LogicalAnd,
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                    )),
+                    BinaryOperator::LogicalOr,
+                    Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                ),
+            ),
+            (
+                "a || b && c",
+                Expression::Binary(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    BinaryOperator::LogicalOr,
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                        BinaryOperator::LogicalAnd,
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                    )),
+                ),
+            ),
+            (
+                "a == b != c",
+                Expression::Binary(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::LogicalEquality,
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                    )),
+                    BinaryOperator::LogicalInequality,
+                    Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                ),
+            ),
+        ];
+
+        for (expr, expected) in expressions {
+            let result = verilog_expression(expr);
+            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+            let (_, parsed_expr) = result.unwrap();
+            assert_eq!(
+                parsed_expr, expected,
+                "Parsed expression did not match expected: {}",
+                expr
+            );
+        }
+    }
 }
