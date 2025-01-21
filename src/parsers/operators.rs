@@ -1,3 +1,5 @@
+use strum_macros::EnumString;
+
 trait Precedence {
     fn precedence(&self) -> u8;
 }
@@ -12,7 +14,7 @@ trait Precedence {
 //  1  -->   & ^~ | && ||
 //  0  -->   ?: (ternary operator)    lowest precedence
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, strum_macros::Display)]
 pub enum UnaryOperator {
     // Arithmetic Operators
     Positive,
@@ -90,7 +92,7 @@ impl RawToken for UnaryOperator {
 pub const ALL_UNARY_OPERATORS: &[&str] =
     &["+", "-", "!", "~", "&", "~&", "|", "~|", "^", "~^", "^~"];
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, strum_macros::Display)]
 pub enum BinaryOperator {
     Addition,
     ArithmeticShiftLeft,
