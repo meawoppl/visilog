@@ -1,3 +1,5 @@
+use core::fmt;
+
 use nom::{
     branch::alt,
     character::complete::one_of,
@@ -37,6 +39,30 @@ pub struct VerilogConstant {
     size: Option<usize>,
     base_type: VerilogBaseType,
     value: String,
+}
+
+impl fmt::Display for VerilogConstant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.size.is_none() && self.base_type == VerilogBaseType::Decimal {
+            return write!(f, "{}", self.value);
+        }
+
+        write!(
+            f,
+            "{}'{}{}",
+            match self.size {
+                Some(size) => size.to_string(),
+                None => "".to_string(),
+            },
+            match self.base_type {
+                VerilogBaseType::Binary => "b",
+                VerilogBaseType::Decimal => "d",
+                VerilogBaseType::Octal => "o",
+                VerilogBaseType::Hexadecimal => "h",
+            },
+            self.value
+        )
+    }
 }
 
 impl VerilogConstant {
