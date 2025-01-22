@@ -132,59 +132,119 @@ mod tests {
     fn test_register_to_binary() {
         let reg = Register::new(4, vec![0, 1, 2, 3]);
         assert_eq!(reg.to_binary(), "01xz");
+
+        let reg = Register::new(8, vec![0, 1, 0, 1, 1, 0, 1, 0]);
+        assert_eq!(reg.to_binary(), "01011010");
+
+        let reg = Register::new(2, vec![2, 3]);
+        assert_eq!(reg.to_binary(), "xz");
     }
 
     #[test]
     fn test_register_to_hex() {
         let reg = Register::new(4, vec![0, 0, 1, 1]);
         assert_eq!(reg.to_hex(), Some("3".to_string()));
+
+        let reg = Register::new(8, vec![1, 0, 1, 0, 1, 1, 0, 0]);
+        assert_eq!(reg.to_hex(), Some("AC".to_string()));
+
+        let reg = Register::new(12, vec![1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0]);
+        assert_eq!(reg.to_hex(), Some("EAC2".to_string()));
     }
 
     #[test]
     fn test_register_to_decimal() {
         let reg = Register::new(4, vec![0, 1, 1, 0]);
         assert_eq!(reg.to_decimal(), Some("6".to_string()));
+
+        let reg = Register::new(8, vec![1, 0, 1, 0, 1, 1, 0, 0]);
+        assert_eq!(reg.to_decimal(), Some("172".to_string()));
+
+        let reg = Register::new(12, vec![1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0]);
+        assert_eq!(reg.to_decimal(), Some("3754".to_string()));
     }
 
     #[test]
     fn test_register_to_octal() {
         let reg = Register::new(3, vec![0, 1, 1]);
         assert_eq!(reg.to_octal(), Some("3".to_string()));
+
+        let reg = Register::new(6, vec![1, 0, 1, 1, 0, 0]);
+        assert_eq!(reg.to_octal(), Some("54".to_string()));
+
+        let reg = Register::new(9, vec![1, 1, 1, 0, 1, 0, 1, 1, 0]);
+        assert_eq!(reg.to_octal(), Some("732".to_string()));
     }
 
     #[test]
     fn test_register_from_binary() {
         let reg = Register::from_binary("01xz");
         assert_eq!(reg.get_raw(), &vec![0, 1, 2, 3]);
+
+        let reg = Register::from_binary("01011010");
+        assert_eq!(reg.get_raw(), &vec![0, 1, 0, 1, 1, 0, 1, 0]);
+
+        let reg = Register::from_binary("xz");
+        assert_eq!(reg.get_raw(), &vec![2, 3]);
     }
 
     #[test]
     fn test_register_from_hex() {
         let reg = Register::from_hex("3");
         assert_eq!(reg.get_raw(), &vec![0, 0, 1, 1]);
+
+        let reg = Register::from_hex("AC");
+        assert_eq!(reg.get_raw(), &vec![1, 0, 1, 0, 1, 1, 0, 0]);
+
+        let reg = Register::from_hex("EAC2");
+        assert_eq!(reg.get_raw(), &vec![1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0]);
     }
 
     #[test]
     fn test_register_from_decimal() {
         let reg = Register::from_decimal("6");
         assert_eq!(reg.get_raw(), &vec![1, 1, 0]);
+
+        let reg = Register::from_decimal("172");
+        assert_eq!(reg.get_raw(), &vec![1, 0, 1, 0, 1, 1, 0, 0]);
+
+        let reg = Register::from_decimal("3754");
+        assert_eq!(reg.get_raw(), &vec![1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0]);
     }
 
     #[test]
     fn test_register_from_octal() {
         let reg = Register::from_octal("3");
         assert_eq!(reg.get_raw(), &vec![0, 1, 1]);
+
+        let reg = Register::from_octal("54");
+        assert_eq!(reg.get_raw(), &vec![1, 0, 1, 1, 0, 0]);
+
+        let reg = Register::from_octal("732");
+        assert_eq!(reg.get_raw(), &vec![1, 1, 1, 0, 1, 0, 1, 1, 0]);
     }
 
     #[test]
     fn test_register_to_hex_with_xz() {
         let reg = Register::new(4, vec![0, 1, 2, 3]);
         assert_eq!(reg.to_hex(), None);
+
+        let reg = Register::new(8, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        assert_eq!(reg.to_hex(), None);
+
+        let reg = Register::new(12, vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
+        assert_eq!(reg.to_hex(), None);
     }
 
     #[test]
     fn test_register_to_decimal_with_xz() {
         let reg = Register::new(4, vec![0, 1, 2, 3]);
+        assert_eq!(reg.to_decimal(), None);
+
+        let reg = Register::new(8, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        assert_eq!(reg.to_decimal(), None);
+
+        let reg = Register::new(12, vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
         assert_eq!(reg.to_decimal(), None);
     }
 
@@ -201,5 +261,29 @@ mod tests {
 
         let reg_oct = Register::from_octal("3");
         assert_eq!(reg_oct.get_raw(), &vec![0, 1, 1]);
+
+        let reg_bin = Register::from_binary("01011010");
+        assert_eq!(reg_bin.get_raw(), &vec![0, 1, 0, 1, 1, 0, 1, 0]);
+
+        let reg_hex = Register::from_hex("AC");
+        assert_eq!(reg_hex.get_raw(), &vec![1, 0, 1, 0, 1, 1, 0, 0]);
+
+        let reg_dec = Register::from_decimal("172");
+        assert_eq!(reg_dec.get_raw(), &vec![1, 0, 1, 0, 1, 1, 0, 0]);
+
+        let reg_oct = Register::from_octal("54");
+        assert_eq!(reg_oct.get_raw(), &vec![1, 0, 1, 1, 0, 0]);
+
+        let reg_bin = Register::from_binary("xz");
+        assert_eq!(reg_bin.get_raw(), &vec![2, 3]);
+
+        let reg_hex = Register::from_hex("EAC2");
+        assert_eq!(reg_hex.get_raw(), &vec![1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0]);
+
+        let reg_dec = Register::from_decimal("3754");
+        assert_eq!(reg_dec.get_raw(), &vec![1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0]);
+
+        let reg_oct = Register::from_octal("732");
+        assert_eq!(reg_oct.get_raw(), &vec![1, 1, 1, 0, 1, 0, 1, 1, 0]);
     }
 }

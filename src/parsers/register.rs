@@ -122,6 +122,42 @@ mod tests {
                 }
             ))
         );
+
+        assert_eq!(
+            parse_register_declaration("reg [15:0] b;"),
+            Ok((
+                "",
+                RegisterDeclaration {
+                    name: "b".to_string(),
+                    range: Some((15, 0)),
+                    dimensions: None,
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_register_declaration("reg c[15:0];"),
+            Ok((
+                "",
+                RegisterDeclaration {
+                    name: "c".to_string(),
+                    range: None,
+                    dimensions: Some((15, 0)),
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_register_declaration("reg [31:0] d[0:255];"),
+            Ok((
+                "",
+                RegisterDeclaration {
+                    name: "d".to_string(),
+                    range: Some((31, 0)),
+                    dimensions: Some((0, 255)),
+                }
+            ))
+        );
     }
 
     #[test]
@@ -134,6 +170,42 @@ mod tests {
                     name: "memb".to_string(),
                     range: Some((7, 0)),
                     dimensions: Some((0, 255)),
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_memory_declaration("reg [15:0] mem[0:1023];"),
+            Ok((
+                "",
+                RegisterDeclaration {
+                    name: "mem".to_string(),
+                    range: Some((15, 0)),
+                    dimensions: Some((0, 1023)),
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_memory_declaration("reg [31:0] mem32[0:2047];"),
+            Ok((
+                "",
+                RegisterDeclaration {
+                    name: "mem32".to_string(),
+                    range: Some((31, 0)),
+                    dimensions: Some((0, 2047)),
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_memory_declaration("reg [63:0] mem64[0:4095];"),
+            Ok((
+                "",
+                RegisterDeclaration {
+                    name: "mem64".to_string(),
+                    range: Some((63, 0)),
+                    dimensions: Some((0, 4095)),
                 }
             ))
         );

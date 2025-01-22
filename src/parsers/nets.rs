@@ -31,6 +31,8 @@ pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {
         value(NetType::Tri, tag("tri")),
         value(NetType::Supply0, tag("supply0")),
         value(NetType::Supply1, tag("supply1")),
+        value(NetType::Tri0, tag("tri0")),
+        value(NetType::Tri1, tag("tri1")),
     ))(input)
 }
 
@@ -54,11 +56,59 @@ mod tests {
         assert_eq!(net_type("trior"), Ok(("", NetType::TriOr)));
         assert_eq!(net_type("supply0"), Ok(("", NetType::Supply0)));
         assert_eq!(net_type("supply1"), Ok(("", NetType::Supply1)));
+        assert_eq!(net_type("tri0"), Ok(("", NetType::Tri0)));
+        assert_eq!(net_type("tri1"), Ok(("", NetType::Tri1)));
         assert!(net_type("invalid").is_err());
     }
 
     #[test]
     fn test_net_declaration() {
-        net_declaration.parse("wire z").unwrap();
+        assert_eq!(
+            net_declaration("wire [7:0] a, b, c"),
+            Ok((
+                "",
+                (
+                    NetType::Wire,
+                    Some((7, 0)),
+                    vec![
+                        Identifier::new("a".to_string()),
+                        Identifier::new("b".to_string()),
+                        Identifier::new("c".to_string())
+                    ]
+                )
+            ))
+        );
+
+        assert_eq!(
+            net_declaration("tri0 a, b, c"),
+            Ok((
+                "",
+                (
+                    NetType::Tri0,
+                    None,
+                    vec![
+                        Identifier::new("a".to_string()),
+                        Identifier::new("b".to_string()),
+                        Identifier::new("c".to_string())
+                    ]
+                )
+            ))
+        );
+
+        assert_eq!(
+            net_declaration("tri1 [3:0] x, y, z"),
+            Ok((
+                "",
+                (
+                    NetType::Tri1,
+                    Some((3, 0)),
+                    vec![
+                        Identifier::new("x".to_string()),
+                        Identifier::new("y".to_string()),
+                        Identifier::new("z".to_string())
+                    ]
+                )
+            ))
+        );
     }
 }
