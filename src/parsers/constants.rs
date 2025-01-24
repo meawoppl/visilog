@@ -170,6 +170,14 @@ mod tests {
             sized_const("8'D234"),
             Ok(("", VerilogConstant::new(Some(8), VerilogBaseType::Decimal, "234".to_string())))
         );
+        assert_eq!(
+            sized_const("4'o77"),
+            Ok(("", VerilogConstant::new(Some(4), VerilogBaseType::Octal, "77".to_string())))
+        );
+        assert_eq!(
+            sized_const("16'hABCD"),
+            Ok(("", VerilogConstant::new(Some(16), VerilogBaseType::Hexadecimal, "ABCD".to_string())))
+        );
     }
 
 
@@ -186,6 +194,14 @@ mod tests {
         assert_eq!(
             integer_constant("456789"),
             Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "456789".to_string())))
+        );
+        assert_eq!(
+            integer_constant("42"),
+            Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "42".to_string())))
+        );
+        assert_eq!(
+            integer_constant("987654321"),
+            Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "987654321".to_string())))
         );
     }
 
@@ -210,6 +226,14 @@ mod tests {
         assert_eq!(
             unsized_const("'HFF"),
             Ok(("", VerilogConstant::new(None, VerilogBaseType::Hexadecimal, "FF".to_string())))
+        );
+        assert_eq!(
+            unsized_const("'b1101"),
+            Ok(("", VerilogConstant::new(None, VerilogBaseType::Binary, "1101".to_string())))
+        );
+        assert_eq!(
+            unsized_const("'d1234"),
+            Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "1234".to_string())))
         );
     }
 
@@ -270,6 +294,14 @@ mod tests {
         assert_eq!(
             verilog_const("'HFF"),
             Ok(("", VerilogConstant::new(None, VerilogBaseType::Hexadecimal, "FF".to_string())))
+        );
+        assert_eq!(
+            verilog_const("4'o77"),
+            Ok(("", VerilogConstant::new(Some(4), VerilogBaseType::Octal, "77".to_string())))
+        );
+        assert_eq!(
+            verilog_const("16'hABCD"),
+            Ok(("", VerilogConstant::new(Some(16), VerilogBaseType::Hexadecimal, "ABCD".to_string())))
         );
     }
 

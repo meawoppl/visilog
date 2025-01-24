@@ -181,4 +181,39 @@ mod tests {
         let result = identifier_list.parse("");
         assert!(result.is_err(), "Empty identifier list should not parse");
     }
+
+    #[test]
+    fn test_identifier_with_special_characters() {
+        let special_identifiers = [
+            "var_a$", "var_a1$", "Var_A$", "Var_A1$", "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$",
+        ];
+        for id_str in &special_identifiers {
+            let parsed = identifier(id_str);
+            assert!(
+                parsed.is_ok(),
+                "Special identifier {} failed to parse",
+                id_str
+            );
+
+            assert_eq!(parsed.unwrap().1.name, id_str.to_string());
+        }
+    }
+
+    #[test]
+    fn test_identifier_with_max_length() {
+        let max_length_identifier = "a".repeat(1024);
+        assert!(
+            identifier(&max_length_identifier).is_ok(),
+            "Identifier with max length failed to parse"
+        );
+    }
+
+    #[test]
+    fn test_identifier_exceeding_max_length() {
+        let exceeding_length_identifier = "a".repeat(1025);
+        assert!(
+            identifier(&exceeding_length_identifier).is_err(),
+            "Identifier exceeding max length should not parse"
+        );
+    }
 }

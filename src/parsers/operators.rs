@@ -511,4 +511,63 @@ mod tests {
         );
         assert!(binary_operator("nonexistent").is_err());
     }
+
+    #[test]
+    fn test_parse_unary_operator() {
+        assert_eq!(unary_operator("+"), Ok(("", UnaryOperator::Positive)));
+        assert_eq!(unary_operator("-"), Ok(("", UnaryOperator::Negative)));
+        assert_eq!(unary_operator("~"), Ok(("", UnaryOperator::BitwiseNegation)));
+        assert_eq!(unary_operator("!"), Ok(("", UnaryOperator::LogicalNegation)));
+        assert_eq!(unary_operator("&"), Ok(("", UnaryOperator::ReductionAnd)));
+        assert_eq!(unary_operator("~&"), Ok(("", UnaryOperator::ReductionNand)));
+        assert_eq!(unary_operator("|"), Ok(("", UnaryOperator::ReductionOr)));
+        assert_eq!(unary_operator("~|"), Ok(("", UnaryOperator::ReductionNor)));
+        assert_eq!(unary_operator("^"), Ok(("", UnaryOperator::ReductionXor)));
+        assert_eq!(unary_operator("~^"), Ok(("", UnaryOperator::ReductionXnor)));
+        assert_eq!(unary_operator("^~"), Ok(("", UnaryOperator::ReductionXnor)));
+        assert!(unary_operator("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_operator_precedence() {
+        let operators = vec![
+            (UnaryOperator::Positive, 7),
+            (UnaryOperator::Negative, 7),
+            (UnaryOperator::LogicalNegation, 7),
+            (UnaryOperator::BitwiseNegation, 7),
+            (UnaryOperator::ReductionAnd, 7),
+            (UnaryOperator::ReductionNand, 7),
+            (UnaryOperator::ReductionOr, 7),
+            (UnaryOperator::ReductionNor, 7),
+            (UnaryOperator::ReductionXor, 7),
+            (UnaryOperator::ReductionXnor, 7),
+            (BinaryOperator::Multiplication, 6),
+            (BinaryOperator::Division, 6),
+            (BinaryOperator::Modulus, 6),
+            (BinaryOperator::Addition, 5),
+            (BinaryOperator::Subtraction, 5),
+            (BinaryOperator::ShiftLeft, 4),
+            (BinaryOperator::ShiftRight, 4),
+            (BinaryOperator::ArithmeticShiftLeft, 4),
+            (BinaryOperator::ArithmeticShiftRight, 4),
+            (BinaryOperator::LessThan, 3),
+            (BinaryOperator::LessThanOrEqual, 3),
+            (BinaryOperator::GreaterThan, 3),
+            (BinaryOperator::GreaterThanOrEqual, 3),
+            (BinaryOperator::LogicalEquality, 2),
+            (BinaryOperator::LogicalInequality, 2),
+            (BinaryOperator::CaseEquality, 2),
+            (BinaryOperator::CaseInequality, 2),
+            (BinaryOperator::BitwiseAnd, 1),
+            (BinaryOperator::BitwiseXOr, 1),
+            (BinaryOperator::BitwiseXNor, 1),
+            (BinaryOperator::BitwiseOr, 1),
+            (BinaryOperator::LogicalAnd, 1),
+            (BinaryOperator::LogicalOr, 1),
+        ];
+
+        for (op, expected_precedence) in operators {
+            assert_eq!(op.precedence(), expected_precedence);
+        }
+    }
 }
