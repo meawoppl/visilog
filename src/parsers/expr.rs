@@ -30,6 +30,8 @@ pub enum Expression {
     Parenthetical(Box<Expression>),
     Concatenation(Vec<Expression>),
     FunctionCall(Identifier, Vec<Expression>),
+    BitSelect(Box<Expression>, Box<Expression>),
+    PartSelect(Box<Expression>, Box<Expression>, Box<Expression>),
 }
 
 impl Expression {
@@ -67,6 +69,8 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Expression::BitSelect(expr, index) => format!("{}[{}]", expr.to_contracted_string(), index.to_contracted_string()),
+            Expression::PartSelect(expr, start, end) => format!("{}[{}:{}]", expr.to_contracted_string(), start.to_contracted_string(), end.to_contracted_string()),
         }
     }
 
@@ -125,6 +129,8 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(",\n")
             ),
+            Expression::BitSelect(expr, index) => format!("{}BitSelect(\n{}{},\n{}{})", indent_str, expr.to_ast_string(indent + 1), indent_str, index.to_ast_string(indent + 1), indent_str),
+            Expression::PartSelect(expr, start, end) => format!("{}PartSelect(\n{}{},\n{}{},\n{}{})", indent_str, expr.to_ast_string(indent + 1), indent_str, start.to_ast_string(indent + 1), indent_str, end.to_ast_string(indent + 1), indent_str),
         }
     }
 }
@@ -199,7 +205,25 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         map(verilog_const, Expression::Constant),
         parenthetical,
         concatenation,
+        bit_select,
+        part_select,
     ))(input)
+}
+
+fn bit_select(input: &str) -> IResult<&str, Expression> {
+    let (input, expr) = operand_no_ws(input)?;
+    let (input, index) = delimited(tag("["), ws(verilog_expression), tag("]"))(input)?;
+    Ok((input, Expression::BitSelect(Box::new(expr), Box::new(index))))
+}
+
+fn part_select(input: &str) -> IResult<&str, Expression> {
+    let (input, expr) = operand_no_ws(input)?;
+    let (input, (start, end)) = delimited(
+        tag("["),
+        pair(ws(verilog_expression), preceded(tag(":"), ws(verilog_expression))),
+        tag("]"),
+    )(input)?;
+    Ok((input, Expression::PartSelect(Box::new(expr), Box::new(start), Box::new(end))))
 }
 
 // Alright, this is following table 5-4 in the IEEE 1364-2005 standard
@@ -474,6 +498,7 @@ mod tests {
                         panic!("Failed to parse expression: {}", expr);
                     }
                 }
+
             }
 
         }
@@ -906,6 +931,21 @@ mod tests {
                     )),
                     BinaryOperator::LogicalInequality,
                     Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                ),
+            ),
+            (
+                "a[3]",
+                Expression::BitSelect(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                ),
+            ),
+            (
+                "a[3:0]",
+                Expression::PartSelect(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                    Box::new(Expression::Constant(VerilogConstant::from_int(0))),
                 ),
             ),
         ];
