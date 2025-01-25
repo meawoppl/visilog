@@ -998,7 +998,7 @@ mod tests {
                     Box::new(Expression::Binary(
                         Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
                         BinaryOperator::Addition,
-                        Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
                     )),
                     Box::new(Expression::Binary(
                         Box::new(Expression::Constant(VerilogConstant::from_int(2))),
