@@ -991,6 +991,49 @@ mod tests {
                     Box::new(Expression::Constant(VerilogConstant::from_int(0))),
                 ),
             ),
+            (
+                "a[b+c:2+4]",
+                Expression::PartSelect(
+                    Identifier::new("a".to_string()),
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                    )),
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Constant(VerilogConstant::from_int(4))),
+                    )),
+                ),
+            ),
+            (
+                "~a[2:3]",
+                Expression::Unary(
+                    UnaryOperator::BitwiseNegation,
+                    Box::new(Expression::PartSelect(
+                        Identifier::new("a".to_string()),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                    )),
+                ),
+            ),
+            (
+                "a[3:4] && b[4:5]",
+                Expression::Binary(
+                    Box::new(Expression::PartSelect(
+                        Identifier::new("a".to_string()),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(4))),
+                    )),
+                    BinaryOperator::LogicalAnd,
+                    Box::new(Expression::PartSelect(
+                        Identifier::new("b".to_string()),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(4))),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(5))),
+                    )),
+                ),
+            ),
         ];
 
         for (expr, expected) in expressions {
