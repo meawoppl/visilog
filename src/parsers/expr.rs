@@ -224,10 +224,12 @@ fn operand(input: &str) -> IResult<&str, Expression> {
 //      a & &b (reduction AND of b, then bitwise AND with a)
 
 fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
-    // NOTE(meawoppl)
+    // NOTE(meawoppl) 
     // fn_call has to go before identifier, as function names
     // are valid identifiers
     alt((
+        fn_call, 
+
         fn_call,
         bit_select,
         part_select,
@@ -236,6 +238,7 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         parenthetical,
         concatenation,
     ))(input)
+
 }
 
 fn bit_select(input: &str) -> IResult<&str, Expression> {
