@@ -10,3 +10,4 @@ pub mod operators;
 pub mod register;
 pub mod simple;
 pub mod string;
+pub mod assignment;
