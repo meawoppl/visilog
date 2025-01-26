@@ -177,116 +177,6 @@ impl std::fmt::Debug for Expression {
     }
 }
 
-impl Expression {
-    pub fn to_contracted_string(&self) -> String {
-        match self {
-            Expression::Constant(c) => format!("{}", c),
-            Expression::Identifier(id) => format!("{}", id.name),
-            Expression::Unary(op, expr) => format!("{}{}", op.raw_token(), expr.to_contracted_string()),
-            Expression::Binary(lhs, op, rhs) => format!(
-                "{} {} {}",
-                lhs.to_contracted_string(),
-                op.raw_token(),
-                rhs.to_contracted_string()
-            ),
-            Expression::Conditional(cond, true_expr, false_expr) => format!(
-                "{} ? {} : {}",
-                cond.to_contracted_string(),
-                true_expr.to_contracted_string(),
-                false_expr.to_contracted_string()
-            ),
-            Expression::Parenthetical(expr) => format!("({})", expr.to_contracted_string()),
-            Expression::Concatenation(exprs) => format!(
-                "{{{}}}",
-                exprs
-                    .iter()
-                    .map(|e| e.to_contracted_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Expression::FunctionCall(id, args) => format!(
-                "{}({})",
-                id.name,
-                args.iter()
-                    .map(|e| e.to_contracted_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
-
-    pub fn to_ast_string(&self, indent: usize) -> String {
-        let indent_str = "  ".repeat(indent);
-        match self {
-            Expression::Constant(c) => format!("{}Constant({})", indent_str, c),
-            Expression::Identifier(id) => format!("{}Identifier(\"{}\")", indent_str, id.name),
-            Expression::Unary(op, expr) => format!(
-                "{}Unary{}(\n{},\n{})",
-                indent_str,
-                op,
-                expr.to_ast_string(indent + 1),
-                indent_str,
-            ),
-            Expression::Binary(lhs, op, rhs) => format!(
-                "{}Binary{}(\n{}{},\n{}{}\n{})",
-                indent_str,
-                op.to_string(),
-                indent_str,
-                lhs.to_ast_string(indent + 1),
-                indent_str,
-                rhs.to_ast_string(indent + 1),
-                indent_str,
-            ),
-            Expression::Conditional(cond, true_expr, false_expr) => format!(
-                "{}Conditional(\n{}{},\n{}{},\n{}{})",
-                indent_str,
-                indent_str,
-                cond.to_ast_string(indent + 1),
-                indent_str,
-                true_expr.to_ast_string(indent + 1),
-                indent_str,
-                false_expr.to_ast_string(indent + 1)
-            ),
-            Expression::Parenthetical(expr) => format!(
-                "{}Parenthetical(\n{})",
-                indent_str,
-                expr.to_ast_string(indent + 1)
-            ),
-            Expression::Concatenation(exprs) => format!(
-                "{}Concatenation(\n{})",
-                indent_str,
-                exprs
-                    .iter()
-                    .map(|e| e.to_ast_string(indent + 1))
-                    .collect::<Vec<_>>()
-                    .join(",\n")
-            ),
-            Expression::FunctionCall(id, args) => format!(
-                "{}FunctionCall({},\n{})",
-                indent_str,
-                id.name,
-                args.iter()
-                    .map(|e| e.to_ast_string(indent + 1))
-                    .collect::<Vec<_>>()
-                    .join(",\n")
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for Expression {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_contracted_string())
-    }
-}
-
-impl std::fmt::Debug for Expression {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}\n{}", self.to_contracted_string(), self.to_ast_string(0))
-    }
-}
-
-
 fn parenthetical(input: &str) -> IResult<&str, Expression> {
     map(
         delimited(tag("("), ws(verilog_expression), tag(")")),
@@ -329,22 +219,6 @@ fn operand(input: &str) -> IResult<&str, Expression> {
 //    whitespace is not allowed between the operator and the operand.
 // 2. Ambiguity with &:  The & symbol can be both a bitwise AND operator
 //    and a unary reduction AND operator. To avoid ambiguity, whitespace
-//    is sometimes necessary:
-//      a & b (bitwise AND)
-//      a & &b (reduction AND of b, then bitwise AND with a)
-
-fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
-    // NOTE(meawoppl)
-    // fn_call has to go before identifier, as function names
-    // are valid identifiers
-    ws(operand_no_ws)(input)
-}
-
-// According gemini (dubious source) the following convention is necessary:
-// 1. Reduction Operators:  When using unary reduction operators (e.g., &a, |b, ^c),
-//    whitespace is not allowed between the operator and the operand.
-// 2. Ambiguity with &:  The & symbol can be both a bitwise AND operator 
-//    and a unary reduction AND operator. To avoid ambiguity, whitespace 
 //    is sometimes necessary:
 //      a & b (bitwise AND)
 //      a & &b (reduction AND of b, then bitwise AND with a)
