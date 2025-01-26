@@ -639,7 +639,7 @@ fn conditional_layer(input: &str) -> IResult<&str, Expression> {
 
 // Layer 14: Concatenation Operators
 
-fn verilog_expression(input: &str) -> IResult<&str, Expression> {
+pub fn verilog_expression(input: &str) -> IResult<&str, Expression> {
     conditional_layer(input)
 }
 
