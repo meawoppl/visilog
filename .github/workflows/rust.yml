@@ -21,7 +21,7 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
     - name: Cache .cache/visilog directory
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       with:
         path: ~/.cache/visilog
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
