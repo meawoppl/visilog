@@ -1,5 +1,5 @@
-use nom::IResult;
 use nom::character::complete::char;
+use nom::IResult;
 
 pub fn assert_parses_completely<T: std::fmt::Debug + PartialEq>(
     parser: impl Fn(&str) -> IResult<&str, T>,
@@ -8,7 +8,11 @@ pub fn assert_parses_completely<T: std::fmt::Debug + PartialEq>(
 ) {
     let (remaining_input, result) = parser(input).expect("Parsing failed");
     assert_eq!(result, expected);
-    assert!(remaining_input.is_empty(), "Input not fully consumed: {}", remaining_input);
+    assert!(
+        remaining_input.is_empty(),
+        "Input not fully consumed: {}",
+        remaining_input
+    );
 }
 
 #[cfg(test)]
