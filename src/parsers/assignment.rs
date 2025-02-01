@@ -2,9 +2,9 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while_m_n},
     character::complete::{char, multispace0},
-    combinator::{map, map_res, opt},
+    combinator::{map, map_res},
     multi::separated_list0,
-    sequence::{delimited, pair, preceded, tuple},
+    sequence::{delimited, preceded},
     IResult,
 };
 
@@ -267,5 +267,4 @@ mod tests {
             Expression::Identifier(Identifier::new("d".to_string()))
         );
     }
-
 }

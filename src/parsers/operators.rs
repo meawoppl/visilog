@@ -1,5 +1,3 @@
-use strum_macros::EnumString;
-
 trait Precedence {
     fn precedence(&self) -> u8;
 }

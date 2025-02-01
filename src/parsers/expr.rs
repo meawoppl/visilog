@@ -1,24 +1,18 @@
 use super::{
     base::RawToken,
     constants::{verilog_const, VerilogConstant},
-    identifier::{self, identifier, Identifier},
-    operators::{
-        binary_operator, unary_operator, unary_operator_from_string, BinaryOperator, UnaryOperator,
-    },
+    identifier::{identifier, Identifier},
+    operators::{unary_operator, BinaryOperator, UnaryOperator},
     simple::ws,
 };
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    combinator::{map, map_res},
-    error::ErrorKind,
-    multi::{fold_many0, many0, many1, separated_list1},
-    sequence::{pair, preceded, tuple},
-    IResult,
+    combinator::{map, map_res, peek},
+    multi::{fold_many0, many1, separated_list1},
+    sequence::{delimited, pair, preceded, tuple},
+    Err, IResult,
 };
-use nom::{combinator::peek, sequence::delimited, Err};
-use rand::seq::SliceRandom;
-use rand::thread_rng;
 
 #[derive(PartialEq, Clone)]
 pub enum Expression {
