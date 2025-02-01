@@ -1,4 +1,4 @@
-use nom::{combinator::opt, sequence::tuple, IResult};
+use nom::{bytes::complete::tag, combinator::opt, sequence::tuple, IResult};
 
 use super::{
     identifier::{identifier_list, Identifier},
@@ -25,6 +25,17 @@ pub struct Net {
     range: (i64, i64),
     net_type: NetType,
     delay: u32,
+}
+
+impl Net {
+    pub fn new(identifier: Identifier, range: (i64, i64), net_type: NetType, delay: u32) -> Self {
+        Net {
+            identifier,
+            range,
+            net_type,
+            delay,
+        }
+    }
 }
 
 pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {
@@ -55,6 +66,7 @@ fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
     let (input, range) = ws(opt(range))(input)?;
     let (input, delay) = opt(parse_delay)(input)?;
     let (input, identifiers) = ws(identifier_list)(input)?;
+    let (input, _) = ws(tag(";"))(input)?;
 
     let nets: Vec<Net> = identifiers
         .iter()
@@ -96,27 +108,51 @@ mod tests {
     }
 
     #[test]
-    fn test_net_declaration() {
-        let result = net_declaration("wire [7:0] #10  z");
+    fn test_net_declaration_delay_array() {
+        let result = net_declaration("wire [7:0] #10  z;");
+        assert!(result.is_ok());
+        let (_, nets) = result.unwrap();
+        assert_eq!(nets.len(), 1);
+        let net = &nets[0];
+        let expected = Net::new(Identifier::new("z".to_string()), (7, 0), NetType::Wire, 10);
+        assert_eq!(net, &expected);
+    }
+
+    #[test]
+    fn test_net_declaration_array() {
+        let result = net_declaration("wire [7:0] z;");
         assert!(result.is_ok());
         let (_, nets) = result.unwrap();
         assert_eq!(nets.len(), 1);
         let net = &nets[0];
 
-        assert_eq!(net.net_type, NetType::Wire);
-        assert_eq!(net.delay, 10);
-        assert_eq!(net.identifier, Identifier::new("z".to_string()));
-        assert_eq!(net.range, (7, 0));
+        let expected_net = Net::new(Identifier::new("z".to_string()), (7, 0), NetType::Wire, 0);
+        assert_eq!(net, &expected_net);
+    }
 
-        let result = net_declaration("wire [7:0] z");
+    #[test]
+    fn test_net_decl_simple() {
+        let result = net_declaration("wire z;");
         assert!(result.is_ok());
         let (_, nets) = result.unwrap();
         assert_eq!(nets.len(), 1);
         let net = &nets[0];
 
-        assert_eq!(net.net_type, NetType::Wire);
-        assert_eq!(net.delay, 0);
-        assert_eq!(net.identifier, Identifier::new("z".to_string()));
-        assert_eq!(net.range, (7, 0));
+        let expected_net = Net::new(Identifier::new("z".to_string()), (0, 0), NetType::Wire, 0);
+        assert_eq!(net, &expected_net);
+    }
+
+    #[test]
+    fn test_net_declaration_multiple_identifiers() {
+        let result = net_declaration("wire [7:0] #5  a, b, c;");
+        assert!(result.is_ok());
+        let (_, nets) = result.unwrap();
+        assert_eq!(nets.len(), 3);
+
+        for net in nets {
+            assert_eq!(net.net_type, NetType::Wire);
+            assert_eq!(net.delay, 5);
+            assert_eq!(net.range, (7, 0));
+        }
     }
 }

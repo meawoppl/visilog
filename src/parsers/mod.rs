@@ -1,3 +1,4 @@
+pub mod assignment;
 pub mod base;
 pub mod constants;
 pub mod expr;
@@ -10,4 +11,3 @@ pub mod operators;
 pub mod register;
 pub mod simple;
 pub mod string;
-pub mod assignment;
