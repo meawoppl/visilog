@@ -93,11 +93,13 @@ mod tests {
     use crate::parsers::expr::Expression;
     use crate::parsers::identifier::Identifier;
 
-    
     #[test]
     fn test_assignment_lhs() {
         let cases = vec![
-            ("a", Expression::Identifier(Identifier::new("a".to_string()))),
+            (
+                "a",
+                Expression::Identifier(Identifier::new("a".to_string())),
+            ),
             (
                 "a[3]",
                 Expression::BitSelect(
@@ -125,7 +127,7 @@ mod tests {
 
         for (input, expected) in cases {
             let result = assignment_lhs(input);
-            assert!(result.is_ok(),  "Failed to parse '{}'", input);
+            assert!(result.is_ok(), "Failed to parse '{}'", input);
             let (remaining, expr) = result.unwrap();
             assert_eq!(remaining, "");
             assert_eq!(expr, expected);
