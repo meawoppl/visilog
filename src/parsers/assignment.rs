@@ -205,4 +205,67 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn test_parse_procedural_assignment_with_bit_select() {
+        let input = "a[3] <= b;";
+        let result = parse_procedural_assignment(input);
+        assert!(result.is_ok());
+        let (remaining, (lhs, rhs)) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            lhs,
+            Expression::BitSelect(
+                Identifier::new("a".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+            )
+        );
+        assert_eq!(
+            rhs,
+            Expression::Identifier(Identifier::new("b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_procedural_assignment_with_part_select() {
+        let input = "a[3:0] <= b;";
+        let result = parse_procedural_assignment(input);
+        assert!(result.is_ok());
+        let (remaining, (lhs, rhs)) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            lhs,
+            Expression::PartSelect(
+                Identifier::new("a".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+            )
+        );
+        assert_eq!(
+            rhs,
+            Expression::Identifier(Identifier::new("b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_procedural_assignment_with_concatenation() {
+        let input = "{a, b, c} <= d;";
+        let result = parse_procedural_assignment(input);
+        assert!(result.is_ok());
+        let (remaining, (lhs, rhs)) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            lhs,
+            Expression::Concatenation(vec![
+                Expression::Identifier(Identifier::new("a".to_string())),
+                Expression::Identifier(Identifier::new("b".to_string())),
+                Expression::Identifier(Identifier::new("c".to_string())),
+            ])
+        );
+        assert_eq!(
+            rhs,
+            Expression::Identifier(Identifier::new("d".to_string()))
+        );
+    }
+
 }
