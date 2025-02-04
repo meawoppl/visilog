@@ -10,14 +10,12 @@ use nom::{
 
 use super::{base::RawToken, simple::ws};
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identifier {
     pub name: String,
 }
 
-impl Identifier
-{
+impl Identifier {
     pub fn new(name: String) -> Self {
         Identifier { name }
     }
@@ -28,7 +26,6 @@ impl RawToken for Identifier {
         self.name.clone()
     }
 }
-
 
 pub fn identifier(input: &str) -> IResult<&str, Identifier> {
     map_res(
@@ -54,6 +51,33 @@ pub fn identifier(input: &str) -> IResult<&str, Identifier> {
 
 pub fn identifier_list(input: &str) -> IResult<&str, Vec<Identifier>> {
     separated_list1(ws(char(',')), ws(identifier))(input)
+}
+
+pub fn parse_bit_select(input: &str) -> IResult<&str, (Identifier, i64)> {
+    let (input, id) = identifier(input)?;
+    let (input, _) = char('[')(input)?;
+    let (input, index) = map_res(
+        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
+        |s: &str| s.parse::<i64>(),
+    )(input)?;
+    let (input, _) = char(']')(input)?;
+    Ok((input, (id, index)))
+}
+
+pub fn parse_part_select(input: &str) -> IResult<&str, (Identifier, i64, i64)> {
+    let (input, id) = identifier(input)?;
+    let (input, _) = char('[')(input)?;
+    let (input, start) = map_res(
+        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
+        |s: &str| s.parse::<i64>(),
+    )(input)?;
+    let (input, _) = char(':')(input)?;
+    let (input, end) = map_res(
+        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
+        |s: &str| s.parse::<i64>(),
+    )(input)?;
+    let (input, _) = char(']')(input)?;
+    Ok((input, (id, start, end)))
 }
 
 mod tests {
@@ -141,9 +165,13 @@ mod tests {
     fn test_identifier_list_double() {
         let result = identifier_list.parse("a,b").unwrap();
         assert_eq!(result.0, "");
-        assert_eq!(result.1, vec![
-            Identifier::new("a".to_string()), Identifier::new("b".to_string())
-        ]);
+        assert_eq!(
+            result.1,
+            vec![
+                Identifier::new("a".to_string()),
+                Identifier::new("b".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -152,7 +180,11 @@ mod tests {
         assert_eq!(result.0, "");
         assert_eq!(
             result.1,
-            vec![Identifier::new("a".to_string()), Identifier::new("b".to_string()), Identifier::new("c".to_string())]
+            vec![
+                Identifier::new("a".to_string()),
+                Identifier::new("b".to_string()),
+                Identifier::new("c".to_string())
+            ]
         );
     }
 
@@ -162,7 +194,11 @@ mod tests {
         assert_eq!(result.0, "");
         assert_eq!(
             result.1,
-            vec![Identifier::new("a".to_string()), Identifier::new("b".to_string()), Identifier::new("c".to_string())]
+            vec![
+                Identifier::new("a".to_string()),
+                Identifier::new("b".to_string()),
+                Identifier::new("c".to_string())
+            ]
         );
     }
 
@@ -180,5 +216,19 @@ mod tests {
     fn test_identifier_list_empty() {
         let result = identifier_list.parse("");
         assert!(result.is_err(), "Empty identifier list should not parse");
+    }
+
+    #[test]
+    fn test_parse_bit_select() {
+        let result = parse_bit_select("a[3]").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(result.1, (Identifier::new("a".to_string()), 3));
+    }
+
+    #[test]
+    fn test_parse_part_select() {
+        let result = parse_part_select("a[3:0]").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(result.1, (Identifier::new("a".to_string()), 3, 0));
     }
 }
