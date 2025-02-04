@@ -3,29 +3,32 @@ use nom::{
     bytes::complete::{tag, take_until},
     character::complete::{alpha1, char, multispace0},
     combinator::{map, opt, recognize},
-    multi::separated_list0,
+    multi::{many0, separated_list0},
     sequence::{delimited, pair, preceded, tuple},
     IResult,
 };
 
+use super::{behavior::{procedural_statement, ProceduralStatements}, identifier::{identifier, Identifier}};
+
 #[derive(Debug, PartialEq)]
 pub struct VerilogModule {
-    pub name: String,
+    pub identifier: Identifier,
     pub ports: Vec<Port>,
+    pub statements: Vec<ProceduralStatements>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Port {
     pub direction: PortDirection,
     pub net_type: Option<NetType>,
-    pub name: String,
+    pub identifier: Identifier,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PortDirection {
     Input,
     Output,
-    Inout,
+    InOut,
 }
 
 #[derive(Debug, PartialEq)]
@@ -34,18 +37,11 @@ pub enum NetType {
     Reg,
 }
 
-fn parse_identifier(input: &str) -> IResult<&str, &str> {
-    recognize(pair(
-        alt((alpha1, tag("_"))),
-        take_while(|c: char| c.is_alphanumeric() || c == '_'),
-    ))(input)
-}
-
 fn parse_port_direction(input: &str) -> IResult<&str, PortDirection> {
     alt((
         map(tag("input"), |_| PortDirection::Input),
         map(tag("output"), |_| PortDirection::Output),
-        map(tag("inout"), |_| PortDirection::Inout),
+        map(tag("inout"), |_| PortDirection::InOut),
     ))(input)
 }
 
@@ -61,13 +57,13 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
     let (input, _) = multispace0(input)?;
     let (input, net_type) = opt(parse_net_type)(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, name) = parse_identifier(input)?;
+    let (input, identifier) = identifier(input)?;
     Ok((
         input,
         Port {
             direction,
             net_type,
-            name: name.to_string(),
+            identifier,
         },
     ))
 }
@@ -83,18 +79,20 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = tag("module")(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, name) = parse_identifier(input)?;
+    let (input, mod_identifier) = identifier(input)?;
     let (input, _) = multispace0(input)?;
     let (input, ports) = parse_ports(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = tag(";")(input)?;
-    let (input, _) = take_until("endmodule")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, statements) = many0(procedural_statement)(input)?;
     let (input, _) = tag("endmodule")(input)?;
     Ok((
         input,
         VerilogModule {
-            name: name.to_string(),
+            identifier: mod_identifier,
             ports,
+            statements,
         },
     ))
 }
@@ -104,67 +102,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_identifier_valid_first_characters() {
-        let valid_identifiers = [
-            "my_module", "_my_module", "My_Module", "_My_Module",
-            "my_module1", "My_Module1", "_my_module1", "_My_Module1"
-        ];
-        for id_str in &valid_identifiers {
-            assert!(
-                parse_identifier(id_str).is_ok(),
-                "Valid identifier {} failed to parse",
-                id_str
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_identifier_invalid_first_characters() {
-        let invalid_identifiers = ["1my_module", "$my_module", "1My_Module", "$My_Module"];
-        for id_str in &invalid_identifiers {
-            assert!(
-                parse_identifier(id_str).is_err(),
-                "Invalid identifier {} should not parse",
-                id_str
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_identifier_mixed_valid_invalid_first_characters() {
-        let mixed_identifiers = [
-            "my_module$", "my_module1$", "My_Module$", "My_Module1$",
-            "_my_module$", "_my_module1$", "_My_Module$", "_My_Module1$"
-        ];
-        for id_str in &mixed_identifiers {
-            assert!(
-                parse_identifier(id_str).is_ok(),
-                "Mixed identifier {} failed to parse",
-                id_str
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_identifier_length() {
-        let valid_identifier = "a".repeat(1024);
-        assert!(
-            parse_identifier(&valid_identifier).is_ok(),
-            "Valid identifier of length 1024 failed to parse"
-        );
-
-        let invalid_identifier = "a".repeat(1025);
-        assert!(
-            parse_identifier(&invalid_identifier).is_err(),
-            "Invalid identifier of length 1025 should not parse"
-        );
-    }
-
-    #[test]
     fn test_parse_port_direction() {
         assert_eq!(parse_port_direction("input"), Ok(("", PortDirection::Input)));
         assert_eq!(parse_port_direction("output"), Ok(("", PortDirection::Output)));
-        assert_eq!(parse_port_direction("inout"), Ok(("", PortDirection::Inout)));
+        assert_eq!(parse_port_direction("inout"), Ok(("", PortDirection::InOut)));
     }
 
     #[test]
@@ -182,7 +123,7 @@ mod tests {
                 Port {
                     direction: PortDirection::Input,
                     net_type: Some(NetType::Wire),
-                    name: "a".to_string(),
+                    identifier: "a".into(),
                 }
             ))
         );
@@ -193,7 +134,7 @@ mod tests {
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
-                    name: "b".to_string(),
+                    identifier: "b".into()
                 }
             ))
         );
@@ -202,9 +143,9 @@ mod tests {
             Ok((
                 "",
                 Port {
-                    direction: PortDirection::Inout,
+                    direction: PortDirection::InOut,
                     net_type: None,
-                    name: "c".to_string(),
+                    identifier: "c".into(),
                 }
             ))
         );
@@ -220,17 +161,17 @@ mod tests {
                     Port {
                         direction: PortDirection::Input,
                         net_type: Some(NetType::Wire),
-                        name: "a".to_string(),
+                        identifier: "a".into(),
                     },
                     Port {
                         direction: PortDirection::Output,
                         net_type: Some(NetType::Reg),
-                        name: "b".to_string(),
+                        identifier: "b".into(),
                     },
                     Port {
-                        direction: PortDirection::Inout,
+                        direction: PortDirection::InOut,
                         net_type: None,
-                        name: "c".to_string(),
+                        identifier: "c".into(),
                     },
                 ]
             ))
@@ -250,9 +191,9 @@ mod tests {
         assert!(result.is_ok());
         let (remaining, module) = result.unwrap();
         assert!(remaining.is_empty());
-        assert_eq!(module.name, "my_module");
+        assert_eq!(module.identifier, "my_module".into());
         assert_eq!(module.ports.len(), 2);
-        assert_eq!(module.ports[0].name, "a");
-        assert_eq!(module.ports[1].name, "b");
+        assert_eq!(module.ports[0].identifier, "a".into());
+        assert_eq!(module.ports[1].identifier, "b".into());
     }
 }
