@@ -2,9 +2,9 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while_m_n},
     character::complete::{char, multispace0},
-    combinator::{map, map_res, opt},
+    combinator::{map, map_res},
     multi::separated_list0,
-    sequence::{delimited, pair, preceded, tuple},
+    sequence::{delimited, preceded},
     IResult,
 };
 
@@ -174,6 +174,8 @@ mod tests {
             assert_eq!(expr, expected);
         }
     }
+
+    #[test]
     fn test_parse_continuous_assignment() {
         let input = "a = b;";
         let result = parse_assignment(input);

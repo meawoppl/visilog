@@ -1,12 +1,10 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_until},
+    bytes::complete::tag,
     character::complete::multispace0,
-    combinator::{map, map_res, opt},
-    error::ParseError,
+    combinator::map,
     multi::{many0, many1},
-    sequence::{delimited, preceded, tuple},
-    IResult, InputLength, Parser,
+    IResult,
 };
 
 use crate::parsers::assignment::parse_assignment;
@@ -15,7 +13,6 @@ use super::{
     assignment::Assignment,
     delay::{parse_delay_statement, Delay},
     expr::Expression,
-    numbers::decimal,
     simple::ws,
 };
 
@@ -104,7 +101,7 @@ mod tests {
         for input in inputs {
             let result = procedural_statement(input);
             assert!(result.is_ok());
-            let (remaining, statements) = result.unwrap();
+            let (remaining, _) = result.unwrap();
             assert_eq!(remaining, "");
         }
     }
