@@ -11,22 +11,63 @@ use nom::{
 use crate::parsers::expr::{verilog_expression, Expression};
 use crate::parsers::identifier::{identifier, Identifier};
 
-use super::{constants::VerilogConstant, simple::ws};
+use super::{
+    constants::VerilogConstant,
+    delay::{parse_delay_opt, Delay},
+    simple::ws,
+};
 
-pub fn parse_continuous_assignment(input: &str) -> IResult<&str, (Expression, Expression)> {
-    let (input, lhs) = assignment_lhs(input)?;
-    let (input, _) = ws(tag("="))(input)?;
-    let (input, rhs) = verilog_expression(input)?;
-    let (input, _) = ws(char(';'))(input)?;
-    Ok((input, (lhs, rhs)))
+#[derive(Debug, PartialEq, Clone)]
+pub enum AssignmentType {
+    Continuous,
+    Procedural,
 }
 
-pub fn parse_procedural_assignment(input: &str) -> IResult<&str, (Expression, Expression)> {
+#[derive(Debug, PartialEq, Clone)]
+pub struct Assignment {
+    pre_delay: Option<Delay>,
+    lhs: Expression,
+    assignment_type: AssignmentType,
+    assignment_delay: Option<Delay>,
+    rhs: Expression,
+}
+
+impl Assignment {
+    pub fn new(
+        pre_delay: Option<Delay>,
+        lhs: Expression,
+        assignment_type: AssignmentType,
+        assignment_delay: Option<Delay>,
+        rhs: Expression,
+    ) -> Self {
+        Assignment {
+            pre_delay,
+            lhs,
+            assignment_type,
+            assignment_delay,
+            rhs,
+        }
+    }
+}
+
+pub fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
+    let (input, pre_delay) = ws(parse_delay_opt)(input)?;
     let (input, lhs) = assignment_lhs(input)?;
-    let (input, _) = ws(tag("<="))(input)?;
+    let (input, assign_op) = ws(alt((tag("="), tag("<="))))(input)?;
+    let (input, assignment_delay) = parse_delay_opt(input)?;
     let (input, rhs) = verilog_expression(input)?;
     let (input, _) = ws(char(';'))(input)?;
-    Ok((input, (lhs, rhs)))
+
+    let assignment_type = match assign_op {
+        "=" => AssignmentType::Continuous,
+        "<=" => AssignmentType::Procedural,
+        _ => unreachable!(),
+    };
+
+    Ok((
+        input,
+        Assignment::new(pre_delay, lhs, assignment_type, assignment_delay, rhs),
+    ))
 }
 
 pub fn assignment_lhs(input: &str) -> IResult<&str, Expression> {
@@ -135,33 +176,35 @@ mod tests {
     }
     fn test_parse_continuous_assignment() {
         let input = "a = b;";
-        let result = parse_continuous_assignment(input);
+        let result = parse_assignment(input);
         assert!(result.is_ok());
-        let (remaining, (lhs, rhs)) = result.unwrap();
+        let (remaining, assignment) = result.unwrap();
         assert!(remaining.is_empty());
         assert_eq!(
-            lhs,
+            assignment.lhs,
             Expression::Identifier(Identifier::new("a".to_string()))
         );
         assert_eq!(
-            rhs,
+            assignment.rhs,
             Expression::Identifier(Identifier::new("b".to_string()))
         );
+
+        assert_eq!(assignment.assignment_type, AssignmentType::Continuous);
     }
 
     #[test]
     fn test_parse_procedural_assignment() {
         let input = "a <= b;";
-        let result = parse_procedural_assignment(input);
+        let result = parse_assignment(input);
         assert!(result.is_ok());
-        let (remaining, (lhs, rhs)) = result.unwrap();
+        let (remaining, assignment) = result.unwrap();
         assert!(remaining.is_empty());
         assert_eq!(
-            lhs,
+            assignment.lhs,
             Expression::Identifier(Identifier::new("a".to_string()))
         );
         assert_eq!(
-            rhs,
+            assignment.rhs,
             Expression::Identifier(Identifier::new("b".to_string()))
         );
     }
@@ -209,19 +252,19 @@ mod tests {
     #[test]
     fn test_parse_procedural_assignment_with_bit_select() {
         let input = "a[3] <= b;";
-        let result = parse_procedural_assignment(input);
+        let result = parse_assignment(input);
         assert!(result.is_ok());
-        let (remaining, (lhs, rhs)) = result.unwrap();
+        let (remaining, assignment) = result.unwrap();
         assert!(remaining.is_empty());
         assert_eq!(
-            lhs,
+            assignment.lhs,
             Expression::BitSelect(
                 Identifier::new("a".to_string()),
                 Box::new(Expression::Constant(VerilogConstant::from_int(3))),
             )
         );
         assert_eq!(
-            rhs,
+            assignment.rhs,
             Expression::Identifier(Identifier::new("b".to_string()))
         );
     }
@@ -229,12 +272,12 @@ mod tests {
     #[test]
     fn test_parse_procedural_assignment_with_part_select() {
         let input = "a[3:0] <= b;";
-        let result = parse_procedural_assignment(input);
+        let result = parse_assignment(input);
         assert!(result.is_ok());
-        let (remaining, (lhs, rhs)) = result.unwrap();
+        let (remaining, assignment) = result.unwrap();
         assert!(remaining.is_empty());
         assert_eq!(
-            lhs,
+            assignment.lhs,
             Expression::PartSelect(
                 Identifier::new("a".to_string()),
                 Box::new(Expression::Constant(VerilogConstant::from_int(3))),
@@ -242,7 +285,7 @@ mod tests {
             )
         );
         assert_eq!(
-            rhs,
+            assignment.rhs,
             Expression::Identifier(Identifier::new("b".to_string()))
         );
     }
@@ -250,12 +293,12 @@ mod tests {
     #[test]
     fn test_parse_procedural_assignment_with_concatenation() {
         let input = "{a, b, c} <= d;";
-        let result = parse_procedural_assignment(input);
+        let result = parse_assignment(input);
         assert!(result.is_ok());
-        let (remaining, (lhs, rhs)) = result.unwrap();
+        let (remaining, assignment) = result.unwrap();
         assert!(remaining.is_empty());
         assert_eq!(
-            lhs,
+            assignment.lhs,
             Expression::Concatenation(vec![
                 Expression::Identifier(Identifier::new("a".to_string())),
                 Expression::Identifier(Identifier::new("b".to_string())),
@@ -263,9 +306,8 @@ mod tests {
             ])
         );
         assert_eq!(
-            rhs,
+            assignment.rhs,
             Expression::Identifier(Identifier::new("d".to_string()))
         );
     }
-
 }

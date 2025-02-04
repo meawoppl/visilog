@@ -1,6 +1,8 @@
 pub mod assignment;
 pub mod base;
+pub mod behavior;
 pub mod constants;
+pub mod delay;
 pub mod expr;
 pub mod identifier;
 pub mod integer;
@@ -11,4 +13,3 @@ pub mod operators;
 pub mod register;
 pub mod simple;
 pub mod string;
-pub mod behavior;
