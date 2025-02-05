@@ -39,7 +39,6 @@ impl From<String> for Identifier {
     }
 }
 
-
 pub fn identifier(input: &str) -> IResult<&str, Identifier> {
     map_res(
         tuple((
@@ -109,12 +108,17 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_parse_identifier_valid_first_characters() {
         let valid_identifiers = [
-            "my_module", "_my_module", "My_Module", "_My_Module",
-            "my_module1", "My_Module1", "_my_module1", "_My_Module1"
+            "my_module",
+            "_my_module",
+            "My_Module",
+            "_My_Module",
+            "my_module1",
+            "My_Module1",
+            "_my_module1",
+            "_My_Module1",
         ];
         for id_str in &valid_identifiers {
             assert!(
@@ -125,11 +129,18 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn test_identifiers_invalid_first_characters() {
-        let invalid_identifiers = ["1var_a", "$var_a", "1Var_A", "$Var_A", "1my_module", "$my_module", "1My_Module", "$My_Module"];
+        let invalid_identifiers = [
+            "1var_a",
+            "$var_a",
+            "1Var_A",
+            "$Var_A",
+            "1my_module",
+            "$my_module",
+            "1My_Module",
+            "$My_Module",
+        ];
         for id_str in &invalid_identifiers {
             assert!(
                 identifier(id_str).is_err(),

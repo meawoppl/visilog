@@ -8,7 +8,10 @@ use nom::{
     IResult,
 };
 
-use super::{behavior::{procedural_statement, ProceduralStatements}, identifier::{identifier, Identifier}};
+use super::{
+    behavior::{procedural_statement, ProceduralStatements},
+    identifier::{identifier, Identifier}, simple::ws,
+};
 
 #[derive(Debug, PartialEq)]
 pub struct VerilogModule {
@@ -70,23 +73,22 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
 
 fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
     delimited(
-        char('('),
-        separated_list0(preceded(multispace0, char(',')), parse_port),
-        char(')'),
+        ws(char('(')),
+        separated_list0( ws(char(',')), parse_port),
+        ws(char(')')),
     )(input)
 }
 
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
-    let (input, _) = tag("module")(input)?;
+    let (input, _) = ws(tag("module"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, mod_identifier) = identifier(input)?;
     let (input, _) = multispace0(input)?;
     let (input, ports) = parse_ports(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, _) = tag(";")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, statements) = many0(procedural_statement)(input)?;
-    let (input, _) = tag("endmodule")(input)?;
+    let (input, _) = ws(tag(";"))(input)?;
+    let (input, statements) = many0(ws(procedural_statement))(input)?;
+    let (input, _) = ws(tag("endmodule"))(input)?;
     Ok((
         input,
         VerilogModule {
@@ -99,87 +101,81 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
 
 #[cfg(test)]
 mod tests {
+    use crate::parsers::helpers::assert_parses_to;
+
     use super::*;
 
     #[test]
     fn test_parse_port_direction() {
-        assert_eq!(parse_port_direction("input"), Ok(("", PortDirection::Input)));
-        assert_eq!(parse_port_direction("output"), Ok(("", PortDirection::Output)));
-        assert_eq!(parse_port_direction("inout"), Ok(("", PortDirection::InOut)));
+        assert_parses_to(parse_port_direction, "input", PortDirection::Input);
+        assert_parses_to(parse_port_direction, "output", PortDirection::Output);
+        assert_parses_to(parse_port_direction, "inout", PortDirection::InOut);
     }
 
     #[test]
     fn test_parse_net_type() {
-        assert_eq!(parse_net_type("wire"), Ok(("", NetType::Wire)));
-        assert_eq!(parse_net_type("reg"), Ok(("", NetType::Reg)));
+        assert_parses_to(parse_net_type, "wire", NetType::Wire);
+        assert_parses_to(parse_net_type, "reg", NetType::Reg);
     }
 
     #[test]
     fn test_parse_port() {
-        assert_eq!(
-            parse_port("input wire a"),
-            Ok((
-                "",
-                Port {
-                    direction: PortDirection::Input,
-                    net_type: Some(NetType::Wire),
-                    identifier: "a".into(),
-                }
-            ))
+        assert_parses_to(
+            parse_port,
+            "input wire a",
+            Port {
+                direction: PortDirection::Input,
+                net_type: Some(NetType::Wire),
+                identifier: "a".into(),
+            },
         );
-        assert_eq!(
-            parse_port("output reg b"),
-            Ok((
-                "",
-                Port {
-                    direction: PortDirection::Output,
-                    net_type: Some(NetType::Reg),
-                    identifier: "b".into()
-                }
-            ))
+        assert_parses_to(
+            parse_port,
+            "output reg b",
+            Port {
+                direction: PortDirection::Output,
+                net_type: Some(NetType::Reg),
+                identifier: "b".into(),
+            },
         );
-        assert_eq!(
-            parse_port("inout c"),
-            Ok((
-                "",
-                Port {
-                    direction: PortDirection::InOut,
-                    net_type: None,
-                    identifier: "c".into(),
-                }
-            ))
+        assert_parses_to(
+            parse_port,
+            "inout c",
+            Port {
+                direction: PortDirection::InOut,
+                net_type: None,
+                identifier: "c".into(),
+            },
         );
     }
 
     #[test]
     fn test_parse_ports() {
-        assert_eq!(
-            parse_ports("(input wire a, output reg b, inout c)"),
-            Ok((
-                "",
-                vec![
-                    Port {
-                        direction: PortDirection::Input,
-                        net_type: Some(NetType::Wire),
-                        identifier: "a".into(),
-                    },
-                    Port {
-                        direction: PortDirection::Output,
-                        net_type: Some(NetType::Reg),
-                        identifier: "b".into(),
-                    },
-                    Port {
-                        direction: PortDirection::InOut,
-                        net_type: None,
-                        identifier: "c".into(),
-                    },
-                ]
-            ))
+        assert_parses_to(
+            parse_ports,
+            "( input wire a, output reg b, inout c )",
+            vec![
+                Port {
+                    direction: PortDirection::Input,
+                    net_type: Some(NetType::Wire),
+                    identifier: "a".into(),
+                },
+                Port {
+                    direction: PortDirection::Output,
+                    net_type: Some(NetType::Reg),
+                    identifier: "b".into(),
+                },
+                Port {
+                    direction: PortDirection::InOut,
+                    net_type: None,
+                    identifier: "c".into(),
+                },
+            ],
         );
     }
 
     #[test]
-    fn test_parse_module_declaration() {
+    fn test_parse_minimal_module_declaration() {
         let input = r#"
             module my_module (
                 input wire a,
