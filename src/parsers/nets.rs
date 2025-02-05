@@ -83,20 +83,26 @@ fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::parsers::helpers::assert_parses_to;
 
-    use nom::Parser;
+    use super::*;
 
     #[test]
     fn test_net_type() {
-        assert_eq!(net_type("wire"), Ok(("", NetType::Wire)));
-        assert_eq!(net_type("wand"), Ok(("", NetType::WireAnd)));
-        assert_eq!(net_type("wor"), Ok(("", NetType::WireOr)));
-        assert_eq!(net_type("tri"), Ok(("", NetType::Tri)));
-        assert_eq!(net_type("triand"), Ok(("", NetType::TriAnd)));
-        assert_eq!(net_type("trior"), Ok(("", NetType::TriOr)));
-        assert_eq!(net_type("supply0"), Ok(("", NetType::Supply0)));
-        assert_eq!(net_type("supply1"), Ok(("", NetType::Supply1)));
+        let tests = vec![
+            ("wire", NetType::Wire),
+            ("wand", NetType::WireAnd),
+            ("wor", NetType::WireOr),
+            ("tri", NetType::Tri),
+            ("triand", NetType::TriAnd),
+            ("trior", NetType::TriOr),
+            ("supply0", NetType::Supply0),
+            ("supply1", NetType::Supply1),
+        ];
+        for (input, expected) in tests {
+            assert_parses_to(net_type, input, expected);
+        }
+
         assert!(net_type("invalid").is_err());
     }
 
