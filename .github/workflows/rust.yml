@@ -20,10 +20,11 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
-    - name: Cache .cache/visilog directory
-      uses: actions/cache@v4
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
       with:
-        path: ~/.cache/visilog
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+        # The prefix cache key, this can be changed to start a new cache manually.
+        # default: "v0-rust"
+        prefix-key: "v0"
+        # To only cache runs from `master`:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
