@@ -81,6 +81,8 @@ pub fn parse_part_select(input: &str) -> IResult<&str, (Identifier, i64, i64)> {
 }
 
 mod tests {
+    use crate::parsers::helpers::assert_parses_to;
+
     use super::*;
     use nom::Parser;
 
@@ -90,14 +92,7 @@ mod tests {
             "var_a", "_var_a", "Var_A", "_Var_A", "var_a1", "Var_A1", "_var_a1", "_Var_A1",
         ];
         for id_str in &valid_identifiers {
-            let parsed = identifier(id_str);
-            assert!(
-                parsed.is_ok(),
-                "Valid identifier {} failed to parse",
-                id_str
-            );
-
-            assert_eq!(parsed.unwrap().1.name, id_str.to_string());
+            assert_parses_to(identifier, id_str, Identifier::new(id_str.to_string()));
         }
     }
 
@@ -156,49 +151,44 @@ mod tests {
 
     #[test]
     fn test_identifier_list_single() {
-        let result = identifier_list.parse("a").unwrap();
-        assert_eq!(result.0, "");
-        assert_eq!(result.1, vec![Identifier::new("a".to_string())]);
+        assert_parses_to(identifier_list, "a", vec![Identifier::new("a".to_string())]);
     }
 
     #[test]
     fn test_identifier_list_double() {
-        let result = identifier_list.parse("a,b").unwrap();
-        assert_eq!(result.0, "");
-        assert_eq!(
-            result.1,
+        assert_parses_to(
+            identifier_list,
+            "a,b",
             vec![
                 Identifier::new("a".to_string()),
-                Identifier::new("b".to_string())
-            ]
+                Identifier::new("b".to_string()),
+            ],
         );
     }
 
     #[test]
     fn test_identifier_list_multiple() {
-        let result = identifier_list.parse("a, b, c").unwrap();
-        assert_eq!(result.0, "");
-        assert_eq!(
-            result.1,
+        assert_parses_to(
+            identifier_list,
+            "a, b, c",
             vec![
                 Identifier::new("a".to_string()),
                 Identifier::new("b".to_string()),
-                Identifier::new("c".to_string())
-            ]
+                Identifier::new("c".to_string()),
+            ],
         );
     }
 
     #[test]
     fn test_identifier_list_with_whitespace() {
-        let result = identifier_list.parse(" a , b , c ").unwrap();
-        assert_eq!(result.0, "");
-        assert_eq!(
-            result.1,
+        assert_parses_to(
+            identifier_list,
+            " a , b , c ",
             vec![
                 Identifier::new("a".to_string()),
                 Identifier::new("b".to_string()),
-                Identifier::new("c".to_string())
-            ]
+                Identifier::new("c".to_string()),
+            ],
         );
     }
 
@@ -220,15 +210,19 @@ mod tests {
 
     #[test]
     fn test_parse_bit_select() {
-        let result = parse_bit_select("a[3]").unwrap();
-        assert_eq!(result.0, "");
-        assert_eq!(result.1, (Identifier::new("a".to_string()), 3));
+        assert_parses_to(
+            parse_bit_select,
+            "a[3]",
+            (Identifier::new("a".to_string()), 3),
+        );
     }
 
     #[test]
     fn test_parse_part_select() {
-        let result = parse_part_select("a[3:0]").unwrap();
-        assert_eq!(result.0, "");
-        assert_eq!(result.1, (Identifier::new("a".to_string()), 3, 0));
+        assert_parses_to(
+            parse_part_select,
+            "a[3:0]",
+            (Identifier::new("a".to_string()), 3, 0),
+        );
     }
 }

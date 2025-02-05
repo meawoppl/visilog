@@ -49,20 +49,19 @@ pub fn unary_operator_from_string(input: &str) -> Option<UnaryOperator> {
 }
 
 pub fn unary_operator(input: &str) -> IResult<&str, UnaryOperator> {
-    // NOTE(meawoppl) - the alt() call only supports 21 arguments, so we need to split it up
     alt((
-        map(tag("+"), |_| UnaryOperator::Positive),
-        map(tag("-"), |_| UnaryOperator::Negative),
-        map(tag("~"), |_| UnaryOperator::BitwiseNegation),
-        map(tag("!"), |_| UnaryOperator::LogicalNegation),
-        //
         map(tag("&"), |_| UnaryOperator::ReductionAnd),
         map(tag("~&"), |_| UnaryOperator::ReductionNand),
         map(tag("|"), |_| UnaryOperator::ReductionOr),
         map(tag("~|"), |_| UnaryOperator::ReductionNor),
-        map(tag("^"), |_| UnaryOperator::ReductionXor),
         map(tag("~^"), |_| UnaryOperator::ReductionXnor),
         map(tag("^~"), |_| UnaryOperator::ReductionXnor),
+        map(tag("^"), |_| UnaryOperator::ReductionXor),
+        //
+        map(tag("+"), |_| UnaryOperator::Positive),
+        map(tag("-"), |_| UnaryOperator::Negative),
+        map(tag("~"), |_| UnaryOperator::BitwiseNegation),
+        map(tag("!"), |_| UnaryOperator::LogicalNegation),
     ))(input)
 }
 
@@ -268,6 +267,8 @@ pub fn binary_operator(input: &str) -> IResult<&str, BinaryOperator> {
 
 #[cfg(test)]
 mod tests {
+    use crate::parsers::helpers::{assert_parses, assert_parses_to};
+
     use super::*;
 
     #[test]
@@ -444,71 +445,44 @@ mod tests {
     #[test]
     fn test_all_unary_operator_from_string() {
         for op in ALL_UNARY_OPERATORS {
-            assert!(
-                unary_operator_from_string(op).is_some(),
-                "Unary operator {} failed to parse",
-                op
-            );
+            assert_parses(unary_operator, op);
         }
         assert_eq!(unary_operator_from_string("nonexistent"), None);
     }
 
     #[test]
     fn test_parse_binary_operator() {
-        assert_eq!(binary_operator("+"), Ok(("", BinaryOperator::Addition)));
-        assert_eq!(binary_operator("-"), Ok(("", BinaryOperator::Subtraction)));
-        assert_eq!(
-            binary_operator("*"),
-            Ok(("", BinaryOperator::Multiplication))
-        );
-        assert_eq!(binary_operator("/"), Ok(("", BinaryOperator::Division)));
-        assert_eq!(binary_operator("%"), Ok(("", BinaryOperator::Modulus)));
-        assert_eq!(
-            binary_operator(">="),
-            Ok(("", BinaryOperator::GreaterThanOrEqual))
-        );
-        assert_eq!(binary_operator(">"), Ok(("", BinaryOperator::GreaterThan)));
-        assert_eq!(
-            binary_operator("<="),
-            Ok(("", BinaryOperator::LessThanOrEqual))
-        );
-        assert_eq!(binary_operator("<"), Ok(("", BinaryOperator::LessThan)));
-        assert_eq!(binary_operator("&&"), Ok(("", BinaryOperator::LogicalAnd)));
-        assert_eq!(binary_operator("||"), Ok(("", BinaryOperator::LogicalOr)));
-        assert_eq!(
-            binary_operator("=="),
-            Ok(("", BinaryOperator::LogicalEquality))
-        );
-        assert_eq!(
-            binary_operator("!="),
-            Ok(("", BinaryOperator::LogicalInequality))
-        );
-        assert_eq!(
-            binary_operator("==="),
-            Ok(("", BinaryOperator::CaseEquality))
-        );
-        assert_eq!(
-            binary_operator("!=="),
-            Ok(("", BinaryOperator::CaseInequality))
-        );
-        assert_eq!(binary_operator("&"), Ok(("", BinaryOperator::BitwiseAnd)));
-        assert_eq!(
-            binary_operator("|"),
-            Ok(("", BinaryOperator::BitwiseInclusiveOr))
-        );
-        assert_eq!(binary_operator("^"), Ok(("", BinaryOperator::BitwiseXOr)));
-        assert_eq!(binary_operator("^~"), Ok(("", BinaryOperator::BitwiseXNor)));
-        assert_eq!(binary_operator("~^"), Ok(("", BinaryOperator::BitwiseXNor)));
-        assert_eq!(binary_operator("<<"), Ok(("", BinaryOperator::ShiftLeft)));
-        assert_eq!(binary_operator(">>"), Ok(("", BinaryOperator::ShiftRight)));
-        assert_eq!(
-            binary_operator("<<<"),
-            Ok(("", BinaryOperator::ArithmeticShiftLeft))
-        );
-        assert_eq!(
-            binary_operator(">>>"),
-            Ok(("", BinaryOperator::ArithmeticShiftRight))
-        );
+        let operator_expected = vec![
+            ("+", BinaryOperator::Addition),
+            ("-", BinaryOperator::Subtraction),
+            ("*", BinaryOperator::Multiplication),
+            ("/", BinaryOperator::Division),
+            ("%", BinaryOperator::Modulus),
+            (">=", BinaryOperator::GreaterThanOrEqual),
+            (">", BinaryOperator::GreaterThan),
+            ("<=", BinaryOperator::LessThanOrEqual),
+            ("<", BinaryOperator::LessThan),
+            ("&&", BinaryOperator::LogicalAnd),
+            ("||", BinaryOperator::LogicalOr),
+            ("==", BinaryOperator::LogicalEquality),
+            ("!=", BinaryOperator::LogicalInequality),
+            ("===", BinaryOperator::CaseEquality),
+            ("!==", BinaryOperator::CaseInequality),
+            ("&", BinaryOperator::BitwiseAnd),
+            ("|", BinaryOperator::BitwiseInclusiveOr),
+            ("^", BinaryOperator::BitwiseXOr),
+            ("^~", BinaryOperator::BitwiseXNor),
+            ("~^", BinaryOperator::BitwiseXNor),
+            ("<<", BinaryOperator::ShiftLeft),
+            (">>", BinaryOperator::ShiftRight),
+            ("<<<", BinaryOperator::ArithmeticShiftLeft),
+            (">>>", BinaryOperator::ArithmeticShiftRight),
+        ];
+
+        for (input, expected) in operator_expected {
+            assert_parses_to(binary_operator, input, expected);
+        }
+
         assert!(binary_operator("nonexistent").is_err());
     }
 }

@@ -519,42 +519,9 @@ pub fn verilog_expression(input: &str) -> IResult<&str, Expression> {
 mod tests {
     use rand::{RngCore, SeedableRng};
 
+    use crate::parsers::helpers::assert_parses_to;
+
     use super::*;
-
-    fn assert_valid_verilog_expression(expr: &str) -> Expression {
-        match verilog_expression(expr) {
-            Ok((leftovers, expression)) => {
-                assert_eq!(
-                    leftovers, "",
-                    "Failed to parse entire expression: {} (leftovers: {})",
-                    expr, leftovers
-                );
-                return expression;
-            }
-            Err(err) => match err {
-                Err::Error(e) | Err::Failure(e) => {
-                    let verbose_error = nom::error::VerboseError {
-                        errors: vec![(expr, nom::error::VerboseErrorKind::Context("context"))],
-                    };
-                    println!("{}", nom::error::convert_error(expr, verbose_error));
-                    panic!();
-                }
-                _ => {
-                    panic!("Failed to parse expression: {}", expr);
-                }
-            },
-        }
-    }
-
-    fn assert_parses_to(expr: &str, expected: Expression) -> Expression {
-        let parsed_expr = assert_valid_verilog_expression(expr);
-        assert_eq!(
-            parsed_expr, expected,
-            "Parsed expression: \n{}\n did not match expected: \n{}\n",
-            parsed_expr, expr
-        );
-        return parsed_expr;
-    }
 
     #[test]
     fn test_unary_ops() {
@@ -592,7 +559,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -611,7 +578,7 @@ mod tests {
         )];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -637,7 +604,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -663,7 +630,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -792,14 +759,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -825,14 +785,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -870,14 +823,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -903,14 +849,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -1038,7 +977,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 }
