@@ -10,7 +10,8 @@ use nom::{
 
 use super::{
     behavior::{procedural_statement, ProceduralStatements},
-    identifier::{identifier, Identifier}, simple::ws,
+    identifier::{identifier, Identifier},
+    simple::ws,
 };
 
 #[derive(Debug, PartialEq)]
@@ -74,7 +75,7 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
 fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
     delimited(
         ws(char('(')),
-        separated_list0( ws(char(',')), parse_port),
+        separated_list0(ws(char(',')), parse_port),
         ws(char(')')),
     )(input)
 }
