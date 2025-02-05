@@ -103,7 +103,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
 #[cfg(test)]
 mod tests {
     use crate::parsers::helpers::assert_parses_to;
-
+    use std::fs;
     use super::*;
 
     #[test]
@@ -192,5 +192,19 @@ mod tests {
         assert_eq!(module.ports.len(), 2);
         assert_eq!(module.ports[0].identifier, "a".into());
         assert_eq!(module.ports[1].identifier, "b".into());
+    }
+
+    #[test]
+    fn test_parse_verilog_examples() {
+        let example_files = vec![
+            "src/verilog/examples/simple_module.v",
+            "src/verilog/examples/complex_module.v",
+        ];
+
+        for file in example_files {
+            let content = fs::read_to_string(file).expect("Unable to read file");
+            let result = parse_module_declaration(&content);
+            assert!(result.is_ok(), "Failed to parse {}", file);
+        }
     }
 }
