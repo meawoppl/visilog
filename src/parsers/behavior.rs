@@ -15,17 +15,20 @@ use super::{
     expr::Expression,
     simple::ws,
 };
-
+#[derive(Debug, PartialEq)]
 pub enum EventTriggers {
     PosEdge,
     NegEdge,
     EitherEdge,
 }
+
+#[derive(Debug, PartialEq)]
 pub struct Event {
     trigger: EventTriggers,
     expression: Expression,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum ProceduralStatements {
     Delay(Delay),
     RegisterDeclaration,

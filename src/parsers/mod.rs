@@ -8,6 +8,7 @@ pub mod helpers;
 pub mod identifier;
 pub mod integer;
 pub mod keywords;
+pub mod modules;
 pub mod nets;
 pub mod numbers;
 pub mod operators;
