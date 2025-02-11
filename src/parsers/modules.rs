@@ -100,6 +100,10 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     ))
 }
 
+pub fn parse_verilog(input: &str) -> IResult<&str, VerilogModule> {
+    parse_module_declaration(input)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parsers::helpers::assert_parses_to;
