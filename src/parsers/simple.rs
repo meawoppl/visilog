@@ -83,6 +83,9 @@ mod tests {
         assert_eq!(parser("   abc   "), Ok(("", "abc")));
         assert_eq!(parser("\tabc\t"), Ok(("", "abc")));
         assert_eq!(parser("abc"), Ok(("", "abc")));
+        assert_eq!(parser("   abc"), Ok(("", "abc")));
+        assert_eq!(parser("abc   "), Ok(("", "abc")));
+        assert_eq!(parser("   abc   def"), Ok(("def", "abc")));
     }
 
     #[test]
@@ -126,6 +129,8 @@ mod tests {
     fn test_range() {
         assert_eq!(range("[1:0]abc"), Ok(("abc", (1, 0))));
         assert_eq!(range("[10:5]abc"), Ok(("abc", (10, 5))));
+        assert_eq!(range("[0:0]abc"), Ok(("abc", (0, 0))));
+        assert_eq!(range("[123:456]abc"), Ok(("abc", (123, 456))));
         assert!(range("abc").is_err());
     }
 }

@@ -485,4 +485,26 @@ mod tests {
 
         assert!(binary_operator("nonexistent").is_err());
     }
+
+    #[test]
+    fn test_parse_unary_operator() {
+        assert_eq!(unary_operator("+"), Ok(("", UnaryOperator::Positive)));
+        assert_eq!(unary_operator("-"), Ok(("", UnaryOperator::Negative)));
+        assert_eq!(
+            unary_operator("~"),
+            Ok(("", UnaryOperator::BitwiseNegation))
+        );
+        assert_eq!(
+            unary_operator("!"),
+            Ok(("", UnaryOperator::LogicalNegation))
+        );
+        assert_eq!(unary_operator("&"), Ok(("", UnaryOperator::ReductionAnd)));
+        assert_eq!(unary_operator("~&"), Ok(("", UnaryOperator::ReductionNand)));
+        assert_eq!(unary_operator("|"), Ok(("", UnaryOperator::ReductionOr)));
+        assert_eq!(unary_operator("~|"), Ok(("", UnaryOperator::ReductionNor)));
+        assert_eq!(unary_operator("^"), Ok(("", UnaryOperator::ReductionXor)));
+        assert_eq!(unary_operator("~^"), Ok(("", UnaryOperator::ReductionXnor)));
+        assert_eq!(unary_operator("^~"), Ok(("", UnaryOperator::ReductionXnor)));
+        assert!(unary_operator("nonexistent").is_err());
+    }
 }

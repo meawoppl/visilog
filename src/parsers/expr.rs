@@ -917,6 +917,86 @@ mod tests {
                 ),
             ),
             (
+                "a + b * c - d / e",
+                Expression::Binary(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Binary(
+                            Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                            BinaryOperator::Multiplication,
+                            Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        )),
+                    )),
+                    BinaryOperator::Subtraction,
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                        BinaryOperator::Division,
+                        Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                    )),
+                ),
+            ),
+            (
+                "a ? b : c ? d : e",
+                Expression::Conditional(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                    Box::new(Expression::Conditional(
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                    )),
+                ),
+            ),
+            (
+                "a ? b ? c : d : e",
+                Expression::Conditional(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Conditional(
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                    )),
+                    Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                ),
+            ),
+            (
+                "a + b * c ? d : e",
+                Expression::Conditional(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Binary(
+                            Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                            BinaryOperator::Multiplication,
+                            Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        )),
+                    )),
+                    Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                    Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                ),
+            ),
+            (
+                "a + b * c ? d : e + f",
+                Expression::Conditional(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Binary(
+                            Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                            BinaryOperator::Multiplication,
+                            Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        )),
+                    )),
+                    Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Identifier(Identifier::new("f".to_string()))),
+                    )),
+                ),
+            ),
+            (
                 "a[3]",
                 Expression::BitSelect(
                     Identifier::new("a".to_string()),
@@ -945,6 +1025,26 @@ mod tests {
                         BinaryOperator::Addition,
                         Box::new(Expression::Constant(VerilogConstant::from_int(4))),
                     )),
+                ),
+            ),
+            (
+                "a + b * c ? d + e : f",
+                Expression::Conditional(
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Binary(
+                            Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                            BinaryOperator::Multiplication,
+                            Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        )),
+                    )),
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                    )),
+                    Box::new(Expression::Identifier(Identifier::new("f".to_string()))),
                 ),
             ),
             (
