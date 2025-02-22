@@ -1,9 +1,14 @@
+pub mod assignment;
 pub mod base;
+pub mod behavior;
 pub mod constants;
+pub mod delay;
 pub mod expr;
+pub mod helpers;
 pub mod identifier;
 pub mod integer;
 pub mod keywords;
+pub mod modules;
 pub mod nets;
 pub mod numbers;
 pub mod operators;
