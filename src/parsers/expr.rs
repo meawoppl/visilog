@@ -7,7 +7,6 @@ use super::{
     },
     simple::ws,
 };
-use nom::{combinator::peek, sequence::delimited, Err};
 use nom::{
     branch::alt,
     bytes::complete::tag,
@@ -17,6 +16,7 @@ use nom::{
     sequence::{pair, preceded, tuple},
     IResult,
 };
+use nom::{combinator::peek, sequence::delimited, Err};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
@@ -30,6 +30,8 @@ pub enum Expression {
     Parenthetical(Box<Expression>),
     Concatenation(Vec<Expression>),
     FunctionCall(Identifier, Vec<Expression>),
+    BitSelect(Identifier, Box<Expression>),
+    PartSelect(Identifier, Box<Expression>, Box<Expression>),
 }
 
 impl Expression {
@@ -37,7 +39,9 @@ impl Expression {
         match self {
             Expression::Constant(c) => format!("{}", c),
             Expression::Identifier(id) => format!("{}", id.name),
-            Expression::Unary(op, expr) => format!("{}{}", op.raw_token(), expr.to_contracted_string()),
+            Expression::Unary(op, expr) => {
+                format!("{}{}", op.raw_token(), expr.to_contracted_string())
+            }
             Expression::Binary(lhs, op, rhs) => format!(
                 "{} {} {}",
                 lhs.to_contracted_string(),
@@ -66,6 +70,15 @@ impl Expression {
                     .map(|e| e.to_contracted_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Expression::BitSelect(ident, index) => {
+                format!("{}[{}]", ident.name, index.to_contracted_string())
+            }
+            Expression::PartSelect(ident, start, end) => format!(
+                "{}[{}:{}]",
+                ident.name,
+                start.to_contracted_string(),
+                end.to_contracted_string()
             ),
         }
     }
@@ -125,6 +138,24 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(",\n")
             ),
+            Expression::BitSelect(ident, index) => format!(
+                "{}BitSelect(\n{}{},\n{}{})",
+                indent_str,
+                ident.name,
+                indent_str,
+                index.to_ast_string(indent + 1),
+                indent_str
+            ),
+            Expression::PartSelect(ident, start, end) => format!(
+                "{}PartSelect(\n{}{},\n{}{},\n{}{})",
+                indent_str,
+                ident.name,
+                indent_str,
+                start.to_ast_string(indent + 1),
+                indent_str,
+                end.to_ast_string(indent + 1),
+                indent_str
+            ),
         }
     }
 }
@@ -137,10 +168,14 @@ impl std::fmt::Display for Expression {
 
 impl std::fmt::Debug for Expression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}\n{}", self.to_contracted_string(), self.to_ast_string(0))
+        write!(
+            f,
+            "{}\n{}",
+            self.to_contracted_string(),
+            self.to_ast_string(0)
+        )
     }
 }
-
 
 fn parenthetical(input: &str) -> IResult<&str, Expression> {
     map(
@@ -148,7 +183,6 @@ fn parenthetical(input: &str) -> IResult<&str, Expression> {
         |expr| Expression::Parenthetical(Box::new(expr)),
     )(input)
 }
-
 
 // TODO(meawoppl) - support the multiplication concatentation operator roughly here
 fn concatenation(input: &str) -> IResult<&str, Expression> {
@@ -174,7 +208,7 @@ fn fn_call(input: &str) -> IResult<&str, Expression> {
 }
 
 fn operand(input: &str) -> IResult<&str, Expression> {
-    // NOTE(meawoppl) 
+    // NOTE(meawoppl)
     // fn_call has to go before identifier, as function names
     // are valid identifiers
     ws(operand_no_ws)(input)
@@ -183,23 +217,48 @@ fn operand(input: &str) -> IResult<&str, Expression> {
 // According gemini (dubious source) the following convention is necessary:
 // 1. Reduction Operators:  When using unary reduction operators (e.g., &a, |b, ^c),
 //    whitespace is not allowed between the operator and the operand.
-// 2. Ambiguity with &:  The & symbol can be both a bitwise AND operator 
-//    and a unary reduction AND operator. To avoid ambiguity, whitespace 
+// 2. Ambiguity with &:  The & symbol can be both a bitwise AND operator
+//    and a unary reduction AND operator. To avoid ambiguity, whitespace
 //    is sometimes necessary:
 //      a & b (bitwise AND)
 //      a & &b (reduction AND of b, then bitwise AND with a)
 
 fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
-    // NOTE(meawoppl) 
+    // NOTE(meawoppl)
     // fn_call has to go before identifier, as function names
     // are valid identifiers
     alt((
-        fn_call, 
+        fn_call,
+        fn_call,
+        bit_select,
+        part_select,
         map(identifier, Expression::Identifier),
         map(verilog_const, Expression::Constant),
         parenthetical,
         concatenation,
     ))(input)
+}
+
+fn bit_select(input: &str) -> IResult<&str, Expression> {
+    let (input, expr) = identifier(input)?;
+    let (input, index) = delimited(tag("["), ws(verilog_expression), tag("]"))(input)?;
+    Ok((input, Expression::BitSelect(expr, Box::new(index))))
+}
+
+fn part_select(input: &str) -> IResult<&str, Expression> {
+    let (input, ident) = identifier(input)?;
+    let (input, (start, end)) = delimited(
+        tag("["),
+        pair(
+            ws(verilog_expression),
+            preceded(tag(":"), ws(verilog_expression)),
+        ),
+        tag("]"),
+    )(input)?;
+    Ok((
+        input,
+        Expression::PartSelect(ident, Box::new(start), Box::new(end)),
+    ))
 }
 
 // Alright, this is following table 5-4 in the IEEE 1364-2005 standard
@@ -210,15 +269,18 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
 // Layer 1: Unary operators
 fn unary_operator_layer(input: &str) -> IResult<&str, Expression> {
     alt((
-        map_res(tuple((many1(unary_operator), operand_no_ws)), |(ops, exp)| {
-            let mut result = exp;
+        map_res(
+            tuple((many1(unary_operator), operand_no_ws)),
+            |(ops, exp)| {
+                let mut result = exp;
 
-            // These apply right to left somewhat confusingly
-            for op in ops.iter().rev() {
-                result = Expression::Unary(op.clone(), Box::new(result));
-            }
-            Ok::<_, nom::Err<(&str, nom::error::ErrorKind)>>(result)
-        }),
+                // These apply right to left somewhat confusingly
+                for op in ops.iter().rev() {
+                    result = Expression::Unary(op.clone(), Box::new(result));
+                }
+                Ok::<_, nom::Err<(&str, nom::error::ErrorKind)>>(result)
+            },
+        ),
         operand,
     ))(input)
 }
@@ -426,28 +488,30 @@ fn conditional_layer(input: &str) -> IResult<&str, Expression> {
 
     // Now can we can recursive sub-descend the remaining bits
     let (after_ternary, tf_pair) = map_res(
-            tuple((
-                ws(tag("?")),
-                verilog_expression,
-                ws(tag(":")),
-                verilog_expression,
-            )),
-            move |(_, true_expr, _, false_expr)| {
-                Ok::<_, nom::Err<nom::error::Error<&str>>>((true_expr, false_expr))
-            }
-        )
-    (remaining)?;
+        tuple((
+            ws(tag("?")),
+            verilog_expression,
+            ws(tag(":")),
+            verilog_expression,
+        )),
+        move |(_, true_expr, _, false_expr)| {
+            Ok::<_, nom::Err<nom::error::Error<&str>>>((true_expr, false_expr))
+        },
+    )(remaining)?;
 
     if after_ternary.len() < remaining.len() {
-        return Ok((after_ternary, Expression::Conditional(Box::new(init), Box::new(tf_pair.0), Box::new(tf_pair.1))));
+        return Ok((
+            after_ternary,
+            Expression::Conditional(Box::new(init), Box::new(tf_pair.0), Box::new(tf_pair.1)),
+        ));
     } else {
-        return Ok((remaining, init))
+        return Ok((remaining, init));
     }
 }
 
 // Layer 14: Concatenation Operators
 
-fn verilog_expression(input: &str) -> IResult<&str, Expression> {
+pub fn verilog_expression(input: &str) -> IResult<&str, Expression> {
     conditional_layer(input)
 }
 
@@ -455,36 +519,9 @@ fn verilog_expression(input: &str) -> IResult<&str, Expression> {
 mod tests {
     use rand::{RngCore, SeedableRng};
 
+    use crate::parsers::helpers::assert_parses_to;
+
     use super::*;
-
-    fn assert_valid_verilog_expression(expr: &str) -> Expression {
-        match verilog_expression(expr) {
-            Ok((leftovers, expression)) => {
-                assert_eq!(leftovers, "", "Failed to parse entire expression: {} (leftovers: {})", expr, leftovers);
-                return expression;
-            }
-            Err(err) => {
-                match err {
-                    Err::Error(e) | Err::Failure(e) => {
-                        let verbose_error = nom::error::VerboseError { errors: vec![(expr, nom::error::VerboseErrorKind::Context("context"))] };
-                        println!("{}", nom::error::convert_error(expr, verbose_error));
-                        panic!();
-                    }
-                    _ => {
-                        panic!("Failed to parse expression: {}", expr);
-                    }
-                }
-            }
-
-        }
-    }
-
-    fn assert_parses_to(expr: &str, expected: Expression) -> Expression {
-        let parsed_expr = assert_valid_verilog_expression(expr);
-        assert_eq!(parsed_expr, expected, "Parsed expression: \n{}\n did not match expected: \n{}\n", parsed_expr, expr);
-        return parsed_expr;
-    }
-
 
     #[test]
     fn test_unary_ops() {
@@ -522,7 +559,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -541,7 +578,7 @@ mod tests {
         )];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -567,7 +604,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -593,7 +630,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            assert_parses_to(expr, expected);
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -644,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_expression() {
+    fn test_parse_expression_ws_removal() {
         let expressions = vec![
             "a",
             "a + b",
@@ -685,7 +722,6 @@ mod tests {
             let result = verilog_expression(expr);
             println!("{:?}", result);
 
-
             assert!(result.is_ok(), "Failed to parse expression: {}", expr);
 
             // Remove whitespace and test that parse still works
@@ -723,14 +759,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -756,14 +785,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -774,13 +796,13 @@ mod tests {
                 "a ? (b ? c : d) : e",
                 Expression::Conditional(
                     Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
-                    Box::new(Expression::Parenthetical(
-                        Box::new(Expression::Conditional(
+                    Box::new(Expression::Parenthetical(Box::new(
+                        Expression::Conditional(
                             Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
                             Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
                             Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
-                        )),
-                    )),
+                        ),
+                    ))),
                     Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
                 ),
             ),
@@ -789,26 +811,19 @@ mod tests {
                 Expression::Conditional(
                     Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
                     Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
-                    Box::new(Expression::Parenthetical(
-                    Box::new(Expression::Conditional(
-                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
-                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
-                        Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
-                    )),
-                )),
+                    Box::new(Expression::Parenthetical(Box::new(
+                        Expression::Conditional(
+                            Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                            Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                            Box::new(Expression::Identifier(Identifier::new("e".to_string()))),
+                        ),
+                    ))),
                 ),
             ),
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -834,14 +849,7 @@ mod tests {
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 
@@ -989,6 +997,37 @@ mod tests {
                 ),
             ),
             (
+                "a[3]",
+                Expression::BitSelect(
+                    Identifier::new("a".to_string()),
+                    Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                ),
+            ),
+            (
+                "a[3:0]",
+                Expression::PartSelect(
+                    Identifier::new("a".to_string()),
+                    Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                    Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+                ),
+            ),
+            (
+                "a[b+c:2+4]",
+                Expression::PartSelect(
+                    Identifier::new("a".to_string()),
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                    )),
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                        BinaryOperator::Addition,
+                        Box::new(Expression::Constant(VerilogConstant::from_int(4))),
+                    )),
+                ),
+            ),
+            (
                 "a + b * c ? d + e : f",
                 Expression::Conditional(
                     Box::new(Expression::Binary(
@@ -1008,17 +1047,37 @@ mod tests {
                     Box::new(Expression::Identifier(Identifier::new("f".to_string()))),
                 ),
             ),
+            (
+                "~a[2:3]",
+                Expression::Unary(
+                    UnaryOperator::BitwiseNegation,
+                    Box::new(Expression::PartSelect(
+                        Identifier::new("a".to_string()),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                    )),
+                ),
+            ),
+            (
+                "a[3:4] && b[4:5]",
+                Expression::Binary(
+                    Box::new(Expression::PartSelect(
+                        Identifier::new("a".to_string()),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(4))),
+                    )),
+                    BinaryOperator::LogicalAnd,
+                    Box::new(Expression::PartSelect(
+                        Identifier::new("b".to_string()),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(4))),
+                        Box::new(Expression::Constant(VerilogConstant::from_int(5))),
+                    )),
+                ),
+            ),
         ];
 
         for (expr, expected) in expressions {
-            let result = verilog_expression(expr);
-            assert!(result.is_ok(), "Failed to parse expression: {}", expr);
-            let (_, parsed_expr) = result.unwrap();
-            assert_eq!(
-                parsed_expr, expected,
-                "Parsed expression did not match expected: {}",
-                expr
-            );
+            assert_parses_to(verilog_expression, expr, expected);
         }
     }
 }

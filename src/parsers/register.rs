@@ -83,59 +83,53 @@ pub fn parse_memory_declaration(input: &str) -> IResult<&str, RegisterDeclaratio
 
 #[cfg(test)]
 mod tests {
+    use crate::parsers::helpers::assert_parses_to;
+
     use super::*;
 
     #[test]
     fn test_parse_register_declaration() {
-        assert_eq!(
-            parse_register_declaration("reg a;"),
-            Ok((
-                "",
-                RegisterDeclaration {
-                    name: "a".to_string(),
-                    range: None,
-                    dimensions: None,
-                }
-            ))
+        assert_parses_to(
+            parse_register_declaration,
+            "reg a;",
+            RegisterDeclaration {
+                name: "a".to_string(),
+                range: None,
+                dimensions: None,
+            },
         );
 
-        assert_eq!(
-            parse_register_declaration("reg [7:0] a;"),
-            Ok((
-                "",
-                RegisterDeclaration {
-                    name: "a".to_string(),
-                    range: Some((7, 0)),
-                    dimensions: None,
-                }
-            ))
+        assert_parses_to(
+            parse_register_declaration,
+            "reg [7:0] a;",
+            RegisterDeclaration {
+                name: "a".to_string(),
+                range: Some((7, 0)),
+                dimensions: None,
+            },
         );
 
-        assert_eq!(
-            parse_register_declaration("reg a[7:0];"),
-            Ok((
-                "",
-                RegisterDeclaration {
-                    name: "a".to_string(),
-                    range: None,
-                    dimensions: Some((7, 0)),
-                }
-            ))
+        assert_parses_to(
+            parse_register_declaration,
+            "reg a[7:0];",
+            RegisterDeclaration {
+                name: "a".to_string(),
+                range: None,
+                dimensions: Some((7, 0)),
+            },
         );
     }
 
     #[test]
     fn test_parse_memory_declaration() {
-        assert_eq!(
-            parse_memory_declaration("reg [7:0] memb[0:255];"),
-            Ok((
-                "",
-                RegisterDeclaration {
-                    name: "memb".to_string(),
-                    range: Some((7, 0)),
-                    dimensions: Some((0, 255)),
-                }
-            ))
+        assert_parses_to(
+            parse_memory_declaration,
+            "reg [7:0] memb[0:255];",
+            RegisterDeclaration {
+                name: "memb".to_string(),
+                range: Some((7, 0)),
+                dimensions: Some((0, 255)),
+            },
         );
     }
 }
