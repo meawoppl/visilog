@@ -1,7 +1,7 @@
-use crate::parsers::modules::VerilogModule;
-use crate::parsers::identifier::Identifier;
 use crate::parsers::assignment::AssignmentType;
 use crate::parsers::behavior::ProceduralStatements;
+use crate::parsers::identifier::Identifier;
+use crate::parsers::modules::VerilogModule;
 
 pub mod validator {
     use super::*;
