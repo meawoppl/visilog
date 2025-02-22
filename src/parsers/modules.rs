@@ -102,9 +102,9 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parsers::helpers::assert_parses_to;
-
     use super::*;
+    use crate::parsers::helpers::{assert_parses, assert_parses_to};
+    use std::fs;
 
     #[test]
     fn test_parse_port_direction() {
@@ -192,5 +192,33 @@ mod tests {
         assert_eq!(module.ports.len(), 2);
         assert_eq!(module.ports[0].identifier, "a".into());
         assert_eq!(module.ports[1].identifier, "b".into());
+    }
+
+    // TODO(meawoppl) this loads and runs all the test files, but we aren't able to parse them all yet
+    // #[test]
+    fn test_parse_verilog_examples() {
+        let example_files_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("verilog")
+            .join("examples");
+        let example_files = fs::read_dir(example_files_dir)
+            .expect("Unable to read directory")
+            .filter_map(|entry| {
+                let entry = entry.expect("Unable to read entry");
+                let path = entry.path();
+                if path.is_file() {
+                    Some(path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .map(|path| {
+                let content = fs::read_to_string(path).expect("Unable to read file");
+
+                assert_parses(parse_module_declaration, &content)
+            })
+            .collect::<Vec<_>>();
+
+        println!("{:?}", example_files);
     }
 }
