@@ -28,7 +28,6 @@ pub struct Event {
     expression: Expression,
 }
 
-
 #[derive(Debug, PartialEq)]
 pub struct InitialBlock {
     statements: Vec<ProceduralStatements>,
@@ -83,9 +82,9 @@ pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
     let (input, _) = ws(tag("always"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
-    
+
     let block = AlwaysBlock::new(vec![], assignments);
-    
+
     Ok((input, block))
 }
 

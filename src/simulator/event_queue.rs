@@ -1,6 +1,5 @@
 use crate::parsers::behavior::{AlwaysBlock, InitialBlock};
 
-
 enum ExecutionCursor {
     // next statement to execute, and the block to execute it in
     InitialCursor((usize, InitialBlock)),
@@ -21,7 +20,9 @@ impl EventQueue {
 
     pub fn insert(&mut self, time: i64, cursor: ExecutionCursor) {
         // TODO(meawoppl) - test insert stability
-        let position = self.cursors.binary_search_by_key(&time, |&(t, _)| t)
+        let position = self
+            .cursors
+            .binary_search_by_key(&time, |&(t, _)| t)
             .unwrap_or_else(|e| e);
         self.cursors.insert(position, (time, cursor));
     }
@@ -54,7 +55,7 @@ mod tests {
     #[test]
     fn test_event_queue_insert_same_time() {
         let mut queue = EventQueue::new();
-        let initial_block1 = InitialBlock::new(vec![]); 
+        let initial_block1 = InitialBlock::new(vec![]);
         let initial_block2 = InitialBlock::new(vec![]);
 
         queue.insert(10, ExecutionCursor::InitialCursor((0, initial_block1)));
