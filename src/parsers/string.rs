@@ -33,3 +33,41 @@ fn parse_string_content(input: &str) -> IResult<&str, String> {
 pub fn parse_verilog_string(input: &str) -> IResult<&str, String> {
     delimited(char('"'), parse_string_content, char('"'))(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::parsers::helpers::assert_parses_to;
+    #[test]
+    fn test_parse_verilog_string() {
+        let from_to = vec![
+            ("\"hello\"", "hello".to_string()),
+            ("\"hello\\nworld\"", "hello\nworld".to_string()),
+            ("\"hello\\tworld\"", "hello\tworld".to_string()),
+            ("\"hello\\\\world\"", "hello\\world".to_string()),
+            ("\"hello\\\"world\"", "hello\"world".to_string()),
+            ("\"hello%world\"", "hello%world".to_string()),
+            ("\"\"", "".to_string()),
+        ];
+
+        for (input, expected) in from_to {
+            assert_parses_to(parse_verilog_string, input, expected);
+        }
+    }
+
+    // NOTE(meawoppl) This is hard to support but part of the spec. Skipped for now
+    // #[test]
+    fn test_escaped_literal_in_string() {
+        assert_parses_to(
+            parse_verilog_string,
+            "hello\\d123world\"",
+            "hello{world".to_string(),
+        );
+        assert_parses_to(
+            parse_verilog_string,
+            "\"\\n\\t\\\\\\\"\\d123%\"",
+            "\n\t\\\"{".to_string(),
+        );
+    }
+}

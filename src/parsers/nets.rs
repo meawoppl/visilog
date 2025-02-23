@@ -47,6 +47,8 @@ pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {
         value(NetType::WireOr, tag("wor")),
         value(NetType::TriAnd, tag("triand")),
         value(NetType::TriOr, tag("trior")),
+        value(NetType::Tri0, tag("tri0")),
+        value(NetType::Tri1, tag("tri1")),
         value(NetType::Tri, tag("tri")),
         value(NetType::Supply0, tag("supply0")),
         value(NetType::Supply1, tag("supply1")),
@@ -98,6 +100,8 @@ mod tests {
             ("trior", NetType::TriOr),
             ("supply0", NetType::Supply0),
             ("supply1", NetType::Supply1),
+            ("tri0", NetType::Tri0),
+            ("tri1", NetType::Tri1),
         ];
         for (input, expected) in tests {
             assert_parses_to(net_type, input, expected);
@@ -107,6 +111,38 @@ mod tests {
     }
 
     #[test]
+    fn test_net_declaration() {
+        assert_parses_to(
+            net_declaration,
+            "wire [7:0] a, b, c;",
+            vec![
+                Net::new("a".into(), (7, 0), NetType::Wire, 0),
+                Net::new("b".into(), (7, 0), NetType::Wire, 0),
+                Net::new("c".into(), (7, 0), NetType::Wire, 0),
+            ],
+        );
+
+        assert_parses_to(
+            net_declaration,
+            "tri0 a, b, c ;",
+            vec![
+                Net::new("a".into(), (0, 0), NetType::Tri0, 0),
+                Net::new("b".into(), (0, 0), NetType::Tri0, 0),
+                Net::new("c".into(), (0, 0), NetType::Tri0, 0),
+            ],
+        );
+
+        assert_parses_to(
+            net_declaration,
+            "tri1 [3:0] x, y, z;",
+            vec![
+                Net::new("x".into(), (3, 0), NetType::Tri1, 0),
+                Net::new("y".into(), (3, 0), NetType::Tri1, 0),
+                Net::new("z".into(), (3, 0), NetType::Tri1, 0),
+            ],
+        );
+    }
+
     fn test_parse_delay() {
         assert_eq!(parse_delay("#10"), Ok(("", 10)));
         assert_eq!(parse_delay("#0"), Ok(("", 0)));

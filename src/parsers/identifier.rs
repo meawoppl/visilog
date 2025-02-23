@@ -102,6 +102,7 @@ mod tests {
     fn test_identifiers_valid_first_characters() {
         let valid_identifiers = [
             "var_a", "_var_a", "Var_A", "_Var_A", "var_a1", "Var_A1", "_var_a1", "_Var_A1",
+            "var_b", "_var_b", "Var_B", "_Var_B", "var_b1", "Var_B1", "_var_b1", "_Var_B1",
         ];
         for id_str in &valid_identifiers {
             assert_parses_to(identifier, id_str, Identifier::new(id_str.to_string()));
@@ -154,6 +155,7 @@ mod tests {
     fn test_identifiers_mixed_valid_invalid_first_characters() {
         let mixed_identifiers = [
             "var_a$", "var_a1$", "Var_A$", "Var_A1$", "_var_a$", "_var_a1$", "_Var_A$", "_Var_A1$",
+            "var_b$", "var_b1$", "Var_B$", "Var_B1$", "_var_b$", "_var_b1$", "_Var_B$", "_Var_B1$",
         ];
         for id_str in &mixed_identifiers {
             let result = identifier(id_str);
@@ -219,6 +221,17 @@ mod tests {
                 Identifier::new("c".to_string()),
             ],
         );
+
+        let result = identifier_list.parse("b, c, d").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(
+            result.1,
+            vec![
+                Identifier::new("b".to_string()),
+                Identifier::new("c".to_string()),
+                Identifier::new("d".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -232,6 +245,17 @@ mod tests {
                 Identifier::new("c".to_string()),
             ],
         );
+
+        let result = identifier_list.parse(" b , c , d ").unwrap();
+        assert_eq!(result.0, "");
+        assert_eq!(
+            result.1,
+            vec![
+                Identifier::new("b".to_string()),
+                Identifier::new("c".to_string()),
+                Identifier::new("d".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -242,11 +266,21 @@ mod tests {
         let (rest, identifiers) = result.unwrap();
         assert_eq!(rest, ", 1b, c");
         assert_eq!(identifiers, vec![Identifier::new("a".to_string())]);
+
+        let result = identifier_list.parse("b, 1c, d");
+        // This should only parse the first identifier here...
+        assert!(result.is_ok());
+        let (rest, identifiers) = result.unwrap();
+        assert_eq!(rest, ", 1c, d");
+        assert_eq!(identifiers, vec![Identifier::new("b".to_string())]);
     }
 
     #[test]
     fn test_identifier_list_empty() {
         let result = identifier_list.parse("");
+        assert!(result.is_err(), "Empty identifier list should not parse");
+
+        let result = identifier_list.parse(" ");
         assert!(result.is_err(), "Empty identifier list should not parse");
     }
 
