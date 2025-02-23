@@ -68,10 +68,7 @@ mod tests {
             comment("/* This is a \n multi-line \n comment */"),
             Ok(("", " This is a \n multi-line \n comment "))
         );
-        assert_eq!(
-            comment("// Another single line comment\n"),
-            Ok(("\n", ""))
-        );
+        assert_eq!(comment("// Another single line comment\n"), Ok(("\n", "")));
         assert_eq!(
             comment("/* Another multi-line comment */"),
             Ok(("", " Another multi-line comment "))
@@ -95,6 +92,9 @@ mod tests {
         assert_eq!(parser("abc"), Ok(("", "abc")));
         assert_eq!(parser(" \tabc \t"), Ok(("", "abc")));
         assert_eq!(parser(" \tabc"), Ok(("", "abc")));
+        assert_eq!(parser("   abc"), Ok(("", "abc")));
+        assert_eq!(parser("abc   "), Ok(("", "abc")));
+        assert_eq!(parser("   abc   def"), Ok(("def", "abc")));
     }
 
     #[test]
@@ -123,10 +123,7 @@ mod tests {
         );
         assert_eq!(single_line_comment("// This is a comment"), Ok(("", "")));
         assert!(single_line_comment("This is not a comment").is_err());
-        assert_eq!(
-            single_line_comment("// Another comment\n"),
-            Ok(("\n", ""))
-        );
+        assert_eq!(single_line_comment("// Another comment\n"), Ok(("\n", "")));
         assert_eq!(single_line_comment("// Another comment"), Ok(("", "")));
     }
 
@@ -155,6 +152,8 @@ mod tests {
     fn test_range() {
         assert_eq!(range("[1:0]abc"), Ok(("abc", (1, 0))));
         assert_eq!(range("[10:5]abc"), Ok(("abc", (10, 5))));
+        assert_eq!(range("[0:0]abc"), Ok(("abc", (0, 0))));
+        assert_eq!(range("[123:456]abc"), Ok(("abc", (123, 456))));
         assert!(range("abc").is_err());
         assert_eq!(range("[3:2]def"), Ok(("def", (3, 2))));
         assert_eq!(range("[8:4]ghi"), Ok(("ghi", (8, 4))));
