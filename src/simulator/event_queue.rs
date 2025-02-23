@@ -21,9 +21,7 @@ impl EventQueue {
     }
 
     pub fn insert(&mut self, time: i64, cursor: ExecutionCursor) {
-        let position = self
-            .times
-            .binary_search(&time);
+        let position = self.times.binary_search(&time);
 
         let position = match position {
             // Found a match, so we have to search for the last match
@@ -33,13 +31,13 @@ impl EventQueue {
                     last_match += 1;
                 }
                 last_match
-            },
+            }
             // No match, so insert is default safe
             Err(position) => position,
         };
 
         // Insert the time and cursor
-        self.cursors.insert(position,  cursor);
+        self.cursors.insert(position, cursor);
         self.times.insert(position, time);
     }
 }
@@ -71,19 +69,38 @@ mod tests {
     #[test]
     fn test_event_queue_insert_same_time() {
         let mut queue = EventQueue::new();
-        let initial_block1 = InitialBlock::new(vec![]);
-        let initial_block2 = InitialBlock::new(vec![]);
 
-        queue.insert(10, ExecutionCursor::InitialCursor((0, initial_block1)));
-        queue.insert(10, ExecutionCursor::InitialCursor((1, initial_block2)));
+        queue.insert(
+            10,
+            ExecutionCursor::InitialCursor((0, InitialBlock::new(vec![]))),
+        );
+        queue.insert(
+            10,
+            ExecutionCursor::InitialCursor((0, InitialBlock::new(vec![]))),
+        );
 
-        assert_eq!(queue.cursors.len(), 2);
-        assert_eq!(queue.times[0], 10);
-        assert_eq!(queue.times[1], 10);
+        for x in 0..10 {
+            queue.insert(
+                10,
+                ExecutionCursor::AlwaysCursor((0, AlwaysBlock::new(vec![], vec![]))),
+            );
+
+            match queue.cursors.last().unwrap() {
+                ExecutionCursor::AlwaysCursor((_, _)) => {}
+                _ => panic!("Expected AlwaysBlock"),
+            }
+
+            queue.insert(
+                10,
+                ExecutionCursor::InitialCursor((0, InitialBlock::new(vec![]))),
+            );
+
+            match queue.cursors.last().unwrap() {
+                ExecutionCursor::InitialCursor((_)) => {}
+                _ => panic!("Expected InitialBlock"),
+            }
+        }
     }
 
-    fn test_event_queue_insert_stable() {
-
-    }
-
+    fn test_event_queue_insert_stable() {}
 }
