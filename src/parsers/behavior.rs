@@ -29,12 +29,37 @@ pub struct Event {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct InitialBlock {
+    statements: Vec<ProceduralStatements>,
+}
+impl InitialBlock {
+    pub fn new(statements: Vec<ProceduralStatements>) -> Self {
+        InitialBlock { statements }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct AlwaysBlock {
+    trigger_events: Vec<Event>,
+    statements: Vec<ProceduralStatements>,
+}
+
+impl AlwaysBlock {
+    pub fn new(trigger_events: Vec<Event>, statements: Vec<ProceduralStatements>) -> Self {
+        AlwaysBlock {
+            trigger_events,
+            statements,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum ProceduralStatements {
     Delay(Delay),
     RegisterDeclaration,
     WireDeclaration,
-    InitialBlock,
-    AlwaysBlock(Vec<Event>, Vec<ProceduralStatements>),
+    InitialBlock(InitialBlock),
+    AlwaysBlock(AlwaysBlock),
     Assignment(Assignment),
 }
 
@@ -45,17 +70,22 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
     ))(input)
 }
 
-pub fn parse_initial_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
+pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
     let (input, _) = ws(tag("initial"))(input)?;
     let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
-    Ok((input, assignments))
+    let initial_block = InitialBlock::new(assignments);
+    Ok((input, initial_block))
 }
 
-pub fn parse_always_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
+pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
+    // TODO(meawoppl) - needs trigger statement parsing
     let (input, _) = ws(tag("always"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
-    Ok((input, assignments))
+
+    let block = AlwaysBlock::new(vec![], assignments);
+
+    Ok((input, block))
 }
 
 pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
@@ -79,9 +109,9 @@ mod tests {
             end"#;
         let result = parse_initial_block(input);
         assert!(result.is_ok());
-        let (remaining, assignments) = result.unwrap();
+        let (remaining, initial_block) = result.unwrap();
         assert!(remaining.is_empty());
-        assert_eq!(assignments.len(), 2);
+        assert_eq!(initial_block.statements.len(), 2);
     }
 
     #[test]
@@ -93,9 +123,9 @@ mod tests {
         "#;
         let result = parse_always_block(input);
         assert!(result.is_ok());
-        let (remaining, assignments) = result.unwrap();
+        let (remaining, block) = result.unwrap();
         assert!(remaining.is_empty());
-        assert_eq!(assignments.len(), 1);
+        assert_eq!(block.statements.len(), 1);
     }
     #[test]
     fn test_block_or_statement_single() {
