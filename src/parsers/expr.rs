@@ -1144,16 +1144,16 @@ mod tests {
                 "a & b | c ^ d",
                 Expression::Binary(
                     Box::new(Expression::Binary(
-                        Box::new(Expression::Binary(
-                            Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
-                            BinaryOperator::BitwiseAnd,
-                            Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
-                        )),
-                        BinaryOperator::BitwiseOr,
-                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                        BinaryOperator::BitwiseAnd,
+                        Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
                     )),
-                    BinaryOperator::BitwiseXOr,
-                    Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                    BinaryOperator::BitwiseOr,
+                    Box::new(Expression::Binary(
+                        Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                        BinaryOperator::BitwiseXOr,
+                        Box::new(Expression::Identifier(Identifier::new("d".to_string()))),
+                    )),
                 ),
             ),
         ];
