@@ -207,15 +207,24 @@ mod tests {
         );
         assert_eq!(
             sized_const("16'hABCD"),
-            Ok(("", VerilogConstant::new(Some(16), VerilogBaseType::Hexadecimal, "ABCD".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(Some(16), VerilogBaseType::Hexadecimal, "ABCD".to_string())
+            ))
         );
         assert_eq!(
             sized_const("4'b1010"),
-            Ok(("", VerilogConstant::new(Some(4), VerilogBaseType::Binary, "1010".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(Some(4), VerilogBaseType::Binary, "1010".to_string())
+            ))
         );
         assert_eq!(
             sized_const("12'd4095"),
-            Ok(("", VerilogConstant::new(Some(12), VerilogBaseType::Decimal, "4095".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(Some(12), VerilogBaseType::Decimal, "4095".to_string())
+            ))
         );
     }
 
@@ -258,11 +267,17 @@ mod tests {
         );
         assert_eq!(
             integer_constant("987654321"),
-            Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "987654321".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Decimal, "987654321".to_string())
+            ))
         );
         assert_eq!(
             integer_constant("42"),
-            Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "42".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Decimal, "42".to_string())
+            ))
         );
     }
 
@@ -439,15 +454,24 @@ mod tests {
         );
         assert_eq!(
             unsized_const("'b1101"),
-            Ok(("", VerilogConstant::new(None, VerilogBaseType::Binary, "1101".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Binary, "1101".to_string())
+            ))
         );
         assert_eq!(
             unsized_const("'d100"),
-            Ok(("", VerilogConstant::new(None, VerilogBaseType::Decimal, "100".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Decimal, "100".to_string())
+            ))
         );
         assert_eq!(
             unsized_const("'hABC"),
-            Ok(("", VerilogConstant::new(None, VerilogBaseType::Hexadecimal, "ABC".to_string())))
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Hexadecimal, "ABC".to_string())
+            ))
         );
     }
 }

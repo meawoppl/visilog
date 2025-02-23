@@ -226,7 +226,11 @@ mod tests {
         assert_eq!(result.0, "");
         assert_eq!(
             result.1,
-            vec![Identifier::new("b".to_string()), Identifier::new("c".to_string()), Identifier::new("d".to_string())]
+            vec![
+                Identifier::new("b".to_string()),
+                Identifier::new("c".to_string()),
+                Identifier::new("d".to_string())
+            ]
         );
     }
 
@@ -246,7 +250,11 @@ mod tests {
         assert_eq!(result.0, "");
         assert_eq!(
             result.1,
-            vec![Identifier::new("b".to_string()), Identifier::new("c".to_string()), Identifier::new("d".to_string())]
+            vec![
+                Identifier::new("b".to_string()),
+                Identifier::new("c".to_string()),
+                Identifier::new("d".to_string())
+            ]
         );
     }
 
