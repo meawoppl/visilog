@@ -1,30 +1,31 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_until},
-    character::complete::{alpha1, char, multispace0},
-    combinator::{map, opt, recognize},
+    bytes::complete::tag,
+    character::complete::{char, multispace0},
+    combinator::{map, opt},
     multi::{many0, separated_list0},
-    sequence::{delimited, pair, preceded, tuple},
+    sequence::delimited,
     IResult,
 };
 
 use super::{
-    behavior::{procedural_statement, ProceduralStatements},
     identifier::{identifier, Identifier},
-    simple::ws,
+    simple::{range, ws},
+    statements::{parse_module_statement, ModuleStatement},
 };
 
 #[derive(Debug, PartialEq)]
 pub struct VerilogModule {
     pub identifier: Identifier,
     pub ports: Vec<Port>,
-    pub statements: Vec<ProceduralStatements>,
+    pub statements: Vec<ModuleStatement>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Port {
     pub direction: PortDirection,
     pub net_type: Option<NetType>,
+    pub range: (i64, i64),
     pub identifier: Identifier,
 }
 
@@ -61,12 +62,15 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
     let (input, _) = multispace0(input)?;
     let (input, net_type) = opt(parse_net_type)(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, range) = opt(range)(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, identifier) = identifier(input)?;
     Ok((
         input,
         Port {
             direction,
             net_type,
+            range: range.unwrap_or((0, 0)),
             identifier,
         },
     ))
@@ -88,7 +92,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, ports) = parse_ports(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = ws(tag(";"))(input)?;
-    let (input, statements) = many0(ws(procedural_statement))(input)?;
+    let (input, statements) = many0(ws(parse_module_statement))(input)?;
     let (input, _) = ws(tag("endmodule"))(input)?;
     Ok((
         input,
@@ -127,6 +131,7 @@ mod tests {
             Port {
                 direction: PortDirection::Input,
                 net_type: Some(NetType::Wire),
+                range: (0, 0),
                 identifier: "a".into(),
             },
         );
@@ -136,6 +141,7 @@ mod tests {
             Port {
                 direction: PortDirection::Output,
                 net_type: Some(NetType::Reg),
+                range: (0, 0),
                 identifier: "b".into(),
             },
         );
@@ -145,6 +151,7 @@ mod tests {
             Port {
                 direction: PortDirection::InOut,
                 net_type: None,
+                range: (0, 0),
                 identifier: "c".into(),
             },
         );
@@ -159,16 +166,19 @@ mod tests {
                 Port {
                     direction: PortDirection::Input,
                     net_type: Some(NetType::Wire),
+                    range: (0, 0),
                     identifier: "a".into(),
                 },
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
+                    range: (0, 0),
                     identifier: "b".into(),
                 },
                 Port {
                     direction: PortDirection::InOut,
                     net_type: None,
+                    range: (0, 0),
                     identifier: "c".into(),
                 },
             ],
@@ -192,6 +202,25 @@ mod tests {
         assert_eq!(module.ports.len(), 2);
         assert_eq!(module.ports[0].identifier, "a".into());
         assert_eq!(module.ports[1].identifier, "b".into());
+
+        assert_eq!(module.statements.len(), 0);
+    }
+
+    #[test]
+    fn test_simple_adder() {
+        let input = r#"
+            module adder(
+                input [7:0] a,
+                input [7:0] b,
+                output [7:0] c
+            );
+                assign c = a + b;
+            endmodule
+        "#;
+
+        let (remaining, module) = parse_module_declaration(input).unwrap();
+        assert!(remaining.trim().is_empty());
+        assert_eq!(module.statements.len(), 1);
     }
 
     // TODO(meawoppl) this loads and runs all the test files, but we aren't able to parse them all yet

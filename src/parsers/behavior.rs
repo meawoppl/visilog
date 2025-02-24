@@ -30,7 +30,7 @@ pub struct Event {
 
 #[derive(Debug, PartialEq)]
 pub struct InitialBlock {
-    statements: Vec<ProceduralStatements>,
+    pub statements: Vec<ProceduralStatements>,
 }
 impl InitialBlock {
     pub fn new(statements: Vec<ProceduralStatements>) -> Self {
@@ -40,8 +40,8 @@ impl InitialBlock {
 
 #[derive(Debug, PartialEq)]
 pub struct AlwaysBlock {
-    trigger_events: Vec<Event>,
-    statements: Vec<ProceduralStatements>,
+    pub trigger_events: Vec<Event>,
+    pub statements: Vec<ProceduralStatements>,
 }
 
 impl AlwaysBlock {
@@ -56,9 +56,12 @@ impl AlwaysBlock {
 #[derive(Debug, PartialEq)]
 pub enum ProceduralStatements {
     Delay(Delay),
+    Assignment(ProceduralAssignment),
+}
+
+pub enum ProceduralBlock {
     InitialBlock(InitialBlock),
     AlwaysBlock(AlwaysBlock),
-    Assignment(ProceduralAssignment),
 }
 
 pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> {
