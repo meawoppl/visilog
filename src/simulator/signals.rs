@@ -1,18 +1,18 @@
-
-#[derive(Debug, PartialEq )]
+#[derive(Debug, PartialEq)]
 pub enum SignalErrors {
     SignalEnded,
-    SignalInvalid
+    SignalInvalid,
 }
 
 fn string_decode_signal(input: &str) -> Result<Vec<bool>, SignalErrors> {
-    input.chars().map(|c| {
-        match c {
+    input
+        .chars()
+        .map(|c| match c {
             '_' => Ok(false),
             '-' => Ok(true),
             _ => Err(SignalErrors::SignalInvalid),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 pub trait Signal {
@@ -20,7 +20,7 @@ pub trait Signal {
 }
 
 pub struct FiniteSignal {
-    values: Vec<bool>
+    values: Vec<bool>,
 }
 
 impl FiniteSignal {
@@ -40,7 +40,7 @@ impl Signal for FiniteSignal {
 }
 
 pub struct InfiniteSignal {
-    val_loop: Vec<bool>
+    val_loop: Vec<bool>,
 }
 
 impl Signal for InfiniteSignal {
@@ -50,7 +50,7 @@ impl Signal for InfiniteSignal {
     }
 }
 
-impl InfiniteSignal{
+impl InfiniteSignal {
     pub fn repeating(pattern: &'static str) -> Self {
         let bits = string_decode_signal(pattern).unwrap();
         InfiniteSignal { val_loop: bits }
@@ -63,7 +63,9 @@ mod tests {
 
     #[test]
     fn test_finite_signal_evaluate() {
-        let signal = FiniteSignal { values: vec![true, false, true] };
+        let signal = FiniteSignal {
+            values: vec![true, false, true],
+        };
 
         assert_eq!(signal.evaluate(0), Ok(true));
         assert_eq!(signal.evaluate(1), Ok(false));
@@ -73,7 +75,9 @@ mod tests {
 
     #[test]
     fn test_infinite_signal_evaluate() {
-        let signal = InfiniteSignal { val_loop: vec![true, false] };
+        let signal = InfiniteSignal {
+            val_loop: vec![true, false],
+        };
 
         assert_eq!(signal.evaluate(0), Ok(true));
         assert_eq!(signal.evaluate(1), Ok(false));
@@ -96,7 +100,6 @@ mod tests {
         assert!(signal.evaluate(3).unwrap());
         assert!(!signal.evaluate(4).unwrap());
         assert!(signal.evaluate(5).unwrap());
-        
 
         let pattern = "-__-";
         let result = InfiniteSignal::repeating(pattern);
