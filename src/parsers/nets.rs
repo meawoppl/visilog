@@ -63,7 +63,7 @@ fn parse_delay(input: &str) -> IResult<&str, u32> {
     map_res(preceded(tag("#"), digit1), |s: &str| s.parse::<u32>())(input)
 }
 
-fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
+pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
     let (input, net_type) = net_type(input)?;
     let (input, range) = ws(opt(range))(input)?;
     let (input, delay) = opt(parse_delay)(input)?;

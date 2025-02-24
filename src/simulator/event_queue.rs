@@ -79,7 +79,7 @@ mod tests {
             ExecutionCursor::InitialCursor((0, InitialBlock::new(vec![]))),
         );
 
-        for x in 0..10 {
+        for _ in 0..10 {
             queue.insert(
                 10,
                 ExecutionCursor::AlwaysCursor((0, AlwaysBlock::new(vec![], vec![]))),
@@ -96,11 +96,9 @@ mod tests {
             );
 
             match queue.cursors.last().unwrap() {
-                ExecutionCursor::InitialCursor((_)) => {}
+                ExecutionCursor::InitialCursor(_) => {}
                 _ => panic!("Expected InitialBlock"),
             }
         }
     }
-
-    fn test_event_queue_insert_stable() {}
 }
