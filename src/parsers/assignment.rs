@@ -18,29 +18,51 @@ use super::{
 };
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum AssignmentType {
-    Continuous,
-    Procedural,
+pub struct ContinuousAssignment {
+    lhs: Expression,
+    rhs: Expression,
+}
+
+impl ContinuousAssignment {
+    pub fn new(lhs: Expression, rhs: Expression) -> Self {
+        ContinuousAssignment { lhs, rhs }
+    }
+}
+
+pub fn parse_continuous_assignment(input: &str) -> IResult<&str, ContinuousAssignment> {
+    let (input, _) = ws(tag("assign"))(input)?;
+    let (input, lhs) = assignment_lhs(input)?;
+    let (input, _) = ws(char('='))(input)?;
+    let (input, rhs) = verilog_expression(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((input, ContinuousAssignment::new(lhs, rhs)))
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Assignment {
+pub enum ProceduralAssignmentType {
+    Blocking,
+    NonBlocking,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ProceduralAssignment {
     pre_delay: Option<Delay>,
     lhs: Expression,
-    assignment_type: AssignmentType,
+    assignment_type: ProceduralAssignmentType,
     assignment_delay: Option<Delay>,
     rhs: Expression,
 }
 
-impl Assignment {
+impl ProceduralAssignment {
     pub fn new(
         pre_delay: Option<Delay>,
         lhs: Expression,
-        assignment_type: AssignmentType,
+        assignment_type: ProceduralAssignmentType,
         assignment_delay: Option<Delay>,
         rhs: Expression,
     ) -> Self {
-        Assignment {
+        ProceduralAssignment {
             pre_delay,
             lhs,
             assignment_type,
@@ -50,7 +72,7 @@ impl Assignment {
     }
 }
 
-pub fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
+pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
     let (input, pre_delay) = ws(parse_delay_opt)(input)?;
     let (input, lhs) = assignment_lhs(input)?;
     let (input, assign_op) = ws(alt((tag("="), tag("<="))))(input)?;
@@ -59,14 +81,14 @@ pub fn parse_assignment(input: &str) -> IResult<&str, Assignment> {
     let (input, _) = ws(char(';'))(input)?;
 
     let assignment_type = match assign_op {
-        "=" => AssignmentType::Continuous,
-        "<=" => AssignmentType::Procedural,
+        "=" => ProceduralAssignmentType::Blocking,
+        "<=" => ProceduralAssignmentType::NonBlocking,
         _ => unreachable!(),
     };
 
     Ok((
         input,
-        Assignment::new(pre_delay, lhs, assignment_type, assignment_delay, rhs),
+        ProceduralAssignment::new(pre_delay, lhs, assignment_type, assignment_delay, rhs),
     ))
 }
 
@@ -176,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_continuous_assignment() {
+    fn test_parse_blocking_assignment() {
         let input = "a = b;";
         let result = parse_assignment(input);
         assert!(result.is_ok());
@@ -191,11 +213,14 @@ mod tests {
             Expression::Identifier(Identifier::new("b".to_string()))
         );
 
-        assert_eq!(assignment.assignment_type, AssignmentType::Continuous);
+        assert_eq!(
+            assignment.assignment_type,
+            ProceduralAssignmentType::Blocking
+        );
     }
 
     #[test]
-    fn test_parse_procedural_assignment() {
+    fn test_parse_nonblocking_assignment() {
         let input = "a <= b;";
         let result = parse_assignment(input);
         assert!(result.is_ok());
@@ -252,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_procedural_assignment_with_bit_select() {
+    fn test_parse_nonblocking_assignment_with_bit_select() {
         let input = "a[3] <= b;";
         let result = parse_assignment(input);
         assert!(result.is_ok());
@@ -272,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_procedural_assignment_with_part_select() {
+    fn test_parse_nonblocking_assignment_with_part_select() {
         let input = "a[3:0] <= b;";
         let result = parse_assignment(input);
         assert!(result.is_ok());
@@ -293,9 +318,68 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_procedural_assignment_with_concatenation() {
+    fn test_parse_nonblocking_assignment_with_concatenation() {
         let input = "{a, b, c} <= d;";
         let result = parse_assignment(input);
+        assert!(result.is_ok());
+        let (remaining, assignment) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            assignment.lhs,
+            Expression::Concatenation(vec![
+                Expression::Identifier(Identifier::new("a".to_string())),
+                Expression::Identifier(Identifier::new("b".to_string())),
+                Expression::Identifier(Identifier::new("c".to_string())),
+            ])
+        );
+        assert_eq!(
+            assignment.rhs,
+            Expression::Identifier(Identifier::new("d".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_continuous_assignment() {
+        let input = "assign a = b;";
+        let result = parse_continuous_assignment(input);
+        assert!(result.is_ok());
+        let (remaining, assignment) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            assignment.lhs,
+            Expression::Identifier(Identifier::new("a".to_string()))
+        );
+        assert_eq!(
+            assignment.rhs,
+            Expression::Identifier(Identifier::new("b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_continuous_assignment_with_part_select() {
+        let input = "assign a[3:0] = b;";
+        let result = parse_continuous_assignment(input);
+        assert!(result.is_ok());
+        let (remaining, assignment) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            assignment.lhs,
+            Expression::PartSelect(
+                Identifier::new("a".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+            )
+        );
+        assert_eq!(
+            assignment.rhs,
+            Expression::Identifier(Identifier::new("b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_continuous_assignment_with_concatenation() {
+        let input = "assign {a, b, c} = d;";
+        let result = parse_continuous_assignment(input);
         assert!(result.is_ok());
         let (remaining, assignment) = result.unwrap();
         assert!(remaining.is_empty());

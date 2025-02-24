@@ -10,7 +10,7 @@ use nom::{
 use crate::parsers::assignment::parse_assignment;
 
 use super::{
-    assignment::Assignment,
+    assignment::{ContinuousAssignment, ProceduralAssignment},
     delay::{parse_delay_statement, Delay},
     expr::Expression,
     simple::ws,
@@ -56,11 +56,9 @@ impl AlwaysBlock {
 #[derive(Debug, PartialEq)]
 pub enum ProceduralStatements {
     Delay(Delay),
-    RegisterDeclaration,
-    WireDeclaration,
     InitialBlock(InitialBlock),
     AlwaysBlock(AlwaysBlock),
-    Assignment(Assignment),
+    Assignment(ProceduralAssignment),
 }
 
 pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> {

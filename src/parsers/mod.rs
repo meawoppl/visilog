@@ -14,4 +14,5 @@ pub mod numbers;
 pub mod operators;
 pub mod register;
 pub mod simple;
+pub mod statements;
 pub mod string;
