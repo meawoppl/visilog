@@ -96,7 +96,7 @@ mod tests {
             );
 
             match queue.cursors.last().unwrap() {
-                ExecutionCursor::InitialCursor((_)) => {}
+                ExecutionCursor::InitialCursor(_) => {}
                 _ => panic!("Expected InitialBlock"),
             }
         }
