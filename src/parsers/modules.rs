@@ -92,7 +92,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = multispace0(input)?;
     let (input, mod_identifier) = identifier(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, ports) = parse_ports(input)?;
+    let (input, ports) = map(opt(parse_ports), |ports| ports.unwrap_or(vec![]))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = ws(tag(";"))(input)?;
     let (input, statements) = many0(ws(parse_module_statement))(input)?;
@@ -305,6 +305,19 @@ mod tests {
         assert_eq!(module.ports[1].identifier, "b".into());
 
         assert_eq!(module.statements.len(), 0);
+    }
+
+    #[test]
+    fn test_minimal_module_definition() {
+        let input = r#"
+            module test1;
+            endmodule
+        "#;
+        let result = parse_module_declaration(input);
+        assert!(result.is_ok());
+        let (remaining, module) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(module.identifier, "test1".into());
     }
 
     #[test]
