@@ -10,7 +10,7 @@ use nom::{
 
 use super::{base::RawToken, simple::ws};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Identifier {
     pub name: String,
 }
