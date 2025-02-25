@@ -519,9 +519,34 @@ pub fn verilog_expression(input: &str) -> IResult<&str, Expression> {
 mod tests {
     use rand::{RngCore, SeedableRng};
 
-    use crate::parsers::helpers::assert_parses_to;
+    use crate::parsers::helpers::{assert_parses, assert_parses_to};
 
     use super::*;
+
+    #[test]
+    fn test_constant_expression() {
+        let expressions = vec![
+            "32'd12",
+            "8'hFF",
+            "16'b1010_1010",
+            "123",
+            "'h1234",
+            "'b101",
+            "'o123",
+            "'x123",
+            "0",
+            "1",
+            "2",
+        ];
+
+        for to_parse in expressions {
+            let expr = assert_parses(verilog_expression, to_parse);
+            match expr {
+                Expression::Constant(_) => {}
+                _ => panic!("Expected a constant expression"),
+            }
+        }
+    }
 
     #[test]
     fn test_unary_ops() {

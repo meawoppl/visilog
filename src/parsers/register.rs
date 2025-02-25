@@ -7,11 +7,14 @@ use nom::{
     IResult,
 };
 
-use super::simple::range;
+use super::{
+    identifier::{identifier, Identifier},
+    simple::range,
+};
 
 #[derive(Debug, PartialEq)]
 pub struct RegisterDeclaration {
-    pub name: String,
+    pub name: Identifier,
     pub range: Option<(i64, i64)>,
     pub dimensions: Option<(i64, i64)>,
 }
@@ -46,7 +49,7 @@ pub fn parse_register_declaration(input: &str) -> IResult<&str, RegisterDeclarat
     let (input, _) = multispace0(input)?;
     let (input, range) = opt(range)(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, name) = parse_identifier(input)?;
+    let (input, name) = identifier(input)?;
     let (input, dimensions) = opt(parse_dimensions)(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = char(';')(input)?;
@@ -54,7 +57,7 @@ pub fn parse_register_declaration(input: &str) -> IResult<&str, RegisterDeclarat
     Ok((
         input,
         RegisterDeclaration {
-            name: name.to_string(),
+            name: name,
             range,
             dimensions,
         },
@@ -66,7 +69,7 @@ pub fn parse_memory_declaration(input: &str) -> IResult<&str, RegisterDeclaratio
     let (input, _) = multispace0(input)?;
     let (input, range) = opt(range)(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, name) = parse_identifier(input)?;
+    let (input, name) = identifier(input)?;
     let (input, dimensions) = opt(parse_dimensions)(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = char(';')(input)?;
@@ -74,7 +77,7 @@ pub fn parse_memory_declaration(input: &str) -> IResult<&str, RegisterDeclaratio
     Ok((
         input,
         RegisterDeclaration {
-            name: name.to_string(),
+            name: name,
             range,
             dimensions,
         },
@@ -93,7 +96,7 @@ mod tests {
             parse_register_declaration,
             "reg a;",
             RegisterDeclaration {
-                name: "a".to_string(),
+                name: "a".into(),
                 range: None,
                 dimensions: None,
             },
@@ -103,7 +106,7 @@ mod tests {
             parse_register_declaration,
             "reg [7:0] a;",
             RegisterDeclaration {
-                name: "a".to_string(),
+                name: "a".into(),
                 range: Some((7, 0)),
                 dimensions: None,
             },
@@ -113,7 +116,7 @@ mod tests {
             parse_register_declaration,
             "reg a[7:0];",
             RegisterDeclaration {
-                name: "a".to_string(),
+                name: "a".into(),
                 range: None,
                 dimensions: Some((7, 0)),
             },
@@ -124,7 +127,7 @@ mod tests {
             Ok((
                 "",
                 RegisterDeclaration {
-                    name: "b".to_string(),
+                    name: "b".into(),
                     range: Some((15, 0)),
                     dimensions: None,
                 }
@@ -136,7 +139,7 @@ mod tests {
             Ok((
                 "",
                 RegisterDeclaration {
-                    name: "c".to_string(),
+                    name: "c".into(),
                     range: None,
                     dimensions: Some((15, 0)),
                 }
@@ -148,7 +151,7 @@ mod tests {
             Ok((
                 "",
                 RegisterDeclaration {
-                    name: "d".to_string(),
+                    name: "d".into(),
                     range: Some((31, 0)),
                     dimensions: Some((0, 255)),
                 }
@@ -162,7 +165,7 @@ mod tests {
             parse_memory_declaration,
             "reg [7:0] memb[0:255];",
             RegisterDeclaration {
-                name: "memb".to_string(),
+                name: "memb".into(),
                 range: Some((7, 0)),
                 dimensions: Some((0, 255)),
             },
@@ -173,7 +176,7 @@ mod tests {
             Ok((
                 "",
                 RegisterDeclaration {
-                    name: "mem".to_string(),
+                    name: "mem".into(),
                     range: Some((15, 0)),
                     dimensions: Some((0, 1023)),
                 }
@@ -185,7 +188,7 @@ mod tests {
             Ok((
                 "",
                 RegisterDeclaration {
-                    name: "mem32".to_string(),
+                    name: "mem32".into(),
                     range: Some((31, 0)),
                     dimensions: Some((0, 2047)),
                 }
@@ -197,7 +200,7 @@ mod tests {
             Ok((
                 "",
                 RegisterDeclaration {
-                    name: "mem64".to_string(),
+                    name: "mem64".into(),
                     range: Some((63, 0)),
                     dimensions: Some((0, 4095)),
                 }

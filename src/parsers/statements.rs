@@ -3,6 +3,7 @@ use nom::{branch::alt, combinator::map, error::context, IResult};
 use super::{
     assignment::{parse_continuous_assignment, ContinuousAssignment},
     behavior::{parse_always_block, parse_initial_block, AlwaysBlock, InitialBlock},
+    modules::ModuleInstantiation,
     nets::{net_declaration, Net},
     register::{parse_register_declaration, RegisterDeclaration},
 };
@@ -15,6 +16,7 @@ pub enum ModuleStatement {
     InitialBlock(InitialBlock),
     AlwaysBlock(AlwaysBlock),
     Assignment(ContinuousAssignment),
+    ModuleInstantiation(ModuleInstantiation),
 }
 
 pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {

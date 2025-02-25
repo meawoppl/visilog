@@ -1,5 +1,4 @@
 // Rough order of operations for this module.
-// 1. Parse the specified verilog "top" module.
 // 2. Validate the module, try to provide useful debugging information.
 // 3. Recrsively descend all submodules, and gather all register definitions
 // 4. Create a StateStore with all the register definitions.
@@ -8,6 +7,50 @@
 // 7. Create the event queue for actual simulation state managment
 // 8. Queue all the initial and unconditiona always blocks
 // 9. Run the simulation
+
+use std::collections::HashMap;
+
+use crate::parsers::{
+    modules::VerilogModule, register::RegisterDeclaration, statements::ModuleStatement,
+};
+
+pub fn gather_registers(
+    module: &VerilogModule,
+    prefix: String,
+) -> HashMap<String, &RegisterDeclaration> {
+    let mut name_to_reg = HashMap::new();
+
+    for statement in &module.statements {
+        match statement {
+            ModuleStatement::RegisterDeclaration(register) => {
+                name_to_reg.insert(format!("{}.{}", prefix, register.name.name), register);
+            }
+            ModuleStatement::ModuleInstantiation(_) => {
+                // TODO(meawoppl)
+            }
+            _ => {}
+        }
+    }
+    name_to_reg
+}
+pub struct Simulator {
+    module: VerilogModule,
+}
+
+impl Simulator {
+    pub fn new(module: VerilogModule) -> Self {
+        Self { module }
+    }
+
+    pub fn setup(&mut self) {
+        // Recursively descend all submodules, and gather all register definitions
+        // TODO(meawoppl)
+    }
+
+    pub fn run(&mut self) {
+        // TODO(meawoppl)
+    }
+}
 
 #[cfg(test)]
 mod tests {

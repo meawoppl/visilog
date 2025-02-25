@@ -1,14 +1,17 @@
+use std::collections::HashMap;
+
 use nom::{
     branch::alt,
     bytes::complete::tag,
     character::complete::{char, multispace0},
     combinator::{map, opt},
-    multi::{many0, separated_list0},
+    multi::{many0, separated_list0, separated_list1},
     sequence::delimited,
     IResult,
 };
 
 use super::{
+    expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
     simple::{range, ws},
     statements::{parse_module_statement, ModuleStatement},
@@ -100,6 +103,104 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             identifier: mod_identifier,
             ports,
             statements,
+        },
+    ))
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum ModuleInitArguments {
+    NoArgs,
+    Positional(Vec<Expression>),
+    Keyword(HashMap<Identifier, Expression>),
+}
+
+pub fn parse_positional_arguments(input: &str) -> IResult<&str, ModuleInitArguments> {
+    map(separated_list1(tag(","), verilog_expression), |args| {
+        ModuleInitArguments::Positional(args)
+    })(input)
+}
+
+fn kw_arg(input: &str) -> IResult<&str, (Identifier, Expression)> {
+    let (input, _) = tag(".")(input)?;
+    let (input, identifier) = identifier(input)?;
+    let (input, expression) = delimited(tag("("), ws(verilog_expression), tag(")"))(input)?;
+    Ok((input, (identifier, expression)))
+}
+
+pub fn parse_keyword_arguments(input: &str) -> IResult<&str, ModuleInitArguments> {
+    map(separated_list1(tag(","), ws(kw_arg)), |args| {
+        let mut map = HashMap::new();
+        for (id, expr) in args {
+            map.insert(id, expr);
+        }
+        ModuleInitArguments::Keyword(map)
+    })(input)
+}
+
+/// Parse a block of arguments, either positional or keyword, without delimiters
+/// eg.
+///
+/// positional: `1,2,3`
+///
+/// keyword: `.a(1),.b(2),.c(3)`
+pub fn parse_arguments(input: &str) -> IResult<&str, ModuleInitArguments> {
+    map(
+        opt(alt((parse_keyword_arguments, parse_positional_arguments))),
+        |args| args.unwrap_or(ModuleInitArguments::NoArgs),
+    )(input)
+}
+
+/// Parse a block of arguments, either positional or keyword
+/// eg.
+///
+/// positional: (1,2,3)
+///
+/// keyword: (.a(1),.b(2),.c(3))
+fn argument_block(input: &str) -> IResult<&str, ModuleInitArguments> {
+    delimited(tag("("), parse_arguments, tag(")"))(input)
+}
+
+fn param_block(input: &str) -> IResult<&str, ModuleInitArguments> {
+    let (input, _) = tag("#")(input)?;
+    argument_block(input)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ModuleInstantiation {
+    pub module_name: Identifier,
+    pub instance_name: Identifier,
+    pub parameters: ModuleInitArguments, // NB(meawoppl) parameters have tighter bounds than arguments (we don't check)
+    pub arguments: ModuleInitArguments,
+}
+
+pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, ModuleInstantiation> {
+    // vdff #(.size(10),.delay(15)) mod_a (.out(out_a),.in(in_a),.clk(clk));
+    // vdff mod_b (.out(out_b),.in(in_b),.clk(clk));
+    // vdff #(.delay(12)) mod_c (.out(out_c),.in(in_c),.clk(clk));
+    // vdff #(.delay( ),.size(10) ) mod_d (.out(out_d),.in(in_d),.clk(clk));
+
+    let (input, module_name) = identifier(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, parameters) = map(opt(param_block), |params| {
+        params.unwrap_or(ModuleInitArguments::NoArgs)
+    })(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, instance_name) = identifier(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, arguments) = argument_block(input)?;
+
+    let (input, _) = ws(tag(";"))(input)?;
+
+    Ok((
+        input,
+        ModuleInstantiation {
+            module_name,
+            instance_name,
+            parameters,
+            arguments,
         },
     ))
 }
@@ -249,5 +350,135 @@ mod tests {
             .collect::<Vec<_>>();
 
         println!("{:?}", example_files);
+    }
+
+    fn abc_123() -> ModuleInitArguments {
+        let mut expected: HashMap<Identifier, Expression> = HashMap::new();
+
+        expected.insert("a".into(), verilog_expression("1".into()).unwrap().1);
+        expected.insert("b".into(), verilog_expression("2".into()).unwrap().1);
+        expected.insert("c".into(), verilog_expression("3".into()).unwrap().1);
+        ModuleInitArguments::Keyword(expected)
+    }
+
+    #[test]
+    fn test_parse_kw_args() {
+        let examples = vec![
+            ".a(1),.b(2),.c(3)",
+            ".a(1),.b(2),.c(3)",
+            ".a( 1 ), .b(2),.c(3) ",
+        ];
+
+        for example in examples {
+            assert_parses_to(parse_keyword_arguments, example, abc_123());
+        }
+    }
+
+    #[test]
+    fn test_parse_pos_args() {
+        let arg_list_examples = vec![
+            "1,2,3",
+            "1, 2, 3",
+            "a + b, foo, bar",
+            "1/0, foo, bar, baz, qux",
+        ];
+
+        for example in arg_list_examples {
+            let res = assert_parses(parse_positional_arguments, example);
+
+            match res {
+                ModuleInitArguments::Positional(args) => {
+                    let comma_count = example.chars().filter(|&c| c == ',').count();
+                    if comma_count == 0 {
+                        assert_eq!(args.len(), 0);
+                    } else {
+                        assert_eq!(args.len(), comma_count + 1);
+                    }
+                }
+                _ => {
+                    panic!("Expected positional arguments, got {:?}", res);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_named_args() {
+        let arg_list_examples = vec![
+            ".a(1),.b(2),.c(3)",
+            ".a(1),.b(2),.c(3)",
+            ".a( 1 ), .b(2),.c(3) ",
+        ];
+
+        for example in arg_list_examples {
+            assert_parses_to(parse_keyword_arguments, example, abc_123());
+        }
+    }
+
+    #[test]
+    fn test_parse_arguments() {
+        let examples = vec!["1,2,3", "1, 2, 3", "1, 2,  3 "];
+
+        for example in examples {
+            let res = assert_parses(parse_arguments, example);
+            match res {
+                ModuleInitArguments::Positional(mapping) => {
+                    assert_eq!(mapping.len(), 3);
+                }
+                _ => {
+                    panic!("Expected Positional arguments");
+                }
+            }
+        }
+    }
+    #[test]
+    fn test_parse_argument_block() {
+        let examples = vec![
+            ("()", ModuleInitArguments::NoArgs),
+            (
+                "(1,2,3)",
+                ModuleInitArguments::Positional(vec![
+                    verilog_expression("1".into()).unwrap().1,
+                    verilog_expression("2".into()).unwrap().1,
+                    verilog_expression("3".into()).unwrap().1,
+                ]),
+            ),
+            (
+                "(1, 2, 3)",
+                ModuleInitArguments::Positional(vec![
+                    verilog_expression("1".into()).unwrap().1,
+                    verilog_expression("2".into()).unwrap().1,
+                    verilog_expression("3".into()).unwrap().1,
+                ]),
+            ),
+            ("(.a(1),.b(2),.c(3))", abc_123()),
+        ];
+
+        for (txt, expected) in examples {
+            assert_parses_to(argument_block, txt, expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_param_block() {
+        assert_parses_to(param_block, "#(.a(1),.b(2),.c(3))", abc_123());
+    }
+
+    #[test]
+    fn test_module_instantiation() {
+        let test_statements = vec![
+            "adder my_adder ();",
+            "adder my_adder (1,2,3);",
+            "adder my_adder (.a(1),.b(2),.c(3));",
+            "adder #() my_adder (1,2,3);",
+            "adder #(1) my_adder (.a(in_a),.b(in_b),.c(sum));",
+            "adder #(.PARAM1(1),.PARAM2(2)) my_adder (.a(in_a),.b(in_b),.c(sum));",
+        ];
+
+        for input in test_statements {
+            let res = assert_parses(parse_module_instantiation_statement, input);
+            assert_eq!(res.module_name, "adder".into());
+            assert_eq!(res.instance_name, "my_adder".into());
+        }
     }
 }
