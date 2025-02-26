@@ -1,3 +1,4 @@
+pub mod build;
 pub mod event_queue;
 pub mod runner;
 pub mod signals;

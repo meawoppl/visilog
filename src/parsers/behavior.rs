@@ -1,19 +1,12 @@
 use nom::{
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::multispace0,
-    combinator::map,
-    multi::{many0, many1},
-    IResult,
+    branch::alt, bytes::complete::tag, character::complete::{multispace0, multispace1}, combinator::{map, opt}, multi::{many0, many1, separated_list0, separated_list1}, sequence::{delimited, tuple}, IResult
 };
 
 use crate::parsers::assignment::parse_assignment;
+use crate::parsers::identifier::identifier;
 
 use super::{
-    assignment::{ContinuousAssignment, ProceduralAssignment},
-    delay::{parse_delay_statement, Delay},
-    expr::Expression,
-    simple::ws,
+    assignment::{ContinuousAssignment, ProceduralAssignment}, delay::{parse_delay_statement, Delay}, expr::{verilog_expression, Expression}, identifier::{self, Identifier}, simple::ws
 };
 #[derive(Debug, PartialEq)]
 pub enum EventTriggers {
@@ -40,12 +33,14 @@ impl InitialBlock {
 
 #[derive(Debug, PartialEq)]
 pub struct AlwaysBlock {
-    pub trigger_events: Vec<Event>,
+    /// None if the trigger is `@(*)`
+    /// Some if the trigger is a (possibly empty) list of events
+    pub trigger_events: Option<Vec<Event>>,
     pub statements: Vec<ProceduralStatements>,
 }
 
 impl AlwaysBlock {
-    pub fn new(trigger_events: Vec<Event>, statements: Vec<ProceduralStatements>) -> Self {
+    pub fn new(trigger_events: Option<Vec<Event>>, statements: Vec<ProceduralStatements>) -> Self {
         AlwaysBlock {
             trigger_events,
             statements,
@@ -78,13 +73,41 @@ pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
     Ok((input, initial_block))
 }
 
+pub fn edge_type(input: &str) -> IResult<&str,EventTriggers> {
+    map(opt(alt((tag("posedge"), tag("negedge")))), |res| {
+        match res {
+            Some("posedge") => EventTriggers::PosEdge,
+            Some("negedge") => EventTriggers::NegEdge,
+            Some(_) => unreachable!(),
+            None => EventTriggers::EitherEdge,            
+        }
+    })(input)
+}   
+
+pub fn trigger_expression(input: &str)-> IResult<&str, Event> {
+    let (input, trigger) = edge_type(input)?;
+    let (input, expression) = verilog_expression(input)?;
+
+    Ok((input, Event{ trigger, expression}))
+}
+
+pub fn trigger_block(input: &str) -> IResult<&str, Vec<Event>> {
+    let (input, _) = tag("@(")(input)?;
+    let (input, _) = multispace0(input)?;
+    let delimited_or = delimited(multispace1, tag("or"), multispace1);
+    let (input, events) = separated_list0(delimited_or, trigger_expression)(input)?;
+    let (input, _) = tag(")")(input)?;
+    Ok((input, events))
+}
+
 pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
     // TODO(meawoppl) - needs trigger statement parsing
     let (input, _) = ws(tag("always"))(input)?;
     let (input, _) = multispace0(input)?;
+    let (input, trigger_events) = opt(trigger_block)(input)?;
     let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
 
-    let block = AlwaysBlock::new(vec![], assignments);
+    let block = AlwaysBlock::new(trigger_events, assignments);
 
     Ok((input, block))
 }
@@ -99,6 +122,8 @@ pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::parsers::helpers::assert_parses;
+
     use super::*;
 
     #[test]
@@ -161,4 +186,24 @@ mod tests {
         let result = parse_block(input);
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_always_block_event_permutation() {
+        let test_cases = vec![
+            "always @(*) begin end",
+            "always @(a) begin end",
+            "always @() begin end",
+            "always @(a) b = c;",
+            "always @(a, b) begin c = a & b; d = a | b; end",
+            "always @(clk) begin if (reset) begin q <= 0; end else begin q <= d; end end",
+            "always @(a, b) begin reg temp; temp = a & b; out = temp; end",
+        ];
+
+        for input in test_cases {
+            let result = parse_always_block(input);
+            assert_parses(parse_always_block, input);
+        }
+
+    }
+
 }

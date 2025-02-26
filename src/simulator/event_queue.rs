@@ -1,6 +1,6 @@
 use crate::parsers::behavior::{AlwaysBlock, InitialBlock};
 
-enum ExecutionCursor {
+pub enum ExecutionCursor {
     // next statement to execute, and the block to execute it in
     InitialCursor((usize, InitialBlock)),
     AlwaysCursor((usize, AlwaysBlock)),
@@ -56,7 +56,7 @@ mod tests {
     fn test_event_queue_insert() {
         let mut queue = EventQueue::new();
         let initial_block = InitialBlock::new(vec![]); // Assuming InitialBlock has a default constructor
-        let always_block = AlwaysBlock::new(vec![], vec![]); // Assuming AlwaysBlock has a default constructor
+        let always_block = AlwaysBlock::new(None, vec![]); // Assuming AlwaysBlock has a default constructor
 
         queue.insert(10, ExecutionCursor::InitialCursor((0, initial_block)));
         queue.insert(5, ExecutionCursor::AlwaysCursor((1, always_block)));
@@ -82,7 +82,7 @@ mod tests {
         for _ in 0..10 {
             queue.insert(
                 10,
-                ExecutionCursor::AlwaysCursor((0, AlwaysBlock::new(vec![], vec![]))),
+                ExecutionCursor::AlwaysCursor((0, AlwaysBlock::new(None, vec![]))),
             );
 
             match queue.cursors.last().unwrap() {
