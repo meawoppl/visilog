@@ -25,7 +25,8 @@ pub fn gather_registers(
             ModuleStatement::RegisterDeclaration(register) => {
                 name_to_reg.insert(format!("{}.{}", prefix, register.name.name), register);
             }
-            ModuleStatement::ModuleInstantiation(_) => {
+            ModuleStatement::ModuleInstantiation(module) => {
+
                 // TODO(meawoppl)
             }
             _ => {}

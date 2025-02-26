@@ -92,7 +92,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = multispace0(input)?;
     let (input, mod_identifier) = identifier(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, ports) = parse_ports(input)?;
+    let (input, ports) = map(opt(parse_ports), |ports| ports.unwrap_or(vec![]))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = ws(tag(";"))(input)?;
     let (input, statements) = many0(ws(parse_module_statement))(input)?;
@@ -207,6 +207,8 @@ pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, Module
 
 #[cfg(test)]
 mod tests {
+    use nom::Parser;
+
     use super::*;
     use crate::parsers::helpers::{assert_parses, assert_parses_to};
     use std::fs;
@@ -308,6 +310,19 @@ mod tests {
     }
 
     #[test]
+    fn test_minimal_module_definition() {
+        let input = r#"
+            module test1;
+            endmodule
+        "#;
+        let result = parse_module_declaration(input);
+        assert!(result.is_ok());
+        let (remaining, module) = result.unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(module.identifier, "test1".into());
+    }
+
+    #[test]
     fn test_simple_adder() {
         let input = r#"
             module adder(
@@ -325,13 +340,14 @@ mod tests {
     }
 
     // TODO(meawoppl) this loads and runs all the test files, but we aren't able to parse them all yet
-    // #[test]
+    #[test]
     fn test_parse_verilog_examples() {
         let example_files_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("verilog")
             .join("examples");
-        let example_files = fs::read_dir(example_files_dir)
+
+        let path_content = fs::read_dir(example_files_dir)
             .expect("Unable to read directory")
             .filter_map(|entry| {
                 let entry = entry.expect("Unable to read entry");
@@ -343,13 +359,28 @@ mod tests {
                 }
             })
             .map(|path| {
-                let content = fs::read_to_string(path).expect("Unable to read file");
-
-                assert_parses(parse_module_declaration, &content)
+                let content = fs::read_to_string(path.clone()).expect("Unable to read file");
+                (path, content)
             })
             .collect::<Vec<_>>();
 
-        println!("{:?}", example_files);
+        let results = path_content
+            .iter()
+            .map(
+                |(path, content)| match parse_module_declaration.parse(content) {
+                    Ok(_) => (path, true),
+                    Err(_) => (path, false),
+                },
+            )
+            .collect::<Vec<_>>();
+
+        for (path, result) in &results {
+            println!("{}: {}", path, result);
+        }
+
+        assert_eq!(*&results.iter().filter(|(_, result)| *result).count(), 2);
+
+        println!("{:?}", path_content);
     }
 
     fn abc_123() -> ModuleInitArguments {
