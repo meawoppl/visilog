@@ -136,9 +136,12 @@ handling in an expression layer, that test is your tripwire.
   the enum in `statements.rs` and `parse_module_instantiation_statement` exists in
   `modules.rs`, but `parse_module_statement`'s `alt(...)` does not include it, so module
   instantiations inside a module body will not parse.
-- **`src/verilog/examples/*.v` are not referenced by any code.** They're a corpus waiting
-  to be wired into tests, not fixtures currently under test. Adding a test that parses
-  them is a good way to find real gaps.
+- **The `src/verilog/examples/*.v` corpus test is disabled because it fails.**
+  `test_parse_verilog_examples` in `parsers/modules.rs` loads every file in that directory
+  via `read_dir` and asserts each parses, but its `#[test]` is commented out. As of this
+  writing only `simple_module.v` and `parity_calculator.v` parse — the other four all use
+  `always @(posedge …)`, and there is no parser for sensitivity lists, `if`/`else`, `case`,
+  or `localparam`. Re-enabling that test is the natural yardstick for front-end progress.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
