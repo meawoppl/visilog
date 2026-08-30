@@ -95,6 +95,8 @@ instantiations are rejected by `setup` with `SimulationError::Unsupported`, and
 | File | Role |
 | --- | --- |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
+| `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
+| `exec.rs` | `execute_statements` / `commit_updates` — procedural bodies, blocking vs non-blocking; also owns the shared `drive` target helpers |
 | `runner.rs` | `Simulator` — `setup()` / `set_input()` / `run()` / `get()`, the combinational driver |
 | `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register` |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |

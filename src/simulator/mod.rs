@@ -1,5 +1,6 @@
 pub mod eval;
 pub mod event_queue;
+pub mod events;
 pub mod exec;
 pub mod runner;
 pub mod signals;
