@@ -80,6 +80,33 @@ impl ProceduralAssignment {
             rhs,
         }
     }
+
+    /// The assigned target, e.g. the `x` of `x <= y;`.
+    pub fn lhs(&self) -> &Expression {
+        &self.lhs
+    }
+
+    /// The assigned expression, e.g. the `y` of `x <= y;`.
+    pub fn rhs(&self) -> &Expression {
+        &self.rhs
+    }
+
+    /// Whether this is `=` (blocking) or `<=` (non-blocking). The distinction
+    /// drives when the target is updated, so a simulator must respect it.
+    pub fn assignment_type(&self) -> &ProceduralAssignmentType {
+        &self.assignment_type
+    }
+
+    /// The delay *before* the statement runs, e.g. the `#50` of `#50 x = y;`.
+    pub fn pre_delay(&self) -> Option<&Delay> {
+        self.pre_delay.as_ref()
+    }
+
+    /// The delay between evaluating the right side and updating the target,
+    /// e.g. the `#50` of `x = #50 y;`.
+    pub fn assignment_delay(&self) -> Option<&Delay> {
+        self.assignment_delay.as_ref()
+    }
 }
 
 pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
