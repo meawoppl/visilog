@@ -36,6 +36,14 @@ impl Net {
             delay,
         }
     }
+
+    pub fn identifier(&self) -> &Identifier {
+        &self.identifier
+    }
+
+    pub fn range(&self) -> (i64, i64) {
+        self.range
+    }
 }
 
 pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {

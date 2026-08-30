@@ -24,3 +24,5 @@ Cargo.lock
 
 /target
 .vscode/
+# Agent worktrees
+.claude/worktrees/

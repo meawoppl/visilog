@@ -80,16 +80,22 @@ that catch this are the associativity/precedence assertions at the bottom of `ex
 
 ### `src/simulator/`
 
-Partly built. The expression evaluator is real and well tested; the driver (`Simulator::setup`
-/ `run`) is still a stub marked `TODO(meawoppl)`, so nothing executes end to end yet.
-The intended pipeline is spelled out in the comment block at the top of `runner.rs`:
-validate → gather registers → build the expression graph → compute edge statements →
-queue initial/always blocks → run the event queue.
+Partly built. **Combinational simulation works end to end**: `Simulator::setup` declares every
+port, net, register and parameter into a `StateStore`, and `Simulator::run` settles the
+module's continuous `assign` statements to a fixpoint, returning the number of passes it
+took. Because the assignments are stored in source order rather than dependency order, a
+single pass is not enough — `run` repeats passes until one changes nothing, and reports
+`SimulationError::NoConvergence` once it hits its pass limit so a combinational loop is an
+error rather than a hang.
+
+Sequential simulation is the next milestone. `always` / `initial` blocks and module
+instantiations are rejected by `setup` with `SimulationError::Unsupported`, and
+`event_queue.rs` / `signals.rs` are not wired into the driver yet.
 
 | File | Role |
 | --- | --- |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
-| `runner.rs` | `Simulator` struct; `setup()` and `run()` are stubs |
+| `runner.rs` | `Simulator` — `setup()` / `set_input()` / `run()` / `get()`, the combinational driver |
 | `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register` |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
