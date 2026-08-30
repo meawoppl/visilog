@@ -24,6 +24,8 @@ jobs:
         prefix-key: "v0"
         # To only cache runs from `master`:
         save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Check formatting
+      run: cargo fmt --all -- --check
     - name: Build
       run: cargo build --verbose
     - name: Run tests
