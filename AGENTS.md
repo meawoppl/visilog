@@ -105,11 +105,17 @@ halts or hits a delay. `exec::execute_statements` is a thin wrapper that compile
 from `0`, and reports `Unsupported` if the block suspends, because its callers have
 nowhere to keep the resume point yet.
 
+`Simulator::advance` moves simulated time forward, which is what gives `#delay` meaning: a
+block that hits a delay suspends and re-queues itself on the `EventQueue` for a later
+timestamp. It is also what lets a design clock itself — `always begin #50 clk = ~clk; end`
+needs no external stimulus, only time. `initial` blocks and free-running `always` blocks
+are queued at time zero; edge-triggered blocks are woken by `settle` instead, so they are
+deliberately skipped in the time wheel (`EventControl::None` reports as firing on *every*
+edge, so a free-running block must not also be edge-driven).
+
 Still unsupported: module instantiation (`setup` reports `Unsupported`), intra-assignment
 delays (`a = #5 b;` — the held right hand side does not fit in a program counter), and
-concatenation as an assignment target. `event_queue.rs` and `signals.rs` are built but not
-yet wired into the driver — the current model settles edges rather than advancing
-simulated time, so nothing schedules on a timestamp yet.
+concatenation as an assignment target. `signals.rs` is built but still unwired.
 
 | File | Role |
 | --- | --- |

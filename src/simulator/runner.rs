@@ -1,4 +1,4 @@
-//! The combinational simulation driver.
+//! The simulation driver.
 //!
 //! [`Simulator`] takes a parsed [`VerilogModule`], declares every port, net,
 //! register and parameter into a [`StateStore`], and then settles the module's
@@ -17,6 +17,11 @@
 //! its non-blocking updates commit, and continuous assignments re-propagate.
 //! That repeats until nothing changes, which is Verilog's delta-cycle model.
 //!
+//! [`Simulator::advance`] moves simulated time forward, which is what gives
+//! `#delay` meaning: a block that hits a delay suspends and re-queues itself
+//! for a later timestamp. That also lets a design clock itself — an
+//! `always begin #50 clk = ~clk; end` needs no external stimulus, just time.
+//!
 //! Module hierarchy is still a later milestone; [`Simulator::setup`] reports an
 //! instantiation as unsupported rather than pretending to elaborate it.
 
@@ -24,18 +29,44 @@ use std::fmt;
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
+    behavior::EventControl,
     modules::{PortDirection, VerilogModule},
     statements::ModuleStatement,
 };
 use crate::register::Register;
 use crate::simulator::eval::{eval, EvalError};
+use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events;
-use crate::simulator::exec::{commit_updates, drive, execute_statements, range_width};
+use crate::simulator::exec::{commit_updates, drive, range_width, PendingUpdate};
+use crate::simulator::program::{self, Program, Resume};
 use crate::simulator::state_store::StateStore;
 
 /// Ceiling on delta cycles within a single settle. A design that keeps
 /// producing edges past this is oscillating, not converging.
 const MAX_DELTA_CYCLES: usize = 100;
+
+/// Ceiling on block resumptions within a single timestamp. A free-running
+/// `always` block with no delay in it restarts forever without time moving;
+/// this turns that into an error rather than a hang.
+const MAX_RESUMPTIONS_PER_TIME: usize = 10_000;
+
+/// What kind of procedural block a compiled program came from.
+#[derive(Debug, PartialEq, Eq)]
+enum BlockKind {
+    Initial,
+    Always,
+}
+
+/// A procedural block compiled to a resumable program.
+struct TimedBlock {
+    /// Index into `module.statements`, so the block's `EventControl` can be
+    /// consulted without cloning it.
+    statement: usize,
+    kind: BlockKind,
+    /// `always` with no event control at all: driven by time, never by edges.
+    free_running: bool,
+    program: Program,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimulationError {
@@ -62,7 +93,7 @@ impl fmt::Display for SimulationError {
             SimulationError::UnknownSignal(name) => write!(f, "no signal named `{}`", name),
             SimulationError::NotAnInput(name) => write!(f, "`{}` is not an input port", name),
             SimulationError::Unsupported(what) => {
-                write!(f, "{} is not supported by the combinational simulator", what)
+                write!(f, "{} is not supported by the simulator", what)
             }
             SimulationError::UnsupportedTarget(text) => {
                 write!(f, "cannot drive `{}`", text)
@@ -86,16 +117,16 @@ impl From<EvalError> for SimulationError {
     }
 }
 
-/// A module whose continuous assignments can be settled against a set of input
-/// values.
+/// A parsed module, elaborated into signals and runnable blocks.
 pub struct Simulator {
     module: VerilogModule,
     state: StateStore,
     assignments: Vec<ContinuousAssignment>,
     /// Indices into `module.statements`. `AlwaysBlock` is not `Clone`, and
     /// holding references would borrow the module for the simulator's lifetime.
-    always_blocks: Vec<usize>,
-    initial_blocks: Vec<usize>,
+    blocks: Vec<TimedBlock>,
+    queue: EventQueue,
+    now: i64,
     inputs: Vec<String>,
     is_setup: bool,
 }
@@ -106,8 +137,9 @@ impl Simulator {
             module,
             state: StateStore::new(),
             assignments: Vec::new(),
-            always_blocks: Vec::new(),
-            initial_blocks: Vec::new(),
+            blocks: Vec::new(),
+            queue: EventQueue::new(),
+            now: 0,
             inputs: Vec::new(),
             is_setup: false,
         }
@@ -119,8 +151,9 @@ impl Simulator {
     pub fn setup(&mut self) -> Result<(), SimulationError> {
         self.state = StateStore::new();
         self.assignments.clear();
-        self.always_blocks.clear();
-        self.initial_blocks.clear();
+        self.blocks.clear();
+        self.queue = EventQueue::new();
+        self.now = 0;
         self.inputs.clear();
         self.is_setup = false;
 
@@ -159,8 +192,22 @@ impl Simulator {
                 ModuleStatement::Assignment(assignment) => {
                     self.assignments.push(assignment.clone())
                 }
-                ModuleStatement::AlwaysBlock(_) => self.always_blocks.push(index),
-                ModuleStatement::InitialBlock(_) => self.initial_blocks.push(index),
+                ModuleStatement::AlwaysBlock(block) => {
+                    self.blocks.push(TimedBlock {
+                        statement: index,
+                        kind: BlockKind::Always,
+                        free_running: block.event_control == EventControl::None,
+                        program: Program::compile(&block.statements)?,
+                    });
+                }
+                ModuleStatement::InitialBlock(block) => {
+                    self.blocks.push(TimedBlock {
+                        statement: index,
+                        kind: BlockKind::Initial,
+                        free_running: false,
+                        program: Program::compile(&block.statements)?,
+                    });
+                }
                 ModuleStatement::ModuleInstantiation(_) => {
                     return Err(SimulationError::Unsupported("a module instantiation"))
                 }
@@ -169,20 +216,21 @@ impl Simulator {
 
         self.is_setup = true;
 
-        // `initial` blocks run once, at time zero, before anything is driven.
-        // Only propagate if one of them actually ran: settling here otherwise
-        // would make a module that never converges fail at setup rather than
-        // at the point someone asks it to run.
-        if !self.initial_blocks.is_empty() {
-            let mut pending = Vec::new();
-            for &index in &self.initial_blocks {
-                if let ModuleStatement::InitialBlock(block) = &self.module.statements[index] {
-                    pending.extend(execute_statements(&block.statements, &mut self.state)?);
-                }
+        // Everything that starts on its own starts at time zero: `initial`
+        // blocks, which run once, and free-running `always` blocks, which have
+        // no event to wait for. Edge-triggered blocks are not queued — they are
+        // woken by `settle`.
+        for id in 0..self.blocks.len() {
+            if self.blocks[id].kind == BlockKind::Initial || self.blocks[id].free_running {
+                self.queue.insert(0, ExecutionCursor::new(id, 0));
             }
-            commit_updates(pending, &mut self.state)?;
-            self.propagate()?;
         }
+
+        // Drain time zero. This is a no-op for a module with no procedural
+        // blocks, which matters: settling unconditionally here would make a
+        // module that never converges fail at setup rather than when someone
+        // actually asks it to run.
+        self.advance(0)?;
 
         Ok(())
     }
@@ -278,11 +326,22 @@ impl Simulator {
             before = self.state.clone();
 
             let mut pending = Vec::new();
-            for &index in &self.always_blocks {
-                if let ModuleStatement::AlwaysBlock(block) = &self.module.statements[index] {
-                    if events::always_block_fires(block, &edges) {
-                        pending.extend(execute_statements(&block.statements, &mut self.state)?);
+            for id in 0..self.blocks.len() {
+                // A free-running `always` waits on nothing, so `always_block_fires`
+                // would report it as firing on every edge. It is driven by time,
+                // not by edges, so it is skipped here.
+                if self.blocks[id].kind != BlockKind::Always || self.blocks[id].free_running {
+                    continue;
+                }
+                let fires = match &self.module.statements[self.blocks[id].statement] {
+                    ModuleStatement::AlwaysBlock(block) => {
+                        events::always_block_fires(block, &edges)
                     }
+                    _ => false,
+                };
+                if fires {
+                    let (updates, _) = self.resume_block(id, 0)?;
+                    pending.extend(updates);
                 }
             }
 
@@ -293,6 +352,83 @@ impl Simulator {
         Err(SimulationError::NoConvergence {
             passes: MAX_DELTA_CYCLES,
         })
+    }
+
+    /// The current simulated time.
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// Runs simulated time forward by `duration` time units, executing every
+    /// scheduled block resumption along the way.
+    ///
+    /// This is what makes `#delay` mean something. A block that hits a delay
+    /// suspends and re-queues itself for a later timestamp; advancing time is
+    /// what brings it back. It is also what drives a self-clocking design —
+    /// `always begin #50 clk = ~clk; end` needs no external stimulus at all,
+    /// just time.
+    pub fn advance(&mut self, duration: i64) -> Result<(), SimulationError> {
+        if !self.is_setup {
+            return Err(SimulationError::NotSetUp);
+        }
+
+        let target = self.now + duration;
+        while let Some(time) = self.queue.peek_time() {
+            if time > target {
+                break;
+            }
+            self.now = time;
+
+            let before = self.state.clone();
+            let mut pending = Vec::new();
+            let mut resumptions = 0;
+
+            // Everything due at this timestamp runs before time moves on,
+            // including anything re-queued for this same instant.
+            while self.queue.peek_time() == Some(time) {
+                resumptions += 1;
+                if resumptions > MAX_RESUMPTIONS_PER_TIME {
+                    return Err(SimulationError::NoConvergence {
+                        passes: resumptions,
+                    });
+                }
+
+                let (_, cursor) = self.queue.pop().expect("peeked time must pop");
+                let (updates, halted) = self.resume_block(cursor.block, cursor.pc)?;
+                pending.extend(updates);
+
+                // A free-running `always` restarts the moment it finishes,
+                // which is how `always begin #50 … end` keeps going forever.
+                if halted && self.blocks[cursor.block].free_running {
+                    self.queue
+                        .insert(self.now, ExecutionCursor::new(cursor.block, 0));
+                }
+            }
+
+            commit_updates(pending, &mut self.state)?;
+            self.propagate()?;
+            self.settle(before)?;
+        }
+
+        self.now = target;
+        Ok(())
+    }
+
+    /// Resumes one block, queueing its continuation if it hits a delay. Returns
+    /// its deferred updates and whether it ran to the end.
+    fn resume_block(
+        &mut self,
+        id: usize,
+        pc: usize,
+    ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
+        match program::resume(&self.blocks[id].program, pc, &mut self.state)? {
+            Resume::Halted { pending } => Ok((pending, true)),
+            Resume::Suspended { pc, delay, pending } => {
+                self.queue
+                    .insert(self.now + delay, ExecutionCursor::new(id, pc));
+                Ok((pending, false))
+            }
+        }
     }
 
     /// Settles the continuous assignments alone. See [`Simulator::run`].
@@ -732,6 +868,156 @@ mod tests {
             simulator.get("nope"),
             Err(SimulationError::UnknownSignal("nope".to_string()))
         );
+    }
+
+    #[test]
+    fn test_initial_block_stimulus_lands_at_its_scheduled_times() {
+        let mut simulator = simulator_for(
+            r#"
+            module stimulus(
+                output reg a,
+                output reg b
+            );
+                initial begin
+                    a = 1'b0;
+                    #10 a = 1'b1;
+                    #10 b = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        // The statements before the first delay have already run at time zero.
+        assert_eq!(simulator.now(), 0);
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "0");
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "x");
+
+        // Stopping short of the delay must not run the next statement.
+        simulator.advance(9).unwrap();
+        assert_eq!(simulator.now(), 9);
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "0");
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.now(), 10);
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "1");
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "x");
+
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "1");
+    }
+
+    #[test]
+    fn test_free_running_always_block_generates_a_clock() {
+        let mut simulator = simulator_for(
+            r#"
+            module oscillator(
+                output reg clk
+            );
+                initial clk = 1'b0;
+                always begin
+                    #50 clk = ~clk;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "0");
+
+        simulator.advance(50).unwrap();
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "1");
+
+        simulator.advance(50).unwrap();
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "0");
+
+        // Several periods in one call.
+        simulator.advance(150).unwrap();
+        assert_eq!(simulator.now(), 250);
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "1");
+    }
+
+    #[test]
+    fn test_self_clocking_counter_runs_on_time_alone() {
+        // No pokes, no ticks — the design drives itself. The free-running block
+        // makes the clock, and the edge-triggered block counts its posedges.
+        let mut simulator = simulator_for(
+            r#"
+            module self_clocked(
+                output reg [3:0] count,
+                output reg clk
+            );
+                initial begin
+                    clk = 1'b0;
+                    count = 4'b0000;
+                end
+                always begin
+                    #10 clk = ~clk;
+                end
+                always @(posedge clk) count <= count + 1;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(0));
+
+        // clk rises at 10, 30, 50, 70, 90 — five posedges by time 100.
+        simulator.advance(100).unwrap();
+        assert_eq!(simulator.now(), 100);
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(5));
+
+        simulator.advance(100).unwrap();
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(10));
+    }
+
+    #[test]
+    fn test_delay_nested_in_a_conditional_schedules_correctly() {
+        // The resume point is inside the `if` body, so this only works because
+        // blocks compile to a flat program with a program counter.
+        let mut simulator = simulator_for(
+            r#"
+            module gated(
+                output reg a,
+                output reg done
+            );
+                initial begin
+                    a = 1'b1;
+                    if (a) begin
+                        #25 done = 1'b1;
+                    end
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("done").unwrap().to_binary(), "x");
+        simulator.advance(24).unwrap();
+        assert_eq!(simulator.get("done").unwrap().to_binary(), "x");
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("done").unwrap().to_binary(), "1");
+    }
+
+    #[test]
+    fn test_free_running_block_without_a_delay_is_reported_not_hung() {
+        // `always begin a = ~a; end` has no delay, so it restarts forever
+        // without time advancing. That has to be an error, not a hang.
+        let (_, module) = parse_module_declaration(
+            r#"
+            module spinner(
+                output reg a
+            );
+                initial a = 1'b0;
+                always begin
+                    a = ~a;
+                end
+            endmodule
+        "#,
+        )
+        .unwrap();
+
+        let mut simulator = Simulator::new(module);
+        assert!(matches!(
+            simulator.setup(),
+            Err(SimulationError::NoConvergence { .. })
+        ));
     }
 
     #[test]
