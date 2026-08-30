@@ -16,6 +16,11 @@ impl Delay {
     pub fn new(delay: i64) -> Self {
         Delay { delay }
     }
+
+    /// The number of time units to wait.
+    pub fn ticks(&self) -> i64 {
+        self.delay
+    }
 }
 
 pub fn parse_delay(input: &str) -> IResult<&str, Delay> {
