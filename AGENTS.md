@@ -12,7 +12,7 @@ This file is the repo guide for coding agents. `CLAUDE.md` is a symlink to it.
 cargo build          # build
 cargo test           # run the full suite (all tests are inline unit tests)
 cargo fmt            # format — run before every push
-cargo fmt --check    # verify formatting without rewriting
+cargo fmt --check    # what CI enforces
 ```
 
 There is no integration-test directory and no benchmark harness. `cargo test` is the
@@ -149,7 +149,7 @@ handling in an expression layer, that test is your tripwire.
 - Branch names are prefixed with the username and use dashes:
   `meawoppl/short-description`.
 - Add files individually (`git add path/to/file`); do not use `git add -A`.
-- Run `cargo fmt` before pushing.
+- Run `cargo fmt` before pushing. CI enforces `cargo fmt --all -- --check`.
 - Keep commit titles to 10 words or fewer.
 - Don't leave dead code behind, and don't leave comments describing code that was removed.
 - Don't add backward-compatibility shims unless they were asked for.
@@ -158,7 +158,7 @@ handling in an expression layer, that test is your tripwire.
 ## CI
 
 `.github/workflows/rust.yml` runs on pushes to `main` and on PRs targeting `main`:
-`Swatinem/rust-cache` for the cargo cache, then `cargo build --verbose` and
-`cargo test --verbose`.
+`Swatinem/rust-cache` for the cargo cache, then `cargo fmt --all -- --check`,
+`cargo build --verbose`, and `cargo test --verbose`.
 
 CI does not pin a Rust toolchain — it uses whatever the `ubuntu-latest` runner ships.
