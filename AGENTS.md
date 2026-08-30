@@ -161,4 +161,6 @@ handling in an expression layer, that test is your tripwire.
 `Swatinem/rust-cache` for the cargo cache, then `cargo fmt --all -- --check`,
 `cargo build --verbose`, and `cargo test --verbose`.
 
-CI does not pin a Rust toolchain — it uses whatever the `ubuntu-latest` runner ships.
+The toolchain is pinned by `rust-toolchain.toml` (currently `1.96.0`), which rustup
+honors for both local builds and CI. To move forward, bump `channel` there, run
+`cargo fmt`, and commit any resulting reformatting in the same change.
