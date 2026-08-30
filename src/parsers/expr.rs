@@ -239,13 +239,16 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
     ))(input)
 }
 
-fn bit_select(input: &str) -> IResult<&str, Expression> {
+/// `a[i]` — a single-bit select. The index is a full expression, so
+/// `a[n]`, `a[n+1]` and `a[c ? x : y]` are all accepted.
+pub fn bit_select(input: &str) -> IResult<&str, Expression> {
     let (input, expr) = identifier(input)?;
     let (input, index) = delimited(tag("["), ws(verilog_expression), tag("]"))(input)?;
     Ok((input, Expression::BitSelect(expr, Box::new(index))))
 }
 
-fn part_select(input: &str) -> IResult<&str, Expression> {
+/// `a[msb:lsb]` — a range select. Both bounds are full expressions.
+pub fn part_select(input: &str) -> IResult<&str, Expression> {
     let (input, ident) = identifier(input)?;
     let (input, (start, end)) = delimited(
         tag("["),

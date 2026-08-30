@@ -150,10 +150,17 @@ handling in an expression layer, that test is your tripwire.
   not something to "fix" by deleting code. It does mean a genuine new warning is easy to
   miss; check the warning count or grep for your file specifically.
 - **Duplicate definitions exist.** `NetType` is defined in *both* `parsers/nets.rs` and
-  `parsers/modules.rs`; `parse_bit_select` / `parse_part_select` are defined in *both*
-  `parsers/identifier.rs` and `parsers/assignment.rs`. Check which one is in scope before
-  assuming a change took effect. (The former duplicate `Register` in `state_store.rs` is
-  gone — there is now one `Register`, in `src/register.rs`.)
+  `parsers/modules.rs`. Check which one is in scope before assuming a change took effect.
+  (The former duplicate `Register` in `state_store.rs` is gone — there is now one
+  `Register`, in `src/register.rs`. The former duplicate `parse_bit_select` /
+  `parse_part_select` in `identifier.rs` and `assignment.rs` are gone too — `expr.rs`'s
+  `bit_select` / `part_select` are now the single definitions, used by both
+  `operand_no_ws` and `assignment_lhs`.)
+- **A bit select is tried before a part select.** Both start `identifier [ expression`,
+  and since the index is a full expression, a conditional index (`q[a ? b : c]`) contains
+  a `:` that looks just like a part-select separator. `bit_select` first means the
+  conditional wins; write `q[(a ? b : c):0]` when you mean a part select with a
+  conditional bound.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.

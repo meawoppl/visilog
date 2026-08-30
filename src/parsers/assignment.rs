@@ -1,18 +1,17 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while_m_n},
+    bytes::complete::tag,
     character::complete::{char, multispace0},
-    combinator::{map, map_res},
+    combinator::map,
     multi::separated_list0,
     sequence::{delimited, preceded},
     IResult,
 };
 
-use crate::parsers::expr::{verilog_expression, Expression};
-use crate::parsers::identifier::{identifier, Identifier};
+use crate::parsers::expr::{bit_select, part_select, verilog_expression, Expression};
+use crate::parsers::identifier::identifier;
 
 use super::{
-    constants::VerilogConstant,
     delay::{parse_delay_opt, Delay},
     simple::ws,
 };
@@ -129,51 +128,20 @@ pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
     ))
 }
 
+/// The target of an assignment: a whole signal, a bit or part select of one, or
+/// a concatenation of those.
+///
+/// `bit_select` is tried before `part_select` so that a conditional index —
+/// `q[a ? b : c]` — is read as a bit select rather than having its `:` mistaken
+/// for a part-select separator. Both bounds of a part select are ordinary
+/// expressions, so `q[n:m]` and `q[i]` work as well as literal indices.
 pub fn assignment_lhs(input: &str) -> IResult<&str, Expression> {
     alt((
-        map(parse_part_select, |(id, start, end)| {
-            Expression::PartSelect(
-                id,
-                Box::new(Expression::Constant(VerilogConstant::from_int(start))),
-                Box::new(Expression::Constant(VerilogConstant::from_int(end))),
-            )
-        }),
-        map(parse_bit_select, |(id, index)| {
-            Expression::BitSelect(
-                id,
-                Box::new(Expression::Constant(VerilogConstant::from_int(index))),
-            )
-        }),
+        bit_select,
+        part_select,
         map(identifier, Expression::Identifier),
         parse_concatenation,
     ))(input)
-}
-
-pub fn parse_bit_select(input: &str) -> IResult<&str, (Identifier, i64)> {
-    let (input, id) = identifier(input)?;
-    let (input, _) = char('[')(input)?;
-    let (input, index) = map_res(
-        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
-        |s: &str| s.parse::<i64>(),
-    )(input)?;
-    let (input, _) = char(']')(input)?;
-    Ok((input, (id, index)))
-}
-
-pub fn parse_part_select(input: &str) -> IResult<&str, (Identifier, i64, i64)> {
-    let (input, id) = identifier(input)?;
-    let (input, _) = char('[')(input)?;
-    let (input, start) = map_res(
-        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
-        |s: &str| s.parse::<i64>(),
-    )(input)?;
-    let (input, _) = char(':')(input)?;
-    let (input, end) = map_res(
-        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
-        |s: &str| s.parse::<i64>(),
-    )(input)?;
-    let (input, _) = char(']')(input)?;
-    Ok((input, (id, start, end)))
 }
 
 pub fn parse_concatenation(input: &str) -> IResult<&str, Expression> {
@@ -190,8 +158,15 @@ pub fn parse_concatenation(input: &str) -> IResult<&str, Expression> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsers::constants::VerilogConstant;
     use crate::parsers::expr::Expression;
+    use crate::parsers::helpers::assert_parses_to;
     use crate::parsers::identifier::Identifier;
+    use crate::parsers::operators::BinaryOperator;
+
+    fn ident(name: &str) -> Expression {
+        Expression::Identifier(Identifier::new(name.to_string()))
+    }
 
     #[test]
     fn test_assignment_lhs() {
@@ -274,26 +249,145 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bit_select() {
-        let input = "a[3]";
-        let result = parse_bit_select(input);
-        assert!(result.is_ok());
-        let (remaining, (id, index)) = result.unwrap();
-        assert!(remaining.is_empty());
-        assert_eq!(id, Identifier::new("a".to_string()));
-        assert_eq!(index, 3);
+    fn test_assignment_lhs_literal_bit_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "a[3]",
+            Expression::BitSelect(
+                Identifier::new("a".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+            ),
+        );
     }
 
     #[test]
-    fn test_parse_part_select() {
-        let input = "a[3:0]";
-        let result = parse_part_select(input);
-        assert!(result.is_ok());
-        let (remaining, (id, start, end)) = result.unwrap();
+    fn test_assignment_lhs_literal_part_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "a[3:0]",
+            Expression::PartSelect(
+                Identifier::new("a".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+            ),
+        );
+    }
+
+    /// A variable index is kept as an identifier expression, not folded into a
+    /// constant.
+    #[test]
+    fn test_assignment_lhs_variable_bit_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "q[i]",
+            Expression::BitSelect(Identifier::new("q".to_string()), Box::new(ident("i"))),
+        );
+    }
+
+    #[test]
+    fn test_assignment_lhs_expression_bit_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "q[a+1]",
+            Expression::BitSelect(
+                Identifier::new("q".to_string()),
+                Box::new(Expression::Binary(
+                    Box::new(ident("a")),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+                )),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_assignment_lhs_variable_part_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "q[n:m]",
+            Expression::PartSelect(
+                Identifier::new("q".to_string()),
+                Box::new(ident("n")),
+                Box::new(ident("m")),
+            ),
+        );
+    }
+
+    /// `q[a ? b : c]` shares its opening shape with a part select, and the
+    /// conditional's `:` looks exactly like a part-select separator. It is a bit
+    /// select: `assignment_lhs` tries `bit_select` first, and the whole
+    /// conditional is consumed as the index.
+    #[test]
+    fn test_assignment_lhs_conditional_index_is_a_bit_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "q[a ? b : c]",
+            Expression::BitSelect(
+                Identifier::new("q".to_string()),
+                Box::new(Expression::Conditional(
+                    Box::new(ident("a")),
+                    Box::new(ident("b")),
+                    Box::new(ident("c")),
+                )),
+            ),
+        );
+    }
+
+    /// The converse of the case above: a part select whose msb happens to be a
+    /// conditional. Parenthesising the conditional ends the index expression at
+    /// the `)`, leaving the part-select `:` to be found.
+    #[test]
+    fn test_assignment_lhs_parenthesised_conditional_part_select() {
+        assert_parses_to(
+            assignment_lhs,
+            "q[(a ? b : c):0]",
+            Expression::PartSelect(
+                Identifier::new("q".to_string()),
+                Box::new(Expression::Parenthetical(Box::new(
+                    Expression::Conditional(
+                        Box::new(ident("a")),
+                        Box::new(ident("b")),
+                        Box::new(ident("c")),
+                    ),
+                ))),
+                Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_parse_assignment_with_variable_bit_select() {
+        let (remaining, assignment) = parse_assignment("q[i] <= 1'b1;").unwrap();
         assert!(remaining.is_empty());
-        assert_eq!(id, Identifier::new("a".to_string()));
-        assert_eq!(start, 3);
-        assert_eq!(end, 0);
+        assert_eq!(
+            assignment.lhs,
+            Expression::BitSelect(Identifier::new("q".to_string()), Box::new(ident("i")))
+        );
+    }
+
+    #[test]
+    fn test_parse_assignment_with_variable_part_select() {
+        let (remaining, assignment) = parse_assignment("q[n:m] <= x;").unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            assignment.lhs,
+            Expression::PartSelect(
+                Identifier::new("q".to_string()),
+                Box::new(ident("n")),
+                Box::new(ident("m")),
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_continuous_assignment_with_variable_bit_select() {
+        let (remaining, assignment) = parse_continuous_assignment("assign mem[addr] = data;")
+            .expect("variable bit select should parse as a continuous assignment target");
+        assert!(remaining.is_empty());
+        assert_eq!(
+            assignment.lhs,
+            Expression::BitSelect(Identifier::new("mem".to_string()), Box::new(ident("addr")))
+        );
     }
 
     #[test]

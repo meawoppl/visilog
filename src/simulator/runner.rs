@@ -565,6 +565,55 @@ mod tests {
         assert_eq!(simulator.get("q").unwrap().to_binary(), "0");
     }
 
+    /// A variable bit-select target — `q[addr] <= 1'b1;` — has to survive
+    /// parsing as an expression index and then resolve against the runtime
+    /// value of `addr`.
+    #[test]
+    fn test_variable_bit_select_target_writes_the_addressed_bit() {
+        let mut simulator = simulator_for(
+            r#"
+            module bit_writer(
+                input clk,
+                input rst,
+                input [1:0] addr,
+                output reg [3:0] q
+            );
+                always @(posedge clk) begin
+                    if (rst)
+                        q <= 4'b0000;
+                    else
+                        q[addr] <= 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.set_input("rst", one()).unwrap();
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_binary(), "0000");
+
+        simulator.set_input("rst", zero()).unwrap();
+        simulator
+            .set_input("addr", Register::from_u128(2, 2))
+            .unwrap();
+        simulator.tick("clk").unwrap();
+        assert_eq!(
+            simulator.get("q").unwrap().to_binary(),
+            "0100",
+            "addr=2 must set bit 2, not a literal index"
+        );
+
+        simulator
+            .set_input("addr", Register::from_u128(0, 2))
+            .unwrap();
+        simulator.tick("clk").unwrap();
+        assert_eq!(
+            simulator.get("q").unwrap().to_binary(),
+            "0101",
+            "the index follows addr from cycle to cycle"
+        );
+    }
+
     #[test]
     fn test_counter_example_counts_and_resets() {
         let mut simulator = simulator_for_example("counter.v");
