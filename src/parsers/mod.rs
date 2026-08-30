@@ -12,6 +12,7 @@ pub mod modules;
 pub mod nets;
 pub mod numbers;
 pub mod operators;
+pub mod parameter;
 pub mod register;
 pub mod simple;
 pub mod statements;
