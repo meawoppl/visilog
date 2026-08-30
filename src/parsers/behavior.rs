@@ -48,16 +48,28 @@ impl InitialBlock {
     }
 }
 
+/// How an `always` block is triggered. The three forms are distinct constructs
+/// and simulate differently.
+#[derive(Debug, PartialEq)]
+pub enum EventControl {
+    /// `always begin … end` — no event control, the body runs continuously.
+    None,
+    /// `always @(*)` — implicitly sensitive to every signal read in the body.
+    Implicit,
+    /// `always @(posedge clk or negedge rst)` — an explicit sensitivity list.
+    Events(Vec<Event>),
+}
+
 #[derive(Debug, PartialEq)]
 pub struct AlwaysBlock {
-    pub trigger_events: Vec<Event>,
+    pub event_control: EventControl,
     pub statements: Vec<ProceduralStatements>,
 }
 
 impl AlwaysBlock {
-    pub fn new(trigger_events: Vec<Event>, statements: Vec<ProceduralStatements>) -> Self {
+    pub fn new(event_control: EventControl, statements: Vec<ProceduralStatements>) -> Self {
         AlwaysBlock {
-            trigger_events,
+            event_control,
             statements,
         }
     }
@@ -196,15 +208,18 @@ fn event_separator(input: &str) -> IResult<&str, &str> {
 }
 
 /// Parse an event control expression: `@(posedge clk or negedge rst)`,
-/// `@(a, b)` or `@(*)`. The wildcard form is represented as an empty list of
-/// events, which is also how a block with no event control is represented.
-pub fn parse_sensitivity_list(input: &str) -> IResult<&str, Vec<Event>> {
+/// `@(a, b)` or `@(*)`. The wildcard form yields `EventControl::Implicit`,
+/// which is distinct from a block that carries no event control at all.
+pub fn parse_sensitivity_list(input: &str) -> IResult<&str, EventControl> {
     let (input, _) = ws(char('@'))(input)?;
     delimited(
         ws(char('(')),
         alt((
-            map(ws(char('*')), |_| Vec::new()),
-            separated_list1(event_separator, parse_event),
+            map(ws(char('*')), |_| EventControl::Implicit),
+            map(
+                separated_list1(event_separator, parse_event),
+                EventControl::Events,
+            ),
         )),
         ws(char(')')),
     )(input)
@@ -219,13 +234,13 @@ pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
 
 pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
     let (input, _) = ws(tag("always"))(input)?;
-    let (input, trigger_events) = map(opt(parse_sensitivity_list), |events| {
-        events.unwrap_or_default()
+    let (input, event_control) = map(opt(parse_sensitivity_list), |control| {
+        control.unwrap_or(EventControl::None)
     })(input)?;
     let (input, _) = multispace0(input)?;
     let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
 
-    let block = AlwaysBlock::new(trigger_events, assignments);
+    let block = AlwaysBlock::new(event_control, assignments);
 
     Ok((input, block))
 }
@@ -313,35 +328,35 @@ mod tests {
         assert_parses_to(
             parse_sensitivity_list,
             "@(posedge clk or negedge rst)",
-            vec![
+            EventControl::Events(vec![
                 Event::new(EventTriggers::PosEdge, identifier_expression("clk")),
                 Event::new(EventTriggers::NegEdge, identifier_expression("rst")),
-            ],
+            ]),
         );
     }
 
     #[test]
     fn test_parse_sensitivity_list_levels() {
-        let expected = vec![
+        let expected = EventControl::Events(vec![
             Event::new(EventTriggers::EitherEdge, identifier_expression("a")),
             Event::new(EventTriggers::EitherEdge, identifier_expression("b")),
-        ];
+        ]);
         assert_parses_to(parse_sensitivity_list, "@(a or b)", expected);
 
         assert_parses_to(
             parse_sensitivity_list,
             "@( a , b )",
-            vec![
+            EventControl::Events(vec![
                 Event::new(EventTriggers::EitherEdge, identifier_expression("a")),
                 Event::new(EventTriggers::EitherEdge, identifier_expression("b")),
-            ],
+            ]),
         );
     }
 
     #[test]
     fn test_parse_sensitivity_list_wildcard() {
-        assert_parses_to(parse_sensitivity_list, "@(*)", vec![]);
-        assert_parses_to(parse_sensitivity_list, "@( * )", vec![]);
+        assert_parses_to(parse_sensitivity_list, "@(*)", EventControl::Implicit);
+        assert_parses_to(parse_sensitivity_list, "@( * )", EventControl::Implicit);
     }
 
     #[test]
@@ -349,10 +364,10 @@ mod tests {
         assert_parses_to(
             parse_sensitivity_list,
             "@(posedge clk)",
-            vec![Event::new(
+            EventControl::Events(vec![Event::new(
                 EventTriggers::PosEdge,
                 identifier_expression("clk"),
-            )],
+            )]),
         );
     }
 
@@ -365,11 +380,11 @@ mod tests {
                end"#,
         );
         assert_eq!(
-            block.trigger_events,
-            vec![
+            block.event_control,
+            EventControl::Events(vec![
                 Event::new(EventTriggers::PosEdge, identifier_expression("clk")),
                 Event::new(EventTriggers::PosEdge, identifier_expression("rst")),
-            ]
+            ])
         );
         assert_eq!(block.statements.len(), 1);
     }
@@ -377,8 +392,38 @@ mod tests {
     #[test]
     fn test_parse_always_block_single_statement_body() {
         let block = assert_parses(parse_always_block, "always @(*) a = b;");
-        assert_eq!(block.trigger_events, vec![]);
+        assert_eq!(block.event_control, EventControl::Implicit);
         assert_eq!(block.statements.len(), 1);
+    }
+
+    /// The three `always` forms are different constructs and must not share a
+    /// representation.
+    #[test]
+    fn test_always_forms_are_distinguishable() {
+        let implicit = assert_parses(parse_always_block, "always @(*) a = b;");
+        let uncontrolled = assert_parses(parse_always_block, "always begin a = b; end");
+        let edge_triggered = assert_parses(parse_always_block, "always @(posedge clk) a <= b;");
+
+        assert_eq!(implicit.event_control, EventControl::Implicit);
+        assert_eq!(uncontrolled.event_control, EventControl::None);
+        assert_eq!(
+            edge_triggered.event_control,
+            EventControl::Events(vec![Event::new(
+                EventTriggers::PosEdge,
+                identifier_expression("clk")
+            )])
+        );
+
+        assert_ne!(implicit.event_control, uncontrolled.event_control);
+        assert_ne!(implicit.event_control, edge_triggered.event_control);
+        assert_ne!(uncontrolled.event_control, edge_triggered.event_control);
+    }
+
+    /// A level-sensitive list is still an explicit list, distinct from `@(*)`.
+    #[test]
+    fn test_explicit_list_is_not_implicit() {
+        let block = assert_parses(parse_always_block, "always @(a or b) c = a & b;");
+        assert_ne!(block.event_control, EventControl::Implicit);
     }
 
     #[test]
@@ -499,10 +544,10 @@ mod tests {
         assert_parses_to(
             parse_sensitivity_list,
             "@(a or origin)",
-            vec![
+            EventControl::Events(vec![
                 Event::new(EventTriggers::EitherEdge, identifier_expression("a")),
                 Event::new(EventTriggers::EitherEdge, identifier_expression("origin")),
-            ],
+            ]),
         );
     }
 
