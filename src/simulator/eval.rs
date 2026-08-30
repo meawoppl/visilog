@@ -685,11 +685,20 @@ mod tests {
 
     #[test]
     fn test_constant_with_unknown_digits() {
-        // The current constant parser cannot produce x/z digits, so the
-        // conversion is exercised directly.
         assert_eq!(constant_register("4'bx1").unwrap().to_binary(), "xxx1");
         assert_eq!(constant_register("2'hz").unwrap().to_binary(), "zz");
         assert_eq!(constant_register("8'hx0").unwrap().to_binary(), "xxxx0000");
+    }
+
+    /// The same x/z literals, but reached through the real parser rather than
+    /// [`constant_register`] directly — this is the seam between the constant
+    /// grammar and the evaluator, so it is worth pinning end to end.
+    #[test]
+    fn test_unknown_digit_constants_round_trip_through_parser() {
+        assert_eq!(bits("4'bx1"), "xxx1");
+        assert_eq!(bits("2'hz"), "zz");
+        assert_eq!(bits("8'hx0"), "xxxx0000");
+        assert_eq!(bits("4'bzzzz"), "zzzz");
     }
 
     #[test]
