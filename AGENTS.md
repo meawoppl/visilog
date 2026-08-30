@@ -54,7 +54,8 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
 | `integer.rs` | `integer a, b;` declarations |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
-| `behavior.rs` | `initial` / `always` / `begin…end` blocks |
+| `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
+| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case` |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `base.rs` | the `RawToken` trait |
@@ -132,16 +133,15 @@ handling in an expression layer, that test is your tripwire.
   `parsers/identifier.rs` and `parsers/assignment.rs`; `Register` is defined in both
   `src/register.rs` and `simulator/state_store.rs`. Check which one is in scope before
   assuming a change took effect.
-- **`ModuleStatement::ModuleInstantiation` exists but isn't parsed.** The variant is in
-  the enum in `statements.rs` and `parse_module_instantiation_statement` exists in
-  `modules.rs`, but `parse_module_statement`'s `alt(...)` does not include it, so module
-  instantiations inside a module body will not parse.
-- **The `src/verilog/examples/*.v` corpus test is disabled because it fails.**
-  `test_parse_verilog_examples` in `parsers/modules.rs` loads every file in that directory
-  via `read_dir` and asserts each parses, but its `#[test]` is commented out. As of this
-  writing only `simple_module.v` and `parity_calculator.v` parse — the other four all use
-  `always @(posedge …)`, and there is no parser for sensitivity lists, `if`/`else`, `case`,
-  or `localparam`. Re-enabling that test is the natural yardstick for front-end progress.
+- **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
+  instantiation is just an identifier followed by an argument block, so putting it earlier
+  lets it shadow every keyword-led statement form.
+- **`src/verilog/examples/*.v` are the parser's corpus.** `test_parse_verilog_examples` in
+  `modules.rs` parses every file in that directory and asserts nothing is left over, so
+  dropping a new `.v` file in there is the cheapest way to add coverage — and the fastest
+  way to break the suite.
+- **`@(*)` is represented as an empty `trigger_events` list**, the same as an `always`
+  block with no event control at all.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.

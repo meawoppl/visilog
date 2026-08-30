@@ -324,8 +324,7 @@ mod tests {
         assert_eq!(module.statements.len(), 1);
     }
 
-    // TODO(meawoppl) this loads and runs all the test files, but we aren't able to parse them all yet
-    // #[test]
+    #[test]
     fn test_parse_verilog_examples() {
         let example_files_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")

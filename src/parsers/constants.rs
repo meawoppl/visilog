@@ -9,7 +9,7 @@ use nom::{
 };
 
 use super::base::RawToken;
-use super::numbers::{decimal, hexadecimal};
+use super::numbers::{based_digits, decimal};
 use nom::character::complete::char;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,10 +108,7 @@ fn integer_constant(input: &str) -> IResult<&str, VerilogConstant> {
 }
 
 fn unsized_const(input: &str) -> IResult<&str, VerilogConstant> {
-    let parsed = tuple((
-        preceded(char('\''), const_type_char),
-        alt((hexadecimal, decimal)),
-    ));
+    let parsed = tuple((preceded(char('\''), const_type_char), based_digits));
 
     map_res(parsed, |(base, content)| {
         let cnst = VerilogConstant::new(None, base, content.to_string());
@@ -120,11 +117,7 @@ fn unsized_const(input: &str) -> IResult<&str, VerilogConstant> {
 }
 
 fn sized_const(input: &str) -> IResult<&str, VerilogConstant> {
-    let parsed = tuple((
-        decimal,
-        preceded(char('\''), const_type_char),
-        alt((hexadecimal, decimal)),
-    ));
+    let parsed = tuple((decimal, preceded(char('\''), const_type_char), based_digits));
 
     map_res(parsed, |(size_str, base, content)| {
         let size = size_str.parse::<usize>().unwrap();
@@ -471,6 +464,31 @@ mod tests {
             Ok((
                 "",
                 VerilogConstant::new(None, VerilogBaseType::Hexadecimal, "ABC".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn test_four_state_constants() {
+        assert_eq!(
+            verilog_const("4'bzzzz"),
+            Ok((
+                "",
+                VerilogConstant::new(Some(4), VerilogBaseType::Binary, "zzzz".to_string())
+            ))
+        );
+        assert_eq!(
+            verilog_const("8'hXX"),
+            Ok((
+                "",
+                VerilogConstant::new(Some(8), VerilogBaseType::Hexadecimal, "XX".to_string())
+            ))
+        );
+        assert_eq!(
+            verilog_const("'b1?0z"),
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Binary, "1?0z".to_string())
             ))
         );
     }
