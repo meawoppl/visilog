@@ -1,11 +1,19 @@
 use std::collections::VecDeque;
 
-use crate::parsers::behavior::{AlwaysBlock, InitialBlock};
+/// Where a suspended block picks up: which compiled block, and the instruction
+/// within it. A block is named by index rather than held by value because
+/// `AlwaysBlock` / `InitialBlock` are not `Clone` and cannot be moved out of
+/// the module that owns them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionCursor {
+    pub block: usize,
+    pub pc: usize,
+}
 
-pub enum ExecutionCursor {
-    // next statement to execute, and the block to execute it in
-    InitialCursor((usize, InitialBlock)),
-    AlwaysCursor((usize, AlwaysBlock)),
+impl ExecutionCursor {
+    pub fn new(block: usize, pc: usize) -> Self {
+        ExecutionCursor { block, pc }
+    }
 }
 
 /// Cursors ordered by the time they are due to resume. Cursors queued for the
@@ -50,14 +58,13 @@ impl EventQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsers::behavior::EventControl;
 
     fn initial_cursor() -> ExecutionCursor {
-        ExecutionCursor::InitialCursor((0, InitialBlock::new(vec![])))
+        ExecutionCursor::new(0, 0)
     }
 
     fn always_cursor() -> ExecutionCursor {
-        ExecutionCursor::AlwaysCursor((0, AlwaysBlock::new(EventControl::None, vec![])))
+        ExecutionCursor::new(1, 0)
     }
 
     #[test]
@@ -71,11 +78,8 @@ mod tests {
     #[test]
     fn test_event_queue_insert() {
         let mut queue = EventQueue::new();
-        let initial_block = InitialBlock::new(vec![]);
-        let always_block = AlwaysBlock::new(EventControl::None, vec![]);
-
-        queue.insert(10, ExecutionCursor::InitialCursor((0, initial_block)));
-        queue.insert(5, ExecutionCursor::AlwaysCursor((1, always_block)));
+        queue.insert(10, ExecutionCursor::new(0, 0));
+        queue.insert(5, ExecutionCursor::new(1, 0));
 
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.entries[0].0, 5);
@@ -92,17 +96,11 @@ mod tests {
         for _ in 0..10 {
             queue.insert(10, always_cursor());
 
-            match &queue.entries.back().unwrap().1 {
-                ExecutionCursor::AlwaysCursor((_, _)) => {}
-                _ => panic!("Expected AlwaysBlock"),
-            }
+            assert_eq!(queue.entries.back().unwrap().1, always_cursor());
 
             queue.insert(10, initial_cursor());
 
-            match &queue.entries.back().unwrap().1 {
-                ExecutionCursor::InitialCursor(_) => {}
-                _ => panic!("Expected InitialBlock"),
-            }
+            assert_eq!(queue.entries.back().unwrap().1, initial_cursor());
         }
     }
 
@@ -133,7 +131,7 @@ mod tests {
         queue.insert(5, always_cursor());
 
         let kinds: Vec<(i64, bool)> = std::iter::from_fn(|| queue.pop())
-            .map(|(time, cursor)| (time, matches!(cursor, ExecutionCursor::InitialCursor(_))))
+            .map(|(time, cursor)| (time, cursor == initial_cursor()))
             .collect();
 
         assert_eq!(kinds, vec![(5, false), (10, true), (10, false), (10, true)]);
