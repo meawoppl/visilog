@@ -1021,6 +1021,152 @@ mod tests {
     }
 
     #[test]
+    fn test_clock_divider_example_resets_and_counts() {
+        let mut simulator = simulator_for_example("clock_divider.v");
+
+        // Asynchronous reset clears both the counter and the divided output.
+        simulator.poke("rst", one()).unwrap();
+        assert_eq!(simulator.get("counter").unwrap().to_u128(), Some(0));
+        assert_eq!(simulator.get("divided_clk").unwrap().to_binary(), "0");
+
+        simulator.poke("rst", zero()).unwrap();
+        for expected in 1..=5u128 {
+            simulator.tick("clk").unwrap();
+            assert_eq!(simulator.get("counter").unwrap().to_u128(), Some(expected));
+        }
+
+        // The divide threshold is 50_000_000, so the output must not have moved
+        // yet. Reaching it by simulation is not practical; the threshold logic
+        // itself is covered at a testable scale by the test below.
+        assert_eq!(simulator.get("divided_clk").unwrap().to_binary(), "0");
+
+        simulator.poke("rst", one()).unwrap();
+        assert_eq!(simulator.get("counter").unwrap().to_u128(), Some(0));
+    }
+
+    #[test]
+    fn test_divider_pattern_toggles_at_its_threshold() {
+        // Same shape as `clock_divider.v` — `counter <= counter + 1;` followed
+        // by a nested `if` that also assigns `counter` — but with a threshold a
+        // test can actually reach. Both writes are non-blocking, so the later
+        // one wins and the counter wraps rather than reaching 4.
+        let mut simulator = simulator_for(
+            r#"
+            module small_divider(
+                input clk,
+                input rst,
+                output reg out
+            );
+                reg [3:0] counter;
+                always @(posedge clk or posedge rst) begin
+                    if (rst) begin
+                        counter <= 4'b0;
+                        out <= 1'b0;
+                    end else begin
+                        counter <= counter + 1;
+                        if (counter == 4'd3) begin
+                            counter <= 4'b0;
+                            out <= ~out;
+                        end
+                    end
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.poke("rst", one()).unwrap();
+        simulator.poke("rst", zero()).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            simulator.tick("clk").unwrap();
+            seen.push((
+                simulator.get("counter").unwrap().to_u128().unwrap(),
+                simulator.get("out").unwrap().to_binary(),
+            ));
+        }
+
+        let expected: Vec<(u128, String)> = [1, 2, 3, 0, 1, 2, 3, 0]
+            .iter()
+            .zip(["0", "0", "0", "1", "1", "1", "1", "0"])
+            .map(|(count, out)| (*count as u128, out.to_string()))
+            .collect();
+        assert_eq!(seen, expected, "counter should wrap at 3 and toggle `out`");
+    }
+
+    #[test]
+    fn test_spi_controller_example_resets_and_drives_its_outputs() {
+        let mut simulator = simulator_for_example("spi_controller.v");
+
+        simulator.poke("rst", one()).unwrap();
+        assert_eq!(simulator.get("state").unwrap().to_binary(), "00", "IDLE");
+        assert_eq!(simulator.get("data").unwrap().to_binary(), "00000000");
+        // assign miso = data[7];
+        assert_eq!(simulator.get("miso").unwrap().to_binary(), "0");
+        // assign cs = (state == IDLE) ? 1 : 0;
+        assert_eq!(simulator.get("cs").unwrap().to_binary(), "1");
+
+        // assign sclk = clk; — a continuous assign straight through.
+        simulator.poke("clk", one()).unwrap();
+        assert_eq!(simulator.get("sclk").unwrap().to_binary(), "1");
+        simulator.poke("clk", zero()).unwrap();
+        assert_eq!(simulator.get("sclk").unwrap().to_binary(), "0");
+
+        // The module cannot leave IDLE, and that is faithful rather than a
+        // simulator bug: `cs` is an *output* driven from `state`, so IDLE forces
+        // `cs` to 1, while the IDLE arm only advances when `cs == 0`. The
+        // example has no way to drive `cs` externally.
+        simulator.poke("rst", zero()).unwrap();
+        for _ in 0..5 {
+            simulator.tick("clk").unwrap();
+        }
+        assert_eq!(
+            simulator.get("state").unwrap().to_binary(),
+            "00",
+            "cs is driven from state, so IDLE is self-latching in this module"
+        );
+    }
+
+    #[test]
+    fn test_every_example_module_simulates() {
+        let dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "src", "verilog", "examples"]
+            .iter()
+            .collect();
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .expect("unable to read examples")
+            .map(|entry| entry.expect("unable to read entry").path())
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        assert_eq!(paths.len(), 6, "expected six example modules");
+
+        for path in paths {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let source = fs::read_to_string(&path).expect("unable to read example");
+            let (remaining, module) = parse_module_declaration(&source)
+                .unwrap_or_else(|error| panic!("{} should parse: {:?}", name, error));
+            assert!(remaining.trim().is_empty(), "{} left {:?}", name, remaining);
+
+            let mut simulator = Simulator::new(module);
+            simulator
+                .setup()
+                .unwrap_or_else(|error| panic!("{} should set up: {}", name, error));
+
+            // Drive whatever stimulus each module happens to have. A module
+            // without a given port is fine; anything else is a real failure.
+            for (port, value) in [("rst", one()), ("rst", zero()), ("clk", one())] {
+                match simulator.poke(port, value) {
+                    Ok(_) | Err(SimulationError::NotAnInput(_)) => {}
+                    Err(error) => panic!("{} failed driving {}: {}", name, port, error),
+                }
+            }
+            simulator
+                .advance(10)
+                .unwrap_or_else(|error| panic!("{} should advance time: {}", name, error));
+        }
+    }
+
+    #[test]
     fn test_methods_require_setup() {
         let (_, module) = parse_module_declaration("module empty(); endmodule").unwrap();
         let mut simulator = Simulator::new(module);

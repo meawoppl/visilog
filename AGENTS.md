@@ -179,10 +179,19 @@ handling in an expression layer, that test is your tripwire.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.
-- **`src/verilog/examples/*.v` are the parser's corpus.** `test_parse_verilog_examples` in
-  `modules.rs` parses every file in that directory and asserts nothing is left over, so
-  dropping a new `.v` file in there is the cheapest way to add coverage — and the fastest
-  way to break the suite.
+- **`src/verilog/examples/*.v` are the corpus, and two tests walk the whole directory.**
+  `test_parse_verilog_examples` in `modules.rs` asserts every file parses with nothing left
+  over; `test_every_example_module_simulates` in `runner.rs` asserts every file also
+  elaborates, accepts stimulus, and advances time. Dropping a new `.v` file in there is the
+  cheapest way to add coverage — and the fastest way to break the suite. Both tests assert
+  the file count, so adding one means updating that number deliberately.
+- **`spi_controller.v` cannot leave its IDLE state, and that is the module, not a bug.**
+  `cs` is an *output* driven by `assign cs = (state == IDLE) ? 1 : 0;`, while the FSM's
+  IDLE arm only advances when `cs == 0` — so IDLE self-latches and there is no external way
+  to drive `cs`. Don't "fix" the simulator over it.
+- **`clock_divider.v`'s threshold is 50,000,000**, which no test can reach by simulation.
+  The nested-`if` divider pattern it uses is covered instead by
+  `test_divider_pattern_toggles_at_its_threshold`, a divide-by-4 of the same shape.
 - **An `always` block's trigger is an `EventControl` enum** (`behavior.rs`), not a bare
   list: `None` for `always begin … end`, `Implicit` for `@(*)`, and `Events(Vec<Event>)`
   for an explicit sensitivity list. The three forms simulate differently, so keep them
