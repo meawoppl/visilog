@@ -13,7 +13,7 @@ use super::numbers::{based_digits, decimal};
 use nom::character::complete::char;
 
 #[derive(Clone, Debug, PartialEq)]
-enum VerilogBaseType {
+pub enum VerilogBaseType {
     Binary,
     Decimal,
     Octal,
@@ -78,6 +78,23 @@ impl VerilogConstant {
             base_type: VerilogBaseType::Decimal,
             value: value.to_string(),
         }
+    }
+
+    /// The declared bit width, e.g. the `8` of `8'hFF`. `None` when the
+    /// literal was written without one (`42`, `'hFF`).
+    pub fn size(&self) -> Option<usize> {
+        self.size
+    }
+
+    /// The radix the digits are written in, e.g. hexadecimal for `8'hFF`.
+    pub fn base_type(&self) -> &VerilogBaseType {
+        &self.base_type
+    }
+
+    /// The digits as written, e.g. the `FACE_47B2` of `32'hFACE_47B2`. Case,
+    /// `_` separators and `x`/`z`/`?` are all preserved verbatim.
+    pub fn digits(&self) -> &str {
+        &self.value
     }
 }
 

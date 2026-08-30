@@ -17,8 +17,7 @@
 
 use std::fmt;
 
-use crate::parsers::base::RawToken;
-use crate::parsers::constants::VerilogConstant;
+use crate::parsers::constants::{VerilogBaseType, VerilogConstant};
 use crate::parsers::expr::Expression;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{Register, ONE, X, Z, ZERO};
@@ -157,44 +156,84 @@ fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError>
 // Constants
 // ---------------------------------------------------------------------------
 
-/// `VerilogConstant`'s fields are private, so its canonical
-/// `<size>'<base><digits>` token is what gets converted here.
 fn eval_constant(constant: &VerilogConstant) -> Result<Register, EvalError> {
-    constant_register(&constant.raw_token())
+    constant_bits(constant.size(), constant.base_type(), constant.digits())
 }
 
-/// Converts a `<size>'<base><digits>` literal into bits. An absent size means
+/// Converts the pieces of a literal — its optional size, its base and its
+/// digits as written — into bits. An absent size means
 /// [`UNSIZED_CONSTANT_WIDTH`]; a size narrower than the digits truncates,
-/// keeping the least significant bits.
-fn constant_register(token: &str) -> Result<Register, EvalError> {
-    let malformed = || EvalError::MalformedConstant(token.to_string());
+/// keeping the least significant bits. `_` separators are ignored.
+/// Rebuilds the `<size>'<base><digits>` text of a literal. Used only to give
+/// [`EvalError::MalformedConstant`] something legible to name — the digits
+/// alone are empty for `4'b`, and misleading for `0'b1`, where the width is
+/// what is wrong.
+fn literal_text(size: Option<usize>, base: &VerilogBaseType, digits: &str) -> String {
+    format!(
+        "{}'{}{}",
+        size.map(|size| size.to_string()).unwrap_or_default(),
+        match base {
+            VerilogBaseType::Binary => 'b',
+            VerilogBaseType::Decimal => 'd',
+            VerilogBaseType::Octal => 'o',
+            VerilogBaseType::Hexadecimal => 'h',
+        },
+        digits
+    )
+}
 
-    let (size_text, rest) = token.split_once('\'').ok_or_else(malformed)?;
-    let mut rest = rest.chars();
-    let base = rest.next().ok_or_else(malformed)?;
-    let digits: String = rest.filter(|c| *c != '_').collect();
+fn constant_bits(
+    size: Option<usize>,
+    base: &VerilogBaseType,
+    digits: &str,
+) -> Result<Register, EvalError> {
+    let malformed = || EvalError::MalformedConstant(literal_text(size, base, digits));
+
+    let digits: String = digits.chars().filter(|c| *c != '_').collect();
     if digits.is_empty() {
         return Err(malformed());
     }
 
-    let bits = match base.to_ascii_lowercase() {
-        'b' => based_bits(&digits, 1)?,
-        'o' => based_bits(&digits, 3)?,
-        'h' => based_bits(&digits, 4)?,
-        'd' => decimal_bits(&digits)?,
-        _ => return Err(malformed()),
-    };
+    // These helpers only see the digits, so restate their complaint in terms
+    // of the whole literal. Both only ever report MalformedConstant.
+    let bits = match base {
+        VerilogBaseType::Binary => based_bits(&digits, 1),
+        VerilogBaseType::Octal => based_bits(&digits, 3),
+        VerilogBaseType::Hexadecimal => based_bits(&digits, 4),
+        VerilogBaseType::Decimal => decimal_bits(&digits),
+    }
+    .map_err(|_| malformed())?;
 
-    let width = if size_text.is_empty() {
-        UNSIZED_CONSTANT_WIDTH
-    } else {
-        size_text.parse::<usize>().map_err(|_| malformed())?
-    };
+    let width = size.unwrap_or(UNSIZED_CONSTANT_WIDTH);
     if width == 0 {
         return Err(malformed());
     }
 
     Ok(Register::from_bits(bits).extend_msb(width))
+}
+
+/// Splits a `<size>'<base><digits>` literal and hands the pieces to
+/// [`constant_bits`].
+fn constant_register(token: &str) -> Result<Register, EvalError> {
+    let malformed = || EvalError::MalformedConstant(token.to_string());
+
+    let (size_text, rest) = token.split_once('\'').ok_or_else(malformed)?;
+    let mut rest = rest.chars();
+    let base = match rest.next().ok_or_else(malformed)?.to_ascii_lowercase() {
+        'b' => VerilogBaseType::Binary,
+        'o' => VerilogBaseType::Octal,
+        'h' => VerilogBaseType::Hexadecimal,
+        'd' => VerilogBaseType::Decimal,
+        _ => return Err(malformed()),
+    };
+
+    let size = if size_text.is_empty() {
+        None
+    } else {
+        Some(size_text.parse::<usize>().map_err(|_| malformed())?)
+    };
+
+    constant_bits(size, &base, rest.as_str())
 }
 
 /// Expands binary / octal / hex digits, `bits_per_digit` bits each. An `x` or
@@ -701,6 +740,43 @@ mod tests {
         assert_eq!(bits("4'bzzzz"), "zzzz");
     }
 
+    /// The two ways into a literal — evaluating a parsed
+    /// `Expression::Constant` and calling [`constant_register`] on the
+    /// equivalent token — share one conversion and must agree exactly.
+    #[test]
+    fn test_parsed_and_token_constant_paths_agree() {
+        let store = StateStore::new();
+        for (source, token) in [
+            ("4'b1010", "4'b1010"),
+            ("8'b1010", "8'b1010"),
+            ("1'b1", "1'b1"),
+            ("8'hFF", "8'hFF"),
+            ("8'hac", "8'hac"),
+            ("6'o54", "6'o54"),
+            ("4'd6", "4'd6"),
+            ("32'hFACE_47B2", "32'hFACE_47B2"),
+            // A declared size narrower than the digits truncates.
+            ("4'hFF", "4'hFF"),
+            ("2'b1011", "2'b1011"),
+            // Unknown and high impedance digits.
+            ("4'bx1", "4'bx1"),
+            ("2'hz", "2'hz"),
+            ("8'hx0", "8'hx0"),
+            ("4'b1?0z", "4'b1?0z"),
+            // Unsized literals take UNSIZED_CONSTANT_WIDTH.
+            ("'b1010", "'b1010"),
+            ("'hFF", "'hFF"),
+            ("42", "'d42"),
+            ("0", "'d0"),
+        ] {
+            let parsed = eval(&parse(source), &store)
+                .unwrap_or_else(|e| panic!("{} failed to evaluate: {}", source, e));
+            let converted = constant_register(token)
+                .unwrap_or_else(|e| panic!("{} failed to convert: {}", token, e));
+            assert_eq!(parsed, converted, "{} and {} disagree", source, token);
+        }
+    }
+
     #[test]
     fn test_malformed_constant() {
         assert!(matches!(
@@ -719,6 +795,22 @@ mod tests {
             constant_register("0'b1"),
             Err(EvalError::MalformedConstant(_))
         ));
+    }
+
+    /// The rejected literal has to be nameable in the message. Reporting only
+    /// the digits leaves `4'b` with an empty payload and blames the digits of
+    /// `0'b1`, where the width is the actual problem.
+    #[test]
+    fn test_malformed_constant_names_the_literal() {
+        for token in ["4'b", "0'b1", "4'b1234"] {
+            let message = constant_register(token).unwrap_err().to_string();
+            assert!(
+                message.contains(token),
+                "{:?} should name {:?}",
+                message,
+                token
+            );
+        }
     }
 
     // -- identifiers -------------------------------------------------------
