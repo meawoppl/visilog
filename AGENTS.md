@@ -97,17 +97,26 @@ produces no edges. `counter.v` and `complex_module.v` simulate end to end.
 **`poke`, not `set_input`, is what drives sequential logic** — an `always` block wakes on
 an *edge*, so a value that is written without settling produces no edge and nothing runs.
 
-Still unsupported: module instantiation (`setup` reports `Unsupported`), delays inside a
-procedural block (`exec` reports `Unsupported`, since suspending mid-block needs a
-resumable cursor), and concatenation as an assignment target. `event_queue.rs` and
-`signals.rs` are built but not yet wired into the driver — the current model settles
-edges rather than advancing simulated time, so nothing schedules on a timestamp yet.
+Procedural bodies run through **one** engine, in `program.rs`. `Program::compile` flattens
+a statement tree into a linear instruction list whose control flow is carried by jumps, so
+a resume point is just a program counter — which is what makes a `#delay` nested inside an
+`if` or `case` arm suspendable. `resume(&program, pc, &mut store)` runs until the block
+halts or hits a delay. `exec::execute_statements` is a thin wrapper that compiles, resumes
+from `0`, and reports `Unsupported` if the block suspends, because its callers have
+nowhere to keep the resume point yet.
+
+Still unsupported: module instantiation (`setup` reports `Unsupported`), intra-assignment
+delays (`a = #5 b;` — the held right hand side does not fit in a program counter), and
+concatenation as an assignment target. `event_queue.rs` and `signals.rs` are built but not
+yet wired into the driver — the current model settles edges rather than advancing
+simulated time, so nothing schedules on a timestamp yet.
 
 | File | Role |
 | --- | --- |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
-| `exec.rs` | `execute_statements` / `commit_updates` — procedural bodies, blocking vs non-blocking; also owns the shared `drive` target helpers |
+| `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
 | `runner.rs` | `Simulator` — `setup()` / `set_input()` / `run()` / `get()`, the combinational driver |
 | `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register` |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
