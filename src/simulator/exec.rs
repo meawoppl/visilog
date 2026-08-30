@@ -1,9 +1,9 @@
 //! Execution of procedural statement bodies.
 //!
-//! [`execute_statements`] walks a `Vec<ProceduralStatements>` — the body of an
-//! `always` or `initial` block, or of an `if` / `case` arm — against a
-//! [`StateStore`]. It is the piece that knows Verilog's two assignment
-//! flavours apart:
+//! [`execute_statements`] runs a `Vec<ProceduralStatements>` — the body of an
+//! `always` or `initial` block — against a [`StateStore`] by compiling it with
+//! [`Program::compile`] and running it to completion. It is the piece that
+//! knows Verilog's two assignment flavours apart:
 //!
 //! * **Blocking** (`=`) evaluates its right hand side and writes the target
 //!   immediately, so a later statement in the same block observes the new
@@ -22,13 +22,15 @@
 //! ```
 //!
 //! Deciding *when* a block runs is not this module's job — it executes a body
-//! start to finish and hands the deferred writes back to a scheduler.
+//! start to finish and hands the deferred writes back to a scheduler. A body
+//! that suspends part way through, on a `#delay`, is beyond what a caller of
+//! this entry point can express: use [`resume`] directly for that.
 
-use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
-use crate::parsers::behavior::{CaseLabel, CaseStatement, IfStatement, ProceduralStatements};
+use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
-use crate::register::{Register, ONE};
+use crate::register::Register;
 use crate::simulator::eval::eval;
+use crate::simulator::program::{resume, Program, Resume, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 
@@ -67,6 +69,11 @@ pub struct PendingUpdate {
 }
 
 impl PendingUpdate {
+    /// Queues `value` to be written into `target`.
+    pub fn new(target: ResolvedTarget, value: Register) -> Self {
+        PendingUpdate { target, value }
+    }
+
     /// Where the update will be written.
     pub fn target(&self) -> &ResolvedTarget {
         &self.target
@@ -78,15 +85,22 @@ impl PendingUpdate {
     }
 }
 
-/// Runs `statements` in order, applying every blocking assignment immediately
-/// and collecting every non-blocking one for [`commit_updates`].
+/// Runs `statements` to completion, applying every blocking assignment
+/// immediately and collecting every non-blocking one for [`commit_updates`].
+///
+/// A block that suspends on a `#delay` cannot be reported through this
+/// signature — the caller would have nowhere to keep the resume point — so a
+/// suspension is [`SimulationError::Unsupported`]. Whatever ran before the
+/// delay has already landed in `store`.
 pub fn execute_statements(
     statements: &[ProceduralStatements],
     store: &mut StateStore,
 ) -> Result<Vec<PendingUpdate>, SimulationError> {
-    let mut pending = Vec::new();
-    execute_into(statements, store, &mut pending)?;
-    Ok(pending)
+    let program = Program::compile(statements)?;
+    match resume(&program, 0, store)? {
+        Resume::Halted { pending } => Ok(pending),
+        Resume::Suspended { .. } => Err(DELAY_UNSUPPORTED),
+    }
 }
 
 /// Applies deferred non-blocking updates in the order they were queued,
@@ -100,120 +114,6 @@ pub fn commit_updates(
         changed |= drive_resolved(store, &update.target, &update.value)?;
     }
     Ok(changed)
-}
-
-fn execute_into(
-    statements: &[ProceduralStatements],
-    store: &mut StateStore,
-    pending: &mut Vec<PendingUpdate>,
-) -> Result<(), SimulationError> {
-    for statement in statements {
-        match statement {
-            ProceduralStatements::Assignment(assignment) => {
-                execute_assignment(assignment, store, pending)?
-            }
-            ProceduralStatements::If(conditional) => execute_if(conditional, store, pending)?,
-            ProceduralStatements::Case(case) => execute_case(case, store, pending)?,
-            // Suspending part way through a block needs a resumable cursor,
-            // which the scheduler does not have yet.
-            ProceduralStatements::Delay(_) => {
-                return Err(SimulationError::Unsupported(
-                    "a delay inside a procedural block",
-                ))
-            }
-        }
-    }
-    Ok(())
-}
-
-fn execute_assignment(
-    assignment: &ProceduralAssignment,
-    store: &mut StateStore,
-    pending: &mut Vec<PendingUpdate>,
-) -> Result<(), SimulationError> {
-    // `#5 q = d;` and `q = #5 d;` both suspend the block, the same way a bare
-    // delay statement does.
-    if assignment.pre_delay().is_some() || assignment.assignment_delay().is_some() {
-        return Err(SimulationError::Unsupported(
-            "a delay inside a procedural block",
-        ));
-    }
-
-    let target = resolve_target(store, assignment.lhs())?;
-    let value = eval(assignment.rhs(), store)?;
-
-    match assignment.assignment_type() {
-        ProceduralAssignmentType::Blocking => {
-            drive_resolved(store, &target, &value)?;
-        }
-        ProceduralAssignmentType::NonBlocking => pending.push(PendingUpdate { target, value }),
-    }
-    Ok(())
-}
-
-fn execute_if(
-    conditional: &IfStatement,
-    store: &mut StateStore,
-    pending: &mut Vec<PendingUpdate>,
-) -> Result<(), SimulationError> {
-    let condition = eval(&conditional.condition, store)?;
-    if is_true(&condition) {
-        execute_into(&conditional.then_statements, store, pending)
-    } else if let Some(else_statements) = &conditional.else_statements {
-        execute_into(else_statements, store, pending)
-    } else {
-        Ok(())
-    }
-}
-
-fn execute_case(
-    case: &CaseStatement,
-    store: &mut StateStore,
-    pending: &mut Vec<PendingUpdate>,
-) -> Result<(), SimulationError> {
-    let subject = eval(&case.subject, store)?;
-
-    let mut default = None;
-    for item in &case.items {
-        match &item.label {
-            // `default` only runs when nothing else matched, wherever it is
-            // written; the first one wins.
-            CaseLabel::Default => {
-                default.get_or_insert(&item.statements);
-            }
-            CaseLabel::Expressions(expressions) => {
-                for expression in expressions {
-                    if case_matches(&subject, &eval(expression, store)?) {
-                        return execute_into(&item.statements, store, pending);
-                    }
-                }
-            }
-        }
-    }
-
-    match default {
-        Some(statements) => execute_into(statements, store, pending),
-        // A `case` with no matching item and no `default` does nothing.
-        None => Ok(()),
-    }
-}
-
-/// Whether a `case` item matches the subject. A plain `case` compares with `==`
-/// semantics, so an `x` or `z` on either side makes the comparison unknown,
-/// which is not a match. (`casex` / `casez` are not parsed yet.)
-fn case_matches(subject: &Register, label: &Register) -> bool {
-    if subject.has_unknown() || label.has_unknown() {
-        return false;
-    }
-    let width = subject.width().max(label.width());
-    subject.resize(width) == label.resize(width)
-}
-
-/// Whether a register used as a condition is true. Verilog calls a condition
-/// true only when it is a *known* non-zero value: zero, `x` and `z` all take
-/// the else branch. An `x` condition is not an "unknown branch" — it is false.
-fn is_true(register: &Register) -> bool {
-    register.get_raw().iter().any(|&bit| bit == ONE)
 }
 
 pub fn range_width(range: (i64, i64)) -> usize {
