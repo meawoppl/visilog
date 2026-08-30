@@ -88,9 +88,20 @@ single pass is not enough — `run` repeats passes until one changes nothing, an
 `SimulationError::NoConvergence` once it hits its pass limit so a combinational loop is an
 error rather than a hang.
 
-Sequential simulation is the next milestone. `always` / `initial` blocks and module
-instantiations are rejected by `setup` with `SimulationError::Unsupported`, and
-`event_queue.rs` / `signals.rs` are not wired into the driver yet.
+Sequential logic runs through `Simulator::poke` (drive an input, then settle) and the
+`tick` helper (one clock pulse). Settling is a delta-cycle loop: diff the state against
+the last settled point, wake every `always` block sensitive to those edges, commit their
+non-blocking updates, re-propagate the continuous assignments, repeat until a round
+produces no edges. `counter.v` and `complex_module.v` simulate end to end.
+
+**`poke`, not `set_input`, is what drives sequential logic** — an `always` block wakes on
+an *edge*, so a value that is written without settling produces no edge and nothing runs.
+
+Still unsupported: module instantiation (`setup` reports `Unsupported`), delays inside a
+procedural block (`exec` reports `Unsupported`, since suspending mid-block needs a
+resumable cursor), and concatenation as an assignment target. `event_queue.rs` and
+`signals.rs` are built but not yet wired into the driver — the current model settles
+edges rather than advancing simulated time, so nothing schedules on a timestamp yet.
 
 | File | Role |
 | --- | --- |
