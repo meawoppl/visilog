@@ -164,24 +164,45 @@ fn eval_constant(constant: &VerilogConstant) -> Result<Register, EvalError> {
 /// digits as written — into bits. An absent size means
 /// [`UNSIZED_CONSTANT_WIDTH`]; a size narrower than the digits truncates,
 /// keeping the least significant bits. `_` separators are ignored.
+/// Rebuilds the `<size>'<base><digits>` text of a literal. Used only to give
+/// [`EvalError::MalformedConstant`] something legible to name — the digits
+/// alone are empty for `4'b`, and misleading for `0'b1`, where the width is
+/// what is wrong.
+fn literal_text(size: Option<usize>, base: &VerilogBaseType, digits: &str) -> String {
+    format!(
+        "{}'{}{}",
+        size.map(|size| size.to_string()).unwrap_or_default(),
+        match base {
+            VerilogBaseType::Binary => 'b',
+            VerilogBaseType::Decimal => 'd',
+            VerilogBaseType::Octal => 'o',
+            VerilogBaseType::Hexadecimal => 'h',
+        },
+        digits
+    )
+}
+
 fn constant_bits(
     size: Option<usize>,
     base: &VerilogBaseType,
     digits: &str,
 ) -> Result<Register, EvalError> {
-    let malformed = || EvalError::MalformedConstant(digits.to_string());
+    let malformed = || EvalError::MalformedConstant(literal_text(size, base, digits));
 
     let digits: String = digits.chars().filter(|c| *c != '_').collect();
     if digits.is_empty() {
         return Err(malformed());
     }
 
+    // These helpers only see the digits, so restate their complaint in terms
+    // of the whole literal. Both only ever report MalformedConstant.
     let bits = match base {
-        VerilogBaseType::Binary => based_bits(&digits, 1)?,
-        VerilogBaseType::Octal => based_bits(&digits, 3)?,
-        VerilogBaseType::Hexadecimal => based_bits(&digits, 4)?,
-        VerilogBaseType::Decimal => decimal_bits(&digits)?,
-    };
+        VerilogBaseType::Binary => based_bits(&digits, 1),
+        VerilogBaseType::Octal => based_bits(&digits, 3),
+        VerilogBaseType::Hexadecimal => based_bits(&digits, 4),
+        VerilogBaseType::Decimal => decimal_bits(&digits),
+    }
+    .map_err(|_| malformed())?;
 
     let width = size.unwrap_or(UNSIZED_CONSTANT_WIDTH);
     if width == 0 {
@@ -774,6 +795,22 @@ mod tests {
             constant_register("0'b1"),
             Err(EvalError::MalformedConstant(_))
         ));
+    }
+
+    /// The rejected literal has to be nameable in the message. Reporting only
+    /// the digits leaves `4'b` with an empty payload and blames the digits of
+    /// `0'b1`, where the width is the actual problem.
+    #[test]
+    fn test_malformed_constant_names_the_literal() {
+        for token in ["4'b", "0'b1", "4'b1234"] {
+            let message = constant_register(token).unwrap_err().to_string();
+            assert!(
+                message.contains(token),
+                "{:?} should name {:?}",
+                message,
+                token
+            );
+        }
     }
 
     // -- identifiers -------------------------------------------------------
