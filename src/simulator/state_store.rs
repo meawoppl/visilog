@@ -74,6 +74,22 @@ impl SignalState {
             None => X,
         }
     }
+
+    /// Writes a single declared bit and reports whether the stored value moved.
+    /// Writing outside the declared range is discarded, which is what Verilog
+    /// does with an out-of-bounds select on the left of an assignment.
+    pub fn set_bit(&mut self, index: i64, value: u8) -> bool {
+        let Some(offset) = self.bit_position(index) else {
+            return false;
+        };
+        let mut bits = self.register.get_raw().clone();
+        if bits[offset] == value {
+            return false;
+        }
+        bits[offset] = value;
+        self.register = Register::from_bits(bits);
+        true
+    }
 }
 
 fn range_width(range: (i64, i64)) -> usize {
@@ -129,6 +145,10 @@ impl StateStore {
 
     pub fn get_signal(&self, name: &str) -> Option<&SignalState> {
         self.name_to_signal.get(name)
+    }
+
+    pub fn get_signal_mut(&mut self, name: &str) -> Option<&mut SignalState> {
+        self.name_to_signal.get_mut(name)
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -256,6 +276,20 @@ mod tests {
         assert_eq!(signal.bit_position(4), None);
         assert_eq!(signal.bit(0), 1);
         assert_eq!(signal.bit(1), 0);
+    }
+
+    #[test]
+    fn test_signal_set_bit() {
+        let mut signal = SignalState::with_range(Register::unknown(4), (7, 4));
+
+        assert!(signal.set_bit(7, 1));
+        assert!(signal.set_bit(4, 0));
+        assert_eq!(signal.register().to_binary(), "1xx0");
+        // Rewriting the same value is not a change.
+        assert!(!signal.set_bit(7, 1));
+        // Out of range writes are discarded.
+        assert!(!signal.set_bit(3, 1));
+        assert_eq!(signal.register().to_binary(), "1xx0");
     }
 
     #[test]

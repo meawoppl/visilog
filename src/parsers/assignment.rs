@@ -27,6 +27,16 @@ impl ContinuousAssignment {
     pub fn new(lhs: Expression, rhs: Expression) -> Self {
         ContinuousAssignment { lhs, rhs }
     }
+
+    /// The driven target, e.g. the `x` of `assign x = y;`.
+    pub fn lhs(&self) -> &Expression {
+        &self.lhs
+    }
+
+    /// The driving expression, e.g. the `y` of `assign x = y;`.
+    pub fn rhs(&self) -> &Expression {
+        &self.rhs
+    }
 }
 
 pub fn parse_continuous_assignment(input: &str) -> IResult<&str, ContinuousAssignment> {
