@@ -1,0 +1,13 @@
+# Pins the toolchain for local builds and CI alike.
+#
+# rustfmt's output can change between Rust releases, so an unpinned toolchain
+# makes the `cargo fmt --all -- --check` CI gate able to fail on an untouched
+# tree whenever the runner image bumps its Rust version. Pinning makes the gate
+# depend only on what is in this repo.
+#
+# To move forward: bump `channel`, run `cargo fmt`, and commit any reformatting
+# in the same change.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt"]
+profile = "minimal"
