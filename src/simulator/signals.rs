@@ -1,6 +1,6 @@
 use crate::parsers::{
     assignment::{ProceduralAssignment, ProceduralAssignmentType},
-    behavior::{AlwaysBlock, InitialBlock, ProceduralBlock, ProceduralStatements},
+    behavior::{AlwaysBlock, EventControl, InitialBlock, ProceduralBlock, ProceduralStatements},
     constants::VerilogConstant,
     delay::Delay,
     expr::Expression,
@@ -98,7 +98,7 @@ impl Signal for InfiniteSignal {
             statements.push(ProceduralStatements::Delay(Delay::new(1)));
         }
 
-        ProceduralBlock::AlwaysBlock(AlwaysBlock::new(vec![], statements))
+        ProceduralBlock::AlwaysBlock(AlwaysBlock::new(EventControl::None, statements))
     }
 }
 

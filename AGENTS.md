@@ -91,7 +91,7 @@ queue initial/always blocks → run the event queue.
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
 | `runner.rs` | `Simulator` struct; `setup()` and `run()` are stubs |
 | `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register` |
-| `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s |
+| `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
 
@@ -142,8 +142,10 @@ handling in an expression layer, that test is your tripwire.
   `modules.rs` parses every file in that directory and asserts nothing is left over, so
   dropping a new `.v` file in there is the cheapest way to add coverage — and the fastest
   way to break the suite.
-- **`@(*)` is represented as an empty `trigger_events` list**, the same as an `always`
-  block with no event control at all.
+- **An `always` block's trigger is an `EventControl` enum** (`behavior.rs`), not a bare
+  list: `None` for `always begin … end`, `Implicit` for `@(*)`, and `Events(Vec<Event>)`
+  for an explicit sensitivity list. The three forms simulate differently, so keep them
+  distinct — don't collapse `@(*)` into an empty `Events` list.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
