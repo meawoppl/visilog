@@ -20,12 +20,12 @@ use std::fmt;
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
-    expr::Expression,
     modules::{PortDirection, VerilogModule},
     statements::ModuleStatement,
 };
 use crate::register::Register;
 use crate::simulator::eval::{eval, EvalError};
+use crate::simulator::exec::{drive, range_width};
 use crate::simulator::state_store::StateStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,80 +215,6 @@ impl Simulator {
         }
         Err(SimulationError::NoConvergence { passes: limit })
     }
-}
-
-fn range_width(range: (i64, i64)) -> usize {
-    ((range.0 - range.1).unsigned_abs() + 1) as usize
-}
-
-/// Writes `value` into whatever `target` names, reporting whether the stored
-/// state actually moved. The value is resized to the width of the target the
-/// way a Verilog assignment is: wider values lose their high bits, narrower
-/// ones are zero extended.
-fn drive(
-    state: &mut StateStore,
-    target: &Expression,
-    value: &Register,
-) -> Result<bool, SimulationError> {
-    match target {
-        Expression::Identifier(id) => {
-            let signal = state
-                .get_signal(&id.name)
-                .ok_or_else(|| SimulationError::UnknownSignal(id.name.clone()))?;
-            let (width, range) = (signal.width(), signal.range());
-            let value = value.resize(width);
-            if signal.register() == &value {
-                return Ok(false);
-            }
-            state.set_ranged(id.name.clone(), value, range);
-            Ok(true)
-        }
-        Expression::BitSelect(id, index) => {
-            let index = target_index(state, index)?;
-            drive_bits(state, &id.name, &[index], value)
-        }
-        Expression::PartSelect(id, first, second) => {
-            let first = target_index(state, first)?;
-            let second = target_index(state, second)?;
-            // Indices run most significant bit first, matching the bit order of
-            // the register being written.
-            let indices: Vec<i64> = if first >= second {
-                (second..=first).rev().collect()
-            } else {
-                (first..=second).collect()
-            };
-            drive_bits(state, &id.name, &indices, value)
-        }
-        other => Err(SimulationError::UnsupportedTarget(
-            other.to_contracted_string(),
-        )),
-    }
-}
-
-/// A bit index on the left of an assignment has to be a constant, so anything
-/// that does not evaluate to a plain number is a target this driver cannot use.
-fn target_index(state: &StateStore, expr: &Expression) -> Result<i64, SimulationError> {
-    eval(expr, state)?
-        .to_u128()
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| SimulationError::UnsupportedTarget(expr.to_contracted_string()))
-}
-
-fn drive_bits(
-    state: &mut StateStore,
-    name: &str,
-    indices: &[i64],
-    value: &Register,
-) -> Result<bool, SimulationError> {
-    let value = value.resize(indices.len());
-    let signal = state
-        .get_signal_mut(name)
-        .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
-    let mut changed = false;
-    for (offset, &index) in indices.iter().enumerate() {
-        changed |= signal.set_bit(index, value.get_raw()[offset]);
-    }
-    Ok(changed)
 }
 
 #[cfg(test)]
