@@ -65,33 +65,7 @@ pub fn identifier_list(input: &str) -> IResult<&str, Vec<Identifier>> {
     separated_list1(ws(char(',')), ws(identifier))(input)
 }
 
-pub fn parse_bit_select(input: &str) -> IResult<&str, (Identifier, i64)> {
-    let (input, id) = identifier(input)?;
-    let (input, _) = char('[')(input)?;
-    let (input, index) = map_res(
-        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
-        |s: &str| s.parse::<i64>(),
-    )(input)?;
-    let (input, _) = char(']')(input)?;
-    Ok((input, (id, index)))
-}
-
-pub fn parse_part_select(input: &str) -> IResult<&str, (Identifier, i64, i64)> {
-    let (input, id) = identifier(input)?;
-    let (input, _) = char('[')(input)?;
-    let (input, start) = map_res(
-        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
-        |s: &str| s.parse::<i64>(),
-    )(input)?;
-    let (input, _) = char(':')(input)?;
-    let (input, end) = map_res(
-        take_while_m_n(1, 10, |c: char| c.is_digit(10)),
-        |s: &str| s.parse::<i64>(),
-    )(input)?;
-    let (input, _) = char(']')(input)?;
-    Ok((input, (id, start, end)))
-}
-
+#[cfg(test)]
 mod tests {
     use crate::parsers::helpers::assert_parses_to;
 
@@ -310,28 +284,12 @@ mod tests {
         );
     }
 
-    fn test_parse_bit_select() {
-        assert_parses_to(
-            parse_bit_select,
-            "a[3]",
-            (Identifier::new("a".to_string()), 3),
-        );
-    }
-
     #[test]
     fn test_identifier_exceeding_max_length() {
         let exceeding_length_identifier = "a".repeat(1025);
         assert!(
             identifier(&exceeding_length_identifier).is_err(),
             "Identifier exceeding max length should not parse"
-        );
-    }
-
-    fn test_parse_part_select() {
-        assert_parses_to(
-            parse_part_select,
-            "a[3:0]",
-            (Identifier::new("a".to_string()), 3, 0),
         );
     }
 }
