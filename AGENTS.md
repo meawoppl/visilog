@@ -80,15 +80,17 @@ that catch this are the associativity/precedence assertions at the bottom of `ex
 
 ### `src/simulator/`
 
-Scaffolding, not a working simulator. Most functions are stubs marked `TODO(meawoppl)`.
+Partly built. The expression evaluator is real and well tested; the driver (`Simulator::setup`
+/ `run`) is still a stub marked `TODO(meawoppl)`, so nothing executes end to end yet.
 The intended pipeline is spelled out in the comment block at the top of `runner.rs`:
 validate → gather registers → build the expression graph → compute edge statements →
 queue initial/always blocks → run the event queue.
 
 | File | Role |
 | --- | --- |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
 | `runner.rs` | `Simulator` struct; `setup()` and `run()` are stubs |
-| `state_store.rs` | `StateStore` — name → `Register` map |
+| `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register` |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -130,9 +132,9 @@ handling in an expression layer, that test is your tripwire.
   miss; check the warning count or grep for your file specifically.
 - **Duplicate definitions exist.** `NetType` is defined in *both* `parsers/nets.rs` and
   `parsers/modules.rs`; `parse_bit_select` / `parse_part_select` are defined in *both*
-  `parsers/identifier.rs` and `parsers/assignment.rs`; `Register` is defined in both
-  `src/register.rs` and `simulator/state_store.rs`. Check which one is in scope before
-  assuming a change took effect.
+  `parsers/identifier.rs` and `parsers/assignment.rs`. Check which one is in scope before
+  assuming a change took effect. (The former duplicate `Register` in `state_store.rs` is
+  gone — there is now one `Register`, in `src/register.rs`.)
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.
