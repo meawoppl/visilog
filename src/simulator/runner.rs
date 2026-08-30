@@ -12,9 +12,13 @@
 //! simulator.get("sum")?;
 //! ```
 //!
-//! Sequential constructs (`always` / `initial` blocks) and module hierarchy are
-//! a later milestone; [`Simulator::setup`] reports them as unsupported rather
-//! than pretending to execute them.
+//! Sequential logic runs through [`Simulator::poke`], which drives an input and
+//! then settles: any `always` block sensitive to the resulting edges executes,
+//! its non-blocking updates commit, and continuous assignments re-propagate.
+//! That repeats until nothing changes, which is Verilog's delta-cycle model.
+//!
+//! Module hierarchy is still a later milestone; [`Simulator::setup`] reports an
+//! instantiation as unsupported rather than pretending to elaborate it.
 
 use std::fmt;
 
@@ -25,8 +29,13 @@ use crate::parsers::{
 };
 use crate::register::Register;
 use crate::simulator::eval::{eval, EvalError};
-use crate::simulator::exec::{drive, range_width};
+use crate::simulator::events;
+use crate::simulator::exec::{commit_updates, drive, execute_statements, range_width};
 use crate::simulator::state_store::StateStore;
+
+/// Ceiling on delta cycles within a single settle. A design that keeps
+/// producing edges past this is oscillating, not converging.
+const MAX_DELTA_CYCLES: usize = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimulationError {
@@ -83,6 +92,10 @@ pub struct Simulator {
     module: VerilogModule,
     state: StateStore,
     assignments: Vec<ContinuousAssignment>,
+    /// Indices into `module.statements`. `AlwaysBlock` is not `Clone`, and
+    /// holding references would borrow the module for the simulator's lifetime.
+    always_blocks: Vec<usize>,
+    initial_blocks: Vec<usize>,
     inputs: Vec<String>,
     is_setup: bool,
 }
@@ -93,6 +106,8 @@ impl Simulator {
             module,
             state: StateStore::new(),
             assignments: Vec::new(),
+            always_blocks: Vec::new(),
+            initial_blocks: Vec::new(),
             inputs: Vec::new(),
             is_setup: false,
         }
@@ -104,6 +119,8 @@ impl Simulator {
     pub fn setup(&mut self) -> Result<(), SimulationError> {
         self.state = StateStore::new();
         self.assignments.clear();
+        self.always_blocks.clear();
+        self.initial_blocks.clear();
         self.inputs.clear();
         self.is_setup = false;
 
@@ -114,7 +131,7 @@ impl Simulator {
             }
         }
 
-        for statement in &self.module.statements {
+        for (index, statement) in self.module.statements.iter().enumerate() {
             match statement {
                 ModuleStatement::WireDeclaration(nets) => {
                     for net in nets {
@@ -142,12 +159,8 @@ impl Simulator {
                 ModuleStatement::Assignment(assignment) => {
                     self.assignments.push(assignment.clone())
                 }
-                ModuleStatement::AlwaysBlock(_) => {
-                    return Err(SimulationError::Unsupported("an always block"))
-                }
-                ModuleStatement::InitialBlock(_) => {
-                    return Err(SimulationError::Unsupported("an initial block"))
-                }
+                ModuleStatement::AlwaysBlock(_) => self.always_blocks.push(index),
+                ModuleStatement::InitialBlock(_) => self.initial_blocks.push(index),
                 ModuleStatement::ModuleInstantiation(_) => {
                     return Err(SimulationError::Unsupported("a module instantiation"))
                 }
@@ -155,6 +168,22 @@ impl Simulator {
         }
 
         self.is_setup = true;
+
+        // `initial` blocks run once, at time zero, before anything is driven.
+        // Only propagate if one of them actually ran: settling here otherwise
+        // would make a module that never converges fail at setup rather than
+        // at the point someone asks it to run.
+        if !self.initial_blocks.is_empty() {
+            let mut pending = Vec::new();
+            for &index in &self.initial_blocks {
+                if let ModuleStatement::InitialBlock(block) = &self.module.statements[index] {
+                    pending.extend(execute_statements(&block.statements, &mut self.state)?);
+                }
+            }
+            commit_updates(pending, &mut self.state)?;
+            self.propagate()?;
+        }
+
         Ok(())
     }
 
@@ -201,7 +230,73 @@ impl Simulator {
         if !self.is_setup {
             return Err(SimulationError::NotSetUp);
         }
+        self.propagate()
+    }
 
+    /// Drives an input and settles the whole design: continuous assignments
+    /// re-propagate, every `always` block sensitive to the resulting edges
+    /// executes, and its non-blocking updates commit. Returns the delta cycles
+    /// taken.
+    ///
+    /// This is the entry point for sequential logic — clocking a design means
+    /// poking its clock, since it is the *edge* that wakes an `always` block.
+    pub fn poke(&mut self, name: &str, value: Register) -> Result<usize, SimulationError> {
+        let before = self.state.clone();
+        self.set_input(name, value)?;
+        self.propagate()?;
+        self.settle(before)
+    }
+
+    /// One full clock pulse: low-to-high, then high-to-low. Edge-triggered
+    /// logic acts on the rising half.
+    pub fn tick(&mut self, clock: &str) -> Result<(), SimulationError> {
+        self.poke(clock, Register::from_u128(1, 1))?;
+        self.poke(clock, Register::from_u128(0, 1))?;
+        Ok(())
+    }
+
+    /// Repeatedly wakes `always` blocks until the design stops changing.
+    ///
+    /// `before` is the state as of the last settled point. The difference
+    /// between it and the current state is the set of edges that may wake a
+    /// block; running those blocks can move more signals, which is itself a new
+    /// set of edges. Verilog calls each of these rounds a delta cycle, and they
+    /// repeat until a round produces no edges at all.
+    ///
+    /// A design that never stops producing edges — a bare `always` block that
+    /// keeps toggling, say — reports [`SimulationError::NoConvergence`] rather
+    /// than hanging.
+    fn settle(&mut self, mut before: StateStore) -> Result<usize, SimulationError> {
+        for delta in 1..=MAX_DELTA_CYCLES {
+            let edges = events::edges_between(&before, &self.state);
+            if edges.is_empty() {
+                return Ok(delta - 1);
+            }
+
+            // Snapshot before running the blocks, so the next round's edges are
+            // exactly what this round moved.
+            before = self.state.clone();
+
+            let mut pending = Vec::new();
+            for &index in &self.always_blocks {
+                if let ModuleStatement::AlwaysBlock(block) = &self.module.statements[index] {
+                    if events::always_block_fires(block, &edges) {
+                        pending.extend(execute_statements(&block.statements, &mut self.state)?);
+                    }
+                }
+            }
+
+            commit_updates(pending, &mut self.state)?;
+            self.propagate()?;
+        }
+
+        Err(SimulationError::NoConvergence {
+            passes: MAX_DELTA_CYCLES,
+        })
+    }
+
+    /// Settles the continuous assignments alone. See [`Simulator::run`].
+    fn propagate(&mut self) -> Result<usize, SimulationError> {
         let limit = 2 * self.assignments.len() + 4;
         for pass in 1..=limit {
             let mut changed = false;
@@ -232,6 +327,14 @@ mod tests {
         let mut simulator = Simulator::new(module);
         simulator.setup().unwrap();
         simulator
+    }
+
+    fn one() -> Register {
+        Register::from_u128(1, 1)
+    }
+
+    fn zero() -> Register {
+        Register::from_u128(0, 1)
     }
 
     fn simulator_for_example(name: &str) -> Simulator {
@@ -429,10 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn test_always_blocks_are_unsupported() {
-        let (_, module) = parse_module_declaration(
+    fn test_edge_triggered_flip_flop_captures_on_rising_edge_only() {
+        let mut simulator = simulator_for(
             r#"
-            module latch(
+            module dff(
                 input clk,
                 input d,
                 output reg q
@@ -440,14 +543,123 @@ mod tests {
                 always @(posedge clk) q <= d;
             endmodule
         "#,
-        )
-        .unwrap();
-
-        let mut simulator = Simulator::new(module);
-        assert_eq!(
-            simulator.setup(),
-            Err(SimulationError::Unsupported("an always block"))
         );
+
+        simulator.poke("d", one()).unwrap();
+        // No clock edge yet, so the flop has not captured anything.
+        assert_eq!(simulator.get("q").unwrap().to_binary(), "x");
+
+        simulator.poke("clk", one()).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_binary(), "1");
+
+        // A falling edge must not capture: drop `d` and clock low again.
+        simulator.poke("d", zero()).unwrap();
+        simulator.poke("clk", zero()).unwrap();
+        assert_eq!(
+            simulator.get("q").unwrap().to_binary(),
+            "1",
+            "a negedge must not capture in a posedge-triggered flop"
+        );
+
+        simulator.poke("clk", one()).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_binary(), "0");
+    }
+
+    #[test]
+    fn test_counter_example_counts_and_resets() {
+        let mut simulator = simulator_for_example("counter.v");
+
+        // Asynchronous reset: a posedge on `rst` clears the count with no clock.
+        simulator.poke("rst", one()).unwrap();
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(0));
+
+        simulator.poke("rst", zero()).unwrap();
+        for expected in 1..=5u128 {
+            simulator.tick("clk").unwrap();
+            assert_eq!(
+                simulator.get("count").unwrap().to_u128(),
+                Some(expected),
+                "count after {} ticks",
+                expected
+            );
+        }
+
+        // 4 bits, so it wraps rather than reaching 16.
+        for _ in 6..=16 {
+            simulator.tick("clk").unwrap();
+        }
+        assert_eq!(
+            simulator.get("count").unwrap().to_u128(),
+            Some(0),
+            "a 4-bit counter wraps at 16"
+        );
+
+        // Reset again mid-count.
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(1));
+        simulator.poke("rst", one()).unwrap();
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(0));
+    }
+
+    #[test]
+    fn test_complex_module_example_pipelines_and_drives_tristate() {
+        // sum <= temp; temp <= a + b; inside one posedge block, so a value
+        // takes two clocks to reach `sum`. `data` is a continuous assign that
+        // has to re-propagate after each clock.
+        let mut simulator = simulator_for_example("complex_module.v");
+
+        simulator.poke("rst", one()).unwrap();
+        assert_eq!(simulator.get("sum").unwrap().to_u128(), Some(0));
+        simulator.poke("rst", zero()).unwrap();
+
+        simulator.poke("a", Register::from_u128(5, 4)).unwrap();
+        simulator.poke("b", Register::from_u128(6, 4)).unwrap();
+
+        // First clock loads temp; sum still holds the old temp.
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("temp").unwrap().to_u128(), Some(11));
+        assert_eq!(simulator.get("sum").unwrap().to_u128(), Some(0));
+
+        // Second clock walks it through to sum, and the assign follows.
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("sum").unwrap().to_u128(), Some(11));
+        assert_eq!(
+            simulator.get("data").unwrap().to_u128(),
+            Some(11),
+            "sum > 4'b1000, so data should be driven with sum"
+        );
+    }
+
+    #[test]
+    fn test_non_blocking_updates_are_visible_across_blocks() {
+        // Two flops in series. With `<=` the second captures the *old* `a`, so
+        // a value takes two clocks to walk the pipeline. Were these blocking,
+        // `b` would take the new `a` and both would move in one clock.
+        let mut simulator = simulator_for(
+            r#"
+            module pipeline(
+                input clk,
+                input d,
+                output reg a,
+                output reg b
+            );
+                always @(posedge clk) a <= d;
+                always @(posedge clk) b <= a;
+            endmodule
+        "#,
+        );
+
+        simulator.poke("d", one()).unwrap();
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "1");
+        assert_eq!(
+            simulator.get("b").unwrap().to_binary(),
+            "x",
+            "b must capture the pre-clock a, not the new one"
+        );
+
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "1");
     }
 
     #[test]
