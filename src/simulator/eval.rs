@@ -20,7 +20,7 @@ use std::fmt;
 use crate::parsers::constants::{VerilogBaseType, VerilogConstant};
 use crate::parsers::expr::Expression;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
-use crate::register::{Register, ONE, X, Z, ZERO};
+use crate::register::{Chunk, Register, ONE, X, Z, ZERO};
 use crate::simulator::state_store::StateStore;
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
@@ -104,11 +104,11 @@ pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError
             if parts.is_empty() {
                 return Err(EvalError::EmptyConcatenation);
             }
-            let mut bits = Vec::new();
+            let mut values = Vec::with_capacity(parts.len());
             for part in parts {
-                bits.extend_from_slice(eval(part, store)?.get_raw());
+                values.push(eval(part, store)?);
             }
-            Ok(Register::from_bits(bits))
+            Ok(Register::concatenated(&values))
         }
         Expression::BitSelect(id, index) => {
             let signal = store
@@ -137,9 +137,8 @@ pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError
             } else {
                 (first..=second).collect()
             };
-            Ok(Register::from_bits(
-                indices.into_iter().map(|i| signal.bit(i)).collect(),
-            ))
+            let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
+            Ok(Register::from_bits(bits))
         }
         Expression::FunctionCall(id, _) => Err(EvalError::UnsupportedFunctionCall(id.name.clone())),
     }
@@ -209,7 +208,7 @@ fn constant_bits(
         return Err(malformed());
     }
 
-    Ok(Register::from_bits(bits).extend_msb(width))
+    Ok(bits.extend_msb(width))
 }
 
 /// Splits a `<size>'<base><digits>` literal and hands the pieces to
@@ -238,7 +237,7 @@ fn constant_register(token: &str) -> Result<Register, EvalError> {
 
 /// Expands binary / octal / hex digits, `bits_per_digit` bits each. An `x` or
 /// `z` digit expands to that many `x` or `z` bits.
-fn based_bits(digits: &str, bits_per_digit: usize) -> Result<Vec<u8>, EvalError> {
+fn based_bits(digits: &str, bits_per_digit: usize) -> Result<Register, EvalError> {
     let radix = 1u32 << bits_per_digit;
     let mut bits = Vec::with_capacity(digits.len() * bits_per_digit);
     for digit in digits.chars() {
@@ -253,16 +252,16 @@ fn based_bits(digits: &str, bits_per_digit: usize) -> Result<Vec<u8>, EvalError>
             }
         }
     }
-    Ok(bits)
+    Ok(Register::from_bits(bits))
 }
 
 /// Decimal digits, rendered in the fewest bits that hold the value.
-fn decimal_bits(digits: &str) -> Result<Vec<u8>, EvalError> {
+fn decimal_bits(digits: &str) -> Result<Register, EvalError> {
     let value = digits
         .parse::<u128>()
         .map_err(|_| EvalError::MalformedConstant(digits.to_string()))?;
     let width = (128 - value.leading_zeros() as usize).max(1);
-    Ok(Register::from_u128(value, width).get_raw().clone())
+    Ok(Register::from_u128(value, width))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,9 +286,10 @@ fn eval_unary(op: &UnaryOperator, operand: &Register) -> Result<Register, EvalEr
         }
         // Bit for bit, width preserving. `z` inverts to `x`, matching Verilog:
         // an undriven bit is not a known 0 or 1.
-        UnaryOperator::BitwiseNegation => Ok(Register::from_bits(
-            operand.get_raw().iter().map(|&bit| invert(bit)).collect(),
-        )),
+        UnaryOperator::BitwiseNegation => Ok(operand.map_chunks(|bits| Chunk {
+            value: bits.zeros(),
+            unknown: bits.unknown,
+        })),
         // One bit: true when the operand is all zero.
         UnaryOperator::LogicalNegation => Ok(logic_bit(match truth(operand) {
             Some(true) => ZERO,
@@ -307,7 +307,7 @@ fn eval_unary(op: &UnaryOperator, operand: &Register) -> Result<Register, EvalEr
 
 /// `&a`: a single 0 forces 0 even when other bits are unknown.
 fn reduce_and(operand: &Register) -> u8 {
-    if operand.get_raw().iter().any(|&bit| bit == ZERO) {
+    if operand.has_zero() {
         ZERO
     } else if operand.has_unknown() {
         X
@@ -318,7 +318,7 @@ fn reduce_and(operand: &Register) -> u8 {
 
 /// `|a`: a single 1 forces 1 even when other bits are unknown.
 fn reduce_or(operand: &Register) -> u8 {
-    if operand.get_raw().iter().any(|&bit| bit == ONE) {
+    if operand.has_one() {
         ONE
     } else if operand.has_unknown() {
         X
@@ -333,8 +333,7 @@ fn reduce_xor(operand: &Register) -> u8 {
     if operand.has_unknown() {
         return X;
     }
-    let ones = operand.get_raw().iter().filter(|&&bit| bit == ONE).count();
-    if ones % 2 == 0 {
+    if operand.count_ones() % 2 == 0 {
         ZERO
     } else {
         ONE
@@ -431,49 +430,40 @@ fn power(lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
 /// width of the wider one.
 fn bitwise(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Register {
     let width = lhs.width().max(rhs.width()).max(1);
-    let lhs = lhs.resize(width);
-    let rhs = rhs.resize(width);
-    let bits = lhs
-        .get_raw()
-        .iter()
-        .zip(rhs.get_raw().iter())
-        .map(|(&a, &b)| bitwise_bit(op, a, b))
-        .collect();
-    Register::from_bits(bits)
+    lhs.zip_chunks(rhs, width, |a, b| bitwise_chunk(op, a, b))
 }
 
-/// The truth tables of IEEE 1364 table 5-1. `z` behaves exactly like `x`: a
-/// bit that is not driven is not a known value.
-fn bitwise_bit(op: &BinaryOperator, a: u8, b: u8) -> u8 {
+/// The truth tables of IEEE 1364 table 5-1, a chunk of bits at a time. `z`
+/// behaves exactly like `x`: a bit that is not driven is not a known value.
+///
+/// Each table is the same statement made of whole words: for `&`, a result bit
+/// is `1` where both operands are a known `1`, and unknown where either operand
+/// is unknown and neither is the dominant `0`. Bits past an operand's width
+/// read as a known `0`, which is the zero extension the narrower operand gets.
+fn bitwise_chunk(op: &BinaryOperator, a: Chunk, b: Chunk) -> Chunk {
     match op {
-        BinaryOperator::BitwiseAnd => {
-            if a == ZERO || b == ZERO {
-                ZERO
-            } else if is_unknown(a) || is_unknown(b) {
-                X
-            } else {
-                ONE
-            }
-        }
-        BinaryOperator::BitwiseOr | BinaryOperator::BitwiseInclusiveOr => {
-            if a == ONE || b == ONE {
-                ONE
-            } else if is_unknown(a) || is_unknown(b) {
-                X
-            } else {
-                ZERO
-            }
-        }
+        BinaryOperator::BitwiseAnd => Chunk {
+            value: a.ones() & b.ones(),
+            unknown: (a.unknown | b.unknown) & !(a.zeros() | b.zeros()),
+        },
+        BinaryOperator::BitwiseOr | BinaryOperator::BitwiseInclusiveOr => Chunk {
+            value: a.ones() | b.ones(),
+            unknown: (a.unknown | b.unknown) & !(a.ones() | b.ones()),
+        },
         BinaryOperator::BitwiseXOr => {
-            if is_unknown(a) || is_unknown(b) {
-                X
-            } else if a == b {
-                ZERO
-            } else {
-                ONE
+            let unknown = a.unknown | b.unknown;
+            Chunk {
+                value: (a.value ^ b.value) & !unknown,
+                unknown,
             }
         }
-        BinaryOperator::BitwiseXNor => invert(bitwise_bit(&BinaryOperator::BitwiseXOr, a, b)),
+        BinaryOperator::BitwiseXNor => {
+            let unknown = a.unknown | b.unknown;
+            Chunk {
+                value: !(a.value ^ b.value) & !unknown,
+                unknown,
+            }
+        }
         other => unreachable!("{} is not a bitwise operator", other),
     }
 }
@@ -495,15 +485,11 @@ fn shift(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register
         op,
         BinaryOperator::ShiftLeft | BinaryOperator::ArithmeticShiftLeft
     );
-    let mut bits = Vec::with_capacity(lhs.width());
-    if left {
-        bits.extend_from_slice(&lhs.get_raw()[amount..]);
-        bits.extend(std::iter::repeat(ZERO).take(amount));
+    Ok(if left {
+        lhs.shifted_left(amount)
     } else {
-        bits.extend(std::iter::repeat(ZERO).take(amount));
-        bits.extend_from_slice(&lhs.get_raw()[..lhs.width() - amount]);
-    }
-    Ok(Register::from_bits(bits))
+        lhs.shifted_right(amount)
+    })
 }
 
 /// `< <= > >=` produce one bit. Comparison is unsigned; an unknown bit in
@@ -568,10 +554,6 @@ fn logical(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Register {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn is_unknown(bit: u8) -> bool {
-    bit == X || bit == Z
-}
-
 /// `0` and `1` swap; `x` and `z` invert to `x`.
 fn invert(bit: u8) -> u8 {
     match bit {
@@ -582,13 +564,13 @@ fn invert(bit: u8) -> u8 {
 }
 
 fn logic_bit(bit: u8) -> Register {
-    Register::from_bits(vec![bit])
+    Register::filled(1, bit)
 }
 
 /// A register used as a condition: any `1` bit is true, all-zero is false, and
 /// anything else (only unknown bits and zeros) is unknown.
 fn truth(register: &Register) -> Option<bool> {
-    if register.get_raw().iter().any(|&bit| bit == ONE) {
+    if register.has_one() {
         Some(true)
     } else if register.has_unknown() {
         None
@@ -617,15 +599,14 @@ fn width_mask(width: usize) -> u128 {
 /// disagree become `x`. Used when a conditional's condition is unknown.
 fn merge(lhs: &Register, rhs: &Register) -> Register {
     let width = lhs.width().max(rhs.width()).max(1);
-    let lhs = lhs.resize(width);
-    let rhs = rhs.resize(width);
-    let bits = lhs
-        .get_raw()
-        .iter()
-        .zip(rhs.get_raw().iter())
-        .map(|(&a, &b)| if a == b { a } else { X })
-        .collect();
-    Register::from_bits(bits)
+    lhs.zip_chunks(rhs, width, |a, b| {
+        // Bits where both planes agree keep their value; the rest become `x`.
+        let same = !(a.value ^ b.value) & !(a.unknown ^ b.unknown);
+        Chunk {
+            value: a.value & same,
+            unknown: (a.unknown & same) | !same,
+        }
+    })
 }
 
 #[cfg(test)]
