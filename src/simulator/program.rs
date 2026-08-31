@@ -22,7 +22,7 @@
 use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
 use crate::parsers::behavior::{CaseLabel, CaseStatement, IfStatement, ProceduralStatements};
 use crate::parsers::expr::Expression;
-use crate::register::{Register, ONE};
+use crate::register::Register;
 use crate::simulator::eval::eval;
 use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate};
 use crate::simulator::runner::SimulationError;
@@ -341,7 +341,7 @@ fn case_matches(subject: &Register, label: &Register) -> bool {
 /// true only when it is a *known* non-zero value: zero, `x` and `z` all take
 /// the else branch. An `x` condition is not an "unknown branch" — it is false.
 fn is_true(register: &Register) -> bool {
-    register.get_raw().iter().any(|&bit| bit == ONE)
+    register.has_one()
 }
 
 #[cfg(test)]
