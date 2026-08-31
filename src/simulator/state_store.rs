@@ -96,31 +96,90 @@ fn range_width(range: (i64, i64)) -> usize {
     ((range.0 - range.1).abs() + 1) as usize
 }
 
-/// Name to value map for every signal in a simulation.
+/// Name to value map for every signal in a simulation, together with a journal
+/// of everything written since the last marker.
+///
+/// The journal is what makes edge detection affordable. A scheduler that has to
+/// discover which signals moved by diffing two whole snapshots pays for every
+/// signal in the design on every delta cycle, when the set of signals that
+/// could possibly have moved is exactly the set something wrote. Writes record
+/// the value they displaced; [`take_changes`](StateStore::take_changes) hands
+/// that list over and starts a fresh one.
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
     name_to_signal: HashMap<String, SignalState>,
+    /// For every signal written since the last marker, the value it held at
+    /// that marker. `None` records a name that did not exist yet, which makes
+    /// the write a declaration rather than a change.
+    journal: HashMap<String, Option<Register>>,
 }
 
 impl StateStore {
     pub fn new() -> Self {
         StateStore {
             name_to_signal: HashMap::new(),
+            journal: HashMap::new(),
         }
+    }
+
+    /// Notes the value `name` holds right now, so that a write about to land on
+    /// it can be reported as a transition.
+    ///
+    /// Only the first write since the marker is recorded: a later one would
+    /// overwrite the value the round actually started from, and it is that
+    /// value an edge has to be measured against.
+    fn record(&mut self, name: &str) {
+        if self.journal.contains_key(name) {
+            return;
+        }
+        let previous = self
+            .name_to_signal
+            .get(name)
+            .map(|signal| signal.register().clone());
+        self.journal.insert(name.to_string(), previous);
+    }
+
+    /// The name and pre-write value of every signal written since the last
+    /// call, sorted by name, clearing the journal so the next round is measured
+    /// from here.
+    ///
+    /// A name that did not exist at the last call is left out: it was declared
+    /// rather than changed, and declaring a signal is not a simulation event.
+    /// Writes that put back the value already there are still reported — the
+    /// journal records what was displaced, not whether it differed — so the
+    /// caller compares.
+    pub fn take_changes(&mut self) -> Vec<(String, Register)> {
+        let mut changes = Vec::with_capacity(self.journal.len());
+        for (name, previous) in self.journal.drain() {
+            if let Some(previous) = previous {
+                changes.push((name, previous));
+            }
+        }
+        changes.sort_by(|left, right| left.0.cmp(&right.0));
+        changes
+    }
+
+    /// Forgets every recorded change, making now the point later changes are
+    /// measured against.
+    pub fn clear_changes(&mut self) {
+        self.journal.clear();
     }
 
     /// Declares a signal over `(msb, lsb)`, initialized to all `x` the way an
     /// unassigned Verilog `reg` starts out.
     pub fn declare(&mut self, name: impl Into<String>, range: (i64, i64)) {
+        let name = name.into();
+        self.record(&name);
         let register = Register::unknown(range_width(range));
         self.name_to_signal
-            .insert(name.into(), SignalState::with_range(register, range));
+            .insert(name, SignalState::with_range(register, range));
     }
 
     /// Sets a signal's value. A previously declared range is preserved when the
     /// widths still agree; otherwise the signal is (re)declared as `(width - 1, 0)`.
     pub fn set(&mut self, name: impl Into<String>, register: Register) {
         let name = name.into();
+        self.record(&name);
         let range = self
             .name_to_signal
             .get(&name)
@@ -135,8 +194,10 @@ impl StateStore {
 
     /// Sets a signal's value and declared range in one step.
     pub fn set_ranged(&mut self, name: impl Into<String>, register: Register, range: (i64, i64)) {
+        let name = name.into();
+        self.record(&name);
         self.name_to_signal
-            .insert(name.into(), SignalState::with_range(register, range));
+            .insert(name, SignalState::with_range(register, range));
     }
 
     pub fn get(&self, name: &str) -> Option<&Register> {
@@ -147,7 +208,10 @@ impl StateStore {
         self.name_to_signal.get(name)
     }
 
+    /// A signal for in-place modification. What it holds now is journalled
+    /// first, since the caller is free to move it.
     pub fn get_signal_mut(&mut self, name: &str) -> Option<&mut SignalState> {
+        self.record(name);
         self.name_to_signal.get_mut(name)
     }
 
