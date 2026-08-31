@@ -85,7 +85,7 @@ impl Signal for InfiniteSignal {
     fn embodiment(&self, identifier: Identifier) -> ProceduralBlock {
         let mut statements = vec![];
 
-        for (i, value) in self.val_loop.iter().enumerate() {
+        for (_i, value) in self.val_loop.iter().enumerate() {
             let assignment = ProceduralAssignment::new(
                 None,
                 Expression::Identifier(identifier.clone()),

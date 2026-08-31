@@ -11,7 +11,7 @@ use nom::{
 use crate::parsers::assignment::parse_assignment;
 
 use super::{
-    assignment::{ContinuousAssignment, ProceduralAssignment},
+    assignment::ProceduralAssignment,
     delay::{parse_delay_statement, Delay},
     expr::{verilog_expression, Expression},
     simple::ws,

@@ -10,3 +10,10 @@ lazy_static = "1.4.0"
 rand = "0.8.5"
 strum = {version="0.26.3", features = ["strum_macros"]}
 strum_macros = "0.26.4"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "simulation"
+harness = false
