@@ -89,10 +89,17 @@ single pass is not enough — `run` repeats passes until one changes nothing, an
 error rather than a hang.
 
 Sequential logic runs through `Simulator::poke` (drive an input, then settle) and the
-`tick` helper (one clock pulse). Settling is a delta-cycle loop: diff the state against
-the last settled point, wake every `always` block sensitive to those edges, commit their
-non-blocking updates, re-propagate the continuous assignments, repeat until a round
-produces no edges. `counter.v` and `complex_module.v` simulate end to end.
+`tick` helper (one clock pulse). Settling is a delta-cycle loop: take the changes the
+`StateStore` journalled since the last round, wake every `always` block sensitive to those
+edges, commit their non-blocking updates, re-propagate the continuous assignments, repeat
+until a round produces no edges. `counter.v` and `complex_module.v` simulate end to end.
+
+**The `StateStore` tracks its own writes.** Every write records the value it displaced, and
+`take_changes` hands that list over and starts a fresh one — so `settle` calling it is both
+"what moved" and "the marker the next round measures from". `events::edges_from_changes`
+turns that list into `SignalEdge`s and costs the number of signals written rather than the
+number of signals in the design; `events::edges_between` is the two-snapshot equivalent and
+must stay off the hot path.
 
 **`poke`, not `set_input`, is what drives sequential logic** — an `always` block wakes on
 an *edge*, so a value that is written without settling produces no edge and nothing runs.
@@ -124,7 +131,7 @@ concatenation as an assignment target. `signals.rs` is built but still unwired.
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
 | `runner.rs` | `Simulator` — `setup()` / `set_input()` / `run()` / `get()`, the combinational driver |
-| `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register` |
+| `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |

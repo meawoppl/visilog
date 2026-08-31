@@ -289,10 +289,13 @@ impl Simulator {
     /// This is the entry point for sequential logic — clocking a design means
     /// poking its clock, since it is the *edge* that wakes an `always` block.
     pub fn poke(&mut self, name: &str, value: Register) -> Result<usize, SimulationError> {
-        let before = self.state.clone();
+        // The marker goes down before the input is written, so writing it is
+        // itself an edge. Without that, nothing an edge-triggered block waits
+        // on ever appears to move and the design never wakes.
+        self.state.clear_changes();
         self.set_input(name, value)?;
         self.propagate()?;
-        self.settle(before)
+        self.settle()
     }
 
     /// One full clock pulse: low-to-high, then high-to-low. Edge-triggered
@@ -305,25 +308,28 @@ impl Simulator {
 
     /// Repeatedly wakes `always` blocks until the design stops changing.
     ///
-    /// `before` is the state as of the last settled point. The difference
-    /// between it and the current state is the set of edges that may wake a
-    /// block; running those blocks can move more signals, which is itself a new
-    /// set of edges. Verilog calls each of these rounds a delta cycle, and they
-    /// repeat until a round produces no edges at all.
+    /// The store journals what is written to it, so the changes it has recorded
+    /// since the caller's marker are the set of edges that may wake a block;
+    /// running those blocks can move more signals, which is itself a new set of
+    /// edges. Verilog calls each of these rounds a delta cycle, and they repeat
+    /// until a round produces no edges at all.
+    ///
+    /// Taking the changes also resets the marker, which is what keeps the
+    /// rounds separate: round N+1 reacts to exactly what round N moved, never
+    /// to an accumulation across rounds.
     ///
     /// A design that never stops producing edges — a bare `always` block that
     /// keeps toggling, say — reports [`SimulationError::NoConvergence`] rather
     /// than hanging.
-    fn settle(&mut self, mut before: StateStore) -> Result<usize, SimulationError> {
+    fn settle(&mut self) -> Result<usize, SimulationError> {
         for delta in 1..=MAX_DELTA_CYCLES {
-            let edges = events::edges_between(&before, &self.state);
+            // Taking the changes here, before the blocks run, is what makes the
+            // next round's edges exactly what this round moves.
+            let changes = self.state.take_changes();
+            let edges = events::edges_from_changes(changes, &self.state);
             if edges.is_empty() {
                 return Ok(delta - 1);
             }
-
-            // Snapshot before running the blocks, so the next round's edges are
-            // exactly what this round moved.
-            before = self.state.clone();
 
             let mut pending = Vec::new();
             for id in 0..self.blocks.len() {
@@ -379,7 +385,9 @@ impl Simulator {
             }
             self.now = time;
 
-            let before = self.state.clone();
+            // Everything the resumptions below move is an edge for the settle
+            // that follows them.
+            self.state.clear_changes();
             let mut pending = Vec::new();
             let mut resumptions = 0;
 
@@ -407,7 +415,7 @@ impl Simulator {
 
             commit_updates(pending, &mut self.state)?;
             self.propagate()?;
-            self.settle(before)?;
+            self.settle()?;
         }
 
         self.now = target;

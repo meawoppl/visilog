@@ -120,6 +120,37 @@ pub fn edges_between(before: &StateStore, after: &StateStore) -> Vec<SignalEdge>
     edges
 }
 
+/// [`edges_between`] for a store that tracked its own writes.
+///
+/// `changes` is what [`StateStore::take_changes`] reported — each written
+/// signal paired with the value it held before — and `after` is that same store
+/// now. The result is identical to diffing a snapshot taken at the marker
+/// against `after`, because a signal nobody wrote cannot have moved; the
+/// difference is that this costs the number of signals that were written rather
+/// than the number of signals in the design.
+///
+/// A write that put the same value back is filtered out here, so both functions
+/// agree that a value which did not move is no edge. A name that has since
+/// vanished from the store is skipped for the same reason `edges_between` skips
+/// one that is missing from a snapshot: an edge needs two values.
+pub fn edges_from_changes(changes: Vec<(String, Register)>, after: &StateStore) -> Vec<SignalEdge> {
+    changes
+        .into_iter()
+        .filter_map(|(name, before)| {
+            let current = after.get(&name)?;
+            if current == &before {
+                return None;
+            }
+            let after = current.clone();
+            Some(SignalEdge {
+                name,
+                before,
+                after,
+            })
+        })
+        .collect()
+}
+
 /// Whether an `always` block's event control fires given the edges observed.
 ///
 /// `implicit_reads` is only consulted for [`EventControl::Implicit`]; it is the
