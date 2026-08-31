@@ -70,7 +70,13 @@ impl SignalState {
     /// yields `x`, which is what Verilog does for an out-of-bounds select.
     pub fn bit(&self, index: i64) -> u8 {
         match self.bit_position(index) {
-            Some(offset) => self.register.get_raw()[offset],
+            // `bit_position` counts from the most significant end, the way the
+            // bits are written in Verilog source; `Register` indexes from the
+            // least significant end.
+            Some(offset) => self
+                .register
+                .bit_from_lsb(self.width() - 1 - offset)
+                .unwrap_or(X),
             None => X,
         }
     }
@@ -82,12 +88,11 @@ impl SignalState {
         let Some(offset) = self.bit_position(index) else {
             return false;
         };
-        let mut bits = self.register.get_raw().clone();
-        if bits[offset] == value {
+        let from_lsb = self.width() - 1 - offset;
+        if self.register.bit_from_lsb(from_lsb) == Some(value) {
             return false;
         }
-        bits[offset] = value;
-        self.register = Register::from_bits(bits);
+        self.register = self.register.with_bit(from_lsb, value);
         true
     }
 }

@@ -272,6 +272,37 @@ impl Register {
         Some(self.code_at(index))
     }
 
+    /// A copy with the bit `index` places from the least significant end set to
+    /// `code` (one of `0`, `1`, `X`, `Z`). An `index` past the width is ignored,
+    /// matching what Verilog does with an out-of-range select on the left of an
+    /// assignment.
+    ///
+    /// This exists so a single-bit write does not have to expand the register
+    /// into a byte per bit and rebuild it — the hot path in
+    /// `simulator::state_store` writes one bit at a time.
+    pub fn with_bit(&self, index: usize, code: u8) -> Self {
+        assert!(
+            code <= Z,
+            "Register bits must be one of 0, 1, x (2) or z (3)"
+        );
+        if index >= self.width {
+            return self.clone();
+        }
+        let (target, offset) = (index / CHUNK_BITS, index % CHUNK_BITS);
+        let bit = 1u128 << offset;
+        Register::from_chunks(self.width, |chunk_index| {
+            let chunk = self.chunk(chunk_index);
+            if chunk_index != target {
+                return chunk;
+            }
+            let set = |plane: u128, on: bool| if on { plane | bit } else { plane & !bit };
+            Chunk {
+                value: set(chunk.value, code & 1 != 0),
+                unknown: set(chunk.unknown, code & 2 != 0),
+            }
+        })
+    }
+
     /// True when any bit is `x` or `z`.
     pub fn has_unknown(&self) -> bool {
         match &self.planes {
