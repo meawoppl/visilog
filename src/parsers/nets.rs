@@ -1,4 +1,4 @@
-use nom::{bytes::complete::tag, combinator::opt, sequence::tuple, IResult};
+use nom::{bytes::complete::tag, combinator::opt, IResult};
 
 use super::{
     identifier::{identifier_list, Identifier},

@@ -27,6 +27,6 @@ pub fn gather_definitions(module: &VerilogModule) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_module(module: VerilogModule) -> Result<(), String> {
+pub fn validate_module(_module: VerilogModule) -> Result<(), String> {
     Ok(())
 }
