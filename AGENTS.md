@@ -58,6 +58,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case` |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
+| `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
 | `base.rs` | the `RawToken` trait |
 
 ### Expression parsing
@@ -183,6 +184,11 @@ handling in an expression layer, that test is your tripwire.
   a `:` that looks just like a part-select separator. `bit_select` first means the
   conditional wins; write `q[(a ? b : c):0]` when you mean a part select with a
   conditional bound.
+- **Comments are only skipped *between* module declarations**, by `ws_and_comments` in
+  `simple.rs`, which `parse_verilog_source` uses. Inside a module — in the port list or the
+  body — nothing consumes them, because every inner parser is wrapped in `ws`
+  (`multispace0` only). A `// …` line inside `module … endmodule` is still a parse error;
+  that is why no corpus `.v` file has one.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.

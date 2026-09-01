@@ -15,5 +15,6 @@ pub mod operators;
 pub mod parameter;
 pub mod register;
 pub mod simple;
+pub mod source;
 pub mod statements;
 pub mod string;
