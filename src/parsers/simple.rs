@@ -1,12 +1,13 @@
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag, take_until, take_while, take_while1},
+    bytes::complete::{tag, take_till, take_until, take_while, take_while1},
     combinator::{map, value},
+    multi::many0,
     sequence::{delimited, preceded, tuple},
     IResult,
 };
 
-use nom::character::complete::{char, multispace0};
+use nom::character::complete::{char, multispace0, multispace1};
 
 pub fn whitespace(input: &str) -> IResult<&str, &str> {
     take_while(|c: char| c.is_whitespace())(input)
@@ -32,7 +33,7 @@ pub fn sign(input: &str) -> IResult<&str, &str> {
 pub fn single_line_comment(input: &str) -> IResult<&str, &str> {
     value(
         "", // We don't care about the content of the comment, so we map it to an empty string
-        preceded(tag("//"), is_not("\n")),
+        preceded(tag("//"), take_till(|c| c == '\n')),
     )(input)
 }
 
@@ -42,6 +43,11 @@ pub fn multi_line_comment(input: &str) -> IResult<&str, &str> {
 
 pub fn comment(input: &str) -> IResult<&str, &str> {
     alt((single_line_comment, multi_line_comment))(input)
+}
+
+/// Consume any run of whitespace and comments, including an empty one.
+pub fn ws_and_comments(input: &str) -> IResult<&str, ()> {
+    value((), many0(alt((multispace1, comment))))(input)
 }
 
 pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
@@ -146,6 +152,21 @@ mod tests {
             multi_line_comment("/* Another comment */"),
             Ok(("", " Another comment "))
         );
+    }
+
+    #[test]
+    fn test_ws_and_comments() {
+        assert_eq!(ws_and_comments(""), Ok(("", ())));
+        assert_eq!(ws_and_comments("abc"), Ok(("abc", ())));
+        assert_eq!(ws_and_comments("   \n\t abc"), Ok(("abc", ())));
+        assert_eq!(ws_and_comments("// a comment\nabc"), Ok(("abc", ())));
+        assert_eq!(ws_and_comments("//\n//\nabc"), Ok(("abc", ())));
+        assert_eq!(ws_and_comments("/* a comment */ abc"), Ok(("abc", ())));
+        assert_eq!(
+            ws_and_comments("\n // one \n /* two */\n\n// three\nabc"),
+            Ok(("abc", ()))
+        );
+        assert_eq!(ws_and_comments("  // trailing"), Ok(("", ())));
     }
 
     #[test]
