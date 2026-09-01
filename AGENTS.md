@@ -1,8 +1,8 @@
 # visilog — guide for agents
 
-A Verilog parser and (nascent) simulator written in Rust. The parser is built on
-[`nom`](https://docs.rs/nom/7) parser combinators; the simulator is early scaffolding
-that consumes the parser's AST.
+A Verilog parser and simulator written in Rust. The parser is built on
+[`nom`](https://docs.rs/nom/7) parser combinators; the simulator elaborates the parsed
+AST — including module hierarchy — and runs it against simulated time.
 
 This file is the repo guide for coding agents. `CLAUDE.md` is a symlink to it.
 
@@ -11,26 +11,37 @@ This file is the repo guide for coding agents. `CLAUDE.md` is a symlink to it.
 ```bash
 cargo build          # build
 cargo test           # run the full suite (all tests are inline unit tests)
+cargo bench          # criterion benchmarks — see benches/simulation.rs
 cargo fmt            # format — run before every push
 cargo fmt --check    # what CI enforces
 ```
 
-There is no integration-test directory and no benchmark harness. `cargo test` is the
-whole story, and it runs in well under a second — run it after every change.
+All tests are inline `#[cfg(test)]` modules; there is no integration-test directory. The
+suite runs in well under a second — run it after every change.
 
-`src/main.rs` is a stub (`fn main() {}`) that exists only to root the module tree.
-There is no CLI yet, so `cargo run` does nothing. Verify work through tests.
+**The crate is a library plus a stub binary.** `src/lib.rs` exports the modules; `src/main.rs`
+is still an empty `fn main() {}`, so `cargo run` does nothing and there is no CLI yet.
+Verify work through tests. The lib target is what lets `benches/` import the crate, and it
+is also why `cargo build` emits only a handful of warnings — before it existed, every
+public item read as dead code and the count was over 250.
+
+**Performance is a stated goal, so measure changes.** `cargo bench` covers ticking whole
+designs, expression evaluation, and parsing. `parse/*` is there as a regression guard: work
+on the simulator should leave it alone.
 
 ## Layout
 
 ```
 src/
-  main.rs              stub binary; declares the module tree
-  git_utils.rs         shallow-clones + caches external repos (for corpus testing)
-  register.rs          4-state register value type (0/1/x/z) and radix conversions
+  lib.rs               the library root; exports everything below
+  main.rs              stub binary, currently empty
+  git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
+  register.rs          4-state (0/1/x/z) value type, packed into two bit planes
   parsers/             the Verilog front end — see below
-  simulator/           event-driven simulation scaffolding
-  verilog/examples/    sample .v files
+  simulator/           elaboration and the event-driven run loop — see below
+  verilog/examples/    sample .v files, walked by two corpus tests
+benches/
+  simulation.rs        criterion throughput benchmarks
 ```
 
 ### `src/parsers/`
@@ -135,8 +146,10 @@ of more than one module is handed over; `Simulator::new(module)` still takes a s
 module as its own top.
 
 Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
-fit in a program counter) and concatenation as an assignment target. `signals.rs` is built
-but still unwired.
+fit in a program counter), concatenation as an assignment target, and comments anywhere
+inside a module body (issue #87 — this blocks most real-world Verilog). Parameter overrides
+cannot change a width, because `simple.rs::range` only parses literal integers, so
+`output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built but still unwired.
 
 | File | Role |
 | --- | --- |
