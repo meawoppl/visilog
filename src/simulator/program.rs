@@ -23,6 +23,7 @@ use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType}
 use crate::parsers::behavior::{CaseLabel, CaseStatement, IfStatement, ProceduralStatements};
 use crate::parsers::expr::Expression;
 use crate::register::Register;
+use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::eval;
 use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate};
 use crate::simulator::runner::SimulationError;
@@ -111,6 +112,30 @@ impl Program {
     /// The compiled instructions, in program order.
     pub fn instructions(&self) -> &[Instruction] {
         &self.instructions
+    }
+
+    /// Rewrites every signal the program names through `resolve`.
+    ///
+    /// Elaborating an instance flattens the child's signals into the parent's
+    /// store under qualified names; this is what re-points an already compiled
+    /// body at them. Doing it on the instruction list rather than on the
+    /// statement tree is what makes it possible at all — the tree is borrowed
+    /// from the parsed module and is not `Clone`, while an [`Instruction`]
+    /// owns its expressions outright.
+    pub fn rename(&mut self, resolve: &dyn Fn(&str) -> String) {
+        for instruction in &mut self.instructions {
+            match instruction {
+                Instruction::Blocking { target, value }
+                | Instruction::NonBlocking { target, value } => {
+                    rename_expression(target, resolve);
+                    rename_expression(value, resolve);
+                }
+                Instruction::JumpIfFalse { condition, .. } => rename_expression(condition, resolve),
+                Instruction::CaseSubject(subject) => rename_expression(subject, resolve),
+                Instruction::JumpIfMatch { label, .. } => rename_expression(label, resolve),
+                Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
+            }
+        }
     }
 
     fn compile_statements(

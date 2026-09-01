@@ -121,17 +121,31 @@ are queued at time zero; edge-triggered blocks are woken by `settle` instead, so
 deliberately skipped in the time wheel (`EventControl::None` reports as firing on *every*
 edge, so a free-running block must not also be edge-driven).
 
-Still unsupported: module instantiation (`setup` reports `Unsupported`), intra-assignment
-delays (`a = #5 b;` — the held right hand side does not fit in a program counter), and
-concatenation as an assignment target. `signals.rs` is built but still unwired.
+**Module hierarchy is flattened at elaboration, in `elaborate.rs`.** `Simulator::setup`
+walks the instantiation tree and inlines every child into the *same* flat `StateStore`,
+assignment list and block list, so nothing about hierarchy survives into the run loop and
+an instanced design costs what the hand-flattened equivalent costs. An instance's internal
+signals take a dotted name — `dut.count`, `mid.leaf.count` — and a port bound to a plain
+identifier is *aliased*: it and the parent's signal are one store entry, resolved
+statically, so there is no propagation step between them and no value can go stale. A port
+bound to a general expression (`.a(x + 1)`) cannot be aliased; an input gets its own signal
+plus a continuous assignment from the parent, and an output reports `UndrivablePort`. An
+unconnected input is declared `z`. `Simulator::with_modules(modules, top)` is how a design
+of more than one module is handed over; `Simulator::new(module)` still takes a single
+module as its own top.
+
+Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
+fit in a program counter) and concatenation as an assignment target. `signals.rs` is built
+but still unwired.
 
 | File | Role |
 | --- | --- |
+| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock` and `rename_expression` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
-| `runner.rs` | `Simulator` — `setup()` / `set_input()` / `run()` / `get()`, the combinational driver |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
 | `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
@@ -211,6 +225,15 @@ handling in an expression layer, that test is your tripwire.
   distinct — don't collapse `@(*)` into an empty `Events` list.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
+- **A parser range is already `(i64, i64)`**, constant-folded at parse time, so a
+  parameter cannot determine a width: `output [WIDTH-1:0] q` does not parse. A parameter
+  override therefore changes a child's *behaviour*, never its widths, until the front end
+  grows expression ranges.
+- **Flattening rewrites names on the compiled `Program`, not on the statement tree.**
+  `AlwaysBlock` and `ProceduralStatements` are not `Clone`, but `Instruction` owns its
+  `Expression`s, so `Program::rename` is what re-points a child's body at the parent's
+  store. A `TimedBlock` therefore carries its own owned `EventControl` and a precomputed
+  `@(*)` read set rather than an index back into `module.statements`.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

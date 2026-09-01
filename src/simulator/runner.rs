@@ -22,23 +22,24 @@
 //! for a later timestamp. That also lets a design clock itself — an
 //! `always begin #50 clk = ~clk; end` needs no external stimulus, just time.
 //!
-//! Module hierarchy is still a later milestone; [`Simulator::setup`] reports an
-//! instantiation as unsupported rather than pretending to elaborate it.
+//! Module hierarchy is flattened at elaboration time by
+//! [`crate::simulator::elaborate`]: a child's signals join the same
+//! [`StateStore`] under qualified names (`dut.count`), and a port bound to a
+//! plain identifier becomes the very same store entry as the parent signal it
+//! was connected to. Hand the simulator more than one module with
+//! [`Simulator::with_modules`].
 
+use std::collections::HashMap;
 use std::fmt;
 
-use crate::parsers::{
-    assignment::ContinuousAssignment,
-    behavior::EventControl,
-    modules::{PortDirection, VerilogModule},
-    statements::ModuleStatement,
-};
+use crate::parsers::{assignment::ContinuousAssignment, modules::VerilogModule};
 use crate::register::Register;
+use crate::simulator::elaborate::{elaborate, BlockKind, TimedBlock};
 use crate::simulator::eval::{eval, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events;
-use crate::simulator::exec::{commit_updates, drive, range_width, PendingUpdate};
-use crate::simulator::program::{self, Program, Resume};
+use crate::simulator::exec::{commit_updates, drive, PendingUpdate};
+use crate::simulator::program::{self, Resume};
 use crate::simulator::state_store::StateStore;
 
 /// Ceiling on delta cycles within a single settle. A design that keeps
@@ -50,24 +51,6 @@ const MAX_DELTA_CYCLES: usize = 100;
 /// this turns that into an error rather than a hang.
 const MAX_RESUMPTIONS_PER_TIME: usize = 10_000;
 
-/// What kind of procedural block a compiled program came from.
-#[derive(Debug, PartialEq, Eq)]
-enum BlockKind {
-    Initial,
-    Always,
-}
-
-/// A procedural block compiled to a resumable program.
-struct TimedBlock {
-    /// Index into `module.statements`, so the block's `EventControl` can be
-    /// consulted without cloning it.
-    statement: usize,
-    kind: BlockKind,
-    /// `always` with no event control at all: driven by time, never by edges.
-    free_running: bool,
-    program: Program,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimulationError {
     /// A name with no entry in the [`StateStore`].
@@ -76,6 +59,31 @@ pub enum SimulationError {
     NotAnInput(String),
     /// A module construct this milestone cannot execute.
     Unsupported(&'static str),
+    /// An instantiation, or a top-level name, that no supplied module defines.
+    UnknownModule(String),
+    /// A named port connection for a port the instantiated module does not have.
+    UnknownPort { module: String, port: String },
+    /// A `#(...)` override for a parameter the instantiated module does not
+    /// declare.
+    UnknownParameter { module: String, parameter: String },
+    /// More positional arguments than the module has ports (or parameters).
+    TooManyArguments {
+        module: String,
+        what: &'static str,
+        expected: usize,
+        found: usize,
+    },
+    /// An output port connected to something that is not a plain signal. The
+    /// child drives it, and there is no way to push a value back out through an
+    /// arbitrary expression.
+    UndrivablePort {
+        instance: String,
+        port: String,
+        connection: String,
+    },
+    /// A module that instantiates itself, directly or around a cycle. No amount
+    /// of flattening terminates on that.
+    RecursiveInstantiation(String),
     /// An `assign` whose left hand side is not something that can be driven.
     UnsupportedTarget(String),
     /// [`Simulator::setup`] has not run yet.
@@ -94,6 +102,35 @@ impl fmt::Display for SimulationError {
             SimulationError::NotAnInput(name) => write!(f, "`{}` is not an input port", name),
             SimulationError::Unsupported(what) => {
                 write!(f, "{} is not supported by the simulator", what)
+            }
+            SimulationError::UnknownModule(name) => write!(f, "no module named `{}`", name),
+            SimulationError::UnknownPort { module, port } => {
+                write!(f, "module `{}` has no port `{}`", module, port)
+            }
+            SimulationError::UnknownParameter { module, parameter } => {
+                write!(f, "module `{}` has no parameter `{}`", module, parameter)
+            }
+            SimulationError::TooManyArguments {
+                module,
+                what,
+                expected,
+                found,
+            } => write!(
+                f,
+                "module `{}` has {} {}, but {} were supplied",
+                module, expected, what, found
+            ),
+            SimulationError::UndrivablePort {
+                instance,
+                port,
+                connection,
+            } => write!(
+                f,
+                "output port `{}` of instance `{}` is connected to `{}`, which cannot be driven",
+                port, instance, connection
+            ),
+            SimulationError::RecursiveInstantiation(name) => {
+                write!(f, "module `{}` instantiates itself", name)
             }
             SimulationError::UnsupportedTarget(text) => {
                 write!(f, "cannot drive `{}`", text)
@@ -117,14 +154,20 @@ impl From<EvalError> for SimulationError {
     }
 }
 
-/// A parsed module, elaborated into signals and runnable blocks.
+/// A parsed design, elaborated into signals and runnable blocks.
 pub struct Simulator {
-    module: VerilogModule,
+    /// Every module the design may draw on. Only the top one is walked
+    /// directly; the rest are reached through instantiations.
+    modules: Vec<VerilogModule>,
+    /// The name of the module to elaborate. Resolved in `setup` rather than in
+    /// the constructor so that every elaboration error surfaces from one place.
+    top: String,
     state: StateStore,
     assignments: Vec<ContinuousAssignment>,
-    /// Indices into `module.statements`. `AlwaysBlock` is not `Clone`, and
-    /// holding references would borrow the module for the simulator's lifetime.
     blocks: Vec<TimedBlock>,
+    /// Qualified names of ports that were aliased onto a parent signal, so they
+    /// can still be read back even though they hold no state of their own.
+    aliases: HashMap<String, String>,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -132,12 +175,25 @@ pub struct Simulator {
 }
 
 impl Simulator {
+    /// A design of exactly one module, which is therefore the top.
     pub fn new(module: VerilogModule) -> Self {
+        let top = module.identifier.name.clone();
+        Self::with_modules(vec![module], top)
+    }
+
+    /// A design of several modules, elaborated from `top` downwards.
+    ///
+    /// A module named by an instantiation is looked up here, so the order of
+    /// `modules` does not matter. A `top` that names nothing is reported by
+    /// [`Simulator::setup`] as [`SimulationError::UnknownModule`].
+    pub fn with_modules(modules: Vec<VerilogModule>, top: impl Into<String>) -> Self {
         Self {
-            module,
+            modules,
+            top: top.into(),
             state: StateStore::new(),
             assignments: Vec::new(),
             blocks: Vec::new(),
+            aliases: HashMap::new(),
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -145,74 +201,35 @@ impl Simulator {
         }
     }
 
-    /// Declares every signal the module names and collects its continuous
-    /// assignments. Signals start out all `x`, the way an undriven Verilog net
-    /// does; parameters are folded to their value immediately.
+    /// Elaborates the design: declares every signal the top module and
+    /// everything it instantiates names, and collects their continuous
+    /// assignments and procedural blocks.
+    ///
+    /// Signals start out all `x`, the way an undriven Verilog net does;
+    /// parameters are folded to their value immediately. A child's signals join
+    /// the same flat store under qualified names, so `dut.count` is read back
+    /// exactly like a local one.
     pub fn setup(&mut self) -> Result<(), SimulationError> {
         self.state = StateStore::new();
         self.assignments.clear();
         self.blocks.clear();
+        self.aliases.clear();
         self.queue = EventQueue::new();
         self.now = 0;
         self.inputs.clear();
         self.is_setup = false;
 
-        for port in &self.module.ports {
-            self.state.declare(port.identifier.name.clone(), port.range);
-            if matches!(port.direction, PortDirection::Input) {
-                self.inputs.push(port.identifier.name.clone());
-            }
-        }
-
-        for (index, statement) in self.module.statements.iter().enumerate() {
-            match statement {
-                ModuleStatement::WireDeclaration(nets) => {
-                    for net in nets {
-                        self.state
-                            .declare(net.identifier().name.clone(), net.range());
-                    }
-                }
-                ModuleStatement::RegisterDeclaration(register) => {
-                    self.state
-                        .declare(register.name.name.clone(), register.range.unwrap_or((0, 0)));
-                }
-                ModuleStatement::ParameterDeclaration(parameters) => {
-                    for parameter in parameters {
-                        let value = eval(&parameter.value, &self.state)?;
-                        match parameter.range {
-                            Some(range) => self.state.set_ranged(
-                                parameter.name.name.clone(),
-                                value.resize(range_width(range)),
-                                range,
-                            ),
-                            None => self.state.set(parameter.name.name.clone(), value),
-                        }
-                    }
-                }
-                ModuleStatement::Assignment(assignment) => {
-                    self.assignments.push(assignment.clone())
-                }
-                ModuleStatement::AlwaysBlock(block) => {
-                    self.blocks.push(TimedBlock {
-                        statement: index,
-                        kind: BlockKind::Always,
-                        free_running: block.event_control == EventControl::None,
-                        program: Program::compile(&block.statements)?,
-                    });
-                }
-                ModuleStatement::InitialBlock(block) => {
-                    self.blocks.push(TimedBlock {
-                        statement: index,
-                        kind: BlockKind::Initial,
-                        free_running: false,
-                        program: Program::compile(&block.statements)?,
-                    });
-                }
-                ModuleStatement::ModuleInstantiation(_) => {
-                    return Err(SimulationError::Unsupported("a module instantiation"))
-                }
-            }
-        }
+        let top = self
+            .modules
+            .iter()
+            .position(|module| module.identifier.name == self.top)
+            .ok_or_else(|| SimulationError::UnknownModule(self.top.clone()))?;
+        let elaborated = elaborate(&self.modules, top)?;
+        self.state = elaborated.state;
+        self.assignments = elaborated.assignments;
+        self.blocks = elaborated.blocks;
+        self.inputs = elaborated.inputs;
+        self.aliases = elaborated.aliases;
 
         self.is_setup = true;
 
@@ -253,11 +270,19 @@ impl Simulator {
         Ok(())
     }
 
-    /// The current value of any signal: an output port, an input, or an
-    /// internal wire.
+    /// The current value of any signal: an output port, an input, an internal
+    /// wire, or anything inside an instance at its qualified name (`dut.count`).
+    ///
+    /// A child port that was aliased onto a parent signal has no store entry of
+    /// its own, so its qualified spelling is looked up through the alias table
+    /// and reads back the signal it shares.
     pub fn get(&self, name: &str) -> Result<&Register, SimulationError> {
-        self.state
+        if let Some(register) = self.state.get(name) {
+            return Ok(register);
+        }
+        self.aliases
             .get(name)
+            .and_then(|canonical| self.state.get(canonical))
             .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))
     }
 
@@ -339,13 +364,7 @@ impl Simulator {
                 if self.blocks[id].kind != BlockKind::Always || self.blocks[id].free_running {
                     continue;
                 }
-                let fires = match &self.module.statements[self.blocks[id].statement] {
-                    ModuleStatement::AlwaysBlock(block) => {
-                        events::always_block_fires(block, &edges)
-                    }
-                    _ => false,
-                };
-                if fires {
+                if self.blocks[id].fires(&edges) {
                     let (updates, _) = self.resume_block(id, 0)?;
                     pending.extend(updates);
                 }

@@ -1,3 +1,4 @@
+pub mod elaborate;
 pub mod eval;
 pub mod event_queue;
 pub mod events;
