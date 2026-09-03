@@ -1,11 +1,6 @@
 use nom::{
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::{char, multispace0},
-    combinator::map,
-    multi::separated_list0,
-    sequence::{delimited, preceded},
-    IResult,
+    branch::alt, bytes::complete::tag, character::complete::char, combinator::map,
+    multi::separated_list0, sequence::delimited, IResult,
 };
 
 use crate::parsers::expr::{bit_select, part_select, verilog_expression, Expression};
@@ -148,7 +143,7 @@ pub fn parse_concatenation(input: &str) -> IResult<&str, Expression> {
     map(
         delimited(
             char('{'),
-            separated_list0(preceded(multispace0, ws(char(','))), assignment_lhs),
+            separated_list0(char(','), ws(assignment_lhs)),
             char('}'),
         ),
         |exprs| Expression::Concatenation(exprs),

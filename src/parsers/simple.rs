@@ -7,17 +7,10 @@ use nom::{
     IResult,
 };
 
-use nom::character::complete::{char, multispace0, multispace1};
+use nom::character::complete::{char, multispace1};
 
 pub fn whitespace(input: &str) -> IResult<&str, &str> {
     take_while(|c: char| c.is_whitespace())(input)
-}
-
-pub fn ws<'a, F: 'a, O>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
-where
-    F: FnMut(&'a str) -> IResult<&'a str, O>,
-{
-    delimited(multispace0, inner, multispace0)
 }
 
 pub fn raw_pos_int(input: &str) -> IResult<&str, i64> {
@@ -48,6 +41,16 @@ pub fn comment(input: &str) -> IResult<&str, &str> {
 /// Consume any run of whitespace and comments, including an empty one.
 pub fn ws_and_comments(input: &str) -> IResult<&str, ()> {
     value((), many0(alt((multispace1, comment))))(input)
+}
+
+/// Wrap a parser so that whitespace *and comments* on either side of it are
+/// skipped. Nearly every parser in the grammar is wrapped in this, which is
+/// what makes a comment legal anywhere a token boundary is.
+pub fn ws<'a, F: 'a, O>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
+where
+    F: FnMut(&'a str) -> IResult<&'a str, O>,
+{
+    delimited(ws_and_comments, inner, ws_and_comments)
 }
 
 pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
@@ -101,6 +104,23 @@ mod tests {
         assert_eq!(parser("   abc"), Ok(("", "abc")));
         assert_eq!(parser("abc   "), Ok(("", "abc")));
         assert_eq!(parser("   abc   def"), Ok(("def", "abc")));
+    }
+
+    #[test]
+    fn test_ws_skips_comments() {
+        let mut parser = ws(tag("abc"));
+        assert_eq!(parser("// a comment\nabc"), Ok(("", "abc")));
+        assert_eq!(parser("/* a comment */abc"), Ok(("", "abc")));
+        assert_eq!(parser("abc // trailing"), Ok(("", "abc")));
+        assert_eq!(parser("abc /* trailing */"), Ok(("", "abc")));
+        assert_eq!(
+            parser(" /* one */ // two\n abc /* three */ def"),
+            Ok(("def", "abc"))
+        );
+        assert_eq!(
+            parser("/*\n * spanning\n * lines\n */ abc"),
+            Ok(("", "abc"))
+        );
     }
 
     #[test]
