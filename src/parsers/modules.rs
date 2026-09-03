@@ -3,16 +3,16 @@ use std::collections::HashMap;
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    character::complete::char,
-    combinator::{map, opt},
+    character::complete::{char, satisfy},
+    combinator::{map, not, opt},
     multi::{many0, separated_list0, separated_list1},
-    sequence::delimited,
+    sequence::{delimited, terminated},
     IResult,
 };
 
 use super::{
     expr::{verilog_expression, Expression},
-    identifier::{identifier, Identifier},
+    identifier::{identifier, identifier_list, Identifier},
     simple::{range, ws, ws_and_comments},
     statements::{parse_module_statement, ModuleStatement},
 };
@@ -32,32 +32,44 @@ pub struct Port {
     pub identifier: Identifier,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PortDirection {
     Input,
     Output,
     InOut,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum NetType {
     Wire,
     Reg,
 }
 
+/// A character that may continue an identifier, so a keyword followed by one
+/// is not a keyword at all: `input` in `inputs`, `reg` in `reg_a`.
+fn identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
 fn parse_port_direction(input: &str) -> IResult<&str, PortDirection> {
-    alt((
-        map(tag("input"), |_| PortDirection::Input),
-        map(tag("output"), |_| PortDirection::Output),
-        map(tag("inout"), |_| PortDirection::InOut),
-    ))(input)
+    terminated(
+        alt((
+            map(tag("input"), |_| PortDirection::Input),
+            map(tag("output"), |_| PortDirection::Output),
+            map(tag("inout"), |_| PortDirection::InOut),
+        )),
+        not(satisfy(identifier_char)),
+    )(input)
 }
 
 fn parse_net_type(input: &str) -> IResult<&str, NetType> {
-    alt((
-        map(tag("wire"), |_| NetType::Wire),
-        map(tag("reg"), |_| NetType::Reg),
-    ))(input)
+    terminated(
+        alt((
+            map(tag("wire"), |_| NetType::Wire),
+            map(tag("reg"), |_| NetType::Reg),
+        )),
+        not(satisfy(identifier_char)),
+    )(input)
 }
 
 fn parse_port(input: &str) -> IResult<&str, Port> {
@@ -87,17 +99,151 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
     )(input)
 }
 
+/// A Verilog-1995 header: bare port names, whose directions and widths are
+/// declared as statements in the body.
+fn parse_port_names(input: &str) -> IResult<&str, Vec<Identifier>> {
+    delimited(ws(char('(')), identifier_list, ws(char(')')))(input)
+}
+
+/// The two spellings of a module header. Both are normalised to a single
+/// `Vec<Port>` by [`reconcile_ports`] before the module is handed on, so
+/// nothing downstream has to know which one was written.
+#[derive(Debug, PartialEq)]
+enum PortHeader {
+    /// `module m(input wire [3:0] a);` — direction and width in the header.
+    Ansi(Vec<Port>),
+    /// `module m(a, b);` — names only.
+    NonAnsi(Vec<Identifier>),
+}
+
+fn parse_port_header(input: &str) -> IResult<&str, PortHeader> {
+    alt((
+        map(parse_ports, PortHeader::Ansi),
+        map(parse_port_names, PortHeader::NonAnsi),
+    ))(input)
+}
+
+/// A Verilog-1995 body port declaration: `input C;`, `output reg [11:0] h, g;`.
+/// One declaration may name several ports, which then share its direction,
+/// net type and width.
+pub fn parse_port_declaration(input: &str) -> IResult<&str, Vec<Port>> {
+    let (input, direction) = parse_port_direction(input)?;
+    let (input, _) = ws_and_comments(input)?;
+    let (input, net_type) = opt(parse_net_type)(input)?;
+    let (input, _) = ws_and_comments(input)?;
+    let (input, port_range) = opt(range)(input)?;
+    let (input, names) = identifier_list(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    Ok((
+        input,
+        names
+            .into_iter()
+            .map(|identifier| Port {
+                direction,
+                net_type,
+                range: port_range.unwrap_or((0, 0)),
+                identifier,
+            })
+            .collect(),
+    ))
+}
+
+/// Why a module's header and its body port declarations do not agree.
+#[derive(Debug, PartialEq)]
+pub enum PortReconciliationError {
+    /// The header declares directions *and* the body does.
+    MixedStyles,
+    /// A header name that no body declaration gives a direction.
+    MissingDirection(Identifier),
+    /// A body declaration naming something the header does not list.
+    NotInHeader(Identifier),
+    /// The same port declared twice.
+    Duplicate(Identifier),
+}
+
+/// Rejects a name that appears more than once in the same list.
+fn check_unique(names: &[Identifier]) -> Result<(), PortReconciliationError> {
+    for (at, name) in names.iter().enumerate() {
+        if names[..at].contains(name) {
+            return Err(PortReconciliationError::Duplicate(name.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Folds a Verilog-1995 header and its body declarations into the one
+/// `Vec<Port>` an ANSI header produces directly, in header order.
+///
+/// A `reg` declaration that names a port is *not* one of `declared` — it is an
+/// ordinary body statement, and an output backed by a register is exactly what
+/// it means — so it is neither a conflict nor a second port here.
+fn reconcile_ports(
+    header: PortHeader,
+    declared: Vec<Port>,
+) -> Result<Vec<Port>, PortReconciliationError> {
+    let names = match header {
+        PortHeader::Ansi(ports) => {
+            if !declared.is_empty() {
+                return Err(PortReconciliationError::MixedStyles);
+            }
+            let names: Vec<Identifier> = ports.iter().map(|p| p.identifier.clone()).collect();
+            check_unique(&names)?;
+            return Ok(ports);
+        }
+        PortHeader::NonAnsi(names) => names,
+    };
+    check_unique(&names)?;
+
+    let mut ports: Vec<Option<Port>> = names.iter().map(|_| None).collect();
+    for port in declared {
+        let at = names
+            .iter()
+            .position(|name| *name == port.identifier)
+            .ok_or_else(|| PortReconciliationError::NotInHeader(port.identifier.clone()))?;
+        if ports[at].is_some() {
+            return Err(PortReconciliationError::Duplicate(port.identifier));
+        }
+        ports[at] = Some(port);
+    }
+
+    names
+        .into_iter()
+        .zip(ports)
+        .map(|(name, port)| port.ok_or(PortReconciliationError::MissingDirection(name)))
+        .collect()
+}
+
 /// Parses `module name (ports); … endmodule`.
 ///
 /// The port list is optional: `module top;` is legal Verilog and is how most
 /// testbenches are written, since a top-level module has nothing to connect to.
+/// It may be written either way round — ANSI, with the directions in the
+/// header, or Verilog-1995, with bare names in the header and the directions
+/// declared in the body. Both leave the same `Vec<Port>` behind.
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = ws(tag("module"))(input)?;
     let (input, mod_identifier) = ws(identifier)(input)?;
-    let (input, ports) = map(opt(parse_ports), Option::unwrap_or_default)(input)?;
+    let (input, header) = map(opt(parse_port_header), |header| {
+        header.unwrap_or(PortHeader::Ansi(Vec::new()))
+    })(input)?;
     let (input, _) = ws(tag(";"))(input)?;
-    let (input, statements) = many0(ws(parse_module_statement))(input)?;
+    let (input, body) = many0(ws(parse_module_statement))(input)?;
     let (input, _) = ws(tag("endmodule"))(input)?;
+
+    // A body port declaration *is* a port, so it is lifted out of the body
+    // rather than left in it as a second description of the same thing.
+    let mut declared = Vec::new();
+    let mut statements = Vec::new();
+    for statement in body {
+        match statement {
+            ModuleStatement::PortDeclaration(ports) => declared.extend(ports),
+            other => statements.push(other),
+        }
+    }
+    let ports = reconcile_ports(header, declared).map_err(|_| {
+        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+    })?;
+
     Ok((
         input,
         VerilogModule {
@@ -610,5 +756,166 @@ mod tests {
             assert_eq!(res.module_name, "adder".into());
             assert_eq!(res.instance_name, "my_adder".into());
         }
+    }
+
+    fn named_port(direction: PortDirection, name: &str) -> Port {
+        Port {
+            direction,
+            net_type: None,
+            range: (0, 0),
+            identifier: name.into(),
+        }
+    }
+
+    /// Issue #104: the Verilog-1995 header lists names only, and the body
+    /// declarations supply the direction and the width.
+    #[test]
+    fn test_parse_non_ansi_port_header() {
+        let module = assert_parses(
+            parse_module_declaration,
+            r#"
+            module addwide ( C, h );
+                input C;
+                output [11:0] h;
+                reg [11:0] h;
+                always @(posedge C) h <= h + 1;
+            endmodule
+            "#,
+        );
+        assert_eq!(module.identifier, "addwide".into());
+        assert_eq!(
+            module.ports,
+            vec![
+                named_port(PortDirection::Input, "C"),
+                Port {
+                    direction: PortDirection::Output,
+                    net_type: None,
+                    range: (11, 0),
+                    identifier: "h".into(),
+                },
+            ]
+        );
+        // The direction declarations became ports; the `reg` — which is what
+        // makes `h` an output backed by a register — is still a body statement.
+        assert_eq!(module.statements.len(), 2);
+        assert!(matches!(
+            module.statements[0],
+            ModuleStatement::RegisterDeclaration(_)
+        ));
+    }
+
+    /// The two spellings of the same header normalise to the same ports, so
+    /// nothing downstream can tell them apart.
+    #[test]
+    fn test_the_two_header_styles_agree() {
+        let ansi = assert_parses(
+            parse_module_declaration,
+            "module m(input wire [3:0] a, output reg b); endmodule",
+        );
+        let non_ansi = assert_parses(
+            parse_module_declaration,
+            "module m(a, b); input wire [3:0] a; output reg b; endmodule",
+        );
+        assert_eq!(ansi, non_ansi);
+    }
+
+    #[test]
+    fn test_parse_port_declaration_names_several_ports() {
+        assert_parses_to(
+            parse_port_declaration,
+            "output reg [11:0] h, g;",
+            vec![
+                Port {
+                    direction: PortDirection::Output,
+                    net_type: Some(NetType::Reg),
+                    range: (11, 0),
+                    identifier: "h".into(),
+                },
+                Port {
+                    direction: PortDirection::Output,
+                    net_type: Some(NetType::Reg),
+                    range: (11, 0),
+                    identifier: "g".into(),
+                },
+            ],
+        );
+    }
+
+    /// A direction keyword is only a keyword when a whole token, so a module
+    /// whose instance name merely starts with one is not a port declaration.
+    #[test]
+    fn test_a_direction_keyword_must_be_a_whole_token() {
+        let module = assert_parses(
+            parse_module_declaration,
+            "module m(a); input a; inputs inst (a); endmodule",
+        );
+        assert_eq!(module.ports.len(), 1);
+        assert!(matches!(
+            module.statements[0],
+            ModuleStatement::ModuleInstantiation(_)
+        ));
+    }
+
+    #[test]
+    fn test_a_header_name_needs_a_direction() {
+        assert_eq!(
+            reconcile_ports(
+                PortHeader::NonAnsi(vec!["a".into(), "b".into()]),
+                vec![named_port(PortDirection::Input, "a")],
+            ),
+            Err(PortReconciliationError::MissingDirection("b".into()))
+        );
+        assert!(parse_module_declaration("module m(a, b); input a; endmodule").is_err());
+    }
+
+    #[test]
+    fn test_a_declaration_must_name_a_header_port() {
+        assert_eq!(
+            reconcile_ports(
+                PortHeader::NonAnsi(vec!["a".into()]),
+                vec![
+                    named_port(PortDirection::Input, "a"),
+                    named_port(PortDirection::Output, "b"),
+                ],
+            ),
+            Err(PortReconciliationError::NotInHeader("b".into()))
+        );
+        assert!(parse_module_declaration("module m(a); input a; output b; endmodule").is_err());
+    }
+
+    #[test]
+    fn test_a_port_cannot_be_declared_twice() {
+        assert_eq!(
+            reconcile_ports(
+                PortHeader::NonAnsi(vec!["a".into()]),
+                vec![
+                    named_port(PortDirection::Input, "a"),
+                    named_port(PortDirection::Output, "a"),
+                ],
+            ),
+            Err(PortReconciliationError::Duplicate("a".into()))
+        );
+        assert!(parse_module_declaration("module m(a); input a; input a; endmodule").is_err());
+
+        // The same name twice in the header itself is the same mistake.
+        assert_eq!(
+            reconcile_ports(
+                PortHeader::NonAnsi(vec!["a".into(), "a".into()]),
+                vec![named_port(PortDirection::Input, "a")],
+            ),
+            Err(PortReconciliationError::Duplicate("a".into()))
+        );
+    }
+
+    #[test]
+    fn test_the_two_header_styles_cannot_be_mixed() {
+        assert_eq!(
+            reconcile_ports(
+                PortHeader::Ansi(vec![named_port(PortDirection::Input, "a")]),
+                vec![named_port(PortDirection::Input, "a")],
+            ),
+            Err(PortReconciliationError::MixedStyles)
+        );
+        assert!(parse_module_declaration("module m(input a); input a; endmodule").is_err());
     }
 }
