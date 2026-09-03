@@ -1048,6 +1048,38 @@ mod tests {
         assert_eq!(simulator.get("count").unwrap().to_u128(), Some(10));
     }
 
+    /// Every name in a comma-separated declaration has to reach the store, not
+    /// just the first — otherwise driving the second one writes nowhere.
+    #[test]
+    fn test_comma_declared_registers_all_simulate() {
+        let mut simulator = simulator_for(
+            r#"
+            module lists(output wire [3:0] sum);
+                reg [3:0] a, b;
+                integer i, j;
+
+                initial begin
+                    a = 4'd3;
+                    b = 4'd4;
+                    i = 7;
+                    j = 9;
+                end
+
+                assign sum = a + b;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(3));
+        assert_eq!(simulator.get("b").unwrap().to_u128(), Some(4));
+        assert_eq!(simulator.get("sum").unwrap().to_u128(), Some(7));
+
+        // An `integer` is 32 bits wide, and both names exist.
+        assert_eq!(simulator.get("i").unwrap().width(), 32);
+        assert_eq!(simulator.get("i").unwrap().to_u128(), Some(7));
+        assert_eq!(simulator.get("j").unwrap().to_u128(), Some(9));
+    }
+
     #[test]
     fn test_delay_nested_in_a_conditional_schedules_correctly() {
         // The resume point is inside the `if` body, so this only works because

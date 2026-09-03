@@ -262,6 +262,15 @@ tripwire.
   parameter cannot determine a width: `output [WIDTH-1:0] q` does not parse. A parameter
   override therefore changes a child's *behaviour*, never its widths, until the front end
   grows expression ranges.
+- **A declaration is a *list*, and every declaration parser returns a `Vec`.**
+  `reg [4:0] a, b;`, `wire a, b, c;` and `integer i, j;` all share one width (or, for an
+  `integer`, one fixed 32-bit width) across every name, so `parse_register_declaration`,
+  `net_declaration` and `parse_integer_declaration` each return a `Vec` and the matching
+  `ModuleStatement` variants wrap one. **A memory is not a separate production** — the
+  address dimension belongs to the *name* (`register::declared_name`), which is what makes
+  `reg [7:0] a, mem [0:15];` legal and what removes the "try the memory form first"
+  ordering hazard that two near-identical `reg`-led parsers would otherwise create.
+  An `integer` is signed, which nothing models yet (issue #96).
 - **Flattening rewrites names on the compiled `Program`, not on the statement tree.**
   `AlwaysBlock` and `ProceduralStatements` are not `Clone`, but `Instruction` owns its
   `Expression`s, so `Program::rename` is what re-points a child's body at the parent's

@@ -255,8 +255,21 @@ impl<'m> Elaborator<'m> {
                     self.declare_local(&net.identifier().name, net.range(), scope);
                 }
             }
-            ModuleStatement::RegisterDeclaration(register) => {
-                self.declare_local(&register.name.name, register.range.unwrap_or((0, 0)), scope);
+            ModuleStatement::RegisterDeclaration(registers) => {
+                for register in registers {
+                    self.declare_local(
+                        &register.name.name,
+                        register.range.unwrap_or((0, 0)),
+                        scope,
+                    );
+                }
+            }
+            ModuleStatement::IntegerDeclaration(integers) => {
+                for declaration in integers {
+                    // An `integer` is 32 bits wide in Verilog. It is also
+                    // signed, which nothing here models yet (issue #96).
+                    self.declare_local(&declaration.name.name, (31, 0), scope);
+                }
             }
             ModuleStatement::ParameterDeclaration(parameters) => {
                 for parameter in parameters {
