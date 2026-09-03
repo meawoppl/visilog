@@ -2,8 +2,8 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
     character::complete::{alpha1, char},
-    combinator::{map, opt, recognize},
-    sequence::{delimited, pair, preceded},
+    combinator::{opt, recognize},
+    sequence::pair,
     IResult,
 };
 
@@ -26,39 +26,21 @@ fn parse_identifier(input: &str) -> IResult<&str, &str> {
     ))(input)
 }
 
-fn parse_dimensions(input: &str) -> IResult<&str, (i64, i64)> {
-    delimited(
-        char('['),
-        pair(
-            map(take_while(|c: char| c.is_digit(10)), |s: &str| {
-                s.parse::<i64>().unwrap()
-            }),
-            preceded(
-                char(':'),
-                map(take_while(|c: char| c.is_digit(10)), |s: &str| {
-                    s.parse::<i64>().unwrap()
-                }),
-            ),
-        ),
-        char(']'),
-    )(input)
-}
-
 pub fn parse_register_declaration(input: &str) -> IResult<&str, RegisterDeclaration> {
     let (input, _) = tag("reg")(input)?;
     let (input, _) = ws_and_comments(input)?;
-    let (input, range) = opt(range)(input)?;
+    let (input, width) = opt(range)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, name) = identifier(input)?;
-    let (input, dimensions) = opt(parse_dimensions)(input)?;
+    let (input, dimensions) = opt(range)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, _) = char(';')(input)?;
 
     Ok((
         input,
         RegisterDeclaration {
-            name: name,
-            range,
+            name,
+            range: width,
             dimensions,
         },
     ))
@@ -67,18 +49,18 @@ pub fn parse_register_declaration(input: &str) -> IResult<&str, RegisterDeclarat
 pub fn parse_memory_declaration(input: &str) -> IResult<&str, RegisterDeclaration> {
     let (input, _) = tag("reg")(input)?;
     let (input, _) = ws_and_comments(input)?;
-    let (input, range) = opt(range)(input)?;
+    let (input, width) = opt(range)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, name) = identifier(input)?;
-    let (input, dimensions) = opt(parse_dimensions)(input)?;
+    let (input, dimensions) = opt(range)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, _) = char(';')(input)?;
 
     Ok((
         input,
         RegisterDeclaration {
-            name: name,
-            range,
+            name,
+            range: width,
             dimensions,
         },
     ))
@@ -89,6 +71,23 @@ mod tests {
     use crate::parsers::helpers::assert_parses_to;
 
     use super::*;
+
+    /// A non-numeric range bound must be a parse *error*, never a panic.
+    ///
+    /// `parse_dimensions` used to duplicate `simple::range` using `take_while`
+    /// (zero or more digits) followed by `.unwrap()`, so `reg [a:0] x;` matched
+    /// an empty digit run and panicked on the failed `parse::<i64>()`. Real
+    /// corpus files hit this the moment port-less modules started parsing.
+    #[test]
+    fn test_non_numeric_range_bounds_error_rather_than_panic() {
+        for source in ["reg [a:0] x;", "reg [:0] x;", "reg [7:] x;", "reg [] x;"] {
+            assert!(
+                parse_register_declaration(source).is_err(),
+                "{:?} should fail to parse, not panic",
+                source
+            );
+        }
+    }
 
     #[test]
     fn test_parse_register_declaration() {

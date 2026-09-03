@@ -61,6 +61,21 @@ fn entries(list: &str) -> Vec<Entry> {
         .collect()
 }
 
+/// Whether the source names a `$task` the simulator does not implement.
+///
+/// Counting every `$` would keep reporting system tasks as a blocker after
+/// they were implemented, which is how a survey heuristic quietly goes stale.
+fn unsupported_system_names(source: &str) -> bool {
+    const SUPPORTED: [&str; 4] = ["display", "write", "finish", "time"];
+    source.match_indices('$').any(|(at, _)| {
+        let name: String = source[at + 1..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        !name.is_empty() && !SUPPORTED.contains(&name.as_str())
+    })
+}
+
 /// Which known-missing features a rejected file uses.
 ///
 /// Counted **independently**, not first-match-wins: a typical corpus file needs
@@ -85,12 +100,8 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
     };
 
     note(
-        source.contains('$'),
-        "system task / function ($display, $finish)",
-    );
-    note(
-        body.contains("//") || body.contains("/*"),
-        "comment inside a module body (#87)",
+        unsupported_system_names(source),
+        "unsupported system function ($random, $signed, $monitor, ...)",
     );
     note(
         source.lines().any(|line| {
@@ -166,6 +177,7 @@ fn ivtest_corpus_parse_rate() {
     let (mut parsed, mut rejected, mut missing) = (0usize, 0usize, 0usize);
     let mut blockers: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut clean = 0usize;
+    let mut unexplained: Vec<String> = Vec::new();
 
     for entry in &normal {
         let path = dir.join(format!("{}.v", entry.name));
@@ -180,6 +192,9 @@ fn ivtest_corpus_parse_rate() {
                 let found = blockers_in(&source);
                 if found.is_empty() {
                     clean += 1;
+                    if unexplained.len() < 12 {
+                        unexplained.push(entry.name.clone());
+                    }
                 }
                 for blocker in found {
                     *blockers.entry(blocker).or_default() += 1;
@@ -217,6 +232,15 @@ fn ivtest_corpus_parse_rate() {
         clean,
         100.0 * clean as f64 / rejected.max(1) as f64
     );
+
+    // Naming a few keeps the survey honest as coverage grows: once the known
+    // blockers stop explaining most failures, these are what to look at next.
+    if !unexplained.is_empty() {
+        println!("\nsample of unexplained rejections:");
+        for name in &unexplained {
+            println!("  {}", name);
+        }
+    }
 
     assert!(attempted > 0, "corpus present but no tests were attempted");
 }
