@@ -1,10 +1,10 @@
 use nom::{
     branch::alt,
-    bytes::complete::tag,
-    character::complete::{char, multispace0, multispace1},
-    combinator::{map, opt, peek, value},
-    multi::{many0, many1, separated_list1},
-    sequence::{delimited, preceded, terminated},
+    bytes::complete::{tag, take_while},
+    character::complete::{alpha1, char, multispace0, multispace1},
+    combinator::{map, opt, peek, recognize, value},
+    multi::{many0, many1, separated_list0, separated_list1},
+    sequence::{delimited, pair, preceded, terminated},
     IResult,
 };
 
@@ -15,6 +15,7 @@ use super::{
     delay::{parse_delay_statement, Delay},
     expr::{verilog_expression, Expression},
     simple::ws,
+    string::parse_verilog_string,
 };
 #[derive(Debug, PartialEq, Clone)]
 pub enum EventTriggers {
@@ -100,12 +101,37 @@ pub struct CaseStatement {
     pub items: Vec<CaseItem>,
 }
 
+/// One argument of a system task call.
+///
+/// A format string is a plain string literal rather than an [`Expression`] —
+/// the expression grammar has no string operand — and `$time` is a system
+/// *function*, which is likewise not an expression operand.
+#[derive(Debug, PartialEq)]
+pub enum SystemTaskArgument {
+    /// A double-quoted literal, as in `$display("PASSED")`.
+    String(String),
+    /// A nested system function, named without its `$`: `$display("%0d", $time)`.
+    SystemFunction(String),
+    /// An ordinary expression.
+    Expression(Expression),
+}
+
+/// `$display("count = %0d", count);` — a system task call, named without its
+/// `$`. Which names are meaningful is the simulator's business, not the
+/// parser's.
+#[derive(Debug, PartialEq)]
+pub struct SystemTaskCall {
+    pub name: String,
+    pub arguments: Vec<SystemTaskArgument>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ProceduralStatements {
     Delay(Delay),
     Assignment(ProceduralAssignment),
     If(IfStatement),
     Case(CaseStatement),
+    SystemTask(SystemTaskCall),
 }
 
 pub enum ProceduralBlock {
@@ -117,6 +143,7 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
     alt((
         map(parse_if_statement, |i| ProceduralStatements::If(i)),
         map(parse_case_statement, |c| ProceduralStatements::Case(c)),
+        map(parse_system_task, |t| ProceduralStatements::SystemTask(t)),
         map(parse_assignment, |a| ProceduralStatements::Assignment(a)),
         map(parse_delay_statement, |d| ProceduralStatements::Delay(d)),
     ))(input)
@@ -130,6 +157,50 @@ fn statement_body(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
 
 fn parenthesized_expression(input: &str) -> IResult<&str, Expression> {
     delimited(ws(char('(')), verilog_expression, ws(char(')')))(input)
+}
+
+/// `$` followed by a name. The `$` is deliberately not folded into
+/// `identifier`: a system task is legal only where a task call is, and letting
+/// `$foo` parse as a name would make it legal everywhere a signal is.
+fn system_task_name(input: &str) -> IResult<&str, String> {
+    map(
+        preceded(
+            char('$'),
+            recognize(pair(
+                alt((alpha1, tag("_"))),
+                take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '$'),
+            )),
+        ),
+        |name: &str| name.to_string(),
+    )(input)
+}
+
+fn system_task_argument(input: &str) -> IResult<&str, SystemTaskArgument> {
+    alt((
+        map(parse_verilog_string, SystemTaskArgument::String),
+        map(system_task_name, SystemTaskArgument::SystemFunction),
+        map(verilog_expression, SystemTaskArgument::Expression),
+    ))(input)
+}
+
+/// `$display("a = %0d", a);`, `$finish;` — a system task call as a statement.
+/// The argument list is optional, and may be empty.
+pub fn parse_system_task(input: &str) -> IResult<&str, SystemTaskCall> {
+    let (input, name) = ws(system_task_name)(input)?;
+    let (input, arguments) = opt(delimited(
+        ws(char('(')),
+        separated_list0(char(','), ws(system_task_argument)),
+        ws(char(')')),
+    ))(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        SystemTaskCall {
+            name,
+            arguments: arguments.unwrap_or_default(),
+        },
+    ))
 }
 
 pub fn parse_if_statement(input: &str) -> IResult<&str, IfStatement> {
@@ -563,5 +634,56 @@ mod tests {
             statement.items[0].label,
             CaseLabel::Expressions(vec![identifier_expression("default_state")])
         );
+    }
+
+    #[test]
+    fn test_parse_system_task_with_a_format_string_and_arguments() {
+        let call = assert_parses(parse_system_task, r#"$display("a = %0d", a, $time);"#);
+        assert_eq!(call.name, "display");
+        assert_eq!(
+            call.arguments,
+            vec![
+                SystemTaskArgument::String("a = %0d".to_string()),
+                SystemTaskArgument::Expression(identifier_expression("a")),
+                SystemTaskArgument::SystemFunction("time".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_system_task_argument_lists_that_are_absent_or_empty() {
+        assert_eq!(
+            assert_parses(parse_system_task, "$finish;").arguments,
+            vec![]
+        );
+        assert_eq!(
+            assert_parses(parse_system_task, "$display ( ) ;").arguments,
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_system_task_is_a_procedural_statement_anywhere_a_statement_is() {
+        for source in [
+            r#"$display("hi");"#,
+            r#"if (a) $display("hi"); else $write("bye");"#,
+        ] {
+            assert!(
+                procedural_statement(source).is_ok(),
+                "did not parse: {}",
+                source
+            );
+        }
+
+        let statements = assert_parses(parse_block, r#"begin a = 'b1; $display("%b", a); end"#);
+        assert!(matches!(statements[1], ProceduralStatements::SystemTask(_)));
+    }
+
+    #[test]
+    fn test_a_dollar_name_is_still_not_an_ordinary_identifier() {
+        // The `$` is a token of its own, not a loosening of `identifier`: a
+        // system task is legal where a statement is, and nowhere else.
+        assert!(verilog_expression("$time").is_err());
+        assert!(procedural_statement("$display = 1;").is_err());
     }
 }

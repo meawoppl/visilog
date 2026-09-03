@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! let program = Program::compile(&block.statements)?;
-//! match resume(&program, 0, &mut store)? {
+//! match resume(&program, 0, &mut store, &mut tasks)? {
 //!     Resume::Halted { pending } => { /* the block finished */ }
 //!     Resume::Suspended { pc, delay, pending } => { /* re-enter at `pc` after `delay` */ }
 //! }
@@ -28,6 +28,7 @@ use crate::simulator::eval::eval;
 use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+use crate::simulator::tasks::{TaskCall, TaskContext};
 
 /// What a delay nobody can run reports — either because it cannot be compiled,
 /// or because the caller cannot hold the resume point a suspension hands back.
@@ -64,6 +65,8 @@ pub enum Instruction {
     JumpIfMatch { label: Expression, target: usize },
     /// `#n` — suspend, and resume at the next instruction `n` time units later.
     Delay(i64),
+    /// `$display(…)` and friends — a call to a system task.
+    Task(TaskCall),
     /// The end of the block.
     Halt,
 }
@@ -133,6 +136,7 @@ impl Program {
                 Instruction::JumpIfFalse { condition, .. } => rename_expression(condition, resolve),
                 Instruction::CaseSubject(subject) => rename_expression(subject, resolve),
                 Instruction::JumpIfMatch { label, .. } => rename_expression(label, resolve),
+                Instruction::Task(call) => call.rename(resolve),
                 Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
             }
         }
@@ -152,6 +156,13 @@ impl Program {
                 }
                 ProceduralStatements::If(conditional) => self.compile_if(conditional)?,
                 ProceduralStatements::Case(case) => self.compile_case(case)?,
+                // Which `$name`s exist is settled here rather than while the
+                // design runs, so an unrecognised one fails before it can look
+                // like a task that quietly printed nothing.
+                ProceduralStatements::SystemTask(call) => {
+                    let call = TaskCall::compile(call)?;
+                    self.emit(Instruction::Task(call));
+                }
             }
         }
         Ok(())
@@ -286,10 +297,13 @@ impl Program {
 ///
 /// Blocking writes land in `store` as they execute; non-blocking ones come back
 /// in the returned `pending` list, whether the block finished or suspended.
+/// Whatever the block prints goes into `tasks`, which also carries the time
+/// `$time` reports and takes the mark a `$finish` leaves behind.
 pub fn resume(
     program: &Program,
     pc: usize,
     store: &mut StateStore,
+    tasks: &mut TaskContext,
 ) -> Result<Resume, SimulationError> {
     let mut pc = pc;
     let mut pending = Vec::new();
@@ -338,6 +352,15 @@ pub fn resume(
                 } else {
                     pc + 1
                 };
+            }
+            Instruction::Task(call) => {
+                tasks.run(call, store)?;
+                // `$finish` ends the simulation, so the rest of the block is
+                // not run — and the driver stops advancing time.
+                if tasks.finished() {
+                    return Ok(Resume::Halted { pending });
+                }
+                pc += 1;
             }
             Instruction::Delay(delay) => {
                 return Ok(Resume::Suspended {
@@ -401,7 +424,7 @@ mod tests {
     /// Runs from `pc`, commits whatever the step queued, and reports where the
     /// block stopped: `Some(pc)` when it suspended, `None` when it halted.
     fn step(program: &Program, pc: usize, store: &mut StateStore) -> Option<(usize, i64)> {
-        match resume(program, pc, store).expect("resume should succeed") {
+        match resume(program, pc, store, &mut TaskContext::new()).expect("resume should succeed") {
             Resume::Halted { pending } => {
                 commit_updates(pending, store).unwrap();
                 None
@@ -587,7 +610,9 @@ mod tests {
         let program = compile("begin a <= b; #5; b <= a; end");
         let mut store = store_with(&[("a", "1010"), ("b", "0101")]);
 
-        let Resume::Suspended { pc, pending, .. } = resume(&program, 0, &mut store).unwrap() else {
+        let Resume::Suspended { pc, pending, .. } =
+            resume(&program, 0, &mut store, &mut TaskContext::new()).unwrap()
+        else {
             panic!("should suspend");
         };
         assert_eq!(pending.len(), 1);
@@ -633,7 +658,12 @@ mod tests {
         let mut store = store_with(&[("a", "0")]);
 
         assert_eq!(
-            resume(&program, program.instructions().len(), &mut store),
+            resume(
+                &program,
+                program.instructions().len(),
+                &mut store,
+                &mut TaskContext::new()
+            ),
             Ok(Resume::Halted {
                 pending: Vec::new()
             })

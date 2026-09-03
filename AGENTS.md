@@ -66,7 +66,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `integer.rs` | `integer a, b;` declarations |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
-| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case` |
+| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
@@ -119,10 +119,11 @@ an *edge*, so a value that is written without settling produces no edge and noth
 Procedural bodies run through **one** engine, in `program.rs`. `Program::compile` flattens
 a statement tree into a linear instruction list whose control flow is carried by jumps, so
 a resume point is just a program counter — which is what makes a `#delay` nested inside an
-`if` or `case` arm suspendable. `resume(&program, pc, &mut store)` runs until the block
-halts or hits a delay. `exec::execute_statements` is a thin wrapper that compiles, resumes
-from `0`, and reports `Unsupported` if the block suspends, because its callers have
-nowhere to keep the resume point yet.
+`if` or `case` arm suspendable. `resume(&program, pc, &mut store, &mut tasks)` runs until the block
+halts or hits a delay. The `TaskContext` is where a `$display` prints and where a `$finish`
+is recorded; `resume` stops the block the moment one lands. `exec::execute_statements` is a
+thin wrapper that compiles, resumes from `0`, and reports `Unsupported` if the block
+suspends, because its callers have nowhere to keep the resume point yet.
 
 `Simulator::advance` moves simulated time forward, which is what gives `#delay` meaning: a
 block that hits a delay suspends and re-queues itself on the `EventQueue` for a later
@@ -145,6 +146,18 @@ unconnected input is declared `z`. `Simulator::with_modules(modules, top)` is ho
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 
+**System tasks print into a buffer, not to stdout.** `$display`, `$write`, `$finish` and
+`$time` are compiled to an `Instruction::Task` and carried out by
+`tasks::TaskContext`, which the `Simulator` owns: `simulator.output()` hands back
+everything the design printed, so "did this design print `PASSED`?" is a plain assertion —
+which is exactly what a self-checking corpus test needs. `$finish` sets a flag rather than
+exiting the process; `advance` and `poke` become no-ops once it is set, and `now` stops
+where it stopped. Which `$name`s exist is decided at *compile* time by `TaskCall::compile`,
+so an unrecognised task is an error naming it rather than a silent no-op — a design that
+quietly printed nothing would look just like one that passed. `$strobe` and `$monitor` are
+rejected by name for the same reason: their output is deferred to the end of a time step,
+which nothing schedules yet.
+
 Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
 fit in a program counter) and concatenation as an assignment target. Parameter overrides
 cannot change a width, because `simple.rs::range` only parses literal integers, so
@@ -158,6 +171,7 @@ cannot change a width, because `simple.rs::range` only parses literal integers, 
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` — system tasks, their format strings, and the buffer they print into |
 | `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
@@ -253,6 +267,13 @@ tripwire.
   `Expression`s, so `Program::rename` is what re-points a child's body at the parent's
   store. A `TimedBlock` therefore carries its own owned `EventControl` and a precomputed
   `@(*)` read set rather than an index back into `module.statements`.
+- **A `$name` is its own token, not an identifier.** `identifier` still rejects a leading
+  `$`, so `$foo` is legal only where `procedural_statement` allows a system task. A format
+  string is likewise a `SystemTaskArgument::String`, not an `Expression` — the expression
+  grammar has no string operand — and `$time` is a `SystemTaskArgument::SystemFunction`.
+- **`Register::to_decimal` accumulates into a machine integer**, so it overflows on
+  anything wider than about 31 bits. `tasks.rs` formats decimals through `to_u128`
+  instead; do the same rather than reaching for `to_decimal` on a real signal.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

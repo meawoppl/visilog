@@ -1367,4 +1367,33 @@ mod tests {
             Err(SimulationError::NotAnInput("dut.clk".to_string()))
         );
     }
+
+    #[test]
+    fn test_a_system_task_in_a_child_reads_the_flattened_signal() {
+        // The call is compiled before the child is flattened, so this only
+        // prints the right number because `TaskCall::rename` re-points it at
+        // `dut.count`.
+        let chatty = r#"
+            module chatty(
+                input clk
+            );
+                reg [3:0] count;
+                initial begin
+                    count = 4'd7;
+                    $display("child count %0d", count);
+                end
+            endmodule
+        "#;
+        let top = r#"
+            module top(
+                input clk
+            );
+                chatty dut (.clk(clk));
+            endmodule
+        "#;
+
+        let simulator = simulator_for(&[top, chatty], "top");
+        assert_eq!(simulator.output().lines(), vec!["child count 7"]);
+        assert_eq!(simulator.get("dut.count").unwrap().to_u128(), Some(7));
+    }
 }

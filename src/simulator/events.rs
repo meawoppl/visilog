@@ -37,6 +37,7 @@ use std::collections::BTreeSet;
 
 use crate::parsers::behavior::{
     AlwaysBlock, CaseLabel, Event, EventControl, EventTriggers, ProceduralStatements,
+    SystemTaskArgument,
 };
 use crate::parsers::expr::Expression;
 use crate::register::{Register, ONE, X, Z, ZERO};
@@ -244,6 +245,16 @@ fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTre
                 collect_statement_reads(&statement.then_statements, names);
                 if let Some(else_statements) = &statement.else_statements {
                     collect_statement_reads(else_statements, names);
+                }
+            }
+            // A system task reads whatever its arguments name, and a value it
+            // prints is as good a reason for an `@(*)` block to wake as one it
+            // assigns.
+            ProceduralStatements::SystemTask(call) => {
+                for argument in &call.arguments {
+                    if let SystemTaskArgument::Expression(expression) = argument {
+                        collect_expression_reads(expression, names);
+                    }
                 }
             }
             ProceduralStatements::Case(statement) => {

@@ -41,6 +41,7 @@ use crate::simulator::events;
 use crate::simulator::exec::{commit_updates, drive, PendingUpdate};
 use crate::simulator::program::{self, Resume};
 use crate::simulator::state_store::StateStore;
+use crate::simulator::tasks::{Output, TaskContext};
 
 /// Ceiling on delta cycles within a single settle. A design that keeps
 /// producing edges past this is oscillating, not converging.
@@ -59,6 +60,11 @@ pub enum SimulationError {
     NotAnInput(String),
     /// A module construct this milestone cannot execute.
     Unsupported(&'static str),
+    /// A `$name(…)` call the simulator cannot carry out: an unrecognised task,
+    /// a format specifier it does not know, or a specifier with no argument.
+    /// It always names what it rejected — a design that silently printed
+    /// nothing would look exactly like one that passed.
+    SystemTask(String),
     /// An instantiation, or a top-level name, that no supplied module defines.
     UnknownModule(String),
     /// A named port connection for a port the instantiated module does not have.
@@ -103,6 +109,7 @@ impl fmt::Display for SimulationError {
             SimulationError::Unsupported(what) => {
                 write!(f, "{} is not supported by the simulator", what)
             }
+            SimulationError::SystemTask(problem) => write!(f, "{}", problem),
             SimulationError::UnknownModule(name) => write!(f, "no module named `{}`", name),
             SimulationError::UnknownPort { module, port } => {
                 write!(f, "module `{}` has no port `{}`", module, port)
@@ -172,6 +179,9 @@ pub struct Simulator {
     now: i64,
     inputs: Vec<String>,
     is_setup: bool,
+    /// Where system tasks print, what `$time` reads, and whether the design has
+    /// called `$finish`.
+    tasks: TaskContext,
 }
 
 impl Simulator {
@@ -198,6 +208,7 @@ impl Simulator {
             now: 0,
             inputs: Vec::new(),
             is_setup: false,
+            tasks: TaskContext::new(),
         }
     }
 
@@ -218,6 +229,7 @@ impl Simulator {
         self.now = 0;
         self.inputs.clear();
         self.is_setup = false;
+        self.tasks = TaskContext::new();
 
         let top = self
             .modules
@@ -314,6 +326,9 @@ impl Simulator {
     /// This is the entry point for sequential logic — clocking a design means
     /// poking its clock, since it is the *edge* that wakes an `always` block.
     pub fn poke(&mut self, name: &str, value: Register) -> Result<usize, SimulationError> {
+        if self.finished() {
+            return Ok(0);
+        }
         // The marker goes down before the input is written, so writing it is
         // itself an edge. Without that, nothing an edge-triggered block waits
         // on ever appears to move and the design never wakes.
@@ -368,6 +383,9 @@ impl Simulator {
                     let (updates, _) = self.resume_block(id, 0)?;
                     pending.extend(updates);
                 }
+                if self.finished() {
+                    break;
+                }
             }
 
             commit_updates(pending, &mut self.state)?;
@@ -384,6 +402,21 @@ impl Simulator {
         self.now
     }
 
+    /// Everything the design has printed with `$display` and `$write`.
+    ///
+    /// System task output is buffered rather than written to stdout, which is
+    /// what makes a self-checking design testable: whether it printed `PASSED`
+    /// is a plain assertion. A caller that wants it on a terminal prints this.
+    pub fn output(&self) -> &Output {
+        self.tasks.output()
+    }
+
+    /// Whether the design has called `$finish`. A finished simulation runs no
+    /// more blocks and its time no longer moves.
+    pub fn finished(&self) -> bool {
+        self.tasks.finished()
+    }
+
     /// Runs simulated time forward by `duration` time units, executing every
     /// scheduled block resumption along the way.
     ///
@@ -395,6 +428,11 @@ impl Simulator {
     pub fn advance(&mut self, duration: i64) -> Result<(), SimulationError> {
         if !self.is_setup {
             return Err(SimulationError::NotSetUp);
+        }
+        // `$finish` ends the simulation: no block runs again and time stops
+        // where it stopped.
+        if self.finished() {
+            return Ok(());
         }
 
         let target = self.now + duration;
@@ -430,11 +468,19 @@ impl Simulator {
                     self.queue
                         .insert(self.now, ExecutionCursor::new(cursor.block, 0));
                 }
+
+                if self.finished() {
+                    break;
+                }
             }
 
             commit_updates(pending, &mut self.state)?;
             self.propagate()?;
             self.settle()?;
+
+            if self.finished() {
+                return Ok(());
+            }
         }
 
         self.now = target;
@@ -448,7 +494,14 @@ impl Simulator {
         id: usize,
         pc: usize,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
-        match program::resume(&self.blocks[id].program, pc, &mut self.state)? {
+        // `$time` reads the timestamp the block is being resumed at.
+        self.tasks.set_time(self.now);
+        match program::resume(
+            &self.blocks[id].program,
+            pc,
+            &mut self.state,
+            &mut self.tasks,
+        )? {
             Resume::Halted { pending } => Ok((pending, true)),
             Resume::Suspended { pc, delay, pending } => {
                 self.queue
@@ -1202,6 +1255,207 @@ mod tests {
         assert_eq!(
             simulator.set_input("a", Register::from_binary("1")),
             Err(SimulationError::NotSetUp)
+        );
+    }
+
+    #[test]
+    fn test_display_in_an_initial_block_is_readable_afterwards() {
+        // Setup drains time zero, so the `initial` block has already run and
+        // said what it thinks of itself.
+        let simulator = simulator_for(
+            r#"
+            module self_checking();
+                initial $display("PASSED");
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().text(), "PASSED\n");
+        assert_eq!(simulator.output().lines(), vec!["PASSED"]);
+    }
+
+    #[test]
+    fn test_display_reports_signal_values_and_the_time() {
+        let mut simulator = simulator_for(
+            r#"
+            module report(
+                output reg [7:0] count
+            );
+                initial begin
+                    count = 8'd7;
+                    $display("count=%0d %b at %0d", count, count, $time);
+                    #20;
+                    count = 8'd8;
+                    $display("count=%0d %b at %0d", count, count, $time);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["count=7 00000111 at 0"]);
+
+        simulator.advance(20).unwrap();
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["count=7 00000111 at 0", "count=8 00001000 at 20"]
+        );
+    }
+
+    #[test]
+    fn test_finish_stops_the_simulation() {
+        let mut simulator = simulator_for(
+            r#"
+            module stopper(
+                output reg [3:0] count
+            );
+                initial begin
+                    count = 4'd0;
+                    #10;
+                    $display("running at %0d", $time);
+                    count = 4'd1;
+                    #10;
+                    $finish;
+                    count = 4'd2;
+                    $display("never reached");
+                end
+            endmodule
+        "#,
+        );
+
+        assert!(!simulator.finished());
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["running at 10"]);
+
+        // `$finish` lands at 20 and takes the rest of the block with it.
+        simulator.advance(10).unwrap();
+        assert!(simulator.finished());
+        assert_eq!(simulator.now(), 20);
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(1));
+
+        // Nothing runs after that, and time no longer moves.
+        simulator.advance(1000).unwrap();
+        assert_eq!(simulator.now(), 20);
+        assert_eq!(simulator.output().lines(), vec!["running at 10"]);
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(1));
+    }
+
+    #[test]
+    fn test_finish_stops_a_free_running_design() {
+        // The clock would toggle forever; `$finish` is what ends it.
+        let mut simulator = simulator_for(
+            r#"
+            module timed(
+                output reg clk
+            );
+                initial begin
+                    clk = 1'b0;
+                    #25;
+                    $finish;
+                end
+                always begin
+                    #10 clk = ~clk;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1000).unwrap();
+        assert!(simulator.finished());
+        assert_eq!(simulator.now(), 25);
+    }
+
+    #[test]
+    fn test_system_task_inside_an_always_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module logger(
+                input clk,
+                output reg [3:0] count
+            );
+                initial count = 4'd0;
+                always @(posedge clk) begin
+                    $display("tick %0d", count);
+                    count <= count + 1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.tick("clk").unwrap();
+        simulator.tick("clk").unwrap();
+
+        // The block reads `count` before its non-blocking update lands, so the
+        // first tick reports the old value.
+        assert_eq!(simulator.output().lines(), vec!["tick 0", "tick 1"]);
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(2));
+    }
+
+    #[test]
+    fn test_system_task_inside_an_if_arm() {
+        // The call sits inside a branch, so it only runs when the jump-threaded
+        // program actually reaches it.
+        let mut simulator = simulator_for(
+            r#"
+            module branching(
+                input sel,
+                output reg done
+            );
+                always @(sel) begin
+                    if (sel) $display("taken");
+                    else $display("not taken");
+                    done = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.poke("sel", one()).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["taken"]);
+
+        simulator.poke("sel", zero()).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["taken", "not taken"]);
+        assert_eq!(simulator.get("done").unwrap().to_binary(), "1");
+    }
+
+    #[test]
+    fn test_write_leaves_the_line_open_for_the_next_task() {
+        let simulator = simulator_for(
+            r#"
+            module piecewise();
+                initial begin
+                    $write("PAS");
+                    $write("SED");
+                    $display("!");
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().text(), "PASSED!\n");
+    }
+
+    #[test]
+    fn test_an_unknown_system_task_is_reported_by_name() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module mystery(
+                output reg a
+            );
+                initial begin
+                    a = 1'b0;
+                    $nosuchtask("x");
+                end
+            endmodule
+        "#,
+        )
+        .unwrap();
+
+        let mut simulator = Simulator::new(module);
+        assert_eq!(
+            simulator.setup(),
+            Err(SimulationError::SystemTask(
+                "unknown system task `$nosuchtask`".to_string()
+            ))
         );
     }
 }

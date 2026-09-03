@@ -17,7 +17,7 @@
 //! leaves both holding the original `b`.
 //!
 //! ```text
-//! let pending = execute_statements(&block.statements, &mut store)?;
+//! let pending = execute_statements(&block.statements, &mut store, &mut tasks)?;
 //! let changed = commit_updates(pending, &mut store)?;
 //! ```
 //!
@@ -33,6 +33,7 @@ use crate::simulator::eval::eval;
 use crate::simulator::program::{resume, Program, Resume, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+use crate::simulator::tasks::TaskContext;
 
 /// An assignment target after its name and bit indices have been worked out,
 /// so that writing it needs no further evaluation.
@@ -95,9 +96,10 @@ impl PendingUpdate {
 pub fn execute_statements(
     statements: &[ProceduralStatements],
     store: &mut StateStore,
+    tasks: &mut TaskContext,
 ) -> Result<Vec<PendingUpdate>, SimulationError> {
     let program = Program::compile(statements)?;
-    match resume(&program, 0, store)? {
+    match resume(&program, 0, store, tasks)? {
         Resume::Halted { pending } => Ok(pending),
         Resume::Suspended { .. } => Err(DELAY_UNSUPPORTED),
     }
@@ -248,7 +250,7 @@ mod tests {
     /// returning whether the commit moved anything.
     fn run(source: &str, store: &mut StateStore) -> Result<bool, SimulationError> {
         let statements = block(source);
-        let pending = execute_statements(&statements, store)?;
+        let pending = execute_statements(&statements, store, &mut TaskContext::new())?;
         commit_updates(pending, store)
     }
 
@@ -292,7 +294,7 @@ mod tests {
         // `c` reads the *old* `a`, because `a`'s update has not landed yet.
         let mut store = store_with(&[("a", "0000"), ("b", "0011"), ("c", "0000")]);
         let statements = block("begin a <= b + 1; c <= a + 1; end");
-        let pending = execute_statements(&statements, &mut store).unwrap();
+        let pending = execute_statements(&statements, &mut store, &mut TaskContext::new()).unwrap();
 
         // Nothing has moved until the updates are committed.
         assert_eq!(value(&store, "a"), "0000");
