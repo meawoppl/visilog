@@ -87,10 +87,14 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
     )(input)
 }
 
+/// Parses `module name (ports); … endmodule`.
+///
+/// The port list is optional: `module top;` is legal Verilog and is how most
+/// testbenches are written, since a top-level module has nothing to connect to.
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = ws(tag("module"))(input)?;
     let (input, mod_identifier) = ws(identifier)(input)?;
-    let (input, ports) = parse_ports(input)?;
+    let (input, ports) = map(opt(parse_ports), Option::unwrap_or_default)(input)?;
     let (input, _) = ws(tag(";"))(input)?;
     let (input, statements) = many0(ws(parse_module_statement))(input)?;
     let (input, _) = ws(tag("endmodule"))(input)?;
@@ -281,6 +285,33 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_parse_module_without_a_port_list() {
+        // `module top;` — how most testbenches are written, since a top-level
+        // module has nothing to connect to.
+        let module = assert_parses(
+            parse_module_declaration,
+            "module top;\n  assign a = b;\nendmodule",
+        );
+        assert_eq!(module.identifier, "top".into());
+        assert!(module.ports.is_empty());
+        assert_eq!(module.statements.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_port_list_and_absent_port_list_agree() {
+        let with_parens = assert_parses(parse_module_declaration, "module m(); endmodule");
+        let without = assert_parses(parse_module_declaration, "module m; endmodule");
+        assert_eq!(with_parens, without);
+    }
+
+    #[test]
+    fn test_an_opened_port_list_must_still_be_well_formed() {
+        // An opening paren commits to a port list; `opt` must not let a
+        // malformed one be silently abandoned.
+        assert!(parse_module_declaration("module m(input a; endmodule").is_err());
     }
 
     #[test]
