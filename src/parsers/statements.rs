@@ -3,6 +3,7 @@ use nom::{branch::alt, combinator::map, error::context, IResult};
 use super::{
     assignment::{parse_continuous_assignment, ContinuousAssignment},
     behavior::{parse_always_block, parse_initial_block, AlwaysBlock, InitialBlock},
+    integer::{parse_integer_declaration, IntegerDeclaration},
     modules::{parse_module_instantiation_statement, ModuleInstantiation},
     nets::{net_declaration, Net},
     parameter::{parse_parameter_declaration, ParameterDeclaration},
@@ -11,7 +12,8 @@ use super::{
 
 #[derive(Debug, PartialEq)]
 pub enum ModuleStatement {
-    RegisterDeclaration(RegisterDeclaration),
+    RegisterDeclaration(Vec<RegisterDeclaration>),
+    IntegerDeclaration(Vec<IntegerDeclaration>),
     WireDeclaration(Vec<Net>),
     ParameterDeclaration(Vec<ParameterDeclaration>),
     InitialBlock(InitialBlock),
@@ -26,6 +28,9 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
         alt((
             map(parse_register_declaration, |d| {
                 ModuleStatement::RegisterDeclaration(d)
+            }),
+            map(parse_integer_declaration, |d| {
+                ModuleStatement::IntegerDeclaration(d)
             }),
             map(net_declaration, |d| ModuleStatement::WireDeclaration(d)),
             map(parse_parameter_declaration, |d| {
@@ -77,6 +82,44 @@ mod tests {
             assert_parses(parse_module_statement, "initial begin a = 'b1; end"),
             ModuleStatement::InitialBlock(_)
         ));
+    }
+
+    /// The declaration forms that carry a *list* keep every name, and a
+    /// module-level `integer` reaches the statement grammar at all.
+    #[test]
+    fn test_parse_declaration_lists() {
+        match assert_parses(parse_module_statement, "reg [4:0] result, b;") {
+            ModuleStatement::RegisterDeclaration(registers) => {
+                assert_eq!(registers.len(), 2);
+                assert_eq!(registers[0].name, "result".into());
+                assert_eq!(registers[1].name, "b".into());
+                assert!(registers.iter().all(|r| r.range == Some((4, 0))));
+            }
+            other => panic!("expected a register declaration, got {:?}", other),
+        }
+
+        match assert_parses(parse_module_statement, "wire a, b, c;") {
+            ModuleStatement::WireDeclaration(nets) => assert_eq!(nets.len(), 3),
+            other => panic!("expected a wire declaration, got {:?}", other),
+        }
+
+        match assert_parses(parse_module_statement, "integer i, j;") {
+            ModuleStatement::IntegerDeclaration(integers) => {
+                assert_eq!(integers.len(), 2);
+                assert_eq!(integers[0].name, "i".into());
+                assert_eq!(integers[1].name, "j".into());
+            }
+            other => panic!("expected an integer declaration, got {:?}", other),
+        }
+
+        match assert_parses(parse_module_statement, "reg [7:0] mem [0:255];") {
+            ModuleStatement::RegisterDeclaration(registers) => {
+                assert_eq!(registers.len(), 1);
+                assert_eq!(registers[0].range, Some((7, 0)));
+                assert_eq!(registers[0].dimensions, Some((0, 255)));
+            }
+            other => panic!("expected a memory declaration, got {:?}", other),
+        }
     }
 
     #[test]
