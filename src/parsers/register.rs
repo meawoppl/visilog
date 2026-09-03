@@ -1,7 +1,7 @@
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
-    character::complete::{alpha1, char, multispace0},
+    character::complete::{alpha1, char},
     combinator::{map, opt, recognize},
     sequence::{delimited, pair, preceded},
     IResult,
@@ -9,7 +9,7 @@ use nom::{
 
 use super::{
     identifier::{identifier, Identifier},
-    simple::range,
+    simple::{range, ws_and_comments},
 };
 
 #[derive(Debug, PartialEq)]
@@ -46,12 +46,12 @@ fn parse_dimensions(input: &str) -> IResult<&str, (i64, i64)> {
 
 pub fn parse_register_declaration(input: &str) -> IResult<&str, RegisterDeclaration> {
     let (input, _) = tag("reg")(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, range) = opt(range)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, name) = identifier(input)?;
     let (input, dimensions) = opt(parse_dimensions)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, _) = char(';')(input)?;
 
     Ok((
@@ -66,12 +66,12 @@ pub fn parse_register_declaration(input: &str) -> IResult<&str, RegisterDeclarat
 
 pub fn parse_memory_declaration(input: &str) -> IResult<&str, RegisterDeclaration> {
     let (input, _) = tag("reg")(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, range) = opt(range)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, name) = identifier(input)?;
     let (input, dimensions) = opt(parse_dimensions)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, _) = char(';')(input)?;
 
     Ok((

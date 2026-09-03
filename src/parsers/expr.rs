@@ -624,6 +624,29 @@ mod tests {
                     Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
                 ),
             ),
+            (
+                "(a+b)",
+                Expression::Parenthetical(Box::new(Expression::Binary(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                ))),
+            ),
+            (
+                "{a,b}",
+                Expression::Concatenation(vec![
+                    Expression::Identifier(Identifier::new("a".to_string())),
+                    Expression::Identifier(Identifier::new("b".to_string())),
+                ]),
+            ),
+            (
+                "a?b:c",
+                Expression::Conditional(
+                    Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+                    Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+                    Box::new(Expression::Identifier(Identifier::new("c".to_string()))),
+                ),
+            ),
         ];
 
         for (expr, expected) in expressions {
@@ -658,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_subtract_constants_identifiers_whitespace() {
+    fn test_add_subtract_constants_identifiers_whitespace_and_comments() {
         let expressions = vec![
             (
                 "1+2",
@@ -678,15 +701,24 @@ mod tests {
             ),
         ];
 
+        // Every token in these expressions is one character wide, so every
+        // insertion point is a token boundary and any filler is legal there.
+        // A `//` comment carries its own newline: without one it would swallow
+        // the rest of the expression rather than separate two tokens.
+        let fillers = [" ", "\t", "\n", "/* c */", "/*\n c\n */", "// c\n"];
+
         for (expr, expected) in expressions {
             let mut rng = rand::rngs::StdRng::seed_from_u64(42);
             for _ in 0..10 {
-                let mut chars: Vec<char> = expr.chars().collect();
-                for _ in 0..(chars.len() / 2) {
-                    let pos = rng.next_u32() as usize % chars.len();
-                    chars.insert(pos, ' ');
+                // Each piece is inserted whole, so a later insertion can never
+                // land in the middle of an earlier comment and unbalance it.
+                let mut pieces: Vec<&str> = expr.split("").filter(|p| !p.is_empty()).collect();
+                for _ in 0..pieces.len() {
+                    let pos = rng.next_u32() as usize % pieces.len();
+                    let filler = fillers[rng.next_u32() as usize % fillers.len()];
+                    pieces.insert(pos, filler);
                 }
-                let expr_with_ws: String = chars.into_iter().collect();
+                let expr_with_ws: String = pieces.concat();
                 let result_with_ws = verilog_expression(&expr_with_ws);
                 assert!(
                     result_with_ws.is_ok(),
@@ -700,6 +732,28 @@ mod tests {
                     expr_with_ws
                 );
             }
+        }
+    }
+
+    /// A comment separates two tokens exactly like whitespace does, so one can
+    /// sit between any operand and any operator.
+    #[test]
+    fn test_comments_between_operands_and_operators() {
+        let expected = Expression::Binary(
+            Box::new(Expression::Identifier(Identifier::new("a".to_string()))),
+            BinaryOperator::Addition,
+            Box::new(Expression::Identifier(Identifier::new("b".to_string()))),
+        );
+        for input in [
+            "a /* c */ + b",
+            "a +/* c */b",
+            "/* c */ a + b",
+            "a + b /* c */",
+            "a // c\n + b",
+            "a + // c\n b",
+            "a /*\n * spanning lines\n */ + b",
+        ] {
+            assert_parses_to(verilog_expression, input, expected.clone());
         }
     }
 

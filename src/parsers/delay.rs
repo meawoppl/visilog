@@ -1,11 +1,13 @@
 use nom::{
     bytes::complete::tag,
-    character::complete::multispace0,
     combinator::{map_res, opt},
     IResult,
 };
 
-use super::{numbers::decimal, simple::ws};
+use super::{
+    numbers::decimal,
+    simple::{ws, ws_and_comments},
+};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Delay {
@@ -26,7 +28,7 @@ impl Delay {
 pub fn parse_delay(input: &str) -> IResult<&str, Delay> {
     let (input, _) = tag("#")(input)?;
     let (input, delay) = map_res(decimal, |s: &str| s.parse::<i64>())(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     Ok((input, Delay::new(delay)))
 }
 

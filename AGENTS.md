@@ -146,8 +146,7 @@ of more than one module is handed over; `Simulator::new(module)` still takes a s
 module as its own top.
 
 Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
-fit in a program counter), concatenation as an assignment target, and comments anywhere
-inside a module body (issue #87 — this blocks most real-world Verilog). Parameter overrides
+fit in a program counter) and concatenation as an assignment target. Parameter overrides
 cannot change a width, because `simple.rs::range` only parses literal integers, so
 `output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built but still unwired.
 
@@ -171,10 +170,11 @@ Prefer this plain form over returning `impl FnMut` — it keeps parsers usable a
 pointers, which the `helpers.rs` assertions require.
 
 **Whitespace.** Use `ws(inner)` from `simple.rs`, which wraps a parser in
-`multispace0` on both sides. Attach whitespace to the *elements* of a list rather than to
-the separator — `separated_list0(char(','), ws(item))` handles space on both sides of the
-comma, whereas putting `multispace0` on the separator only eats one side and leaves the
-next element starting with a space.
+`ws_and_comments` on both sides, so it skips comments as well as whitespace. Attach
+whitespace to the *elements* of a list rather than to the separator —
+`separated_list0(char(','), ws(item))` handles space on both sides of the comma, whereas
+putting `multispace0` on the separator only eats one side and leaves the next element
+starting with a space.
 
 **Tests live next to the code** in an inline `#[cfg(test)] mod tests`. Use the helpers:
 
@@ -189,9 +189,12 @@ Both assert the parser consumed the *entire* input, which is the failure these p
 hit most often. A parser that returns `Ok` with unconsumed trailing input is almost
 always a bug — assert on the remainder, not just `is_ok()`.
 
-`expr.rs` also has a whitespace-injection fuzz test that splices random spaces into known
-expressions using a seeded `StdRng` (seed 42) and re-parses. If you touch whitespace
-handling in an expression layer, that test is your tripwire.
+`expr.rs` also has an injection fuzz test that splices random whitespace *and comments*
+into known expressions using a seeded `StdRng` (seed 42) and re-parses. Every token in the
+expressions it uses is one character wide, so any insertion point is a token boundary; the
+`//` filler carries its own newline, because without one it would swallow the rest of the
+expression. If you touch whitespace handling in an expression layer, that test is your
+tripwire.
 
 ## Gotchas
 
@@ -211,11 +214,14 @@ handling in an expression layer, that test is your tripwire.
   a `:` that looks just like a part-select separator. `bit_select` first means the
   conditional wins; write `q[(a ? b : c):0]` when you mean a part select with a
   conditional bound.
-- **Comments are only skipped *between* module declarations**, by `ws_and_comments` in
-  `simple.rs`, which `parse_verilog_source` uses. Inside a module — in the port list or the
-  body — nothing consumes them, because every inner parser is wrapped in `ws`
-  (`multispace0` only). A `// …` line inside `module … endmodule` is still a parse error;
-  that is why no corpus `.v` file has one.
+- **Comments are skipped by `ws`**, which is `delimited(ws_and_comments, inner,
+  ws_and_comments)` — one skipper, used both by `parse_verilog_source` between modules and
+  by every parser inside one. A comment is therefore legal anywhere a token boundary is.
+  Two consequences: a parser that consumes whitespace with a bare `multispace0` instead of
+  `ws`/`ws_and_comments` is a hole where a comment is still rejected, and `ws_and_comments`
+  must keep using `multispace1` inside its `alt`, or `many0` matches empty and panics.
+  Still rejected: a comment *inside* a token that is separated by a bare `multispace1` —
+  `posedge/*c*/clk` and `or/*c*/rst` in a sensitivity list (`behavior.rs`).
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.

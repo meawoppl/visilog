@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    character::complete::{char, multispace0},
+    character::complete::char,
     combinator::{map, opt},
     multi::{many0, separated_list0, separated_list1},
     sequence::delimited,
@@ -13,7 +13,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, ws},
+    simple::{range, ws, ws_and_comments},
     statements::{parse_module_statement, ModuleStatement},
 };
 
@@ -62,11 +62,11 @@ fn parse_net_type(input: &str) -> IResult<&str, NetType> {
 
 fn parse_port(input: &str) -> IResult<&str, Port> {
     let (input, direction) = parse_port_direction(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, net_type) = opt(parse_net_type)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, range) = opt(range)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, identifier) = identifier(input)?;
     Ok((
         input,
@@ -89,11 +89,8 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
 
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = ws(tag("module"))(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, mod_identifier) = identifier(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, mod_identifier) = ws(identifier)(input)?;
     let (input, ports) = parse_ports(input)?;
-    let (input, _) = multispace0(input)?;
     let (input, _) = ws(tag(";"))(input)?;
     let (input, statements) = many0(ws(parse_module_statement))(input)?;
     let (input, _) = ws(tag("endmodule"))(input)?;
@@ -180,15 +177,15 @@ pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, Module
     // vdff #(.delay( ),.size(10) ) mod_d (.out(out_d),.in(in_d),.clk(clk));
 
     let (input, module_name) = identifier(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
 
     let (input, parameters) = map(opt(param_block), |params| {
         params.unwrap_or(ModuleInitArguments::NoArgs)
     })(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
 
     let (input, instance_name) = identifier(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = ws_and_comments(input)?;
 
     let (input, arguments) = argument_block(input)?;
 
@@ -349,6 +346,109 @@ mod tests {
             .collect::<Vec<_>>();
 
         println!("{:?}", example_files);
+    }
+
+    /// Issue #87: a comment is legal wherever whitespace is, including inside a
+    /// port list — between ports, around the parens, and mid-declaration.
+    #[test]
+    fn test_comments_in_a_port_list() {
+        let module = assert_parses(
+            parse_module_declaration,
+            r#"
+            module commented /* named */ ( // the port list opens here
+                input wire a,   // the first port
+                /* the second port, on its own line */
+                input /* the direction is done */ reg [7:0] b,
+                /*
+                 * a block comment that spans
+                 * several lines, mid-declaration
+                 */
+                output c // the last port
+            ) /* after the ports */ ;
+            endmodule
+            "#,
+        );
+        assert_eq!(module.identifier, "commented".into());
+        assert_eq!(module.ports.len(), 3);
+        assert_eq!(module.ports[1].identifier, "b".into());
+        assert_eq!(module.ports[1].range, (7, 0));
+        assert_eq!(module.ports[2].identifier, "c".into());
+    }
+
+    /// A comment between statements, between a statement and its semicolon, and
+    /// between the last statement and `endmodule`. A `/* … */` around a whole
+    /// statement comments it out.
+    #[test]
+    fn test_comments_in_a_module_body() {
+        let module = assert_parses(
+            parse_module_declaration,
+            r#"
+            module body_comments(input a, input b, output c);
+                // a leading line comment
+                wire d; /* trailing a declaration */
+                /* assign d = 0; */
+                assign d = a & b /* before the semicolon */;
+                assign c = /* inside the expression */ d;
+                // the last word before endmodule
+            endmodule
+            "#,
+        );
+        assert_eq!(module.statements.len(), 3);
+    }
+
+    /// Comments inside procedural code: a sensitivity list, a `begin … end`
+    /// block, and the arms of a `case`.
+    #[test]
+    fn test_comments_in_procedural_code() {
+        let module = assert_parses(
+            parse_module_declaration,
+            r#"
+            module procedural_comments(input clk, input rst, output reg [1:0] q);
+                always @(posedge clk /* the clock */ or posedge rst) begin // opens
+                    // right after begin
+                    if (rst) /* held in reset */ q <= 0;
+                    else q <= q + 1;
+                    // right before end
+                end
+
+                always @(*) begin
+                    case (q) // the subject
+                        // before the first arm
+                        0 /* the label */ : q = 1;
+                        1: q = 2; // after an arm
+                        /* a whole arm, commented out
+                        2: q = 3;
+                        */
+                        default /* the catch-all */ : q = 0;
+                        // after the last arm
+                    endcase
+                end
+            endmodule
+            "#,
+        );
+        assert_eq!(module.statements.len(), 2);
+
+        // The commented-out arm is not one of them.
+        let case = match &module.statements[1] {
+            ModuleStatement::AlwaysBlock(block) => match &block.statements[0] {
+                crate::parsers::behavior::ProceduralStatements::Case(case) => case,
+                other => panic!("expected a case statement, got {:?}", other),
+            },
+            other => panic!("expected an always block, got {:?}", other),
+        };
+        assert_eq!(case.items.len(), 3);
+    }
+
+    /// A comment in a module instantiation, between the module name, the
+    /// parameter block, the instance name and the argument list.
+    #[test]
+    fn test_comments_in_a_module_instantiation() {
+        let instantiation = assert_parses(
+            parse_module_instantiation_statement,
+            "counter /* the module */ dut /* the instance */ ( .clk(clk), .q(q) ) ; // done",
+        );
+        assert_eq!(instantiation.module_name, "counter".into());
+        assert_eq!(instantiation.instance_name, "dut".into());
     }
 
     fn abc_123() -> ModuleInitArguments {
