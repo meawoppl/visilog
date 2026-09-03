@@ -392,7 +392,6 @@ fn keyword(input: &str) -> IResult<&str, VerilogKeyword> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nom::Parser;
 
     #[test]
     fn test_keyword_from_string() {

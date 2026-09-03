@@ -149,7 +149,6 @@ pub fn verilog_const(input: &str) -> IResult<&str, VerilogConstant> {
 
 #[cfg(test)]
 mod tests {
-    use nom::Parser;
 
     use super::*;
 
