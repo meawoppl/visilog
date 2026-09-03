@@ -1490,4 +1490,55 @@ mod tests {
             ))
         );
     }
+
+    /// Issue #104: a Verilog-1995 module simulates, and the width of its output
+    /// comes from the body declaration — the header carries names only.
+    #[test]
+    fn test_a_non_ansi_module_simulates() {
+        let mut simulator = simulator_for(
+            r#"
+            module widen ( a, q );
+                input a;
+                output [11:0] q;
+                assign q = a ? 12'hfff : 12'h000;
+            endmodule
+            "#,
+        );
+
+        simulator.set_input("a", one()).unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(0xfff));
+        assert_eq!(simulator.get("q").unwrap().width(), 12);
+
+        simulator.set_input("a", zero()).unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(0));
+    }
+
+    /// A port that is both `output` and `reg` is one signal, not two: the
+    /// direction declaration is the port, the `reg` says what backs it.
+    #[test]
+    fn test_a_non_ansi_output_reg_is_one_signal() {
+        let mut simulator = simulator_for(
+            r#"
+            module counter95 ( clk, count );
+                input clk;
+                output [3:0] count;
+                reg [3:0] count;
+                initial count = 0;
+                always @(posedge clk) count <= count + 1;
+            endmodule
+            "#,
+        );
+
+        assert_eq!(simulator.state.names().len(), 2);
+        assert_eq!(simulator.get("count").unwrap().width(), 4);
+        assert_eq!(simulator.get("count").unwrap().to_u128(), Some(0));
+
+        for expected in 1..=3 {
+            simulator.poke("clk", one()).unwrap();
+            simulator.poke("clk", zero()).unwrap();
+            assert_eq!(simulator.get("count").unwrap().to_u128(), Some(expected));
+        }
+    }
 }

@@ -4,7 +4,9 @@ use super::{
     assignment::{parse_continuous_assignment, ContinuousAssignment},
     behavior::{parse_always_block, parse_initial_block, AlwaysBlock, InitialBlock},
     integer::{parse_integer_declaration, IntegerDeclaration},
-    modules::{parse_module_instantiation_statement, ModuleInstantiation},
+    modules::{
+        parse_module_instantiation_statement, parse_port_declaration, ModuleInstantiation, Port,
+    },
     nets::{net_declaration, Net},
     parameter::{parse_parameter_declaration, ParameterDeclaration},
     register::{parse_register_declaration, RegisterDeclaration},
@@ -12,6 +14,9 @@ use super::{
 
 #[derive(Debug, PartialEq)]
 pub enum ModuleStatement {
+    /// A Verilog-1995 body port declaration. It never survives
+    /// `parse_module_declaration`, which folds it into the module's ports.
+    PortDeclaration(Vec<Port>),
     RegisterDeclaration(Vec<RegisterDeclaration>),
     IntegerDeclaration(Vec<IntegerDeclaration>),
     WireDeclaration(Vec<Net>),
@@ -26,6 +31,7 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
     context(
         "module statement",
         alt((
+            map(parse_port_declaration, ModuleStatement::PortDeclaration),
             map(parse_register_declaration, |d| {
                 ModuleStatement::RegisterDeclaration(d)
             }),

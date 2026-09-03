@@ -261,7 +261,8 @@ tripwire.
 - **A parser range is already `(i64, i64)`**, constant-folded at parse time, so a
   parameter cannot determine a width: `output [WIDTH-1:0] q` does not parse. A parameter
   override therefore changes a child's *behaviour*, never its widths, until the front end
-  grows expression ranges.
+  grows expression ranges. `range` also rejects whitespace inside the brackets, so
+  `output [ 0:0] c;` still does not parse.
 - **A declaration is a *list*, and every declaration parser returns a `Vec`.**
   `reg [4:0] a, b;`, `wire a, b, c;` and `integer i, j;` all share one width (or, for an
   `integer`, one fixed 32-bit width) across every name, so `parse_register_declaration`,
@@ -271,6 +272,15 @@ tripwire.
   `reg [7:0] a, mem [0:15];` legal and what removes the "try the memory form first"
   ordering hazard that two near-identical `reg`-led parsers would otherwise create.
   An `integer` is signed, which nothing models yet (issue #96).
+- **Both module header styles are normalised to `Vec<Port>` at parse time.**
+  `parse_module_declaration` reads an ANSI header (`module m(input wire [3:0] a);`) or a
+  Verilog-1995 one (`module m(a, h);` plus `input a; output [11:0] h;` in the body), lifts
+  the body direction declarations out of `statements`, and reconciles them against the
+  header names. Nothing downstream can tell the two apart, which is why `elaborate` needs
+  no notion of either. Mixing them, a header name with no direction, a direction naming
+  something absent from the header, and a port declared twice are all `nom::Err::Failure`.
+  A `reg` naming a port is *not* a second declaration of it — an output backed by a
+  register is one signal, and the `reg` stays an ordinary body statement.
 - **Flattening rewrites names on the compiled `Program`, not on the statement tree.**
   `AlwaysBlock` and `ProceduralStatements` are not `Clone`, but `Instruction` owns its
   `Expression`s, so `Program::rename` is what re-points a child's body at the parent's
