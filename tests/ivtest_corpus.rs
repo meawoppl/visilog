@@ -260,13 +260,17 @@ fn ivtest_corpus_compile_error_cases() {
     let dir = root.join("ivtest").join("ivltests");
 
     let (mut rejected, mut accepted) = (0usize, 0usize);
+    let mut accepted_names: Vec<String> = Vec::new();
     for entry in entries.iter().filter(|e| e.kind == "CE") {
         let path = dir.join(format!("{}.v", entry.name));
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
         match parse_verilog_source(&source) {
-            Ok(_) => accepted += 1,
+            Ok(_) => {
+                accepted += 1;
+                accepted_names.push(entry.name.clone());
+            }
             Err(_) => rejected += 1,
         }
     }
@@ -277,6 +281,12 @@ fn ivtest_corpus_compile_error_cases() {
         "accepted (too permissive, or accidentally right) : {}",
         accepted
     );
+    // Named, because this count only grows as the grammar accepts more, and
+    // "we do not model that semantic rule" versus "the grammar went loose" can
+    // only be told apart by looking at which files they are.
+    for name in &accepted_names {
+        println!("  {}", name);
+    }
 }
 
 /// A control for the corpus tests: the harness must be able to accept
