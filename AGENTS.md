@@ -177,6 +177,48 @@ cannot change a width, because `simple.rs::range` only parses literal integers, 
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
 
+## Measuring progress: the ivtest corpus
+
+`tests/ivtest_corpus.rs` measures the front end and simulator against Icarus Verilog's own
+regression suite. Its `regress-vlg.list` is the subset iverilog's authors describe as
+"tests that should work using any simulator that supports standard Verilog (1364-2005)",
+so it scores us against someone else's expectations rather than our own.
+
+The corpus is **GPL-2.0** and this crate is MIT, so it is cloned rather than vendored:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse \
+    https://github.com/steveicarus/iverilog ~/.cache/visilog/ivtest
+cd ~/.cache/visilog/ivtest && git sparse-checkout set ivtest
+cargo test --test ivtest_corpus -- --ignored --nocapture
+```
+
+Every corpus test is `#[ignore]`d, so CI never depends on that clone. `VISILOG_IVTEST`
+overrides the path.
+
+**Closure — the `PASSED` count — is the headline metric, not `parsed`.** The corpus is
+self-checking: a test prints `PASSED` when it is satisfied. Parsing a file therefore says
+nothing about whether the simulator got the right answer, and counting parses overstates
+progress by roughly a factor of two. `ivtest_corpus_closure_rate` reports the whole funnel
+— parsed, elaborated, ran, then `PASSED` / wrong answer / silent.
+
+**A wrong answer is worth more attention than a parse failure.** A file that runs and
+prints `FAILED` is one the simulator understood well enough to execute and still got wrong,
+which is a correctness bug rather than a missing feature. Those are printed **by name** for
+exactly that reason.
+
+Three control tests are *not* ignored and run in normal CI: a known-good design must parse,
+a self-checking design must reach `PASSED`, and a deliberately wrong one must be reported as
+a wrong answer. They exist so a low corpus score can never be a harness bug misreported as
+a simulator limitation — the first draft of the closure metric read `0%`, and only a control
+distinguishes that from a real result.
+
+The blocker tables in `ivtest_corpus_parse_rate` are text heuristics, not parser
+diagnostics. **They go stale as features land** — a row counting files that *contain* a
+construct cannot move once that construct is supported. Prune a row when its feature ships;
+the "sample of unexplained rejections" exists to point at whatever the heuristics no longer
+explain.
+
 ## Conventions
 
 **Parser signature.** Everything is a free function `fn(&str) -> IResult<&str, T>`.

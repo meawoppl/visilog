@@ -23,7 +23,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use visilog::parsers::modules::VerilogModule;
 use visilog::parsers::source::parse_verilog_source;
+use visilog::parsers::statements::ModuleStatement;
+use visilog::simulator::runner::Simulator;
 
 /// Where the corpus lives. `VISILOG_IVTEST` overrides the default cache path.
 fn corpus_root() -> Option<PathBuf> {
@@ -307,4 +310,228 @@ fn harness_accepts_known_good_source() {
     let (rest, modules) = parse_verilog_source(source).expect("control source should parse");
     assert!(rest.trim().is_empty());
     assert_eq!(modules.len(), 2);
+}
+
+/// How far simulated time is advanced before a design is judged. Generous
+/// enough for the corpus's self-checking testbenches, which typically finish
+/// within a few hundred time units, and bounded so a free-running design
+/// cannot run the suite forever.
+const TIME_BUDGET: i64 = 10_000;
+
+/// The module to elaborate: one that nothing else instantiates.
+///
+/// A corpus file is a self-contained testbench plus the modules it exercises,
+/// with no marker saying which is which. The testbench is the one at the root
+/// of the instantiation graph. Ties are broken by the conventional names, then
+/// by source order, which matters because picking a leaf module would elaborate
+/// a design with no stimulus and score it as silent.
+fn top_module(modules: &[VerilogModule]) -> Option<String> {
+    let instantiated: Vec<&str> = modules
+        .iter()
+        .flat_map(|module| &module.statements)
+        .filter_map(|statement| match statement {
+            ModuleStatement::ModuleInstantiation(instance) => {
+                Some(instance.module_name.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let roots: Vec<&str> = modules
+        .iter()
+        .map(|module| module.identifier.name.as_str())
+        .filter(|name| !instantiated.contains(name))
+        .collect();
+
+    for conventional in ["main", "top", "test", "tb", "bench"] {
+        if roots.contains(&conventional) {
+            return Some(conventional.to_string());
+        }
+    }
+    roots
+        .last()
+        .map(|name| name.to_string())
+        .or_else(|| modules.last().map(|m| m.identifier.name.clone()))
+}
+
+/// What became of one corpus file.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Outcome {
+    /// The front end rejected it.
+    ParseFailed,
+    /// It parsed, but elaboration refused it.
+    SetupFailed(String),
+    /// It elaborated, but running it raised an error.
+    RunFailed(String),
+    /// It ran and reported success.
+    Passed,
+    /// It ran and reported *failure* — we simulated it and got the wrong
+    /// answer. This is the only outcome that indicates a correctness bug
+    /// rather than a missing feature.
+    WrongAnswer,
+    /// It ran and printed nothing, so it never reached its own check.
+    Silent,
+}
+
+fn judge(source: &str) -> Outcome {
+    let Ok((_, modules)) = parse_verilog_source(source) else {
+        return Outcome::ParseFailed;
+    };
+    let Some(top) = top_module(&modules) else {
+        return Outcome::ParseFailed;
+    };
+
+    let mut simulator = Simulator::with_modules(modules, top);
+    if let Err(error) = simulator.setup() {
+        return Outcome::SetupFailed(error_kind(&error));
+    }
+    if let Err(error) = simulator.advance(TIME_BUDGET) {
+        return Outcome::RunFailed(error_kind(&error));
+    }
+
+    let output = simulator.output().text();
+    // A corpus test prints FAILED for every check it fails and PASSED once at
+    // the end, so any FAILED outweighs a PASSED.
+    if output.contains("FAILED") {
+        Outcome::WrongAnswer
+    } else if output.contains("PASSED") {
+        Outcome::Passed
+    } else {
+        Outcome::Silent
+    }
+}
+
+/// The variant name alone, so outcomes group by kind rather than by the
+/// specific signal or module a message happens to mention.
+fn error_kind(error: &impl std::fmt::Debug) -> String {
+    let text = format!("{:?}", error);
+    text.split(['(', ' ', '{'])
+        .next()
+        .unwrap_or("Unknown")
+        .to_string()
+}
+
+/// **The headline metric: how many corpus tests actually pass.**
+///
+/// The corpus is self-checking — a test prints `PASSED` when it is satisfied —
+/// so parsing a file says nothing about whether the simulator got the right
+/// answer. Measuring `parsed` alone overstates progress, and it is blind to the
+/// worst outcome of all: a design that runs and produces a wrong result.
+#[test]
+#[ignore]
+fn ivtest_corpus_closure_rate() {
+    let Some((root, entries)) = load() else {
+        return;
+    };
+    let dir = root.join("ivtest").join("ivltests");
+
+    let mut outcomes: Vec<(String, Outcome)> = Vec::new();
+    for entry in entries.iter().filter(|e| e.kind.starts_with("normal")) {
+        let Ok(source) = std::fs::read_to_string(dir.join(format!("{}.v", entry.name))) else {
+            continue;
+        };
+        outcomes.push((entry.name.clone(), judge(&source)));
+    }
+
+    let total = outcomes.len();
+    let count = |f: &dyn Fn(&Outcome) -> bool| outcomes.iter().filter(|(_, o)| f(o)).count();
+
+    let parsed = count(&|o| *o != Outcome::ParseFailed);
+    let elaborated = count(&|o| !matches!(o, Outcome::ParseFailed | Outcome::SetupFailed(_)));
+    let ran = count(&|o| matches!(o, Outcome::Passed | Outcome::WrongAnswer | Outcome::Silent));
+    let passed = count(&|o| *o == Outcome::Passed);
+    let wrong = count(&|o| *o == Outcome::WrongAnswer);
+    let silent = count(&|o| *o == Outcome::Silent);
+
+    let pct = |n: usize| 100.0 * n as f64 / total.max(1) as f64;
+    println!("\n=== ivtest closure: `regress-vlg.list`, `normal` tests ===");
+    println!("{:>5}         corpus files", total);
+    println!("{:>5}  {:>5.1}%  parsed", parsed, pct(parsed));
+    println!("{:>5}  {:>5.1}%  elaborated", elaborated, pct(elaborated));
+    println!("{:>5}  {:>5.1}%  ran without error", ran, pct(ran));
+    println!("{:>5}  {:>5.1}%  PASSED   <-- closure", passed, pct(passed));
+    println!("{:>5}  {:>5.1}%  wrong answer", wrong, pct(wrong));
+    println!(
+        "{:>5}  {:>5.1}%  ran but printed nothing",
+        silent,
+        pct(silent)
+    );
+
+    // Where the ones that never ran fell over.
+    let mut stages: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, outcome) in &outcomes {
+        match outcome {
+            Outcome::SetupFailed(kind) => {
+                *stages.entry(format!("setup: {}", kind)).or_default() += 1
+            }
+            Outcome::RunFailed(kind) => *stages.entry(format!("run:   {}", kind)).or_default() += 1,
+            _ => {}
+        }
+    }
+    if !stages.is_empty() {
+        println!("\n--- stopped before reporting ---");
+        let mut ranked: Vec<_> = stages.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (stage, n) in ranked {
+            println!("{:>5}  {}", n, stage);
+        }
+    }
+
+    // Naming these matters more than counting them: each one is a design the
+    // simulator understood well enough to run and still got wrong.
+    let wrong_names: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| *o == Outcome::WrongAnswer)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !wrong_names.is_empty() {
+        println!("\n--- wrong answers (correctness bugs, not missing features) ---");
+        for name in wrong_names {
+            println!("  {}", name);
+        }
+    }
+
+    assert!(total > 0, "corpus present but no tests were attempted");
+    // A floor, not a target: this guards against a change that silently stops
+    // designs running at all. Raise it when closure improves.
+    assert!(
+        passed >= 80,
+        "closure dropped to {}; it has been at least 80",
+        passed
+    );
+}
+
+/// A control for [`ivtest_corpus_closure_rate`], and the reason a low closure
+/// number can be trusted: a self-checking design must make it all the way to
+/// `PASSED` through the same code path the corpus uses.
+#[test]
+fn harness_reaches_passed_on_a_self_checking_design() {
+    // Deliberately avoids `#5 if (...)`: a delay may currently prefix only an
+    // assignment, so a control written the obvious way would fail on a parser
+    // gap rather than on anything it was meant to check.
+    let source = r#"
+        module main;
+            reg [3:0] counter;
+            initial begin
+                counter = 4'b0000;
+                #5 counter = counter + 1;
+                #5 counter = counter + 1;
+                if (counter == 4'b0010) $display("PASSED");
+                else $display("FAILED");
+            end
+        endmodule
+    "#;
+    assert_eq!(judge(source), Outcome::Passed);
+}
+
+/// The other half of the control: a design that computes the wrong thing must
+/// be reported as a wrong answer, not quietly as a pass.
+#[test]
+fn harness_reports_a_wrong_answer_rather_than_passing_it() {
+    let source = r#"
+        module main;
+            initial $display("FAILED");
+        endmodule
+    "#;
+    assert_eq!(judge(source), Outcome::WrongAnswer);
 }
