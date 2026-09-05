@@ -151,6 +151,14 @@ impl Program {
                 ProceduralStatements::Delay(delay) => {
                     self.emit(Instruction::Delay(delay.ticks()));
                 }
+                // `#5 <statement>` waits, then runs the statement — exactly
+                // what a bare `#5;` written in front of it would do. The body
+                // is compiled inline, so a delay nested in it suspends just as
+                // one at the top level does.
+                ProceduralStatements::Delayed { delay, statements } => {
+                    self.emit(Instruction::Delay(delay.ticks()));
+                    self.compile_statements(statements)?;
+                }
                 ProceduralStatements::Assignment(assignment) => {
                     self.compile_assignment(assignment)?
                 }
@@ -174,12 +182,6 @@ impl Program {
     ) -> Result<(), SimulationError> {
         if assignment.assignment_delay().is_some() {
             return Err(DELAY_UNSUPPORTED);
-        }
-
-        // `#5 a = b;` waits before the statement runs, exactly as a bare `#5;`
-        // written in front of it would.
-        if let Some(delay) = assignment.pre_delay() {
-            self.emit(Instruction::Delay(delay.ticks()));
         }
 
         let target = assignment.lhs().clone();
@@ -595,6 +597,75 @@ mod tests {
             Instruction::Blocking { .. }
         ));
         assert_eq!(program.instructions()[2], Instruction::Halt);
+    }
+
+    /// A delay in front of a `begin`…`end` block waits once, then runs the
+    /// whole block — the same instructions a bare `#50;` in front of it emits.
+    #[test]
+    fn test_a_delayed_block_compiles_to_one_delay_then_its_body() {
+        let program = compile("begin #50 begin a = 1'b1; b = 1'b0; end end");
+        assert_eq!(program.instructions()[0], Instruction::Delay(50));
+        assert!(matches!(
+            program.instructions()[1],
+            Instruction::Blocking { .. }
+        ));
+        assert!(matches!(
+            program.instructions()[2],
+            Instruction::Blocking { .. }
+        ));
+        assert_eq!(program.instructions()[3], Instruction::Halt);
+    }
+
+    /// A delay prefixing a statement *inside* a case arm is the resume point a
+    /// statement index cannot name: it is neither the arm nor the case.
+    #[test]
+    fn test_a_delayed_statement_inside_a_case_arm_suspends_and_resumes() {
+        let program = compile(
+            r#"begin
+                case (sel)
+                    2'b01: #6 a = 4'b0001;
+                    default: a = 4'b1000;
+                endcase
+                b = 4'b0111;
+            end"#,
+        );
+        let mut store = store_with(&[("sel", "01"), ("a", "0000"), ("b", "0000")]);
+
+        let (pc, delay) = step(&program, 0, &mut store).expect("should suspend");
+        assert_eq!(delay, 6);
+        // The arm has not run yet, and neither has the statement after the
+        // `case`.
+        assert_eq!(value(&store, "a"), "0000");
+        assert_eq!(value(&store, "b"), "0000");
+
+        assert!(step(&program, pc, &mut store).is_none());
+        assert_eq!(value(&store, "a"), "0001");
+        assert_eq!(value(&store, "b"), "0111");
+    }
+
+    /// The same, in an `if` arm, and with the delay in front of a nested
+    /// block rather than a single assignment.
+    #[test]
+    fn test_a_delayed_block_inside_an_if_arm_suspends_and_resumes() {
+        let program = compile(
+            r#"begin
+                if (sel) #3 begin
+                    a = 4'b0001;
+                    b = 4'b0010;
+                end
+                c = 4'b0100;
+            end"#,
+        );
+        let mut store = store_with(&[("sel", "1"), ("a", "0000"), ("b", "0000"), ("c", "0000")]);
+
+        let (pc, delay) = step(&program, 0, &mut store).expect("should suspend");
+        assert_eq!(delay, 3);
+        assert_eq!(value(&store, "a"), "0000");
+
+        assert!(step(&program, pc, &mut store).is_none());
+        assert_eq!(value(&store, "a"), "0001");
+        assert_eq!(value(&store, "b"), "0010");
+        assert_eq!(value(&store, "c"), "0100");
     }
 
     #[test]

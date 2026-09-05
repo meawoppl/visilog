@@ -54,7 +54,6 @@ impl Signal for FiniteSignal {
 
         for (i, value) in self.values.iter().enumerate() {
             let assignment = ProceduralAssignment::new(
-                None,
                 Expression::Identifier(identifier.clone()),
                 ProceduralAssignmentType::Blocking,
                 None,
@@ -87,7 +86,6 @@ impl Signal for InfiniteSignal {
 
         for (_i, value) in self.val_loop.iter().enumerate() {
             let assignment = ProceduralAssignment::new(
-                None,
                 Expression::Identifier(identifier.clone()),
                 ProceduralAssignmentType::Blocking,
                 None,

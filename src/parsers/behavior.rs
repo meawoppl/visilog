@@ -12,7 +12,7 @@ use crate::parsers::assignment::parse_assignment;
 
 use super::{
     assignment::ProceduralAssignment,
-    delay::{parse_delay_statement, Delay},
+    delay::{parse_delay, parse_delay_statement, Delay},
     expr::{verilog_expression, Expression},
     simple::ws,
     string::parse_verilog_string,
@@ -128,6 +128,16 @@ pub struct SystemTaskCall {
 #[derive(Debug, PartialEq)]
 pub enum ProceduralStatements {
     Delay(Delay),
+    /// `#5 a = 1;`, `#5 begin … end` — a statement prefixed by a delay.
+    ///
+    /// The delay belongs to the *statement*, not to any one statement kind, so
+    /// it wraps a body rather than living as a field on an assignment. The
+    /// body is a single statement or a `begin`…`end` block, which is why it is
+    /// a list.
+    Delayed {
+        delay: Delay,
+        statements: Vec<ProceduralStatements>,
+    },
     Assignment(ProceduralAssignment),
     If(IfStatement),
     Case(CaseStatement),
@@ -145,8 +155,19 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
         map(parse_case_statement, |c| ProceduralStatements::Case(c)),
         map(parse_system_task, |t| ProceduralStatements::SystemTask(t)),
         map(parse_assignment, |a| ProceduralStatements::Assignment(a)),
+        // `#5;` is a statement in its own right, so it is tried before the
+        // prefix form, whose body would have nothing to match.
         map(parse_delay_statement, |d| ProceduralStatements::Delay(d)),
+        parse_delayed_statement,
     ))(input)
+}
+
+/// `#5 <statement>` — a delay prefixing any procedural statement, including a
+/// `begin`…`end` block, an `if` or a `case`.
+fn parse_delayed_statement(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, delay) = ws(parse_delay)(input)?;
+    let (input, statements) = statement_body(input)?;
+    Ok((input, ProceduralStatements::Delayed { delay, statements }))
 }
 
 /// The body of a conditional or case arm: either a `begin`…`end` block or a
@@ -677,6 +698,100 @@ mod tests {
 
         let statements = assert_parses(parse_block, r#"begin a = 'b1; $display("%b", a); end"#);
         assert!(matches!(statements[1], ProceduralStatements::SystemTask(_)));
+    }
+
+    /// A delay prefixes a *statement*, not an assignment, so every statement
+    /// form can carry one.
+    #[test]
+    fn test_a_delay_prefixes_any_procedural_statement() {
+        for source in [
+            "#5 a = 1;",
+            "#5 a <= 1;",
+            r#"#5 $display("x");"#,
+            "#5 begin a = 1; b = 2; end",
+            "#5 if (a) b = 1;",
+            "#5 if (a) b = 1; else b = 0;",
+            "#5 case (a) 1: b = 1; default: b = 0; endcase",
+            "# 5 a = 1;",
+            "#/* later */5 a = 1;",
+            "#5 #3 a = 1;",
+        ] {
+            let statement = assert_parses(procedural_statement, source);
+            assert!(
+                matches!(statement, ProceduralStatements::Delayed { .. }),
+                "{} should be a delayed statement, got {:?}",
+                source,
+                statement
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_delayed_block_keeps_every_statement_in_it() {
+        let statement = assert_parses(procedural_statement, "#5 begin a = 1; b = 2; end");
+        match statement {
+            ProceduralStatements::Delayed { delay, statements } => {
+                assert_eq!(delay, Delay::new(5));
+                assert_eq!(statements.len(), 2);
+            }
+            other => panic!("expected a delayed statement, got {:?}", other),
+        }
+    }
+
+    /// `#5;` waits and does nothing else, which is a different statement from
+    /// `#5 <something>`.
+    #[test]
+    fn test_a_bare_delay_is_not_a_delayed_statement() {
+        for source in ["#5;", "# 12 ;", "#0;"] {
+            let statement = assert_parses(procedural_statement, source);
+            assert!(
+                matches!(statement, ProceduralStatements::Delay(_)),
+                "{} should be a bare delay, got {:?}",
+                source,
+                statement
+            );
+        }
+    }
+
+    /// The delay nested in the arm is what a statement-index resume point
+    /// could not address; the parser has to keep it inside the arm.
+    #[test]
+    fn test_a_delay_nests_inside_an_if_and_a_case_arm() {
+        let statement = assert_parses(procedural_statement, "if (a) #5 b = 1; else #7 b = 0;");
+        let ProceduralStatements::If(conditional) = statement else {
+            panic!("expected an if statement");
+        };
+        assert!(matches!(
+            conditional.then_statements[0],
+            ProceduralStatements::Delayed { .. }
+        ));
+        let else_statements = conditional
+            .else_statements
+            .expect("expected an else branch");
+        assert!(matches!(
+            else_statements[0],
+            ProceduralStatements::Delayed { .. }
+        ));
+
+        let statement = assert_parses(
+            procedural_statement,
+            "case (a) 1: #5 b = 1; default: #7 b = 0; endcase",
+        );
+        let ProceduralStatements::Case(case) = statement else {
+            panic!("expected a case statement");
+        };
+        for item in &case.items {
+            assert!(matches!(
+                item.statements[0],
+                ProceduralStatements::Delayed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_whitespace_between_a_hash_and_its_value_in_a_block() {
+        let statements = assert_parses(parse_block, "begin # 3 a = 1; # 4 ; end");
+        assert_eq!(statements.len(), 2);
     }
 
     #[test]

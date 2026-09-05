@@ -25,8 +25,13 @@ impl Delay {
     }
 }
 
+/// `#10`, `# 10`, `#/* wait */10` — a delay term.
+///
+/// The `#` and its value are separate tokens, so whitespace and comments are
+/// legal between them just as they are anywhere else.
 pub fn parse_delay(input: &str) -> IResult<&str, Delay> {
     let (input, _) = tag("#")(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, delay) = map_res(decimal, |s: &str| s.parse::<i64>())(input)?;
     let (input, _) = ws_and_comments(input)?;
     Ok((input, Delay::new(delay)))
@@ -52,6 +57,19 @@ mod tests {
         assert_eq!(parse_delay("#0"), Ok(("", Delay::new(0))));
         assert!(parse_delay("10").is_err());
         assert!(parse_delay("#abc").is_err());
+    }
+
+    /// The `#` and its value are separate tokens, so the usual token-boundary
+    /// rules apply between them.
+    #[test]
+    fn test_parse_delay_allows_whitespace_after_the_hash() {
+        assert_eq!(parse_delay("# 3"), Ok(("", Delay::new(3))));
+        assert_eq!(parse_delay("#\n   12"), Ok(("", Delay::new(12))));
+        assert_eq!(parse_delay("#/* wait */5"), Ok(("", Delay::new(5))));
+        assert_eq!(parse_delay_statement("# 3;"), Ok(("", Delay::new(3))));
+        assert_eq!(parse_delay_statement("# 12 ;"), Ok(("", Delay::new(12))));
+        // A `#` with nothing to delay by is still not a delay.
+        assert!(parse_delay("# ;").is_err());
     }
 
     #[test]

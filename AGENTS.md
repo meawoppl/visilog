@@ -342,6 +342,20 @@ tripwire.
   `$`, so `$foo` is legal only where `procedural_statement` allows a system task. A format
   string is likewise a `SystemTaskArgument::String`, not an `Expression` — the expression
   grammar has no string operand — and `$time` is a `SystemTaskArgument::SystemFunction`.
+- **A `#delay` is a statement *prefix*, not a field on an assignment.**
+  `#5 a = 1;`, `#5 $display(…);`, `#5 begin … end`, `#5 if (…) …` and
+  `#5 case (…) … endcase` all parse to `ProceduralStatements::Delayed { delay,
+  statements }`, which wraps a `statement_body` — a single statement or a
+  `begin`…`end` block. A bare `#5;` stays `ProceduralStatements::Delay` and is
+  tried first in `procedural_statement`'s `alt`, because the prefix form's body
+  would have nothing to match. `program.rs` compiles `Delayed` to an
+  `Instruction::Delay` followed by the body inline, so a delay nested in an
+  `if` or `case` arm suspends and resumes by program counter like any other.
+  Intra-assignment delay (`a = #5 b;`) is still a field on
+  `ProceduralAssignment` and still rejected at compile time.
+- **`#` and its value are separate tokens.** `parse_delay` skips whitespace and
+  comments between them, so `# 3;` and `#/* wait */5` parse. This is worth
+  roughly +24 corpus files on its own.
 - **`Register::to_decimal` accumulates into a machine integer**, so it overflows on
   anything wider than about 31 bits. `tasks.rs` formats decimals through `to_u128`
   instead; do the same rather than reaching for `to_decimal` on a real signal.

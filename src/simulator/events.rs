@@ -236,6 +236,10 @@ fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTre
         match statement {
             // A `#5;` delay reads nothing.
             ProceduralStatements::Delay(_) => {}
+            // A delay reads nothing, but the statement it prefixes does.
+            ProceduralStatements::Delayed { statements, .. } => {
+                collect_statement_reads(statements, names)
+            }
             ProceduralStatements::Assignment(assignment) => {
                 collect_target_reads(assignment.lhs(), names);
                 collect_expression_reads(assignment.rhs(), names);
@@ -694,7 +698,6 @@ mod tests {
     #[test]
     fn test_signals_read_includes_reads_inside_a_target() {
         let assignment = ProceduralAssignment::new(
-            None,
             Expression::BitSelect(
                 "mem".into(),
                 Box::new(Expression::Identifier("addr".into())),
