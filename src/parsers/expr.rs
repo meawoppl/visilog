@@ -705,7 +705,16 @@ mod tests {
         // insertion point is a token boundary and any filler is legal there.
         // A `//` comment carries its own newline: without one it would swallow
         // the rest of the expression rather than separate two tokens.
-        let fillers = [" ", "\t", "\n", "/* c */", "/*\n c\n */", "// c\n"];
+        let fillers = [
+            " ",
+            "\t",
+            "\n",
+            "/* c */",
+            "/*\n c\n */",
+            "// c\n",
+            "(* a *)",
+            "(* a = 3 * 4 *)",
+        ];
 
         for (expr, expected) in expressions {
             let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -733,6 +742,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An attribute is metadata with no simulation semantics, so it is skipped
+    /// like a comment and may sit between the operands of an expression.
+    #[test]
+    fn test_attributes_between_operands_and_operators() {
+        let expected = Expression::Binary(
+            Box::new(Expression::Identifier(Identifier::new("inp_a".to_string()))),
+            BinaryOperator::Addition,
+            Box::new(Expression::Identifier(Identifier::new("inp_b".to_string()))),
+        );
+        for input in [
+            "inp_a + (* ripple_adder *) inp_b",
+            "inp_a (* ripple_adder *) + inp_b",
+            "(* ripple_adder *) inp_a + inp_b",
+            "inp_a + inp_b (* ripple_adder *)",
+            "inp_a +(* a = \"x\", b = 3 * 4 *)inp_b",
+        ] {
+            assert_parses_to(verilog_expression, input, expected.clone());
+        }
+    }
+
+    /// The regression risk of skipping `(*`: an ordinary parenthesised operand
+    /// and the multiplication operator must be untouched. `*` is not a unary
+    /// operator in Verilog, so `(*` can only ever start an attribute.
+    #[test]
+    fn test_parenthesised_expressions_and_multiplication_still_parse() {
+        let a = || Expression::Identifier(Identifier::new("a".to_string()));
+        let b = || Expression::Identifier(Identifier::new("b".to_string()));
+        let paren = |e: Expression| Expression::Parenthetical(Box::new(e));
+        let product = |l: Expression, r: Expression| {
+            Expression::Binary(Box::new(l), BinaryOperator::Multiplication, Box::new(r))
+        };
+        for input in ["(a) * (b)", "(a)*(b)", "( a ) * ( b )"] {
+            assert_parses_to(verilog_expression, input, product(paren(a()), paren(b())));
+        }
+        assert_parses_to(verilog_expression, "a*(b)", product(a(), paren(b())));
+        assert_parses_to(verilog_expression, "(a)*b", product(paren(a()), b()));
+        assert_parses_to(
+            verilog_expression,
+            "(a) ** (b)",
+            Expression::Binary(
+                Box::new(paren(a())),
+                BinaryOperator::Power,
+                Box::new(paren(b())),
+            ),
+        );
+        assert_parses(verilog_expression, "(2**3)*(4%5)");
+        // An unterminated attribute is not a licence to eat the rest of the
+        // input: it is simply not an expression.
+        assert!(verilog_expression("(* a").is_err());
     }
 
     /// A comment separates two tokens exactly like whitespace does, so one can

@@ -288,6 +288,15 @@ tripwire.
   must keep using `multispace1` inside its `alt`, or `many0` matches empty and panics.
   Still rejected: a comment *inside* a token that is separated by a bare `multispace1` —
   `posedge/*c*/clk` and `or/*c*/rst` in a sensitivity list (`behavior.rs`).
+- **`(*` is ambiguous with `always @(*)`, not with a parenthesised expression.** `*` is not
+  a unary operator in Verilog, so `( *foo` is not the collision — but without a guard the
+  `(*` of one `@(*)` pairs with the `*)` of the *next* one and swallows everything between
+  them. `simple.rs::attribute` therefore requires `(*` **not** followed by `)`, which is
+  also what the LRM says: an `attribute_instance` must carry at least one `attr_spec`, so
+  `(*)` is never an attribute.
+- **Attribute bodies are discarded.** They are synthesis metadata with no simulation
+  meaning, so `ws_and_comments` skips them exactly as it skips comments. Anything that
+  later wants to *read* an attribute has to stop throwing them away first.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.
