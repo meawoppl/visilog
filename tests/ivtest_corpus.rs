@@ -110,10 +110,9 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
         unsupported_system_names(source),
         "unsupported system function ($monitor, $fdisplay, $realtime, ...)",
     );
-    note(
-        body.contains("function") || body.contains("task"),
-        "function / task",
-    );
+    // `function` has shipped; a row that counts a feature the front end has
+    // would keep reporting it as a blocker for ever.
+    note(body.contains("task"), "task");
     note(
         body.contains("for (")
             || body.contains("for(")

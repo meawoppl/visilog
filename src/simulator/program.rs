@@ -19,6 +19,8 @@
 //! evaluates its right hand side now but hands the write back as a
 //! [`PendingUpdate`] for [`commit_updates`](super::exec::commit_updates).
 
+use std::collections::BTreeSet;
+
 use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
 use crate::parsers::behavior::{
     CaseKind, CaseLabel, CaseStatement, ForStatement, IfStatement, ProceduralStatements,
@@ -28,7 +30,7 @@ use crate::parsers::expr::Expression;
 use crate::register::Register;
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::eval;
-use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate};
+use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate, ResolvedTarget};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{TaskCall, TaskContext};
@@ -37,6 +39,12 @@ use crate::simulator::tasks::{TaskCall, TaskContext};
 /// or because the caller cannot hold the resume point a suspension hands back.
 pub(crate) const DELAY_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a delay inside a procedural block");
+
+/// What a function body that could consume time reports. A function returns a
+/// value into the expression that called it, and an expression is evaluated at
+/// one instant, so there is no later for it to resume at.
+pub(crate) const FUNCTION_DELAY_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a delay inside a function");
 
 /// Ceiling on the instructions one [`resume`] may execute before it is called
 /// a non-terminating loop.
@@ -414,6 +422,98 @@ impl Program {
             | Instruction::RepeatNext { target: slot, .. } => *slot = target,
             other => unreachable!("cannot patch {:?}", other),
         }
+    }
+}
+
+/// One variable in a function's frame: an argument, a body-local, or the
+/// function's own name — the variable a body assigns to return a value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameVariable {
+    /// The qualified name the frame holds it under: `dut.parity.a`.
+    pub name: String,
+    pub range: (i64, i64),
+    pub signed: bool,
+}
+
+/// A function the design declares, compiled into the shape a call needs.
+///
+/// A call runs the body against a **frame**: a small [`StateStore`] of its own
+/// holding the result variable, the arguments, the locals, and copies of the
+/// design signals the body reads. That is what lets a call be made from
+/// [`eval`](crate::simulator::eval::eval), which holds a `&StateStore` and
+/// could not write into the design even if a function were allowed to — and it
+/// is what gives every call its own arguments, so recursion is a stack of
+/// frames rather than one set of variables the calls trample on together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunctionDefinition {
+    /// The variable the body assigns to return a value, named after the
+    /// function itself.
+    pub result: FrameVariable,
+    /// The arguments, in call order.
+    pub arguments: Vec<FrameVariable>,
+    pub locals: Vec<FrameVariable>,
+    /// The design signals the body reads, including those read by anything it
+    /// calls. A call copies exactly these into its frame, so it costs the
+    /// function rather than the design.
+    pub reads: BTreeSet<String>,
+    /// The functions this one calls, which is what `reads` is closed over.
+    pub calls: BTreeSet<String>,
+    pub program: Program,
+}
+
+impl FunctionDefinition {
+    /// How many arguments a call has to supply.
+    pub fn arity(&self) -> usize {
+        self.arguments.len()
+    }
+
+    /// Runs the body against a frame of its own and hands back whatever the
+    /// function's name was left holding.
+    ///
+    /// `arguments` are already evaluated, in the caller's scope, because that
+    /// is where the expressions that produced them were written.
+    pub fn call(
+        &self,
+        arguments: &[Register],
+        store: &StateStore,
+    ) -> Result<Register, SimulationError> {
+        let mut frame = store.frame();
+        for name in &self.reads {
+            // A name the design does not have is left out rather than invented:
+            // the body reading it is then the same `UnknownIdentifier` it would
+            // be anywhere else.
+            if let Some(signal) = store.get_signal(name) {
+                frame.set_ranged(name.clone(), signal.register().clone(), signal.range());
+            }
+        }
+
+        frame.declare_signed(
+            self.result.name.clone(),
+            self.result.range,
+            self.result.signed,
+        );
+        for variable in self.arguments.iter().chain(&self.locals) {
+            frame.declare_signed(variable.name.clone(), variable.range, variable.signed);
+        }
+        for (variable, value) in self.arguments.iter().zip(arguments) {
+            let target = ResolvedTarget::Whole(variable.name.clone());
+            drive_resolved(&mut frame, &target, value)?;
+        }
+
+        // Nothing in a function body may print, and nothing in one may
+        // suspend: both are rejected when the function is elaborated, which is
+        // why the context here is a fresh one nobody reads and a suspension is
+        // an error rather than a resume point.
+        let mut tasks = TaskContext::new();
+        match resume(&self.program, 0, &mut frame, &mut tasks)? {
+            Resume::Halted { .. } => {}
+            Resume::Suspended { .. } => return Err(FUNCTION_DELAY_UNSUPPORTED),
+        }
+
+        frame
+            .get(&self.result.name)
+            .cloned()
+            .ok_or_else(|| SimulationError::UnknownSignal(self.result.name.clone()))
     }
 }
 

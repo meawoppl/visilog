@@ -67,7 +67,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `integer.rs` | `integer a, b;` declarations |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
-| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls |
+| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction` |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
@@ -239,21 +239,57 @@ widen the operands of the expression on its right before it is evaluated, so
 the assignment is real, which is why `assign y = $signed(a) | $signed(b);` into a wider `y`
 does come out right.
 
-Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
-fit in a program counter) and concatenation as an assignment target. Parameter overrides
-cannot change a width, because `simple.rs::range` only parses literal integers, so
-`output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built but still unwired.
+**A design's own functions are compiled at elaboration and called from `eval`.**
+`function [7:0] f; input [7:0] a; f = a + 1; endfunction` parses in both the 1995 form
+(arguments as `input` declarations inside the body) and the 2001 one (`f(input [7:0] a)`),
+and `elaborate` turns each one into a `program::FunctionDefinition`: the compiled body,
+plus the frame variables it needs — its result (the function's own name), its arguments,
+its locals — and the design signals it reads. The definitions live on the `StateStore`,
+because `eval` is handed a `&StateStore` and nothing else, and that is where a call has to
+find its body.
+
+**A call runs against a frame, which is a `StateStore` of its own.**
+`FunctionDefinition::call` builds one holding the result variable, the arguments, the
+locals, and *copies* of the design signals the body reads, then runs the body through the
+same `resume` every other procedural body goes through. Nothing the body writes reaches
+the design — which is exactly why a call can be made from an evaluator holding a shared
+reference — and every call gets its own frame, so **recursion works**: `fact(n) = n *
+fact(n - 1)` returns 120 for 5. `MAX_CALL_DEPTH` (64) is what makes a function that never
+reaches its base case `EvalError::FunctionCallDepth` rather than a stack overflow; the
+bound is deliberately well under the ~120 an unoptimised build actually survives.
+
+The read set is why a frame costs the *function* rather than the design, and it is closed
+over the call graph (`close_reads`): a function that calls another has to copy in what
+that one reads too, or the inner call's frame would be missing it. An `@(*)` block's
+implicit sensitivity list is extended the same way — a block whose only reader of a signal
+is a call still has to wake when that signal moves.
+
+Because a frame is thrown away, a function body that would need to be seen from outside is
+a **named error at elaboration**, never a silent no-op: a `#delay`, a system task (its
+output would go into a `TaskContext` nobody reads), a non-blocking assignment (its write
+lands after the call has ended), an assignment to a signal outside the function, and
+`$random` (the stream it would advance is the frame's). Those five are the whole list, and
+`$display` inside a function is the one worth revisiting — it needs an output sink the
+evaluator can reach.
+
+Still unsupported: **tasks** (`task … endtask` and a call to one) — a task may consume
+time, so a call to one is a suspendable statement and interacts with `resume` the way a
+delay does, which a function never has to; intra-assignment delays (`a = #5 b;` — the held
+right hand side does not fit in a program counter); and concatenation as an assignment
+target. Parameter overrides cannot change a width, because `simple.rs::range` only parses
+literal integers, so `output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built
+but still unwired.
 
 | File | Role |
 | --- | --- |
-| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock` and `rename_expression` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, including signedness (`expression_is_signed` / `operand_rule`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them |
+| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression` and the compiling of a `function` into a `FunctionDefinition` |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, including signedness (`expression_is_signed` / `operand_rule`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` — system tasks, their format strings, and the buffer they print into |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive, the simulated clock `$time` reads, and the `$random` stream |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -538,6 +574,27 @@ tripwire.
 - **`Register::to_decimal` accumulates into a machine integer**, so it overflows on
   anything wider than about 31 bits. `tasks.rs` formats decimals through `to_u128`
   instead; do the same rather than reaching for `to_decimal` on a real signal.
+- **A function's own name is a variable, and now so is its qualified spelling.** The body
+  returns a value by assigning to it, so `elaborate` gives the function's name, its
+  arguments and its locals frame names (`dut.f`, `dut.f.a`) and renames the compiled body
+  through a resolver that knows the difference between one of those and a design signal.
+  That is also why `rename_expression` qualifies the name of a *called* function: a
+  function belongs to the instance that declares it, and two instances of one module have
+  a definition each. A `$name` is still never qualified — it is the simulator's, not the
+  design's.
+- **What a function body may not do is checked once, at elaboration.** `analyse_function_body`
+  walks the compiled instructions and rejects a `#delay`, a system task, a non-blocking
+  assignment, a write to anything the function does not declare, and `$random` — each with
+  a name. Every one of them is something a frame would silently swallow, and a call that
+  quietly did nothing is the hardest kind of wrong answer to find. The same walk is what
+  produces the read set a call copies into its frame, so adding a new `Instruction` means
+  teaching `BodyNames` about it or a function will stop seeing what it reads.
+- **A function item is told from a statement by whether it declares a type.**
+  `behavior.rs::function_item` gives up unless it saw a direction or a storage keyword —
+  `input`, `reg`, `wire`, `integer`, `time`, `signed`, or a range — which is what lets
+  `many0` stop at the first statement of the body. A body is then a `begin`…`end` block or
+  a bare list of statements, the same `alt` `initial` uses. A function's range is a
+  `simple.rs::range` like any other, so `function [WIDTH-1:0] f;` still does not parse.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow
