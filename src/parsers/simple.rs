@@ -80,6 +80,29 @@ where
     delimited(ws_and_comments, inner, ws_and_comments)
 }
 
+/// A character that may continue an identifier, so a keyword followed by one is
+/// not a keyword at all: `signed` in `signed_a`.
+fn identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// The optional `signed` / `unsigned` qualifier a `reg`, net or port
+/// declaration may carry, as `true` when the declaration is signed.
+///
+/// It is *optional* rather than a separate production because every one of
+/// those declarations has the same shape with and without it, and absent means
+/// unsigned — what every Verilog data type is unless it says otherwise. An
+/// `integer` is the exception, and it says so by being an `integer`.
+pub fn signedness(input: &str) -> IResult<&str, bool> {
+    map(
+        nom::combinator::opt(nom::sequence::terminated(
+            alt((value(true, tag("signed")), value(false, tag("unsigned")))),
+            not(nom::character::complete::satisfy(identifier_char)),
+        )),
+        |qualifier| qualifier.unwrap_or(false),
+    )(input)
+}
+
 pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
     delimited(
         char('['),

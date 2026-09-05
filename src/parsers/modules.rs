@@ -13,7 +13,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
-    simple::{range, ws, ws_and_comments},
+    simple::{range, signedness, ws, ws_and_comments},
     statements::{parse_module_statement, ModuleStatement},
 };
 
@@ -30,6 +30,9 @@ pub struct Port {
     pub net_type: Option<NetType>,
     pub range: (i64, i64),
     pub identifier: Identifier,
+    /// Whether the declaration carried a `signed` qualifier —
+    /// `input signed [3:0] a`.
+    pub signed: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -77,6 +80,8 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
     let (input, _) = ws_and_comments(input)?;
     let (input, net_type) = opt(parse_net_type)(input)?;
     let (input, _) = ws_and_comments(input)?;
+    let (input, signed) = signedness(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, range) = opt(range)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, identifier) = identifier(input)?;
@@ -87,6 +92,7 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
             net_type,
             range: range.unwrap_or((0, 0)),
             identifier,
+            signed,
         },
     ))
 }
@@ -131,6 +137,8 @@ pub fn parse_port_declaration(input: &str) -> IResult<&str, Vec<Port>> {
     let (input, _) = ws_and_comments(input)?;
     let (input, net_type) = opt(parse_net_type)(input)?;
     let (input, _) = ws_and_comments(input)?;
+    let (input, signed) = signedness(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, port_range) = opt(range)(input)?;
     let (input, names) = identifier_list(input)?;
     let (input, _) = ws(char(';'))(input)?;
@@ -143,6 +151,7 @@ pub fn parse_port_declaration(input: &str) -> IResult<&str, Vec<Port>> {
                 net_type,
                 range: port_range.unwrap_or((0, 0)),
                 identifier,
+                signed,
             })
             .collect(),
     ))
@@ -381,6 +390,7 @@ mod tests {
                 net_type: Some(NetType::Wire),
                 range: (0, 0),
                 identifier: "a".into(),
+                signed: false,
             },
         );
         assert_parses_to(
@@ -391,6 +401,7 @@ mod tests {
                 net_type: Some(NetType::Reg),
                 range: (0, 0),
                 identifier: "b".into(),
+                signed: false,
             },
         );
         assert_parses_to(
@@ -401,6 +412,7 @@ mod tests {
                 net_type: None,
                 range: (0, 0),
                 identifier: "c".into(),
+                signed: false,
             },
         );
     }
@@ -416,18 +428,21 @@ mod tests {
                     net_type: Some(NetType::Wire),
                     range: (0, 0),
                     identifier: "a".into(),
+                    signed: false,
                 },
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
                     range: (0, 0),
                     identifier: "b".into(),
+                    signed: false,
                 },
                 Port {
                     direction: PortDirection::InOut,
                     net_type: None,
                     range: (0, 0),
                     identifier: "c".into(),
+                    signed: false,
                 },
             ],
         );
@@ -764,6 +779,7 @@ mod tests {
             net_type: None,
             range: (0, 0),
             identifier: name.into(),
+            signed: false,
         }
     }
 
@@ -792,6 +808,7 @@ mod tests {
                     net_type: None,
                     range: (11, 0),
                     identifier: "h".into(),
+                    signed: false,
                 },
             ]
         );
@@ -819,6 +836,57 @@ mod tests {
         assert_eq!(ansi, non_ansi);
     }
 
+    /// `signed` follows the net type and precedes the width, in both header
+    /// styles.
+    #[test]
+    fn test_ports_carry_a_signed_qualifier() {
+        assert_parses_to(
+            parse_port,
+            "input wire signed [3:0] a",
+            Port {
+                direction: PortDirection::Input,
+                net_type: Some(NetType::Wire),
+                range: (3, 0),
+                identifier: "a".into(),
+                signed: true,
+            },
+        );
+
+        assert_parses_to(
+            parse_port_declaration,
+            "output signed [11:0] h, g;",
+            vec![
+                Port {
+                    direction: PortDirection::Output,
+                    net_type: None,
+                    range: (11, 0),
+                    identifier: "h".into(),
+                    signed: true,
+                },
+                Port {
+                    direction: PortDirection::Output,
+                    net_type: None,
+                    range: (11, 0),
+                    identifier: "g".into(),
+                    signed: true,
+                },
+            ],
+        );
+
+        // A port named after the keyword is still a port.
+        assert_parses_to(
+            parse_port,
+            "input signedness",
+            Port {
+                direction: PortDirection::Input,
+                net_type: None,
+                range: (0, 0),
+                identifier: "signedness".into(),
+                signed: false,
+            },
+        );
+    }
+
     #[test]
     fn test_parse_port_declaration_names_several_ports() {
         assert_parses_to(
@@ -830,12 +898,14 @@ mod tests {
                     net_type: Some(NetType::Reg),
                     range: (11, 0),
                     identifier: "h".into(),
+                    signed: false,
                 },
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
                     range: (11, 0),
                     identifier: "g".into(),
+                    signed: false,
                 },
             ],
         );

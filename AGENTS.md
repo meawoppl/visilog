@@ -52,7 +52,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | File | Owns |
 | --- | --- |
 | `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
-| `simple.rs` | whitespace, comments, `raw_pos_int`, `range`, and the `ws` combinator |
+| `simple.rs` | whitespace, comments, `raw_pos_int`, `range`, `signedness`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
 | `numbers.rs` | raw binary / decimal / hex digit runs |
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
@@ -224,10 +224,20 @@ that draws random stimulus draws the *same* stimulus on every run and a self-che
 test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
 write the seed back the way a real simulator's `inout` argument does.
 
-`$signed` / `$unsigned` are the identity on the bits today. Signedness is unmodelled
-(issue #96), so only the width half of the cast is real — this is documented rather than
-faked, which is why the corpus's `signed5`, `br_gh99r`, `br_gh199a` and `pr2138979` now
-run and honestly report a wrong answer instead of silently not parsing.
+**Signedness is modelled, widths are still self-determined.** `reg signed [3:0] a;`,
+`wire signed`, `input signed`, an `integer`, `4'sd12` and a bare decimal like `42` are all
+signed; everything else is unsigned. It rides on the `Register` a lookup produces — a
+register is bits *plus how to read them* — and `$signed` / `$unsigned` are real casts that
+set that bit and change nothing else. It changes the answer in exactly five places: `/`,
+`%`, `>>>`, the relational operators, and the widening that happens when two operands of
+different widths meet or when a value is written into a wider target.
+
+What is *not* modelled is context-determined **width**: an assignment's target cannot
+widen the operands of the expression on its right before it is evaluated, so
+`reg [15:0] r; r = -4'd12;` still negates in four bits and stores `16'h0004`. That is what
+`signed2`, `signed3`, `shift_pad` and `pr2823711` are still waiting on. Sign extension *at*
+the assignment is real, which is why `assign y = $signed(a) | $signed(b);` into a wider `y`
+does come out right.
 
 Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
 fit in a program counter) and concatenation as an assignment target. Parameter overrides
@@ -237,13 +247,13 @@ cannot change a width, because `simple.rs::range` only parses literal integers, 
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock` and `rename_expression` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, including the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, including signedness (`expression_is_signed` / `operand_rule`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them |
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` — system tasks, their format strings, and the buffer they print into |
-| `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive, the simulated clock `$time` reads, and the `$random` stream |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive, the simulated clock `$time` reads, and the `$random` stream |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -428,7 +438,8 @@ tripwire.
   address dimension belongs to the *name* (`register::declared_name`), which is what makes
   `reg [7:0] a, mem [0:15];` legal and what removes the "try the memory form first"
   ordering hazard that two near-identical `reg`-led parsers would otherwise create.
-  An `integer` is signed, which nothing models yet (issue #96).
+  A `signed` / `unsigned` qualifier belongs to the *declaration* rather than to a name, so
+  every name in the list shares it; an `integer` is signed by being an `integer`.
 - **A declaration initialiser belongs to the *name*, and `wire` and `reg` mean opposite
   things by it.** `wire a = expr;` is shorthand for a declaration *plus a continuous
   assignment*: `elaborate` pushes it onto the same list an explicit `assign` uses, so the
@@ -501,6 +512,29 @@ tripwire.
   `behavior.rs::keyword`'s trailing `peek(not(identifier_char))`, `forever_more = 1;` reads
   as `forever` plus an assignment. `for` is also a prefix of `forever`, so the longer
   keyword is tried first in `procedural_statement`'s `alt`.
+- **Signedness rides on the value, and is not part of equality.** A `Register` is bits
+  plus how to read them, and that is the only copy of the flag: `SignalState` keeps the
+  *declared* signedness by re-stamping it onto the register on every write, so a value
+  cannot bring its own and a write can never change a declaration. Carrying it on the
+  value is what lets `exec::drive_resolved` sign extend an assignment whose right hand
+  side it only ever sees as a `Register`, and what lets `eval` learn a signal's
+  signedness by looking the name up rather than asking a second question. `Register`'s
+  `PartialEq` and `Hash` are hand written to ignore the flag: `4'sb1111` and `4'b1111`
+  are the same four bits, and a store that called them different would journal an edge
+  where nothing moved.
+- **Signedness propagates *down* as well as up.** `expression_is_signed` walks a
+  subexpression without evaluating it, because Verilog decides an operation's signedness
+  before evaluating its operands and then pushes the answer back down: `(a >>> 1) | u` is
+  unsigned because `u` is, and that makes the `>>>` inside it a plain `>>` even though `a`
+  was declared signed (corpus `pr3104254`). A bottom-up rule alone gets that wrong. The
+  operand classification lives in one place, `eval::operand_rule`, and
+  `expression_is_signed` and `eval_in_context` both read it so they cannot disagree.
+  Two things keep that walk off the hot path, and both matter: `StateStore::any_signed`
+  answers for every identifier in a design that declares nothing signed without hashing a
+  name, and the "an unsigned context demotes the result" step lives in the *leaf* arms of
+  `eval_in_context` rather than in a shared epilogue — an operand evaluated in an unsigned
+  context already comes back unsigned, so there is nothing for an operator to demote.
+  Putting it in the epilogue instead costs about 40% on `bench eval`.
 - **`Register::to_decimal` accumulates into a machine integer**, so it overflows on
   anything wider than about 31 bits. `tasks.rs` formats decimals through `to_u128`
   instead; do the same rather than reaching for `to_decimal` on a real signal.

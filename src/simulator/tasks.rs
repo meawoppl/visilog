@@ -507,6 +507,9 @@ fn unknown(register: &Register) -> String {
 /// Decimal, going through `to_u128` rather than `Register::to_decimal` because
 /// that one accumulates into a machine integer. A value wider than 128 bits is
 /// printed from its low 128 bits.
+///
+/// A *signed* value prints as a two's complement number, minus sign and all:
+/// `%d` on an `integer` holding -12 has to read `-12`, not `4294967284`.
 fn decimal(register: &Register) -> String {
     if register.has_unknown() {
         return unknown(register);
@@ -518,6 +521,11 @@ fn decimal(register: &Register) -> String {
     } else {
         register
     };
+    if register.is_signed() {
+        return register
+            .to_i128()
+            .map_or_else(|| unknown(register), |value| value.to_string());
+    }
     register
         .to_u128()
         .map_or_else(|| unknown(register), |value| value.to_string())
@@ -703,6 +711,18 @@ mod tests {
         assert_eq!(printed(r#"$display("x", a);"#, &store), "x 3\n");
     }
 
+    /// A signed value prints in decimal as the two's complement number it is.
+    #[test]
+    fn test_decimal_prints_a_signed_value_with_its_sign() {
+        let store = store_with(&[]);
+        assert_eq!(printed(r#"$display("%0d", -12);"#, &store), "-12\n");
+        // The same bits read as unsigned are the large number they spell.
+        assert_eq!(
+            printed(r#"$display("%0d", $unsigned(-12));"#, &store),
+            "4294967284\n"
+        );
+    }
+
     #[test]
     fn test_time_is_an_argument() {
         let mut store = store_with(&[]);
@@ -718,10 +738,11 @@ mod tests {
         store.set_time(9);
         assert_eq!(printed(r#"$display("%0d", $stime);"#, &store), "9\n");
         // `$random` reads the store's stream: a bare `$name` argument is an
-        // expression like any other, not a second table of task names.
+        // expression like any other, not a second table of task names. It
+        // draws a *signed* integer, so half the stream prints negative.
         let drawn = printed(r#"$display("%0d", $random);"#, &store);
         assert!(
-            drawn.trim().parse::<u32>().is_ok(),
+            drawn.trim().parse::<i32>().is_ok(),
             "expected a number, got {:?}",
             drawn
         );

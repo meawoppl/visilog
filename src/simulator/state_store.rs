@@ -37,6 +37,13 @@ impl Default for RandomStream {
 ///
 /// The range matters for bit and part selects: `reg [7:0] a` and `reg [0:7] a`
 /// hold the same bits but `a[0]` names opposite ends of the vector.
+///
+/// Signedness lives here too, because in Verilog it is a property of the
+/// *declaration* — `reg signed [3:0] a` — and not of the bits. It is carried on
+/// the stored value itself rather than in a field beside it, so there is one
+/// copy of it and an expression that reads the signal reads it along with the
+/// bits; what makes it a *declared* property is that the store re-stamps it on
+/// every write, and a value cannot bring its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalState {
     register: Register,
@@ -62,6 +69,17 @@ impl SignalState {
             register.width()
         );
         SignalState { register, range }
+    }
+
+    /// The same signal, declared signed or unsigned.
+    pub fn with_signedness(mut self, signed: bool) -> Self {
+        self.register = self.register.with_signedness(signed);
+        self
+    }
+
+    /// Whether the signal was declared `signed`.
+    pub fn is_signed(&self) -> bool {
+        self.register.is_signed()
     }
 
     pub fn register(&self) -> &Register {
@@ -121,7 +139,13 @@ impl SignalState {
         if self.register.bit_from_lsb(from_lsb) == Some(value) {
             return false;
         }
-        self.register = self.register.with_bit(from_lsb, value);
+        // `with_bit` builds a fresh register, which is an unsigned one until it
+        // is told otherwise; the declaration outlives a single bit write.
+        let signed = self.register.is_signed();
+        self.register = self
+            .register
+            .with_bit(from_lsb, value)
+            .with_signedness(signed);
         true
     }
 }
@@ -152,11 +176,25 @@ pub struct StateStore {
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
+    /// Whether any signal here was declared signed.
+    ///
+    /// A hint, not a fact to reason from: it is set when a signed signal is
+    /// declared and never cleared. It exists because `expression_is_signed`
+    /// asks about every identifier it walks past, and hashing a name to answer
+    /// "no" for a design that declares nothing signed is most of what that walk
+    /// would otherwise cost.
+    any_signed: bool,
 }
 
 impl StateStore {
     pub fn new() -> Self {
         StateStore::default()
+    }
+
+    /// Whether any signal in the store was declared signed. `false` is exact —
+    /// nothing here is signed — while `true` only means something once was.
+    pub fn any_signed(&self) -> bool {
+        self.any_signed
     }
 
     /// The simulated time `$time` reports.
@@ -230,11 +268,31 @@ impl StateStore {
     /// Declares a signal over `(msb, lsb)`, initialized to all `x` the way an
     /// unassigned Verilog `reg` starts out.
     pub fn declare(&mut self, name: impl Into<String>, range: (i64, i64)) {
+        self.declare_signed(name, range, false);
+    }
+
+    /// [`declare`](StateStore::declare) for a signal whose declaration carried
+    /// a `signed` qualifier.
+    pub fn declare_signed(&mut self, name: impl Into<String>, range: (i64, i64), signed: bool) {
         let name = name.into();
         self.record(&name);
+        self.any_signed |= signed;
         let register = Register::unknown(range_width(range));
+        self.name_to_signal.insert(
+            name,
+            SignalState::with_range(register, range).with_signedness(signed),
+        );
+    }
+
+    /// The signedness a write to `name` has to keep: the one the signal was
+    /// declared with, since a value cannot change a declaration. A name that
+    /// does not exist yet is being declared by this very write, so it takes the
+    /// signedness of the value instead.
+    fn declared_signedness(&self, name: &str, register: &Register) -> bool {
         self.name_to_signal
-            .insert(name, SignalState::with_range(register, range));
+            .get(name)
+            .map(|signal| signal.is_signed())
+            .unwrap_or_else(|| register.is_signed())
     }
 
     /// Sets a signal's value. A previously declared range is preserved when the
@@ -242,6 +300,8 @@ impl StateStore {
     pub fn set(&mut self, name: impl Into<String>, register: Register) {
         let name = name.into();
         self.record(&name);
+        let signed = self.declared_signedness(&name, &register);
+        self.any_signed |= signed;
         let range = self
             .name_to_signal
             .get(&name)
@@ -251,15 +311,20 @@ impl StateStore {
             Some(range) => SignalState::with_range(register, range),
             None => SignalState::new(register),
         };
-        self.name_to_signal.insert(name, signal);
+        self.name_to_signal
+            .insert(name, signal.with_signedness(signed));
     }
 
     /// Sets a signal's value and declared range in one step.
     pub fn set_ranged(&mut self, name: impl Into<String>, register: Register, range: (i64, i64)) {
         let name = name.into();
         self.record(&name);
-        self.name_to_signal
-            .insert(name, SignalState::with_range(register, range));
+        let signed = self.declared_signedness(&name, &register);
+        self.any_signed |= signed;
+        self.name_to_signal.insert(
+            name,
+            SignalState::with_range(register, range).with_signedness(signed),
+        );
     }
 
     pub fn get(&self, name: &str) -> Option<&Register> {

@@ -5,8 +5,9 @@ use super::{expr::Expression, identifier::Identifier, register::declared_name, s
 /// One name from an `integer a, b[0:3];` declaration.
 ///
 /// An `integer` is a fixed 32-bit value, so it carries no width — only the
-/// optional array dimension. It is also *signed*, which the simulator does not
-/// model yet (issue #96).
+/// optional array dimension. It is also *signed*, and says so by being an
+/// `integer`, which is why there is no qualifier here to record: `elaborate`
+/// declares one signed without asking.
 #[derive(Debug, PartialEq)]
 pub struct IntegerDeclaration {
     pub name: Identifier,

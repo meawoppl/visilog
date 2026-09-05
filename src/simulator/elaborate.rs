@@ -217,7 +217,9 @@ impl<'m> Elaborator<'m> {
             Some(Binding::Alias(_)) => return Ok(()),
             Some(Binding::Driven(expression)) => {
                 let name = scope.qualified(local);
-                self.out.state.declare(name.clone(), port.range);
+                self.out
+                    .state
+                    .declare_signed(name.clone(), port.range, port.signed);
                 self.out.assignments.push(ContinuousAssignment::new(
                     Expression::Identifier(Identifier::new(name)),
                     expression.clone(),
@@ -228,7 +230,9 @@ impl<'m> Elaborator<'m> {
         }
 
         let name = scope.qualified(local);
-        self.out.state.declare(name.clone(), port.range);
+        self.out
+            .state
+            .declare_signed(name.clone(), port.range, port.signed);
 
         if !matches!(port.direction, PortDirection::Input) {
             return Ok(());
@@ -252,7 +256,7 @@ impl<'m> Elaborator<'m> {
         match statement {
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
-                    self.declare_local(&net.identifier().name, net.range(), scope);
+                    self.declare_local(&net.identifier().name, net.range(), net.is_signed(), scope);
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -260,15 +264,17 @@ impl<'m> Elaborator<'m> {
                     self.declare_local(
                         &register.name.name,
                         register.range.unwrap_or((0, 0)),
+                        register.signed,
                         scope,
                     );
                 }
             }
             ModuleStatement::IntegerDeclaration(integers) => {
                 for declaration in integers {
-                    // An `integer` is 32 bits wide in Verilog. It is also
-                    // signed, which nothing here models yet (issue #96).
-                    self.declare_local(&declaration.name.name, (31, 0), scope);
+                    // An `integer` is a 32 bit *signed* variable. Signedness is
+                    // part of what the keyword means, so there is no qualifier
+                    // to read here — it is always true.
+                    self.declare_local(&declaration.name.name, (31, 0), true, scope);
                 }
             }
             ModuleStatement::ParameterDeclaration(parameters) => {
@@ -282,11 +288,11 @@ impl<'m> Elaborator<'m> {
                     };
                     let name = scope.qualified(local);
                     match parameter.range {
-                        Some(range) => {
-                            self.out
-                                .state
-                                .set_ranged(name, value.resize(range_width(range)), range)
-                        }
+                        Some(range) => self.out.state.set_ranged(
+                            name,
+                            value.coerced(range_width(range)),
+                            range,
+                        ),
                         None => self.out.state.set(name, value),
                     }
                 }
@@ -301,11 +307,13 @@ impl<'m> Elaborator<'m> {
     /// A redeclaration of an aliased port (`output q;` followed by `reg q;`) is
     /// skipped: the parent's signal is the one the port names, and resetting it
     /// to `x` at the child's width would clobber it.
-    fn declare_local(&mut self, local: &str, range: (i64, i64), scope: &Scope) {
+    fn declare_local(&mut self, local: &str, range: (i64, i64), signed: bool, scope: &Scope) {
         if matches!(scope.bindings.get(local), Some(Binding::Alias(_))) {
             return;
         }
-        self.out.state.declare(scope.qualified(local), range);
+        self.out
+            .state
+            .declare_signed(scope.qualified(local), range, signed);
     }
 
     /// Applies a variable initialiser: `reg a = expr;` and `integer i = expr;`.
@@ -738,6 +746,46 @@ mod tests {
     fn reset(simulator: &mut Simulator) {
         simulator.poke("rst", one()).unwrap();
         simulator.poke("rst", zero()).unwrap();
+    }
+
+    /// A `signed` qualifier is a property of the declaration, so it has to
+    /// survive elaboration and land on the store entry — including through an
+    /// instance, where the name it lands under is the qualified one.
+    #[test]
+    fn test_signedness_reaches_the_elaborated_signals() {
+        let child = r#"
+            module child(input signed [3:0] p, output [3:0] q);
+                reg signed [3:0] r;
+                wire signed [7:0] w;
+                integer i;
+                reg [3:0] plain;
+                wire [7:0] bare;
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                wire [3:0] a, b;
+                child dut (.p(a), .q(b));
+            endmodule
+        "#;
+
+        let simulator = simulator_for(&[top, child], "top");
+        let signed = |name: &str| {
+            simulator
+                .get(name)
+                .unwrap_or_else(|_| panic!("no signal {}", name))
+                .is_signed()
+        };
+
+        assert!(signed("dut.r"), "reg signed");
+        assert!(signed("dut.w"), "wire signed");
+        // An `integer` is signed by being an `integer`; there is no qualifier.
+        assert!(signed("dut.i"), "integer");
+        assert!(!signed("dut.plain"), "reg without a qualifier");
+        assert!(!signed("dut.bare"), "wire without a qualifier");
+        // A port bound to a plain identifier *is* the parent's signal, and the
+        // parent declared that one unsigned.
+        assert!(!signed("a"), "the parent's own wire");
     }
 
     #[test]

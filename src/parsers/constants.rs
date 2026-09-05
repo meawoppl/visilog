@@ -38,6 +38,13 @@ pub struct VerilogConstant {
     size: Option<usize>,
     base_type: VerilogBaseType,
     value: String,
+    /// The `s` of `4'sd12` — the literal is a two's complement number.
+    signed: bool,
+}
+
+/// The optional `s` that makes a based literal signed: `4'sd12`, `8'SH0F`.
+fn const_signedness(input: &str) -> IResult<&str, bool> {
+    map(nom::combinator::opt(one_of("sS")), |s| s.is_some())(input)
 }
 
 impl fmt::Display for VerilogConstant {
@@ -48,11 +55,12 @@ impl fmt::Display for VerilogConstant {
 
         write!(
             f,
-            "{}'{}{}",
+            "{}'{}{}{}",
             match self.size {
                 Some(size) => size.to_string(),
                 None => "".to_string(),
             },
+            if self.signed { "s" } else { "" },
             match self.base_type {
                 VerilogBaseType::Binary => "b",
                 VerilogBaseType::Decimal => "d",
@@ -70,14 +78,35 @@ impl VerilogConstant {
             size,
             base_type,
             value,
+            signed: false,
         }
     }
+
+    /// The same literal, read as two's complement — the `s` of `4'sd12`.
+    fn with_signedness(mut self, signed: bool) -> Self {
+        self.signed = signed;
+        self
+    }
+
     pub fn from_int(value: i64) -> Self {
         VerilogConstant {
             size: None,
             base_type: VerilogBaseType::Decimal,
             value: value.to_string(),
+            signed: false,
         }
+    }
+
+    /// Whether the literal is a two's complement number.
+    ///
+    /// Two spellings make one: the `s` designator of `4'sd12`, and a decimal
+    /// written with neither a size nor a base — `42` is signed where `4'd42`
+    /// is not. The LRM draws that second line at the *base* rather than at the
+    /// size, so `'d42` is unsigned to it and signed here; nothing on this type
+    /// records whether a base was written, and an unsized based decimal is
+    /// rare enough not to be worth a field that could not be compared.
+    pub fn is_signed(&self) -> bool {
+        self.signed || (self.size.is_none() && self.base_type == VerilogBaseType::Decimal)
     }
 
     /// The declared bit width, e.g. the `8` of `8'hFF`. `None` when the
@@ -101,11 +130,12 @@ impl VerilogConstant {
 impl RawToken for VerilogConstant {
     fn raw_token(&self) -> String {
         format!(
-            "{}'{}{}",
+            "{}'{}{}{}",
             match self.size {
                 Some(size) => size.to_string(),
                 None => "".to_string(),
             },
+            if self.signed { "s" } else { "" },
             match self.base_type {
                 VerilogBaseType::Binary => "b",
                 VerilogBaseType::Decimal => "d",
@@ -125,20 +155,28 @@ fn integer_constant(input: &str) -> IResult<&str, VerilogConstant> {
 }
 
 fn unsized_const(input: &str) -> IResult<&str, VerilogConstant> {
-    let parsed = tuple((preceded(char('\''), const_type_char), based_digits));
+    let parsed = tuple((
+        preceded(char('\''), tuple((const_signedness, const_type_char))),
+        based_digits,
+    ));
 
-    map_res(parsed, |(base, content)| {
-        let cnst = VerilogConstant::new(None, base, content.to_string());
+    map_res(parsed, |((signed, base), content)| {
+        let cnst = VerilogConstant::new(None, base, content.to_string()).with_signedness(signed);
         Ok::<_, nom::Err<nom::error::Error<&str>>>(cnst)
     })(input)
 }
 
 fn sized_const(input: &str) -> IResult<&str, VerilogConstant> {
-    let parsed = tuple((decimal, preceded(char('\''), const_type_char), based_digits));
+    let parsed = tuple((
+        decimal,
+        preceded(char('\''), tuple((const_signedness, const_type_char))),
+        based_digits,
+    ));
 
-    map_res(parsed, |(size_str, base, content)| {
+    map_res(parsed, |(size_str, (signed, base), content)| {
         let size = size_str.parse::<usize>().unwrap();
-        let cnst = VerilogConstant::new(Some(size), base, content.to_string());
+        let cnst =
+            VerilogConstant::new(Some(size), base, content.to_string()).with_signedness(signed);
         Ok::<_, nom::Err<nom::error::Error<&str>>>(cnst)
     })(input)
 }

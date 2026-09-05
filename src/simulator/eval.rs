@@ -11,16 +11,32 @@
 //! **self-determined**: the width of a sub-expression depends only on that
 //! sub-expression. The individual rules are documented on the helpers below.
 //!
-//! Everything is treated as **unsigned**. The AST carries no signedness, so
-//! `>>>` behaves like `>>`, `<<<` behaves like `<<`, and relational operators
-//! compare magnitudes rather than two's complement values.
+//! # Signedness
+//!
+//! Signedness *is* modelled. It starts at a declaration — `reg signed [3:0] a`,
+//! an `integer`, a literal with the `s` designator or written as a bare decimal
+//! — and rides on the [`Register`] a lookup produces, because a register is
+//! bits plus how to read them.
+//!
+//! Verilog's propagation rule is then one sentence: **an operation is signed
+//! only if every one of its operands is**. A single unsigned operand makes the
+//! whole expression unsigned, which is why `$signed(a) | b` is unsigned even
+//! though half of it was cast. The rule has teeth in exactly five places —
+//! `/`, `%`, `>>>`, the relational operators, and the widening that happens
+//! whenever two operands of different widths meet — and everything else moves
+//! the same bits either way. A concatenation, a bit or part select, and the
+//! result of a comparison are unsigned no matter what went into them.
+//!
+//! Sizing is still self-determined, so the one thing the operators here cannot
+//! do is let an assignment's target widen a signed operand *before* the
+//! operation: `reg [15:0] r; r = -4'd12;` still negates in four bits.
 
 use std::fmt;
 
 use crate::parsers::constants::{VerilogBaseType, VerilogConstant};
 use crate::parsers::expr::Expression;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
-use crate::register::{Chunk, Register, ONE, X, Z, ZERO};
+use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, X, Z, ZERO};
 use crate::simulator::state_store::StateStore;
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
@@ -96,24 +112,85 @@ impl fmt::Display for EvalError {
 impl std::error::Error for EvalError {}
 
 /// Evaluates `expr` against the values in `store`.
+///
+/// The top of an expression is self-determined — nothing outside it can change
+/// how it reads its own bits — so this is [`eval_in_context`] with a signed
+/// context.
 pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError> {
+    eval_in_context(expr, store, true)
+}
+
+/// Evaluates `expr` where `signed_context` says whether the expression around
+/// it allows a signed reading.
+///
+/// Verilog decides signedness for a whole expression *before* evaluating it and
+/// then pushes the answer back down: `(a >>> 1) | u` is unsigned because `u`
+/// is, and being unsigned makes the `>>>` inside it a plain `>>` even though
+/// `a` was declared signed. That is why signedness cannot simply be computed
+/// bottom-up out of the operand values — it has to arrive from above as well,
+/// which is what this parameter carries. [`expression_is_signed`] is the other
+/// half: it answers "would this subexpression be signed on its own?" without
+/// evaluating it.
+///
+/// A *self-determined* operand — the operands of a comparison, a shift amount,
+/// a concatenation member, a system function argument — is evaluated with a
+/// signed context of `true`, because nothing above it has a say.
+fn eval_in_context(
+    expr: &Expression,
+    store: &StateStore,
+    signed_context: bool,
+) -> Result<Register, EvalError> {
     match expr {
-        Expression::Constant(constant) => eval_constant(constant),
-        Expression::Identifier(id) => store
-            .get(&id.name)
-            .cloned()
-            .ok_or_else(|| EvalError::UnknownIdentifier(id.name.clone())),
-        Expression::Parenthetical(inner) => eval(inner, store),
-        Expression::Unary(op, operand) => eval_unary(op, &eval(operand, store)?),
-        Expression::Binary(lhs, op, rhs) => eval_binary(op, &eval(lhs, store)?, &eval(rhs, store)?),
+        // Only a *leaf* has to be told that its context is unsigned. Every
+        // operator below already asks its own operands, and an operand
+        // evaluated in an unsigned context comes back unsigned — so by the time
+        // an operator decides its result there is nothing left to demote.
+        Expression::Constant(constant) => eval_constant(constant, signed_context),
+        Expression::Identifier(id) => {
+            let value = store
+                .get(&id.name)
+                .cloned()
+                .ok_or_else(|| EvalError::UnknownIdentifier(id.name.clone()))?;
+            Ok(demoted(value, signed_context))
+        }
+        Expression::Parenthetical(inner) => eval_in_context(inner, store, signed_context),
+        Expression::Unary(op, operand) => {
+            let context = if unary_keeps_signedness(op) {
+                signed_context && expression_is_signed(operand, store)
+            } else {
+                true
+            };
+            eval_unary(op, &eval_in_context(operand, store, context)?)
+        }
+        Expression::Binary(lhs, op, rhs) => {
+            let (left, right) = operand_contexts(op, lhs, rhs, store, signed_context);
+            eval_binary(
+                op,
+                &eval_in_context(lhs, store, left)?,
+                &eval_in_context(rhs, store, right)?,
+            )
+        }
         Expression::Conditional(condition, when_true, when_false) => {
             // Only the taken branch is evaluated. When the condition is `x` both
             // branches are needed, and the result merges them bit by bit: bits
             // that agree survive, bits that disagree become `x`.
+            //
+            // Both arms carry the conditional's own signedness, so a signed arm
+            // beside an unsigned one is read unsigned even when it is the one
+            // taken. The condition itself is self-determined.
+            let arms = signed_context
+                && expression_is_signed(when_true, store)
+                && expression_is_signed(when_false, store);
             match truth(&eval(condition, store)?) {
-                Some(true) => eval(when_true, store),
-                Some(false) => eval(when_false, store),
-                None => Ok(merge(&eval(when_true, store)?, &eval(when_false, store)?)),
+                Some(true) => eval_in_context(when_true, store, arms),
+                Some(false) => eval_in_context(when_false, store, arms),
+                None => {
+                    let (when_true, when_false) = (
+                        eval_in_context(when_true, store, arms)?,
+                        eval_in_context(when_false, store, arms)?,
+                    );
+                    Ok(merge(&when_true, &when_false).with_signedness(arms))
+                }
             }
         }
         Expression::Concatenation(parts) => {
@@ -157,9 +234,157 @@ pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError
             Ok(Register::from_bits(bits))
         }
         Expression::FunctionCall(id, _) => Err(EvalError::UnsupportedFunctionCall(id.name.clone())),
-        Expression::SystemFunctionCall(name, arguments) => {
-            eval_system_function(name, arguments, store)
+        // `$signed(...)` is the one call that produces a signed value out of
+        // nothing, so it is a leaf for this purpose too.
+        Expression::SystemFunctionCall(name, arguments) => Ok(demoted(
+            eval_system_function(name, arguments, store)?,
+            signed_context,
+        )),
+    }
+}
+
+/// `value` as an unsigned one unless the context allows it to stay signed.
+fn demoted(value: Register, signed_context: bool) -> Register {
+    if signed_context {
+        value
+    } else {
+        value.with_signedness(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signedness
+// ---------------------------------------------------------------------------
+
+/// Where a binary operator's operands take their signedness from.
+///
+/// The distinction is not about the operator's arithmetic — it is about which
+/// operands are *context-determined*, meaning the expression around them can
+/// make them unsigned, and which decide for themselves.
+enum OperandRule {
+    /// `+ - * / % & | ^ ^~`: both operands are context-determined, and the
+    /// result is signed only when both of them are.
+    Shared,
+    /// `**`: the base is context-determined, the exponent is self-determined —
+    /// its width cannot change the result, but its sign can, since a negative
+    /// exponent has its own rule.
+    BaseAndExponent,
+    /// `<< >> <<< >>>`: the value being shifted is context-determined and alone
+    /// decides the result; the shift amount is self-determined.
+    ShiftedValue,
+    /// `< <= > >= == != === !== && ||`: both operands are self-determined and
+    /// the one-bit result is unsigned however they compared.
+    SelfDetermined,
+}
+
+fn operand_rule(op: &BinaryOperator) -> OperandRule {
+    match op {
+        BinaryOperator::Addition
+        | BinaryOperator::Subtraction
+        | BinaryOperator::Multiplication
+        | BinaryOperator::Division
+        | BinaryOperator::Modulus
+        | BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseInclusiveOr
+        | BinaryOperator::BitwiseXOr
+        | BinaryOperator::BitwiseXNor => OperandRule::Shared,
+        BinaryOperator::Power => OperandRule::BaseAndExponent,
+        BinaryOperator::ShiftLeft
+        | BinaryOperator::ShiftRight
+        | BinaryOperator::ArithmeticShiftLeft
+        | BinaryOperator::ArithmeticShiftRight => OperandRule::ShiftedValue,
+        _ => OperandRule::SelfDetermined,
+    }
+}
+
+/// The signed context each operand of `op` is evaluated in.
+fn operand_contexts(
+    op: &BinaryOperator,
+    lhs: &Expression,
+    rhs: &Expression,
+    store: &StateStore,
+    signed_context: bool,
+) -> (bool, bool) {
+    match operand_rule(op) {
+        OperandRule::Shared => {
+            let signed = signed_context
+                && expression_is_signed(lhs, store)
+                && expression_is_signed(rhs, store);
+            (signed, signed)
         }
+        OperandRule::BaseAndExponent => {
+            let signed = signed_context
+                && expression_is_signed(lhs, store)
+                && expression_is_signed(rhs, store);
+            (signed, true)
+        }
+        OperandRule::ShiftedValue => (signed_context && expression_is_signed(lhs, store), true),
+        OperandRule::SelfDetermined => (true, true),
+    }
+}
+
+/// Whether a unary operator hands its operand's signedness on. `+ - ~` do; a
+/// reduction and `!` produce one unsigned bit.
+fn unary_keeps_signedness(op: &UnaryOperator) -> bool {
+    matches!(
+        op,
+        UnaryOperator::Positive | UnaryOperator::Negative | UnaryOperator::BitwiseNegation
+    )
+}
+
+/// Whether `expr` would be signed if nothing around it had a say.
+///
+/// This walks the expression without evaluating it, which is what lets
+/// [`eval_in_context`] decide an operation's signedness *before* it evaluates
+/// the operands — the order Verilog requires. It reads the same sources the
+/// evaluator does, so the two cannot disagree about a leaf: a literal's own
+/// designator, a signal's declaration, and [`system_function_is_signed`].
+fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
+    match expr {
+        Expression::Constant(constant) => constant.is_signed(),
+        // The store's hint first: looking a name up costs a hash of it, and in
+        // a design that declares nothing signed the answer is already known.
+        Expression::Identifier(id) => {
+            store.any_signed()
+                && store
+                    .get_signal(&id.name)
+                    .is_some_and(|signal| signal.is_signed())
+        }
+        Expression::Parenthetical(inner) => expression_is_signed(inner, store),
+        Expression::Unary(op, operand) => {
+            unary_keeps_signedness(op) && expression_is_signed(operand, store)
+        }
+        Expression::Binary(lhs, op, rhs) => match operand_rule(op) {
+            OperandRule::Shared | OperandRule::BaseAndExponent => {
+                expression_is_signed(lhs, store) && expression_is_signed(rhs, store)
+            }
+            OperandRule::ShiftedValue => expression_is_signed(lhs, store),
+            OperandRule::SelfDetermined => false,
+        },
+        Expression::Conditional(_, when_true, when_false) => {
+            expression_is_signed(when_true, store) && expression_is_signed(when_false, store)
+        }
+        // A concatenation and a select are bit vectors, not numbers: unsigned
+        // however signed the things that went into them were.
+        Expression::Concatenation(_)
+        | Expression::BitSelect(_, _)
+        | Expression::PartSelect(_, _, _) => false,
+        // A design's own functions are not evaluated at all yet.
+        Expression::FunctionCall(_, _) => false,
+        Expression::SystemFunctionCall(name, _) => system_function_is_signed(name),
+    }
+}
+
+/// Whether `$name(...)` hands back a signed value.
+///
+/// Everything that returns Verilog's `integer` does — including `$random`,
+/// which is why half the numbers it draws are negative. `$time` is the
+/// exception: `time` is a 64 bit *unsigned* type.
+fn system_function_is_signed(name: &str) -> bool {
+    match name {
+        "unsigned" | "time" => false,
+        _ => true,
     }
 }
 
@@ -195,6 +420,18 @@ fn eval_system_function(
     arguments: &[Expression],
     store: &StateStore,
 ) -> Result<Register, EvalError> {
+    // Every arm below produces bits; how they are read is one decision, taken
+    // once here, so that the table [`expression_is_signed`] consults cannot
+    // drift from what the evaluator actually hands back.
+    let value = eval_system_function_bits(name, arguments, store)?;
+    Ok(value.with_signedness(system_function_is_signed(name)))
+}
+
+fn eval_system_function_bits(
+    name: &str,
+    arguments: &[Expression],
+    store: &StateStore,
+) -> Result<Register, EvalError> {
     let arity = |expected: &str, allowed: &[usize]| -> Result<(), EvalError> {
         if allowed.contains(&arguments.len()) {
             return Ok(());
@@ -222,12 +459,10 @@ fn eval_system_function(
                 width,
             ))
         }
-        // Signedness is not modelled at all (issue #96): the AST carries none
-        // and every operator here treats its operands as unsigned. Both casts
-        // are therefore the identity on the bits, which is the *width* half of
-        // what they mean and is right for the common `$signed(a) == b` shape.
-        // The sign half — `$signed(4'b1000)` extending as -8, and `>>>` on the
-        // result being arithmetic — waits on #96 rather than being faked here.
+        // A cast that changes no bit and no width: it says only how the bits
+        // that are already there are to be read. Everything it changes happens
+        // in the operator that receives the result — `$signed(4'b1000)` widens
+        // as -8, compares as -8, and `>>>` on it is arithmetic.
         "signed" | "unsigned" => {
             arity("exactly one argument", &[1])?;
             eval(&arguments[0], store)
@@ -291,8 +526,9 @@ fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError>
 // Constants
 // ---------------------------------------------------------------------------
 
-fn eval_constant(constant: &VerilogConstant) -> Result<Register, EvalError> {
-    constant_bits(constant.size(), constant.base_type(), constant.digits())
+fn eval_constant(constant: &VerilogConstant, signed_context: bool) -> Result<Register, EvalError> {
+    let bits = constant_bits(constant.size(), constant.base_type(), constant.digits())?;
+    Ok(bits.with_signedness(signed_context && constant.is_signed()))
 }
 
 /// Converts the pieces of a literal — its optional size, its base and its
@@ -406,26 +642,33 @@ fn decimal_bits(digits: &str) -> Result<Register, EvalError> {
 
 fn eval_unary(op: &UnaryOperator, operand: &Register) -> Result<Register, EvalError> {
     match op {
-        // `+a` is a no-op on an unsigned value.
+        // `+a` is a no-op on the bits, and leaves the operand's signedness
+        // alone with them.
         UnaryOperator::Positive => Ok(operand.clone()),
         // Two's complement in the operand's own width. Any unknown bit makes
         // the whole result unknown, because a carry can reach every bit.
+        // Negating an *unsigned* value is still unsigned — `-4'd12` is `4'd4`,
+        // and only a wider context could make it -12.
         UnaryOperator::Negative => {
             let width = operand.width().max(1);
+            let signed = operand.is_signed();
             match numeric(operand)? {
                 Some(value) => Ok(Register::from_u128(
                     value.wrapping_neg() & width_mask(width),
                     width,
-                )),
-                None => Ok(Register::unknown(width)),
+                )
+                .with_signedness(signed)),
+                None => Ok(Register::unknown(width).with_signedness(signed)),
             }
         }
         // Bit for bit, width preserving. `z` inverts to `x`, matching Verilog:
         // an undriven bit is not a known 0 or 1.
-        UnaryOperator::BitwiseNegation => Ok(operand.map_chunks(|bits| Chunk {
-            value: bits.zeros(),
-            unknown: bits.unknown,
-        })),
+        UnaryOperator::BitwiseNegation => Ok(operand
+            .map_chunks(|bits| Chunk {
+                value: bits.zeros(),
+                unknown: bits.unknown,
+            })
+            .with_signedness(operand.is_signed())),
         // One bit: true when the operand is all zero.
         UnaryOperator::LogicalNegation => Ok(logic_bit(match truth(operand) {
             Some(true) => ZERO,
@@ -521,34 +764,73 @@ fn eval_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Re
 /// carries let one unknown bit reach any output bit. Division or modulus by
 /// zero is `x`, as in Verilog.
 fn arithmetic(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
-    let width = lhs.width().max(rhs.width()).max(1);
-    let (Some(a), Some(b)) = (numeric(lhs)?, numeric(rhs)?) else {
-        return Ok(Register::unknown(width));
+    let (width, signed, values) = align_numeric(lhs, rhs)?;
+    let Some((a, b)) = values else {
+        return Ok(Register::unknown(width).with_signedness(signed));
     };
 
     let mask = width_mask(width);
+    // Both operands read as `width` bits by now, so the two's complement value
+    // of each is a reinterpretation of the bits rather than another widening.
+    let two_s_complement = || (sign_extend_to_i128(a, width), sign_extend_to_i128(b, width));
     let value = match op {
+        // Add, subtract and multiply produce the same bits either way round,
+        // which is the whole point of two's complement.
         BinaryOperator::Addition => a.wrapping_add(b) & mask,
         BinaryOperator::Subtraction => a.wrapping_sub(b) & mask,
         BinaryOperator::Multiplication => a.wrapping_mul(b) & mask,
         BinaryOperator::Division | BinaryOperator::Modulus if b == 0 => {
-            return Ok(Register::unknown(width));
+            return Ok(Register::unknown(width).with_signedness(signed));
+        }
+        // Division and modulus do not. Rust truncates a quotient toward zero
+        // and gives a remainder the sign of the dividend, which is exactly what
+        // Verilog asks for. `wrapping_` is for the one overflowing case,
+        // `-2**(n-1) / -1`, which Verilog wraps back to itself.
+        BinaryOperator::Division if signed => {
+            let (a, b) = two_s_complement();
+            (a.wrapping_div(b) as u128) & mask
+        }
+        BinaryOperator::Modulus if signed => {
+            let (a, b) = two_s_complement();
+            (a.wrapping_rem(b) as u128) & mask
         }
         BinaryOperator::Division => (a / b) & mask,
         BinaryOperator::Modulus => (a % b) & mask,
         other => unreachable!("{} is not an arithmetic operator", other),
     };
-    Ok(Register::from_u128(value, width))
+    Ok(Register::from_u128(value, width).with_signedness(signed))
 }
 
 /// `**` takes the width of its left operand, per IEEE 1364 table 5-22.
+///
+/// A *negative* exponent cannot produce a fraction in integer arithmetic, so
+/// Verilog collapses it to one of a handful of answers (IEEE 1364 table 5-6):
+/// `1 ** -n` is 1, `-1 ** -n` alternates, `0 ** -n` is `x` and everything else
+/// is 0.
 fn power(lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
     let width = lhs.width().max(1);
+    let signed = lhs.is_signed() && rhs.is_signed();
     let (Some(base), Some(exponent)) = (numeric(lhs)?, numeric(rhs)?) else {
-        return Ok(Register::unknown(width));
+        return Ok(Register::unknown(width).with_signedness(signed));
     };
 
     let mask = width_mask(width);
+    let exponent_value = sign_extend_to_i128(exponent, rhs.width());
+    if rhs.is_signed() && exponent_value < 0 {
+        let base = if lhs.is_signed() {
+            sign_extend_to_i128(base, lhs.width())
+        } else {
+            base as i128
+        };
+        let value: i128 = match base {
+            0 => return Ok(Register::unknown(width).with_signedness(signed)),
+            1 => 1,
+            -1 if exponent_value % 2 == 0 => 1,
+            -1 => -1,
+            _ => 0,
+        };
+        return Ok(Register::from_u128((value as u128) & mask, width).with_signedness(signed));
+    }
     let mut result = 1u128 & mask;
     let mut base = base & mask;
     let mut exponent = exponent;
@@ -559,14 +841,26 @@ fn power(lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
         base = base.wrapping_mul(base) & mask;
         exponent >>= 1;
     }
-    Ok(Register::from_u128(result, width))
+    Ok(Register::from_u128(result, width).with_signedness(signed))
 }
 
-/// `& | ^ ^~` applied bit by bit. The narrower operand is zero-extended to the
-/// width of the wider one.
+/// `& | ^ ^~` applied bit by bit. The narrower operand is widened to the width
+/// of the wider one — sign extended when both operands are signed, zero
+/// extended otherwise.
 fn bitwise(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Register {
     let width = lhs.width().max(rhs.width()).max(1);
+    let signed = lhs.is_signed() && rhs.is_signed();
+    // `zip_chunks` already reads a narrower operand's missing bits as zeros, so
+    // only a signed operation has anything to widen.
+    let extended;
+    let (lhs, rhs) = if signed && lhs.width() != rhs.width() {
+        extended = (lhs.sign_extended(width), rhs.sign_extended(width));
+        (&extended.0, &extended.1)
+    } else {
+        (lhs, rhs)
+    };
     lhs.zip_chunks(rhs, width, |a, b| bitwise_chunk(op, a, b))
+        .with_signedness(signed)
 }
 
 /// The truth tables of IEEE 1364 table 5-1, a chunk of bits at a time. `z`
@@ -605,63 +899,72 @@ fn bitwise_chunk(op: &BinaryOperator, a: Chunk, b: Chunk) -> Chunk {
 }
 
 /// Shifts move bits rather than numbers, so `x` and `z` bits survive being
-/// shifted. The result keeps the left operand's width and vacated positions
-/// fill with `0`. An unknown shift amount makes the whole result `x`.
+/// shifted. The result keeps the left operand's width — and its signedness,
+/// since the right operand only says how far — and an unknown shift amount
+/// makes the whole result `x`.
 ///
-/// `>>>` and `<<<` are treated as `>>` and `<<`: nothing in the AST records
-/// signedness, so there is no sign bit to replicate.
+/// `>>>` on a *signed* left operand replicates the sign bit into the vacated
+/// positions instead of filling them with `0`, which is the one thing that
+/// tells it apart from `>>`. On an unsigned operand the two are the same
+/// operation, and `<<<` is always `<<`.
 fn shift(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
     let width = lhs.width().max(1);
+    let signed = lhs.is_signed();
     let Some(amount) = numeric(rhs)? else {
-        return Ok(Register::unknown(width));
+        return Ok(Register::unknown(width).with_signedness(signed));
     };
     let amount = amount.min(lhs.width() as u128) as usize;
 
-    let left = matches!(
-        op,
-        BinaryOperator::ShiftLeft | BinaryOperator::ArithmeticShiftLeft
-    );
-    Ok(if left {
-        lhs.shifted_left(amount)
-    } else {
-        lhs.shifted_right(amount)
-    })
+    let shifted = match op {
+        BinaryOperator::ShiftLeft | BinaryOperator::ArithmeticShiftLeft => lhs.shifted_left(amount),
+        BinaryOperator::ArithmeticShiftRight if signed => lhs.shifted_right_signed(amount),
+        _ => lhs.shifted_right(amount),
+    };
+    Ok(shifted.with_signedness(signed))
 }
 
-/// `< <= > >=` produce one bit. Comparison is unsigned; an unknown bit in
+/// `< <= > >=` produce one bit — an unsigned one, whatever they compared. The
+/// comparison itself is two's complement when *both* operands are signed and a
+/// magnitude comparison otherwise, so `-1 < 0` is true between two signed
+/// operands and false the moment either side is unsigned. An unknown bit in
 /// either operand makes the answer `x`.
 fn relational(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
-    let (Some(a), Some(b)) = (numeric(lhs)?, numeric(rhs)?) else {
+    let (width, signed, values) = align_numeric(lhs, rhs)?;
+    let Some((a, b)) = values else {
         return Ok(Register::unknown(1));
     };
+    let ordering = if signed {
+        sign_extend_to_i128(a, width).cmp(&sign_extend_to_i128(b, width))
+    } else {
+        a.cmp(&b)
+    };
     let result = match op {
-        BinaryOperator::LessThan => a < b,
-        BinaryOperator::LessThanOrEqual => a <= b,
-        BinaryOperator::GreaterThan => a > b,
-        BinaryOperator::GreaterThanOrEqual => a >= b,
+        BinaryOperator::LessThan => ordering.is_lt(),
+        BinaryOperator::LessThanOrEqual => ordering.is_le(),
+        BinaryOperator::GreaterThan => ordering.is_gt(),
+        BinaryOperator::GreaterThanOrEqual => ordering.is_ge(),
         other => unreachable!("{} is not a relational operator", other),
     };
     Ok(logic_bit(if result { ONE } else { ZERO }))
 }
 
 /// `==` and `!=` produce one bit, and are `x` if either operand contains an
-/// unknown bit.
+/// unknown bit. The narrower operand is widened first, sign extended when both
+/// sides are signed — which is what makes `-1 == 32'hffffffff` true and
+/// `$signed(4'b1111) == 4'd15` false.
 fn logical_equality(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Register {
     if lhs.has_unknown() || rhs.has_unknown() {
         return Register::unknown(1);
     }
-    let width = lhs.width().max(rhs.width());
-    let equal = lhs.resize(width) == rhs.resize(width);
-    let matched = matches!(op, BinaryOperator::LogicalEquality) == equal;
+    let matched = matches!(op, BinaryOperator::LogicalEquality) == equal_values(lhs, rhs);
     logic_bit(if matched { ONE } else { ZERO })
 }
 
 /// `===` and `!==` compare all four states exactly and are never `x`. The
-/// narrower operand is zero-extended, so `4'b0001 === 1'b1` holds.
+/// narrower operand is widened the same way [`logical_equality`] widens it, so
+/// `4'b0001 === 1'b1` holds.
 fn case_equality(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Register {
-    let width = lhs.width().max(rhs.width());
-    let equal = lhs.resize(width) == rhs.resize(width);
-    let matched = matches!(op, BinaryOperator::CaseEquality) == equal;
+    let matched = matches!(op, BinaryOperator::CaseEquality) == equal_values(lhs, rhs);
     logic_bit(if matched { ONE } else { ZERO })
 }
 
@@ -712,6 +1015,55 @@ fn truth(register: &Register) -> Option<bool> {
         None
     } else {
         Some(false)
+    }
+}
+
+/// Both operands of a binary operator as numbers at a common width, with that
+/// width and whether the operation is signed. `None` means an operand had an
+/// unknown bit, so there is no number to work with.
+///
+/// Two rules meet here, and they are the whole of Verilog's signedness
+/// propagation. The operation is signed only when **both** operands are — one
+/// unsigned operand makes the result unsigned — and the widening that brings
+/// the narrower operand up replicates its sign bit exactly when the operation
+/// is signed. An unsigned operation therefore reads a signed operand as the
+/// plain bit pattern it is, which is what `$signed(a) | b` does.
+///
+/// The widening is arithmetic rather than a pair of new registers: extending a
+/// value is a shift and a mask, and building two registers to throw away is
+/// work the arithmetic and relational operators do not need.
+type AlignedOperands = (usize, bool, Option<(u128, u128)>);
+
+fn align_numeric(lhs: &Register, rhs: &Register) -> Result<AlignedOperands, EvalError> {
+    let width = lhs.width().max(rhs.width()).max(1);
+    let signed = lhs.is_signed() && rhs.is_signed();
+    let (Some(a), Some(b)) = (numeric(lhs)?, numeric(rhs)?) else {
+        return Ok((width, signed, None));
+    };
+    if !signed {
+        // Zero extension is what the number already is.
+        return Ok((width, signed, Some((a, b))));
+    }
+    let mask = width_mask(width);
+    let extend = |value: u128, from: usize| (sign_extend_to_i128(value, from) as u128) & mask;
+    Ok((
+        width,
+        signed,
+        Some((extend(a, lhs.width()), extend(b, rhs.width()))),
+    ))
+}
+
+/// Whether two values are the same bits once the narrower one is widened — sign
+/// extended when both sides are signed, zero extended otherwise.
+fn equal_values(lhs: &Register, rhs: &Register) -> bool {
+    if lhs.width() == rhs.width() {
+        return lhs == rhs;
+    }
+    let width = lhs.width().max(rhs.width());
+    if lhs.is_signed() && rhs.is_signed() {
+        lhs.sign_extended(width) == rhs.sign_extended(width)
+    } else {
+        lhs.resize(width) == rhs.resize(width)
     }
 }
 
@@ -1385,8 +1737,9 @@ mod tests {
     #[test]
     fn test_signed_and_unsigned_preserve_the_bits_and_the_width() {
         let store = sample_store();
-        // Signedness is unmodelled (issue #96), so both casts are the identity
-        // on the bits today. The width half is what is being asserted here.
+        // Both casts change how the bits are read and nothing else: same bits,
+        // same width. What they change shows up in the operator that receives
+        // the result, which is what the signedness tests below assert.
         assert_eq!(bits_in("$signed(a)", &store), "10100110");
         assert_eq!(bits_in("$unsigned(a)", &store), "10100110");
         assert_eq!(bits_in("$signed(b)", &store), "0011");
@@ -1503,6 +1856,161 @@ mod tests {
         assert_eq!(
             error("$time(a)", &store).to_string(),
             "`$time` takes no arguments, but was given 1"
+        );
+    }
+
+    // -- signedness --------------------------------------------------------
+
+    /// `reg signed [3:0] s = 4'b1000;` — that is -8 — beside the same bits
+    /// declared unsigned, and a small unsigned constant to mix in.
+    fn signed_store() -> StateStore {
+        let mut store = StateStore::new();
+        store.set_ranged(
+            "s",
+            Register::from_binary("1000").with_signedness(true),
+            (3, 0),
+        );
+        store.set_ranged("u", Register::from_binary("1000"), (3, 0));
+        store.set_ranged("one", Register::from_binary("0001"), (3, 0));
+        store
+    }
+
+    /// The two's complement value of an expression, which is what a signed
+    /// result means.
+    fn signed_value_in(source: &str, store: &StateStore) -> i128 {
+        eval(&parse(source), store)
+            .unwrap_or_else(|e| panic!("{} failed to evaluate: {}", source, e))
+            .to_i128()
+            .unwrap_or_else(|| panic!("{} evaluated to a non-numeric value", source))
+    }
+
+    fn signed_value(source: &str) -> i128 {
+        signed_value_in(source, &StateStore::new())
+    }
+
+    /// A decimal written without a base is signed; anything with a base is
+    /// unsigned unless it says `s`.
+    #[test]
+    fn test_which_literals_are_signed() {
+        assert!(eval(&parse("42"), &StateStore::new()).unwrap().is_signed());
+        assert!(!eval(&parse("4'd2"), &StateStore::new())
+            .unwrap()
+            .is_signed());
+        assert!(eval(&parse("4'sd2"), &StateStore::new())
+            .unwrap()
+            .is_signed());
+        assert!(eval(&parse("4'sb1000"), &StateStore::new())
+            .unwrap()
+            .is_signed());
+        // The `s` changes no bit, only how they read.
+        assert_eq!(bits("4'sb1000"), "1000");
+    }
+
+    /// `-1 < 0` is true between signed operands and false the moment either
+    /// side is unsigned, because the comparison is then a magnitude one.
+    #[test]
+    fn test_relational_comparison_follows_signedness() {
+        let store = signed_store();
+        assert_eq!(bits_in("s < 0", &store), "1");
+        assert_eq!(bits_in("u < 0", &store), "0");
+
+        // Parenthesised because a unary expression does not yet consume the
+        // whitespace after it, so `-1 < 0` stops the parser at the `<`.
+        assert_eq!(bits("(-1) < 0"), "1");
+        assert_eq!(bits("$unsigned(-1) < 0"), "0");
+
+        // -8 is less than 1, but 8 is not.
+        assert_eq!(bits_in("s < one", &store), "0");
+        assert_eq!(bits_in("$signed(s) < $signed(one)", &store), "1");
+    }
+
+    /// `>>>` replicates the sign bit of a signed value; `>>` never does, and on
+    /// an unsigned value the two are the same shift.
+    #[test]
+    fn test_arithmetic_right_shift_replicates_the_sign_bit() {
+        let store = signed_store();
+        assert_eq!(bits_in("s >>> 1", &store), "1100");
+        assert_eq!(bits_in("s >> 1", &store), "0100");
+        assert_eq!(bits_in("u >>> 1", &store), "0100");
+        assert_eq!(bits_in("$signed(u) >>> 2", &store), "1110");
+        // Shifting further than the width leaves the sign bit everywhere.
+        assert_eq!(bits_in("s >>> 9", &store), "1111");
+        // `<<<` is `<<` whatever the signedness.
+        assert_eq!(bits_in("s <<< 1", &store), "0000");
+    }
+
+    /// A signed quotient truncates toward zero and a signed remainder takes the
+    /// sign of the dividend — which is what Verilog asks for and what an
+    /// unsigned division of the same bits does not do.
+    #[test]
+    fn test_signed_division_truncates_toward_zero() {
+        assert_eq!(signed_value("(-7) / 2"), -3);
+        assert_eq!(signed_value("7 / (-2)"), -3);
+        assert_eq!(signed_value("(-7) % 2"), -1);
+        assert_eq!(signed_value("7 % (-2)"), 1);
+        assert_eq!(signed_value("(-8) / 2"), -4);
+
+        // The same bits divided as magnitudes are a different answer entirely.
+        assert_eq!(value("$unsigned(-7) / 2"), 0x7fff_fffc);
+    }
+
+    /// One unsigned operand makes the whole expression unsigned, and that
+    /// reaches *inside* it: the `>>>` of an unsigned expression is a plain
+    /// `>>` even over an operand that was declared signed.
+    #[test]
+    fn test_a_mixed_expression_is_unsigned_throughout() {
+        let store = signed_store();
+        assert_eq!(bits_in("(s >>> 1) | 4'sb0001", &store), "1101");
+        assert_eq!(bits_in("(s >>> 1) | one", &store), "0101");
+        assert!(!eval(&parse("s + one"), &store).unwrap().is_signed());
+        assert!(eval(&parse("s + 4'sd1"), &store).unwrap().is_signed());
+
+        // A concatenation and a select are bit vectors, so they are unsigned
+        // however signed the thing they were built from was.
+        assert!(!eval(&parse("{s}"), &store).unwrap().is_signed());
+        assert!(!eval(&parse("s[3]"), &store).unwrap().is_signed());
+    }
+
+    /// The narrower operand of a signed operation is sign extended rather than
+    /// zero extended, which is the whole of why `-1 == 32'hffffffff` holds.
+    #[test]
+    fn test_widening_extends_the_sign_of_a_signed_operand() {
+        let store = signed_store();
+        // -8 + 0 in 32 bits is still -8, but 8 zero extended is 8.
+        assert_eq!(signed_value_in("s + 0", &store), -8);
+        assert_eq!(value_in("u + 32'd0", &store), 8);
+        assert_eq!(bits("(-1) == 32'hffffffff"), "1");
+        assert_eq!(bits_in("$signed(s) == (-8)", &store), "1");
+        assert_eq!(bits_in("s == 4'd8", &store), "1");
+    }
+
+    /// `$signed` and `$unsigned` are casts, not identities: they decide how the
+    /// operator that receives the value reads it.
+    #[test]
+    fn test_signed_and_unsigned_are_real_casts() {
+        let store = signed_store();
+        assert!(eval(&parse("$signed(u)"), &store).unwrap().is_signed());
+        assert!(!eval(&parse("$unsigned(s)"), &store).unwrap().is_signed());
+        assert_eq!(bits_in("$signed(u) < 0", &store), "1");
+        assert_eq!(bits_in("$unsigned(s) < 0", &store), "0");
+    }
+
+    /// An `x` or `z` sign bit replicates too, so a partly undriven signed value
+    /// does not read as a positive number when it is widened.
+    #[test]
+    fn test_sign_extension_carries_an_unknown_sign_bit() {
+        let mut store = StateStore::new();
+        store.set_ranged(
+            "floating",
+            Register::from_binary("z010").with_signedness(true),
+            (3, 0),
+        );
+        assert_eq!(
+            eval(&parse("floating"), &store)
+                .unwrap()
+                .sign_extended(6)
+                .to_binary(),
+            "zzz010"
         );
     }
 }
