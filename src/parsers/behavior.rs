@@ -1,7 +1,7 @@
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    character::complete::{char, multispace0, multispace1},
+    character::complete::{char, multispace0, multispace1, satisfy},
     combinator::{map, not, opt, peek, value},
     multi::{many0, many1, separated_list0, separated_list1},
     sequence::{delimited, preceded, terminated},
@@ -11,10 +11,10 @@ use nom::{
 use crate::parsers::assignment::parse_assignment;
 
 use super::{
-    assignment::ProceduralAssignment,
+    assignment::{assignment_lhs, ProceduralAssignment, ProceduralAssignmentType},
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
-    simple::ws,
+    simple::{ws, ws_and_comments},
     string::parse_verilog_string,
 };
 #[derive(Debug, PartialEq, Clone)]
@@ -116,6 +116,34 @@ pub struct CaseStatement {
     pub items: Vec<CaseItem>,
 }
 
+/// `for (i = 0; i < 4; i = i + 1) …` — the three header parts are an
+/// initialising assignment, a condition and a stepping assignment. The two
+/// assignments are *assignments*, not expressions: the `;` between the parts
+/// belongs to the header, so they cannot carry one of their own.
+#[derive(Debug, PartialEq)]
+pub struct ForStatement {
+    pub initializer: ProceduralAssignment,
+    pub condition: Expression,
+    pub step: ProceduralAssignment,
+    pub statements: Vec<ProceduralStatements>,
+}
+
+/// `while (a) …` — the condition is re-evaluated before every iteration.
+#[derive(Debug, PartialEq)]
+pub struct WhileStatement {
+    pub condition: Expression,
+    pub statements: Vec<ProceduralStatements>,
+}
+
+/// `repeat (4) …` — the count is evaluated **once**, on entry, and never
+/// again, so a body that moves one of its operands does not change how many
+/// iterations are left.
+#[derive(Debug, PartialEq)]
+pub struct RepeatStatement {
+    pub count: Expression,
+    pub statements: Vec<ProceduralStatements>,
+}
+
 /// One argument of a system task call.
 ///
 /// A format string is a plain string literal rather than an [`Expression`] —
@@ -156,6 +184,12 @@ pub enum ProceduralStatements {
     Assignment(ProceduralAssignment),
     If(IfStatement),
     Case(CaseStatement),
+    For(ForStatement),
+    While(WhileStatement),
+    Repeat(RepeatStatement),
+    /// `forever …` — a body with an unconditional back-jump and nothing that
+    /// ends it, so only a `#delay` in it lets time move.
+    Forever(Vec<ProceduralStatements>),
     SystemTask(SystemTaskCall),
 }
 
@@ -168,6 +202,11 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
     alt((
         map(parse_if_statement, |i| ProceduralStatements::If(i)),
         map(parse_case_statement, |c| ProceduralStatements::Case(c)),
+        // `for` is a prefix of `forever`, so the longer keyword is tried first.
+        parse_forever_statement,
+        map(parse_for_statement, |f| ProceduralStatements::For(f)),
+        map(parse_while_statement, |w| ProceduralStatements::While(w)),
+        map(parse_repeat_statement, |r| ProceduralStatements::Repeat(r)),
         map(parse_system_task, |t| ProceduralStatements::SystemTask(t)),
         map(parse_assignment, |a| ProceduralStatements::Assignment(a)),
         // `#5;` is a statement in its own right, so it is tried before the
@@ -295,6 +334,101 @@ pub fn parse_case_statement(input: &str) -> IResult<&str, CaseStatement> {
             items,
         },
     ))
+}
+
+/// A character that could continue an identifier, and so cannot immediately
+/// follow a keyword.
+fn identifier_char(input: &str) -> IResult<&str, char> {
+    satisfy(|c: char| c.is_alphanumeric() || c == '_' || c == '$')(input)
+}
+
+/// A keyword token, with the leading whitespace skipped and a word boundary
+/// after it.
+///
+/// `if` and `case` are always followed by punctuation, so they need no
+/// boundary; `forever`, `while` and `repeat` are followed by a statement, so
+/// without one `forever_more = 1;` would read as `forever` plus an assignment.
+/// The trailing whitespace is deliberately left for the caller: skipping it
+/// here would put the boundary check on the wrong side of it.
+fn keyword<'a>(input: &'a str, word: &str) -> IResult<&'a str, ()> {
+    let (input, _) = ws_and_comments(input)?;
+    let (input, _) = tag(word)(input)?;
+    let (input, _) = peek(not(identifier_char))(input)?;
+    Ok((input, ()))
+}
+
+/// The assignment in a `for` header: `i = 0`, `i = i + 1`. It is not a
+/// statement and so carries no `;` of its own — the two separators belong to
+/// the header.
+fn for_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
+    let (input, lhs) = ws(assignment_lhs)(input)?;
+    let (input, operator) = ws(alt((tag("<="), tag("="))))(input)?;
+    let (input, rhs) = verilog_expression(input)?;
+
+    let assignment_type = match operator {
+        "<=" => ProceduralAssignmentType::NonBlocking,
+        _ => ProceduralAssignmentType::Blocking,
+    };
+
+    Ok((
+        input,
+        ProceduralAssignment::new(lhs, assignment_type, None, rhs),
+    ))
+}
+
+/// `for (i = 0; i < 4; i = i + 1) <statement>`.
+pub fn parse_for_statement(input: &str) -> IResult<&str, ForStatement> {
+    let (input, _) = keyword(input, "for")?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, initializer) = for_assignment(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    let (input, condition) = verilog_expression(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    let (input, step) = for_assignment(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    let (input, statements) = statement_body(input)?;
+
+    Ok((
+        input,
+        ForStatement {
+            initializer,
+            condition,
+            step,
+            statements,
+        },
+    ))
+}
+
+/// `while (a) <statement>`.
+pub fn parse_while_statement(input: &str) -> IResult<&str, WhileStatement> {
+    let (input, _) = keyword(input, "while")?;
+    let (input, condition) = parenthesized_expression(input)?;
+    let (input, statements) = statement_body(input)?;
+
+    Ok((
+        input,
+        WhileStatement {
+            condition,
+            statements,
+        },
+    ))
+}
+
+/// `repeat (4) <statement>`.
+pub fn parse_repeat_statement(input: &str) -> IResult<&str, RepeatStatement> {
+    let (input, _) = keyword(input, "repeat")?;
+    let (input, count) = parenthesized_expression(input)?;
+    let (input, statements) = statement_body(input)?;
+
+    Ok((input, RepeatStatement { count, statements }))
+}
+
+/// `forever <statement>`.
+fn parse_forever_statement(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, _) = keyword(input, "forever")?;
+    let (input, statements) = statement_body(input)?;
+
+    Ok((input, ProceduralStatements::Forever(statements)))
 }
 
 fn parse_edge(input: &str) -> IResult<&str, EventTriggers> {
@@ -889,5 +1023,114 @@ mod tests {
             Expression::SystemFunctionCall("time".to_string(), vec![]),
         );
         assert!(procedural_statement("$display = 1;").is_err());
+    }
+
+    /// Every loop form, with a single-statement body and with a `begin`…`end`
+    /// one.
+    #[test]
+    fn test_parse_every_loop_form() {
+        let inputs = vec![
+            "for (i = 0; i < 4; i = i + 1) a = i;",
+            "for (i = 0; i < 4; i = i + 1) begin a = i; b = i; end",
+            "while (a) b = 1;",
+            "while (a) begin b = 1; a = 0; end",
+            "repeat (4) a = 1;",
+            "repeat (n + 1) begin a = 1; end",
+            "forever a = 1;",
+            "forever begin #5 a = ~a; end",
+        ];
+
+        for input in inputs {
+            assert_parses(procedural_statement, input);
+        }
+    }
+
+    #[test]
+    fn test_for_header_is_two_assignments_and_a_condition() {
+        let statement = assert_parses(parse_for_statement, "for (i = 0; i < 4; i = i + 1) a = i;");
+
+        assert_eq!(statement.initializer.lhs().to_contracted_string(), "i");
+        assert_eq!(statement.initializer.rhs().to_contracted_string(), "0");
+        assert_eq!(statement.condition.to_contracted_string(), "i < 4");
+        assert_eq!(statement.step.lhs().to_contracted_string(), "i");
+        assert_eq!(statement.step.rhs().to_contracted_string(), "i + 1");
+        assert_eq!(statement.statements.len(), 1);
+    }
+
+    /// The header separators belong to the header, so a `;` after the step is
+    /// not part of it — `for (i = 0; i < 4; i = i + 1;)` is not a `for` loop.
+    #[test]
+    fn test_a_for_header_assignment_carries_no_semicolon() {
+        assert!(parse_for_statement("for (i = 0; i < 4; i = i + 1;) a = i;").is_err());
+    }
+
+    #[test]
+    fn test_loops_nest() {
+        let statement = assert_parses(
+            parse_for_statement,
+            "for (i = 0; i < 4; i = i + 1) begin repeat (2) while (go) a = a + 1; end",
+        );
+
+        let ProceduralStatements::Repeat(repeat) = &statement.statements[0] else {
+            panic!("expected a repeat, got {:?}", statement.statements[0]);
+        };
+        assert!(matches!(
+            repeat.statements[0],
+            ProceduralStatements::While(_)
+        ));
+    }
+
+    /// `for` is a prefix of `forever`, and both are prefixes of an identifier
+    /// that starts with them. The `(` after `for` and the word boundary after
+    /// `forever` are what keep the three apart.
+    #[test]
+    fn test_a_loop_keyword_does_not_swallow_a_longer_identifier() {
+        assert!(matches!(
+            assert_parses(procedural_statement, "forever_more = 1;"),
+            ProceduralStatements::Assignment(_)
+        ));
+        assert!(matches!(
+            assert_parses(procedural_statement, "format = 1;"),
+            ProceduralStatements::Assignment(_)
+        ));
+        assert!(matches!(
+            assert_parses(procedural_statement, "repeat_count = 1;"),
+            ProceduralStatements::Assignment(_)
+        ));
+        assert!(matches!(
+            assert_parses(procedural_statement, "while_ready = 1;"),
+            ProceduralStatements::Assignment(_)
+        ));
+        assert!(matches!(
+            assert_parses(procedural_statement, "forever a = 1;"),
+            ProceduralStatements::Forever(_)
+        ));
+    }
+
+    #[test]
+    fn test_a_loop_is_a_legal_statement_inside_a_block() {
+        let statements = assert_parses(
+            parse_block,
+            r#"begin
+                total = 0;
+                for (i = 0; i < 4; i = i + 1) total = total + i;
+                forever #5 clk = ~clk;
+            end"#,
+        );
+
+        assert_eq!(statements.len(), 3);
+        assert!(matches!(statements[1], ProceduralStatements::For(_)));
+        assert!(matches!(statements[2], ProceduralStatements::Forever(_)));
+    }
+
+    /// Comments are legal wherever a token boundary is, and a loop header is
+    /// all token boundaries.
+    #[test]
+    fn test_comments_inside_a_loop_header() {
+        assert_parses(
+            procedural_statement,
+            "for /*a*/ ( /*b*/ i = 0 /*c*/ ; /*d*/ i < 4 ; i = i + 1 ) /*e*/ a = i;",
+        );
+        assert_parses(procedural_statement, "repeat /*n*/ (4) a = 1;");
     }
 }

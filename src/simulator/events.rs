@@ -261,6 +261,26 @@ fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTre
                     }
                 }
             }
+            // A loop reads whatever its header names as well as its body: the
+            // condition is re-tested and the step re-run on every iteration,
+            // and a `repeat` count is read when the loop is entered.
+            ProceduralStatements::For(statement) => {
+                collect_target_reads(statement.initializer.lhs(), names);
+                collect_expression_reads(statement.initializer.rhs(), names);
+                collect_expression_reads(&statement.condition, names);
+                collect_target_reads(statement.step.lhs(), names);
+                collect_expression_reads(statement.step.rhs(), names);
+                collect_statement_reads(&statement.statements, names);
+            }
+            ProceduralStatements::While(statement) => {
+                collect_expression_reads(&statement.condition, names);
+                collect_statement_reads(&statement.statements, names);
+            }
+            ProceduralStatements::Repeat(statement) => {
+                collect_expression_reads(&statement.count, names);
+                collect_statement_reads(&statement.statements, names);
+            }
+            ProceduralStatements::Forever(statements) => collect_statement_reads(statements, names),
             ProceduralStatements::Case(statement) => {
                 collect_expression_reads(&statement.subject, names);
                 for item in &statement.items {
@@ -751,5 +771,37 @@ mod tests {
     fn test_signals_read_of_a_delay_only_body_is_empty() {
         let statements = body("begin #10; end");
         assert!(signals_read(&statements).is_empty());
+    }
+
+    /// A loop header is read every iteration, so an `@(*)` block is sensitive
+    /// to it as much as to the body. The `for` counter is a target, not a read.
+    #[test]
+    fn test_signals_read_covers_a_loop_header_and_its_body() {
+        let statements = body(
+            r#"begin
+                   for (i = first; i < limit; i = i + step) total = total + d;
+               end"#,
+        );
+
+        assert_eq!(
+            signals_read(&statements),
+            name_set(&["d", "first", "i", "limit", "step", "total"])
+        );
+    }
+
+    #[test]
+    fn test_signals_read_covers_while_repeat_and_forever() {
+        assert_eq!(
+            signals_read(&body("begin while (go) a = b; end")),
+            name_set(&["b", "go"])
+        );
+        assert_eq!(
+            signals_read(&body("begin repeat (n) a = b; end")),
+            name_set(&["b", "n"])
+        );
+        assert_eq!(
+            signals_read(&body("begin forever #5 a = b; end")),
+            name_set(&["b"])
+        );
     }
 }
