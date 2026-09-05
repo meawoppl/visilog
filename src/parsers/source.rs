@@ -435,13 +435,16 @@ mod tests {
 
     #[test]
     fn test_the_library_reports_a_preprocessor_failure_separately() {
-        let error = ModuleLibrary::from_source("module m;\n`MISSING\nendmodule\n").unwrap_err();
+        let source = "`define LOOP `LOOP\nmodule m;\nx = `LOOP;\nendmodule\n";
+        let error = ModuleLibrary::from_source(source).unwrap_err();
         assert!(
-            matches!(&error, LibraryError::Preprocess(inner) if inner.at == "<source>:2"),
+            // The location carries the expansion context too, which is the
+            // source map doing its job.
+            matches!(&error, LibraryError::Preprocess(inner) if inner.at.starts_with("<source>:3")),
             "expected a located preprocessor error, got {:?}",
             error
         );
-        assert!(error.to_string().contains("undefined macro `MISSING"));
+        assert!(error.to_string().contains("expands to itself"));
     }
 
     #[test]

@@ -176,10 +176,6 @@ impl fmt::Display for Timescale {
 /// What went wrong, without the "where".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// A `` `name `` that was never defined. Deliberately not an empty
-    /// expansion: a macro that silently vanished would turn a typo into a
-    /// mystery parse error somewhere else entirely.
-    UndefinedMacro(String),
     /// A macro that, directly or through others, expands to itself.
     RecursiveMacro(String),
     /// A function-like macro invoked with the wrong argument list.
@@ -195,7 +191,6 @@ pub enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ErrorKind::UndefinedMacro(name) => write!(f, "undefined macro `{}", name),
             ErrorKind::RecursiveMacro(name) => write!(f, "macro `{} expands to itself", name),
             ErrorKind::BadArguments { name, detail } => {
                 write!(f, "bad arguments to macro `{}: {}", name, detail)
@@ -838,8 +833,13 @@ impl Run<'_> {
         line: &mut usize,
         loc: Loc,
     ) -> Result<(), PreprocessError> {
+        // IEEE 1364-2001 §19.3.2: "An undefined text macro has no value, just
+        // as if it had never been defined." So a reference to one expands to
+        // nothing rather than failing — which is what makes `undef` usable at
+        // all, since the whole point of undefining a macro is to be able to
+        // reference it afterwards and get nothing.
         let Some(def) = self.macros.get(name).cloned() else {
-            return Err(self.error(loc, ErrorKind::UndefinedMacro(name.to_string())));
+            return Ok(());
         };
         if self.expanding.iter().any(|active| active == name) {
             return Err(self.error(loc, ErrorKind::RecursiveMacro(name.to_string())));
@@ -1437,10 +1437,13 @@ mod tests {
         assert_eq!(expand(source).trim(), "no");
     }
 
+    /// IEEE 1364-2001 §19.3.2: "An undefined text macro has no value, just as
+    /// if it had never been defined." Referencing one after `undef` therefore
+    /// expands to nothing — being able to do that is the entire point of
+    /// undefining a macro.
     #[test]
-    fn test_undef_makes_a_later_use_an_error() {
-        let kind = error("`define A 1\n`undef A\nx = `A;\n").kind;
-        assert_eq!(kind, ErrorKind::UndefinedMacro("A".to_string()));
+    fn test_a_use_after_undef_expands_to_nothing() {
+        assert_eq!(expand("`define A 1\n`undef A\nx = `A;\n").trim(), "x = ;");
     }
 
     #[test]
@@ -1520,12 +1523,13 @@ mod tests {
         );
     }
 
+    /// A macro that was never defined expands to nothing for the same reason
+    /// as one that was undefined — the standard draws no distinction between
+    /// the two states.
     #[test]
-    fn test_an_undefined_macro_is_a_named_error() {
-        let error = error("module m;\n  x = `MISSING;\nendmodule\n");
-        assert_eq!(error.kind, ErrorKind::UndefinedMacro("MISSING".to_string()));
-        assert_eq!(error.at, "test.v:2");
-        assert_eq!(error.to_string(), "test.v:2: undefined macro `MISSING");
+    fn test_a_never_defined_macro_expands_to_nothing() {
+        let text = expand("module m;\n  x = `MISSING;\nendmodule\n");
+        assert!(text.contains("x = ;"), "got {:?}", text);
     }
 
     #[test]
