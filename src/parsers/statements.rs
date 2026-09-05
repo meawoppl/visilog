@@ -128,6 +128,44 @@ mod tests {
         }
     }
 
+    /// Every declaration form reaches the statement grammar with an
+    /// initialiser attached, and a list keeps one per name.
+    #[test]
+    fn test_parse_declaration_initialisers() {
+        match assert_parses(parse_module_statement, "wire a = 1'b1;") {
+            ModuleStatement::WireDeclaration(nets) => {
+                assert_eq!(nets.len(), 1);
+                assert!(nets[0].init().is_some());
+            }
+            other => panic!("expected a wire declaration, got {:?}", other),
+        }
+
+        match assert_parses(parse_module_statement, "reg [3:0] b = 4'h5;") {
+            ModuleStatement::RegisterDeclaration(registers) => {
+                assert_eq!(registers[0].range, Some((3, 0)));
+                assert!(registers[0].init.is_some());
+            }
+            other => panic!("expected a register declaration, got {:?}", other),
+        }
+
+        match assert_parses(parse_module_statement, "integer i = 0;") {
+            ModuleStatement::IntegerDeclaration(integers) => {
+                assert!(integers[0].init.is_some());
+            }
+            other => panic!("expected an integer declaration, got {:?}", other),
+        }
+
+        match assert_parses(parse_module_statement, "wire x = 1, y = 2;") {
+            ModuleStatement::WireDeclaration(nets) => {
+                assert_eq!(nets.len(), 2);
+                assert_eq!(nets[0].identifier(), &"x".into());
+                assert_eq!(nets[1].identifier(), &"y".into());
+                assert_ne!(nets[0].init(), nets[1].init());
+            }
+            other => panic!("expected a wire declaration, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_parse_module_instantiation_statement() {
         let statement = assert_parses(

@@ -1,7 +1,15 @@
-use nom::{bytes::complete::tag, combinator::opt, IResult};
+use nom::{
+    bytes::complete::tag,
+    character::complete::char,
+    combinator::opt,
+    multi::separated_list1,
+    sequence::{pair, preceded},
+    IResult,
+};
 
 use super::{
-    identifier::{identifier_list, Identifier},
+    expr::{verilog_expression, Expression},
+    identifier::{identifier, Identifier},
     simple::{range, ws},
 };
 
@@ -25,6 +33,13 @@ pub struct Net {
     range: (i64, i64),
     net_type: NetType,
     delay: u32,
+    /// The driver a `wire a = expr;` declaration carries.
+    ///
+    /// A net initialiser is shorthand for a *continuous assignment*, not a
+    /// one-off starting value: the net follows `expr` for the whole
+    /// simulation. It belongs to the name rather than to the declaration, so
+    /// `wire x = 1, y = 2;` gives `x` and `y` different drivers.
+    init: Option<Expression>,
 }
 
 impl Net {
@@ -34,7 +49,14 @@ impl Net {
             range,
             net_type,
             delay,
+            init: None,
         }
+    }
+
+    /// The same net, continuously driven by `init`.
+    pub fn with_init(mut self, init: Expression) -> Self {
+        self.init = Some(init);
+        self
     }
 
     pub fn identifier(&self) -> &Identifier {
@@ -43,6 +65,10 @@ impl Net {
 
     pub fn range(&self) -> (i64, i64) {
         self.range
+    }
+
+    pub fn init(&self) -> Option<&Expression> {
+        self.init.as_ref()
     }
 }
 
@@ -71,20 +97,26 @@ fn parse_delay(input: &str) -> IResult<&str, u32> {
     map_res(preceded(tag("#"), digit1), |s: &str| s.parse::<u32>())(input)
 }
 
+/// One declared net name plus the optional expression that drives it.
+fn declared_net(input: &str) -> IResult<&str, (Identifier, Option<Expression>)> {
+    pair(identifier, opt(preceded(ws(char('=')), verilog_expression)))(input)
+}
+
 pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
     let (input, net_type) = net_type(input)?;
     let (input, range) = ws(opt(range))(input)?;
     let (input, delay) = opt(parse_delay)(input)?;
-    let (input, identifiers) = ws(identifier_list)(input)?;
+    let (input, names) = separated_list1(ws(char(',')), ws(declared_net))(input)?;
     let (input, _) = ws(tag(";"))(input)?;
 
-    let nets: Vec<Net> = identifiers
-        .iter()
-        .map(|identifier| Net {
-            identifier: identifier.clone(),
+    let nets: Vec<Net> = names
+        .into_iter()
+        .map(|(identifier, init)| Net {
+            identifier,
             net_type: net_type.clone(),
             range: range.unwrap_or((0, 0)),
             delay: delay.unwrap_or(0),
+            init,
         })
         .collect();
 
@@ -204,5 +236,52 @@ mod tests {
             assert_eq!(net.delay, 5);
             assert_eq!(net.range, (7, 0));
         }
+    }
+
+    /// The expression a source fragment parses to, so a test can spell an
+    /// initialiser the way Verilog does rather than as an AST literal.
+    fn expression(source: &str) -> Expression {
+        let (rest, expression) =
+            verilog_expression(source).expect("the expression should have parsed");
+        assert!(rest.is_empty(), "unparsed input: {}", rest);
+        expression
+    }
+
+    #[test]
+    fn test_net_declaration_initialiser() {
+        assert_parses_to(
+            net_declaration,
+            "wire a = 1'b1;",
+            vec![Net::new("a".into(), (0, 0), NetType::Wire, 0).with_init(expression("1'b1"))],
+        );
+
+        assert_parses_to(
+            net_declaration,
+            "wire [3:0] q = a + b;",
+            vec![Net::new("q".into(), (3, 0), NetType::Wire, 0).with_init(expression("a + b"))],
+        );
+    }
+
+    /// An initialiser belongs to the *name*, so every net in a list gets its
+    /// own driver — and a name without one is still an undriven net.
+    #[test]
+    fn test_net_initialisers_are_per_name() {
+        assert_parses_to(
+            net_declaration,
+            "wire x = 1, y = 2;",
+            vec![
+                Net::new("x".into(), (0, 0), NetType::Wire, 0).with_init(expression("1")),
+                Net::new("y".into(), (0, 0), NetType::Wire, 0).with_init(expression("2")),
+            ],
+        );
+
+        assert_parses_to(
+            net_declaration,
+            "wire [7:0] a = 8'h0f, b;",
+            vec![
+                Net::new("a".into(), (7, 0), NetType::Wire, 0).with_init(expression("8'h0f")),
+                Net::new("b".into(), (7, 0), NetType::Wire, 0),
+            ],
+        );
     }
 }

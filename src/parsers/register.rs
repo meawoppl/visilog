@@ -1,13 +1,10 @@
 use nom::{
-    bytes::complete::tag,
-    character::complete::char,
-    combinator::opt,
-    multi::separated_list1,
-    sequence::{pair, preceded},
-    IResult,
+    bytes::complete::tag, character::complete::char, combinator::opt, multi::separated_list1,
+    sequence::preceded, IResult,
 };
 
 use super::{
+    expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
     simple::{range, ws, ws_and_comments},
 };
@@ -17,16 +14,29 @@ pub struct RegisterDeclaration {
     pub name: Identifier,
     pub range: Option<(i64, i64)>,
     pub dimensions: Option<(i64, i64)>,
+    /// The value a `reg a = expr;` declaration starts with.
+    ///
+    /// A variable initialiser is applied *once*, at time zero. It is not a
+    /// continuous assignment: a later procedural write owns the register from
+    /// then on.
+    pub init: Option<Expression>,
 }
 
-/// One declared name plus the optional address dimension that makes it a
-/// memory: `mem [0:255]`.
+/// One declared name, the optional address dimension that makes it a memory
+/// (`mem [0:255]`), and the optional initialiser that gives it a starting
+/// value (`a = 0`).
 ///
-/// The dimension belongs to the *name*, not to the declaration as a whole,
-/// which is what makes `reg [7:0] a, mem [0:15];` legal — one width, but only
-/// the second name is a memory.
-pub fn declared_name(input: &str) -> IResult<&str, (Identifier, Option<(i64, i64)>)> {
-    pair(identifier, opt(preceded(ws_and_comments, range)))(input)
+/// Both belong to the *name*, not to the declaration as a whole, which is what
+/// makes `reg [7:0] a, mem [0:15];` legal — one width, but only the second name
+/// is a memory — and what gives `reg a = 0, b = 1;` two different starting
+/// values.
+pub fn declared_name(
+    input: &str,
+) -> IResult<&str, (Identifier, Option<(i64, i64)>, Option<Expression>)> {
+    let (input, name) = identifier(input)?;
+    let (input, dimensions) = opt(preceded(ws_and_comments, range))(input)?;
+    let (input, init) = opt(preceded(ws(char('=')), verilog_expression))(input)?;
+    Ok((input, (name, dimensions, init)))
 }
 
 /// `reg [width]? name [dims]? (, name [dims]?)* ;`
@@ -44,10 +54,11 @@ pub fn parse_register_declaration(input: &str) -> IResult<&str, Vec<RegisterDecl
         input,
         names
             .into_iter()
-            .map(|(name, dimensions)| RegisterDeclaration {
+            .map(|(name, dimensions, init)| RegisterDeclaration {
                 name,
                 range: width,
                 dimensions,
+                init,
             })
             .collect(),
     ))
@@ -85,6 +96,7 @@ mod tests {
                 name: "a".into(),
                 range: None,
                 dimensions: None,
+                init: None,
             }],
         );
 
@@ -95,6 +107,7 @@ mod tests {
                 name: "a".into(),
                 range: Some((7, 0)),
                 dimensions: None,
+                init: None,
             }],
         );
 
@@ -105,6 +118,7 @@ mod tests {
                 name: "a".into(),
                 range: None,
                 dimensions: Some((7, 0)),
+                init: None,
             }],
         );
 
@@ -116,6 +130,7 @@ mod tests {
                     name: "b".into(),
                     range: Some((15, 0)),
                     dimensions: None,
+                    init: None,
                 }]
             ))
         );
@@ -128,6 +143,7 @@ mod tests {
                     name: "c".into(),
                     range: None,
                     dimensions: Some((15, 0)),
+                    init: None,
                 }]
             ))
         );
@@ -140,6 +156,7 @@ mod tests {
                     name: "d".into(),
                     range: Some((31, 0)),
                     dimensions: Some((0, 255)),
+                    init: None,
                 }]
             ))
         );
@@ -154,6 +171,7 @@ mod tests {
                 name: "memb".into(),
                 range: Some((7, 0)),
                 dimensions: Some((0, 255)),
+                init: None,
             }],
         );
 
@@ -165,6 +183,7 @@ mod tests {
                     name: "mem".into(),
                     range: Some((15, 0)),
                     dimensions: Some((0, 1023)),
+                    init: None,
                 }]
             ))
         );
@@ -177,6 +196,7 @@ mod tests {
                     name: "mem32".into(),
                     range: Some((31, 0)),
                     dimensions: Some((0, 2047)),
+                    init: None,
                 }]
             ))
         );
@@ -189,6 +209,7 @@ mod tests {
                     name: "mem64".into(),
                     range: Some((63, 0)),
                     dimensions: Some((0, 4095)),
+                    init: None,
                 }]
             ))
         );
@@ -205,11 +226,13 @@ mod tests {
                     name: "result".into(),
                     range: Some((4, 0)),
                     dimensions: None,
+                    init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some((4, 0)),
                     dimensions: None,
+                    init: None,
                 },
             ],
         );
@@ -222,16 +245,19 @@ mod tests {
                     name: "a".into(),
                     range: None,
                     dimensions: None,
+                    init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: None,
                     dimensions: None,
+                    init: None,
                 },
                 RegisterDeclaration {
                     name: "c".into(),
                     range: None,
                     dimensions: None,
+                    init: None,
                 },
             ],
         );
@@ -249,16 +275,19 @@ mod tests {
                     name: "a".into(),
                     range: Some((7, 0)),
                     dimensions: None,
+                    init: None,
                 },
                 RegisterDeclaration {
                     name: "mem".into(),
                     range: Some((7, 0)),
                     dimensions: Some((0, 15)),
+                    init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some((7, 0)),
                     dimensions: None,
+                    init: None,
                 },
             ],
         );
@@ -275,11 +304,13 @@ mod tests {
                     name: "a".into(),
                     range: Some((3, 0)),
                     dimensions: None,
+                    init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some((3, 0)),
                     dimensions: None,
+                    init: None,
                 },
             ],
         );
@@ -295,5 +326,58 @@ mod tests {
                 source
             );
         }
+    }
+
+    /// The expression a source fragment parses to, so a test can spell an
+    /// initialiser the way Verilog does rather than as an AST literal.
+    fn expression(source: &str) -> Expression {
+        let (rest, expression) =
+            verilog_expression(source).expect("the expression should have parsed");
+        assert!(rest.is_empty(), "unparsed input: {}", rest);
+        expression
+    }
+
+    #[test]
+    fn test_register_initialiser() {
+        assert_parses_to(
+            parse_register_declaration,
+            "reg [3:0] b = 4'h5;",
+            vec![RegisterDeclaration {
+                name: "b".into(),
+                range: Some((3, 0)),
+                dimensions: None,
+                init: Some(expression("4'h5")),
+            }],
+        );
+    }
+
+    /// An initialiser belongs to the *name*, so every register in a list gets
+    /// its own starting value.
+    #[test]
+    fn test_register_initialisers_are_per_name() {
+        assert_parses_to(
+            parse_register_declaration,
+            "reg x = 1, y = 2, z;",
+            vec![
+                RegisterDeclaration {
+                    name: "x".into(),
+                    range: None,
+                    dimensions: None,
+                    init: Some(expression("1")),
+                },
+                RegisterDeclaration {
+                    name: "y".into(),
+                    range: None,
+                    dimensions: None,
+                    init: Some(expression("2")),
+                },
+                RegisterDeclaration {
+                    name: "z".into(),
+                    range: None,
+                    dimensions: None,
+                    init: None,
+                },
+            ],
+        );
     }
 }
