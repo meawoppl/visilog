@@ -51,7 +51,6 @@ pub enum ProceduralAssignmentType {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ProceduralAssignment {
-    pre_delay: Option<Delay>,
     lhs: Expression,
     assignment_type: ProceduralAssignmentType,
     assignment_delay: Option<Delay>,
@@ -60,14 +59,12 @@ pub struct ProceduralAssignment {
 
 impl ProceduralAssignment {
     pub fn new(
-        pre_delay: Option<Delay>,
         lhs: Expression,
         assignment_type: ProceduralAssignmentType,
         assignment_delay: Option<Delay>,
         rhs: Expression,
     ) -> Self {
         ProceduralAssignment {
-            pre_delay,
             lhs,
             assignment_type,
             assignment_delay,
@@ -91,11 +88,6 @@ impl ProceduralAssignment {
         &self.assignment_type
     }
 
-    /// The delay *before* the statement runs, e.g. the `#50` of `#50 x = y;`.
-    pub fn pre_delay(&self) -> Option<&Delay> {
-        self.pre_delay.as_ref()
-    }
-
     /// The delay between evaluating the right side and updating the target,
     /// e.g. the `#50` of `x = #50 y;`.
     pub fn assignment_delay(&self) -> Option<&Delay> {
@@ -103,9 +95,10 @@ impl ProceduralAssignment {
     }
 }
 
+/// `x = y;` / `x <= y;`. A leading `#5` is *not* part of an assignment — a
+/// delay prefixes any procedural statement, so `behavior.rs` owns it.
 pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
-    let (input, pre_delay) = ws(parse_delay_opt)(input)?;
-    let (input, lhs) = assignment_lhs(input)?;
+    let (input, lhs) = ws(assignment_lhs)(input)?;
     let (input, assign_op) = ws(alt((tag("="), tag("<="))))(input)?;
     let (input, assignment_delay) = parse_delay_opt(input)?;
     let (input, rhs) = verilog_expression(input)?;
@@ -119,7 +112,7 @@ pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
 
     Ok((
         input,
-        ProceduralAssignment::new(pre_delay, lhs, assignment_type, assignment_delay, rhs),
+        ProceduralAssignment::new(lhs, assignment_type, assignment_delay, rhs),
     ))
 }
 

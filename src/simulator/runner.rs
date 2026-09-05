@@ -1541,4 +1541,99 @@ mod tests {
             assert_eq!(simulator.get("count").unwrap().to_u128(), Some(expected));
         }
     }
+
+    /// A delay prefixing a system task has to hold the task back, not just the
+    /// next assignment: the print lands when the delay expires and not before.
+    #[test]
+    fn test_a_delayed_system_task_prints_when_the_delay_expires() {
+        let mut simulator = simulator_for(
+            r#"
+            module delayed_task(
+                output reg [3:0] count
+            );
+                initial begin
+                    count = 4'd0;
+                    #10 $display("first at %0d", $time);
+                    #10 $display("second at %0d", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        assert!(simulator.output().lines().is_empty());
+        simulator.advance(9).unwrap();
+        assert!(simulator.output().lines().is_empty());
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["first at 10"]);
+
+        simulator.advance(10).unwrap();
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["first at 10", "second at 20"]
+        );
+    }
+
+    /// A delay prefixing an `if` holds back the whole conditional — the
+    /// condition is not even tested until the delay expires.
+    #[test]
+    fn test_a_delayed_if_runs_when_the_delay_expires() {
+        let mut simulator = simulator_for(
+            r#"
+            module delayed_if(
+                output reg [3:0] q
+            );
+                initial begin
+                    q = 4'd1;
+                    #15 if (q == 4'd1) begin
+                        q = 4'd2;
+                        $display("taken at %0d", $time);
+                    end else begin
+                        $display("not taken");
+                    end
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(14).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(1));
+        assert!(simulator.output().lines().is_empty());
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(2));
+        assert_eq!(simulator.output().lines(), vec!["taken at 15"]);
+    }
+
+    /// A delayed statement nested inside a `case` arm suspends the block and
+    /// resumes inside the arm, then carries on past the `case`.
+    #[test]
+    fn test_a_delayed_statement_inside_a_case_arm_advances_time() {
+        let mut simulator = simulator_for(
+            r#"
+            module delayed_arm(
+                output reg [3:0] q
+            );
+                initial begin
+                    q = 4'd0;
+                    case (q)
+                        4'd0: begin
+                            #5 q = 4'd1;
+                            #5 $display("arm at %0d", $time);
+                        end
+                        default: $display("default arm");
+                    endcase
+                    $display("after at %0d", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(5).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(1));
+        assert!(simulator.output().lines().is_empty());
+
+        simulator.advance(5).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["arm at 10", "after at 10"]);
+    }
 }
