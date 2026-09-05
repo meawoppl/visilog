@@ -50,7 +50,7 @@ use crate::parsers::{
 use crate::register::Register;
 use crate::simulator::eval::eval;
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
-use crate::simulator::exec::range_width;
+use crate::simulator::exec::{drive, range_width};
 use crate::simulator::program::Program;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
@@ -308,9 +308,57 @@ impl<'m> Elaborator<'m> {
         self.out.state.declare(scope.qualified(local), range);
     }
 
+    /// Applies a variable initialiser: `reg a = expr;` and `integer i = expr;`.
+    ///
+    /// This is a single write at elaboration time, *not* a continuous
+    /// assignment. The register holds the value until something writes it
+    /// again, and a later procedural assignment simply wins — which is the
+    /// whole difference between this and the net form below.
+    fn initialise(
+        &mut self,
+        local: &str,
+        init: &Expression,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        let value = eval(&renamed(init, scope), &self.out.state)?;
+        let target = Expression::Identifier(Identifier::new(scope.resolve(local)));
+        drive(&mut self.out.state, &target, &value)?;
+        Ok(())
+    }
+
     /// The second pass: everything that runs.
     fn build(&mut self, statement: &ModuleStatement, scope: &Scope) -> Result<(), SimulationError> {
         match statement {
+            // `wire a = expr;` is a declaration plus a continuous assignment,
+            // so the initialiser joins the same list an explicit `assign`
+            // uses and settles through the same fixpoint. The net follows its
+            // operands for the whole simulation.
+            ModuleStatement::WireDeclaration(nets) => {
+                for net in nets {
+                    if let Some(init) = net.init() {
+                        let target = Expression::Identifier(Identifier::new(
+                            scope.resolve(&net.identifier().name),
+                        ));
+                        self.out
+                            .assignments
+                            .push(ContinuousAssignment::new(target, renamed(init, scope)));
+                    }
+                }
+            }
+            ModuleStatement::RegisterDeclaration(registers) => {
+                for register in registers {
+                    if let Some(init) = &register.init {
+                        self.initialise(&register.name.name, init, scope)?;
+                    }
+                }
+            }
+            ModuleStatement::IntegerDeclaration(integers) => {
+                for declaration in integers {
+                    if let Some(init) = &declaration.init {
+                        self.initialise(&declaration.name.name, init, scope)?;
+                    }
+                }
+            }
             ModuleStatement::Assignment(assignment) => {
                 self.out.assignments.push(ContinuousAssignment::new(
                     renamed(assignment.lhs(), scope),
@@ -1408,5 +1456,110 @@ mod tests {
         let simulator = simulator_for(&[top, chatty], "top");
         assert_eq!(simulator.output().lines(), vec!["child count 7"]);
         assert_eq!(simulator.get("dut.count").unwrap().to_u128(), Some(7));
+    }
+
+    /// `wire a = expr;` is a continuous assignment, so the net keeps following
+    /// its operands long after time zero.
+    #[test]
+    fn test_net_initialiser_drives_continuously() {
+        let source = r#"
+            module nets(
+                input [3:0] a
+            );
+                wire [3:0] doubled = a + a;
+                wire x = 1, y = 0;
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[source], "nets");
+
+        // The initialisers joined the continuous assignments, so settling is
+        // what applies them — and each name in a list carries its own driver.
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("x").unwrap().to_u128(), Some(1));
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(0));
+
+        simulator.poke("a", Register::from_u128(3, 4)).unwrap();
+        assert_eq!(simulator.get("doubled").unwrap().to_u128(), Some(6));
+
+        // The operand moves after time zero and the net moves with it, which a
+        // one-shot starting value would not do.
+        simulator.poke("a", Register::from_u128(5, 4)).unwrap();
+        assert_eq!(simulator.get("doubled").unwrap().to_u128(), Some(10));
+    }
+
+    /// `reg a = expr;` is a starting value, not a driver: a procedural write
+    /// owns the register from then on and the initialiser does not fight it.
+    #[test]
+    fn test_register_initialiser_is_applied_once() {
+        let source = r#"
+            module regs(
+                input clk
+            );
+                reg [3:0] n = 4'd5;
+                always @(posedge clk) n <= n + 1;
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[source], "regs");
+        assert_eq!(simulator.get("n").unwrap().to_u128(), Some(5));
+
+        // Were this a continuous assignment, settling would put 5 back after
+        // every clock and the register would never count.
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("n").unwrap().to_u128(), Some(6));
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("n").unwrap().to_u128(), Some(7));
+    }
+
+    /// An `integer` initialiser follows the `reg` rule.
+    #[test]
+    fn test_integer_initialiser_is_applied_once() {
+        let source = r#"
+            module counts(
+                input clk
+            );
+                integer i = 0;
+                always @(posedge clk) i <= i + 1;
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[source], "counts");
+        assert_eq!(simulator.get("i").unwrap().to_u128(), Some(0));
+
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("i").unwrap().to_u128(), Some(1));
+    }
+
+    /// A child's initialisers are resolved into the flat store like everything
+    /// else: the net's driver names the qualified signal, and the parent's
+    /// value reaches it through the aliased port.
+    #[test]
+    fn test_child_initialisers_are_namespaced() {
+        let child = r#"
+            module scaler(
+                input [3:0] a,
+                output [3:0] out
+            );
+                wire [3:0] doubled = a + a;
+                reg [3:0] seed = 4'd9;
+                assign out = doubled;
+            endmodule
+        "#;
+        let top = r#"
+            module top(
+                input [3:0] a,
+                output [3:0] out
+            );
+                scaler dut (.a(a), .out(out));
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, child], "top");
+        assert_eq!(simulator.get("dut.seed").unwrap().to_u128(), Some(9));
+
+        simulator.poke("a", Register::from_u128(6, 4)).unwrap();
+        assert_eq!(simulator.get("dut.doubled").unwrap().to_u128(), Some(12));
+        assert_eq!(simulator.get("out").unwrap().to_u128(), Some(12));
     }
 }

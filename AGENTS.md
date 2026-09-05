@@ -324,6 +324,16 @@ tripwire.
   `reg [7:0] a, mem [0:15];` legal and what removes the "try the memory form first"
   ordering hazard that two near-identical `reg`-led parsers would otherwise create.
   An `integer` is signed, which nothing models yet (issue #96).
+- **A declaration initialiser belongs to the *name*, and `wire` and `reg` mean opposite
+  things by it.** `wire a = expr;` is shorthand for a declaration *plus a continuous
+  assignment*: `elaborate` pushes it onto the same list an explicit `assign` uses, so the
+  net follows its operands for the whole simulation. `reg a = expr;` and `integer i =
+  expr;` are a starting value applied *once* — a single store write during elaboration —
+  so a later procedural write owns the register and the initialiser does not fight it.
+  Getting these the same way round is the substance of the feature; a `wire` initialiser
+  that behaves like a one-shot looks right in a smoke test and is wrong in a real design.
+  `register::declared_name` carries the initialiser next to the memory dimension, which is
+  what makes `wire x = 1, y = 2;` give the two names different drivers.
 - **Both module header styles are normalised to `Vec<Port>` at parse time.**
   `parse_module_declaration` reads an ANSI header (`module m(input wire [3:0] a);`) or a
   Verilog-1995 one (`module m(a, h);` plus `input a; output [11:0] h;` in the body), lifts
