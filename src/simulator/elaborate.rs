@@ -37,11 +37,11 @@
 //! parent's. That is the price of never having to reconcile the two, and it
 //! only differs from Verilog when a connection is deliberately mismatched.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
-    behavior::{Event, EventControl},
+    behavior::{Event, EventControl, FunctionDeclaration, FunctionVariable},
     expr::Expression,
     identifier::Identifier,
     modules::{ModuleInitArguments, ModuleInstantiation, Port, PortDirection, VerilogModule},
@@ -51,9 +51,35 @@ use crate::register::Register;
 use crate::simulator::eval::eval;
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
-use crate::simulator::program::Program;
+use crate::simulator::program::{
+    FrameVariable, FunctionDefinition, Instruction, Program, FUNCTION_DELAY_UNSUPPORTED,
+};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+
+/// A function body prints into a [`TaskContext`](crate::simulator::tasks::TaskContext)
+/// nobody reads — a call happens inside an expression, and an expression has no
+/// way to hand output back — so a body that prints is rejected rather than
+/// silently swallowed.
+const FUNCTION_TASK_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a system task inside a function");
+
+/// A non-blocking assignment defers its write past the end of the call, and a
+/// call ends the moment the expression around it needs the value.
+const FUNCTION_NONBLOCKING_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a non-blocking assignment inside a function");
+
+/// A call runs against a frame of its own, so a write to anything outside the
+/// function would be thrown away with the frame. Losing it quietly would make a
+/// design that depends on it look like one that works.
+const FUNCTION_SIDE_EFFECT_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a function assigning a signal outside itself");
+
+/// The `$random` stream lives on the store a frame is *copied* from, so a draw
+/// made inside a call would be lost with the frame and the next call would draw
+/// the same number again.
+const FUNCTION_RANDOM_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("`$random` inside a function");
 
 /// What kind of procedural block a compiled program came from.
 #[derive(Debug, PartialEq, Eq)]
@@ -196,6 +222,10 @@ impl<'m> Elaborator<'m> {
         for port in &module.ports {
             self.declare_port(port, scope)?;
         }
+        // Functions come before the declarations rather than with them: a
+        // parameter's value may be a call, and the call has to find its
+        // definition already compiled.
+        self.declare_functions(module, scope)?;
         for statement in &module.statements {
             self.declare(statement, scope)?;
         }
@@ -245,6 +275,89 @@ impl<'m> Elaborator<'m> {
             self.out.state.set_ranged(name, floating, port.range);
         }
         Ok(())
+    }
+
+    /// Compiles every function this module declares and puts it in the store
+    /// under its qualified name, so a call anywhere in the design finds it.
+    ///
+    /// They are staged into one map first because a function may call a sibling
+    /// declared further down the file, and closing each one's read set over
+    /// what it calls needs all of them in hand.
+    fn declare_functions(
+        &mut self,
+        module: &VerilogModule,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        let mut staged: BTreeMap<String, FunctionDefinition> = BTreeMap::new();
+        for statement in &module.statements {
+            if let ModuleStatement::FunctionDeclaration(function) = statement {
+                let definition = self.compile_function(function, scope)?;
+                staged.insert(definition.result.name.clone(), definition);
+            }
+        }
+        close_reads(&mut staged);
+        for (name, definition) in staged {
+            self.out.state.declare_function(name, definition);
+        }
+        Ok(())
+    }
+
+    /// Compiles one function body and works out the frame a call to it needs.
+    ///
+    /// The body is renamed like any other compiled program, but through a
+    /// resolver of two minds: a name the function itself declares — its own
+    /// name, an argument, a local — becomes a frame variable, and everything
+    /// else resolves into the design's flat store the way the rest of the
+    /// module does.
+    fn compile_function(
+        &self,
+        function: &FunctionDeclaration,
+        scope: &Scope,
+    ) -> Result<FunctionDefinition, SimulationError> {
+        let qualified = scope.qualified(&function.name.name);
+
+        // The function's own name is the variable its body assigns to return a
+        // value, so it is a frame variable like the arguments and the locals.
+        let mut frame_names: HashMap<&str, String> = HashMap::new();
+        frame_names.insert(function.name.name.as_str(), qualified.clone());
+
+        let variable = |variable: &FunctionVariable| FrameVariable {
+            name: format!("{}.{}", qualified, variable.name.name),
+            range: variable.range,
+            signed: variable.signed,
+        };
+        let arguments: Vec<FrameVariable> = function.arguments.iter().map(variable).collect();
+        let locals: Vec<FrameVariable> = function.locals.iter().map(variable).collect();
+        for (declared, frame) in function
+            .arguments
+            .iter()
+            .chain(&function.locals)
+            .zip(arguments.iter().chain(&locals))
+        {
+            frame_names.insert(declared.name.name.as_str(), frame.name.clone());
+        }
+
+        let mut program = Program::compile(&function.statements)?;
+        program.rename(&|name| match frame_names.get(name) {
+            Some(qualified) => qualified.clone(),
+            None => scope.resolve(name),
+        });
+
+        let own: BTreeSet<String> = frame_names.values().cloned().collect();
+        let names = analyse_function_body(&program, &own)?;
+
+        Ok(FunctionDefinition {
+            result: FrameVariable {
+                name: qualified,
+                range: function.range,
+                signed: function.signed,
+            },
+            arguments,
+            locals,
+            reads: names.reads,
+            calls: names.calls,
+            program,
+        })
     }
 
     /// The first pass: everything that brings a name into existence.
@@ -387,16 +500,27 @@ impl<'m> Elaborator<'m> {
                             .collect(),
                     ),
                 };
-                let implicit_reads = match block.event_control {
-                    EventControl::Implicit => signals_read(&block.statements)
-                        .iter()
-                        .map(|name| scope.resolve(name))
-                        .collect(),
-                    _ => BTreeSet::new(),
-                };
                 if !scope.is_root() {
                     program.rename(&|name| scope.resolve(name));
                 }
+                let implicit_reads = match block.event_control {
+                    EventControl::Implicit => {
+                        let mut reads: BTreeSet<String> = signals_read(&block.statements)
+                            .iter()
+                            .map(|name| scope.resolve(name))
+                            .collect();
+                        // A call reads whatever the function it names reads, and
+                        // an `@(*)` block is sensitive to everything it reads —
+                        // so it has to wake when one of those moves too.
+                        for called in BodyNames::of(&program).calls {
+                            if let Some(definition) = self.out.state.function(&called) {
+                                reads.extend(definition.reads.iter().cloned());
+                            }
+                        }
+                        reads
+                    }
+                    _ => BTreeSet::new(),
+                };
                 self.out.blocks.push(TimedBlock {
                     kind: BlockKind::Always,
                     free_running: block.event_control == EventControl::None,
@@ -603,6 +727,196 @@ fn plain_identifier(expression: &Expression) -> Option<&Identifier> {
     }
 }
 
+/// Checks what a compiled function body does and reports the design signals it
+/// reads and the functions it calls.
+///
+/// A function is evaluated inside an expression, which fixes what a body may
+/// do: it cannot consume time, it cannot print, it cannot defer a write past
+/// its own end, and it cannot write anything but its own variables. Each of
+/// those is a named error here rather than something that quietly does nothing
+/// at every call.
+fn analyse_function_body(
+    program: &Program,
+    own: &BTreeSet<String>,
+) -> Result<BodyNames, SimulationError> {
+    for instruction in program.instructions() {
+        match instruction {
+            Instruction::Blocking { target, .. } => match assigned_name(target) {
+                Some(name) if own.contains(name) => {}
+                Some(_) => return Err(FUNCTION_SIDE_EFFECT_UNSUPPORTED),
+                None => {
+                    return Err(SimulationError::UnsupportedTarget(
+                        target.to_contracted_string(),
+                    ))
+                }
+            },
+            Instruction::NonBlocking { .. } => return Err(FUNCTION_NONBLOCKING_UNSUPPORTED),
+            Instruction::Task(_) => return Err(FUNCTION_TASK_UNSUPPORTED),
+            Instruction::Delay(_) => return Err(FUNCTION_DELAY_UNSUPPORTED),
+            _ => {}
+        }
+    }
+
+    let mut names = BodyNames::of(program);
+    if names.random {
+        return Err(FUNCTION_RANDOM_UNSUPPORTED);
+    }
+    // What the function declares itself is not something a call has to copy in.
+    names.reads.retain(|name| !own.contains(name));
+    Ok(names)
+}
+
+/// The signal an assignment target writes, or `None` when the target is not
+/// something that names one.
+fn assigned_name(target: &Expression) -> Option<&str> {
+    match target {
+        Expression::Identifier(id)
+        | Expression::BitSelect(id, _)
+        | Expression::PartSelect(id, _, _) => Some(&id.name),
+        Expression::Parenthetical(inner) => assigned_name(inner),
+        _ => None,
+    }
+}
+
+/// The names a compiled body uses, gathered in one walk.
+///
+/// The three are collected together because they all come out of the same
+/// expression trees, and asking for them separately would mean walking those
+/// trees once per question.
+#[derive(Debug, Default)]
+struct BodyNames {
+    /// Every signal name an expression in the body reads. An assignment target
+    /// is not one — writing a signal is not reading it — but an index inside a
+    /// target is.
+    reads: BTreeSet<String>,
+    /// Every function the body calls, under the name it resolved to.
+    calls: BTreeSet<String>,
+    /// Whether anything in the body draws from the `$random` stream.
+    random: bool,
+}
+
+impl BodyNames {
+    /// The names a whole compiled program uses.
+    fn of(program: &Program) -> BodyNames {
+        let mut names = BodyNames::default();
+        for instruction in program.instructions() {
+            names.instruction(instruction);
+        }
+        names
+    }
+
+    fn instruction(&mut self, instruction: &Instruction) {
+        match instruction {
+            Instruction::Blocking { target, value }
+            | Instruction::NonBlocking { target, value } => {
+                self.target(target);
+                self.expression(value);
+            }
+            Instruction::JumpIfFalse { condition, .. } => self.expression(condition),
+            Instruction::CaseSubject(subject) => self.expression(subject),
+            Instruction::JumpIfMatch { label, .. } => self.expression(label),
+            Instruction::RepeatInit { count, .. } => self.expression(count),
+            Instruction::Jump(_)
+            | Instruction::RepeatNext { .. }
+            | Instruction::Task(_)
+            | Instruction::Delay(_)
+            | Instruction::Halt => {}
+        }
+    }
+
+    /// The reads hiding inside an assignment target: a select index, a
+    /// part-select bound. The target's own name is a write, not one of them.
+    fn target(&mut self, target: &Expression) {
+        match target {
+            Expression::Identifier(_) => {}
+            Expression::Parenthetical(inner) => self.target(inner),
+            Expression::BitSelect(_, index) => self.expression(index),
+            Expression::PartSelect(_, first, second) => {
+                self.expression(first);
+                self.expression(second);
+            }
+            other => self.expression(other),
+        }
+    }
+
+    fn expression(&mut self, expression: &Expression) {
+        match expression {
+            Expression::Constant(_) => {}
+            Expression::Identifier(id) => {
+                self.reads.insert(id.name.clone());
+            }
+            Expression::Unary(_, inner) | Expression::Parenthetical(inner) => {
+                self.expression(inner)
+            }
+            Expression::Binary(lhs, _, rhs) => {
+                self.expression(lhs);
+                self.expression(rhs);
+            }
+            Expression::Conditional(condition, when_true, when_false) => {
+                self.expression(condition);
+                self.expression(when_true);
+                self.expression(when_false);
+            }
+            Expression::Concatenation(parts) => {
+                for part in parts {
+                    self.expression(part);
+                }
+            }
+            Expression::FunctionCall(id, arguments) => {
+                self.calls.insert(id.name.clone());
+                for argument in arguments {
+                    self.expression(argument);
+                }
+            }
+            Expression::SystemFunctionCall(name, arguments) => {
+                self.random |= name == "random";
+                for argument in arguments {
+                    self.expression(argument);
+                }
+            }
+            Expression::BitSelect(id, index) => {
+                self.reads.insert(id.name.clone());
+                self.expression(index);
+            }
+            Expression::PartSelect(id, first, second) => {
+                self.reads.insert(id.name.clone());
+                self.expression(first);
+                self.expression(second);
+            }
+        }
+    }
+}
+
+/// Adds to every function's read set the reads of the functions it calls, until
+/// nothing more is added.
+///
+/// A call seeds its frame from the store it was called against, so a function
+/// that calls another has to copy in what *that* one reads as well — otherwise
+/// the inner call would find the design signals it wanted missing. A cycle in
+/// the call graph is what the fixpoint is for: a recursive function's reads are
+/// its own.
+fn close_reads(functions: &mut BTreeMap<String, FunctionDefinition>) {
+    loop {
+        let mut grew = false;
+        let names: Vec<String> = functions.keys().cloned().collect();
+        for name in names {
+            let mut inherited = BTreeSet::new();
+            for called in &functions[&name].calls {
+                if let Some(definition) = functions.get(called) {
+                    inherited.extend(definition.reads.iter().cloned());
+                }
+            }
+            let definition = functions.get_mut(&name).expect("a staged function");
+            for read in inherited {
+                grew |= definition.reads.insert(read);
+            }
+        }
+        if !grew {
+            return;
+        }
+    }
+}
+
 /// A copy of `expression` with every signal it names resolved into the flat
 /// store.
 fn renamed(expression: &Expression, scope: &Scope) -> Expression {
@@ -613,10 +927,10 @@ fn renamed(expression: &Expression, scope: &Scope) -> Expression {
     copy
 }
 
-/// Rewrites every signal an expression names through `resolve`.
+/// Rewrites every name an expression uses through `resolve`.
 ///
-/// A function's *name* is left alone: it is not a signal, and qualifying it
-/// would only make it unresolvable.
+/// That includes the name of a function it calls, which is qualified exactly as
+/// a signal is: a function belongs to the instance that declares it.
 pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> String) {
     match expression {
         Expression::Constant(_) => {}
@@ -638,7 +952,18 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
                 rename_expression(part, resolve);
             }
         }
-        Expression::FunctionCall(_, arguments) | Expression::SystemFunctionCall(_, arguments) => {
+        // A function is qualified like a signal, and for the same reason: an
+        // instance's function is its own, so a call inside a child has to
+        // resolve to the definition elaborated for *that* instance.
+        Expression::FunctionCall(id, arguments) => {
+            id.name = resolve(&id.name);
+            for argument in arguments {
+                rename_expression(argument, resolve);
+            }
+        }
+        // A `$name` is the simulator's, not the design's, so it is the one name
+        // that is never qualified.
+        Expression::SystemFunctionCall(_, arguments) => {
             for argument in arguments {
                 rename_expression(argument, resolve);
             }

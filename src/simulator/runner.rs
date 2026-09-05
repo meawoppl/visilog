@@ -1767,4 +1767,358 @@ mod tests {
         );
         assert!(simulator.get("q").unwrap().has_unknown());
     }
+
+    // -- the design's own functions ---------------------------------------
+
+    /// A function declared the 1995 way — arguments as `input` declarations
+    /// inside the body — is evaluated inside an ordinary expression, and
+    /// returns by assigning to its own name.
+    #[test]
+    fn test_function_evaluates_inside_an_expression() {
+        let mut simulator = simulator_for(
+            r#"
+            module incrementer(input [7:0] a, output [7:0] y);
+                function [7:0] do_add;
+                    input [7:0] value;
+                    do_add = value + 1;
+                endfunction
+
+                assign y = do_add(a) + 1;
+            endmodule
+        "#,
+        );
+
+        simulator
+            .set_input("a", Register::from_u128(40, 8))
+            .unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(42));
+    }
+
+    /// Two calls in the *same* expression get their own arguments: a frame per
+    /// call is what tells this apart from one set of variables the calls write
+    /// over each other.
+    #[test]
+    fn test_function_arguments_are_bound_per_call() {
+        let mut simulator = simulator_for(
+            r#"
+            module squares(input [7:0] a, input [7:0] b, output [7:0] y);
+                function [7:0] square(input [7:0] value);
+                    square = value * value;
+                endfunction
+
+                assign y = square(a) - square(b);
+            endmodule
+        "#,
+        );
+
+        simulator.set_input("a", Register::from_u128(5, 8)).unwrap();
+        simulator.set_input("b", Register::from_u128(3, 8)).unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(16));
+
+        // The same function, different arguments, a different answer.
+        simulator.set_input("a", Register::from_u128(9, 8)).unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(72));
+    }
+
+    /// A body-local variable is the function's own: it is declared into the
+    /// frame a call builds, and a loop over it runs to a value.
+    #[test]
+    fn test_function_with_a_local_variable() {
+        let mut simulator = simulator_for(
+            r#"
+            module popcount(input [3:0] value, output [7:0] ones);
+                function [7:0] count_ones;
+                    input [3:0] bits;
+                    integer i;
+                    begin
+                        count_ones = 0;
+                        for (i = 0; i < 4; i = i + 1)
+                            count_ones = count_ones + bits[i];
+                    end
+                endfunction
+
+                assign ones = count_ones(value);
+            endmodule
+        "#,
+        );
+
+        simulator
+            .set_input("value", Register::from_binary("1011"))
+            .unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("ones").unwrap().to_u128(), Some(3));
+    }
+
+    /// A function may read the design around it, not only its arguments — the
+    /// signals its body names are copied into the frame a call runs in.
+    #[test]
+    fn test_function_reads_a_design_signal() {
+        let mut simulator = simulator_for(
+            r#"
+            module scaled(input [7:0] a, output [7:0] y);
+                parameter STEP = 3;
+
+                function [7:0] step_up;
+                    input [7:0] value;
+                    step_up = value + STEP;
+                endfunction
+
+                assign y = step_up(a);
+            endmodule
+        "#,
+        );
+
+        simulator
+            .set_input("a", Register::from_u128(10, 8))
+            .unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(13));
+    }
+
+    /// Recursion works, because a call's variables live in a frame of its own
+    /// rather than in the design's store.
+    #[test]
+    fn test_recursive_function() {
+        let mut simulator = simulator_for(
+            r#"
+            module factorial(input [7:0] n, output [31:0] y);
+                function [31:0] fact;
+                    input [7:0] value;
+                    if (value <= 1)
+                        fact = 1;
+                    else
+                        fact = value * fact(value - 1);
+                endfunction
+
+                assign y = fact(n);
+            endmodule
+        "#,
+        );
+
+        simulator.set_input("n", Register::from_u128(5, 8)).unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(120));
+    }
+
+    /// Recursion that never reaches a base case is a named error rather than a
+    /// stack overflow.
+    #[test]
+    fn test_runaway_recursion_is_a_named_error() {
+        let mut simulator = simulator_for(
+            r#"
+            module runaway(input [7:0] n, output [7:0] y);
+                function [7:0] forever_deeper;
+                    input [7:0] value;
+                    forever_deeper = forever_deeper(value + 1);
+                endfunction
+
+                assign y = forever_deeper(n);
+            endmodule
+        "#,
+        );
+
+        simulator.set_input("n", Register::from_u128(1, 8)).unwrap();
+        let error = simulator.run().expect_err("runaway recursion should fail");
+        assert!(
+            matches!(
+                error,
+                SimulationError::Eval(EvalError::FunctionCallDepth { .. })
+            ),
+            "unexpected error: {:?}",
+            error
+        );
+    }
+
+    /// A function in an instantiated module belongs to that instance: it is
+    /// qualified like every other name, so two instances do not share one.
+    #[test]
+    fn test_function_inside_an_instance() {
+        let child = r#"
+            module doubler(input [7:0] a, output [7:0] y);
+                function [7:0] twice;
+                    input [7:0] value;
+                    twice = value + value;
+                endfunction
+
+                assign y = twice(a);
+            endmodule
+        "#;
+        let top = r#"
+            module top(input [7:0] a, output [7:0] y, output [7:0] z);
+                doubler one (.a(a), .y(y));
+                doubler two (.a(y), .y(z));
+            endmodule
+        "#;
+
+        let (_, child) = parse_module_declaration(child).expect("child should parse");
+        let (_, top) = parse_module_declaration(top).expect("top should parse");
+        let mut simulator = Simulator::with_modules(vec![top, child], "top");
+        simulator.setup().unwrap();
+
+        simulator.set_input("a", Register::from_u128(3, 8)).unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(6));
+        assert_eq!(simulator.get("z").unwrap().to_u128(), Some(12));
+    }
+
+    /// A function may be called from a procedural block as readily as from a
+    /// continuous assignment: both go through the same evaluator.
+    #[test]
+    fn test_function_called_from_a_procedural_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module checker(output reg [7:0] q);
+                function [7:0] twice;
+                    input [7:0] value;
+                    twice = value + value;
+                endfunction
+
+                initial begin
+                    q = twice(8'd21);
+                    if (q == 42)
+                        $display("PASSED");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(42));
+        assert_eq!(simulator.output().text().trim(), "PASSED");
+    }
+
+    /// What a function body may not do is decided when the design is
+    /// elaborated, and each of those is an error naming what it rejected — a
+    /// call that quietly did nothing would be far harder to find.
+    #[test]
+    fn test_a_function_body_that_cannot_be_run_is_rejected() {
+        let rejected = [
+            ("#5 f = 1;", "a delay inside a function"),
+            ("$display(\"hi\");", "a system task inside a function"),
+            ("f <= 1;", "a non-blocking assignment inside a function"),
+            (
+                "outside = 1;",
+                "a function assigning a signal outside itself",
+            ),
+            ("f = $random;", "`$random` inside a function"),
+        ];
+
+        for (body, expected) in rejected {
+            let source = format!(
+                r#"
+                module rejected(output [7:0] y);
+                    reg [7:0] outside;
+                    function [7:0] f;
+                        input [7:0] value;
+                        {}
+                    endfunction
+
+                    assign y = f(8'd1);
+                endmodule
+            "#,
+                body
+            );
+            let (_, module) = parse_module_declaration(&source).expect("module should parse");
+            let mut simulator = Simulator::new(module);
+            let error = simulator
+                .setup()
+                .expect_err("the function body should be rejected");
+            assert_eq!(
+                error.to_string(),
+                format!("{} is not supported by the simulator", expected)
+            );
+        }
+    }
+
+    /// A parameter's value may be a call, which is why functions are compiled
+    /// before the declarations rather than with them.
+    #[test]
+    fn test_a_parameter_may_be_computed_by_a_function() {
+        let mut simulator = simulator_for(
+            r#"
+            module sized(output [7:0] y);
+                function [7:0] doubled;
+                    input [7:0] value;
+                    doubled = value * 2;
+                endfunction
+
+                localparam WIDTH = doubled(8'd4);
+                assign y = WIDTH;
+            endmodule
+        "#,
+        );
+
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(8));
+    }
+
+    /// An `@(*)` block that calls a function is sensitive to what the
+    /// *function* reads as well as to what the block itself names — otherwise a
+    /// design whose call is its only reader would never wake.
+    #[test]
+    fn test_implicit_sensitivity_reaches_through_a_call() {
+        let mut simulator = simulator_for(
+            r#"
+            module sensitive(input clk, output reg [7:0] y);
+                reg [7:0] offset;
+
+                function [7:0] plus_offset;
+                    input [7:0] value;
+                    plus_offset = value + offset;
+                endfunction
+
+                initial offset = 8'd0;
+                always @(posedge clk) offset = offset + 1;
+                always @(*) y = plus_offset(8'd10);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(10));
+
+        // `y` names neither `offset` nor anything that moved but the clock, so
+        // it can only follow if the call's own reads are in the block's
+        // sensitivity list.
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(11));
+    }
+
+    /// A call with the wrong number of arguments names the function and both
+    /// counts.
+    #[test]
+    fn test_function_called_with_the_wrong_number_of_arguments() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module mismatched(output [7:0] y);
+                function [7:0] twice;
+                    input [7:0] value;
+                    twice = value + value;
+                endfunction
+
+                assign y = twice(8'd1, 8'd2);
+            endmodule
+        "#,
+        )
+        .expect("module should parse");
+        let mut simulator = Simulator::new(module);
+        simulator.setup().unwrap();
+
+        let error = simulator.run().expect_err("the arity should be rejected");
+        assert!(
+            matches!(
+                error,
+                SimulationError::Eval(EvalError::FunctionArity {
+                    expected: 1,
+                    found: 2,
+                    ..
+                })
+            ),
+            "unexpected error: {:?}",
+            error
+        );
+    }
 }

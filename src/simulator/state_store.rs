@@ -1,11 +1,13 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
 use crate::register::{Register, X};
+use crate::simulator::program::FunctionDefinition;
 
 /// What the `$random` stream starts from.
 ///
@@ -15,6 +17,18 @@ use crate::register::{Register, X};
 /// needs. A simulation gets a fresh [`StateStore`], so the stream restarts at
 /// this seed every time a design is set up.
 const DEFAULT_RANDOM_SEED: u64 = 0;
+
+/// How deep calls to a design's own functions may nest.
+///
+/// Every call gets a frame of its own, so a recursive function *works* — but it
+/// works on the host's stack, and one that never reaches its base case would
+/// take the process down with it. This is the bound that makes runaway
+/// recursion a named error instead.
+///
+/// It is deliberately well under what the stack holds: an unoptimised build
+/// runs out somewhere between 96 and 128 nested calls, and a call whose
+/// expressions nest deeply costs more than the plain ones that measurement used.
+pub const MAX_CALL_DEPTH: usize = 64;
 
 /// The stream `$random` draws from.
 ///
@@ -176,6 +190,15 @@ pub struct StateStore {
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
+    /// The functions the design declares, keyed by qualified name.
+    ///
+    /// They live here because [`eval`](crate::simulator::eval::eval) is handed
+    /// a `&StateStore` and nothing else, and a call has to find its definition.
+    /// The table is shared rather than copied so that a call's frame — itself a
+    /// store — can call a function in turn without cloning every compiled body.
+    functions: Rc<HashMap<String, FunctionDefinition>>,
+    /// How many function calls are on the stack above this store.
+    call_depth: Cell<usize>,
     /// Whether any signal here was declared signed.
     ///
     /// A hint, not a fact to reason from: it is set when a signed signal is
@@ -195,6 +218,50 @@ impl StateStore {
     /// nothing here is signed — while `true` only means something once was.
     pub fn any_signed(&self) -> bool {
         self.any_signed
+    }
+
+    /// A store for the body of a function called against this one: the same
+    /// function table and the same clock, but no signals — a call's variables
+    /// are its own, and nothing it writes is allowed to reach the design.
+    ///
+    /// The call depth comes across so that recursion is bounded by the whole
+    /// chain of calls rather than restarting at every frame. The `$random`
+    /// stream deliberately does not: a frame is thrown away, so advancing a
+    /// stream in one would be lost, which is why a function body that draws
+    /// from it is rejected when it is elaborated.
+    pub fn frame(&self) -> StateStore {
+        StateStore {
+            name_to_signal: HashMap::new(),
+            journal: HashMap::new(),
+            time: self.time,
+            random: RandomStream::default(),
+            functions: Rc::clone(&self.functions),
+            call_depth: Cell::new(self.call_depth.get()),
+            any_signed: false,
+        }
+    }
+
+    /// Records a function the design declared, under its qualified name.
+    pub fn declare_function(&mut self, name: impl Into<String>, definition: FunctionDefinition) {
+        Rc::make_mut(&mut self.functions).insert(name.into(), definition);
+    }
+
+    /// The definition a call resolves against, if the design declares one.
+    pub fn function(&self, name: &str) -> Option<&FunctionDefinition> {
+        self.functions.get(name)
+    }
+
+    /// Counts one more call onto the stack, or reports that the chain of calls
+    /// has gone too deep to be anything but runaway recursion.
+    ///
+    /// The count comes back down when the guard is dropped, so an error on the
+    /// way out of a call unwinds it exactly as a value does.
+    pub fn enter_call(&self) -> Option<CallGuard<'_>> {
+        if self.call_depth.get() >= MAX_CALL_DEPTH {
+            return None;
+        }
+        self.call_depth.set(self.call_depth.get() + 1);
+        Some(CallGuard(self))
     }
 
     /// The simulated time `$time` reports.
@@ -359,6 +426,15 @@ impl StateStore {
         let mut names: Vec<&str> = self.name_to_signal.keys().map(|k| k.as_str()).collect();
         names.sort();
         names
+    }
+}
+
+/// One call's place on the stack, which it gives back when it is dropped.
+pub struct CallGuard<'a>(&'a StateStore);
+
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        self.0.call_depth.set(self.0.call_depth.get() - 1);
     }
 }
 

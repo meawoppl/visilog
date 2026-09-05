@@ -14,7 +14,8 @@ use super::{
     assignment::{assignment_lhs, ProceduralAssignment, ProceduralAssignmentType},
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
-    simple::{ws, ws_and_comments},
+    identifier::{identifier, identifier_list, Identifier},
+    simple::{range, signedness, ws, ws_and_comments},
     string::parse_verilog_string,
 };
 #[derive(Debug, PartialEq, Clone)]
@@ -502,6 +503,209 @@ pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
     let (input, assignments) = many0(procedural_statement)(input)?;
     let (input, _) = ws(tag("end"))(input)?;
     Ok((input, assignments))
+}
+
+/// One variable a `function` declares: an argument or a body-local.
+///
+/// A function's *own name* is one of these too — it is the variable the body
+/// assigns to return a value — which is why the return width and the width of
+/// a local are described by the same thing.
+#[derive(Debug, PartialEq, Clone)]
+pub struct FunctionVariable {
+    pub name: Identifier,
+    pub range: (i64, i64),
+    pub signed: bool,
+}
+
+/// `function [7:0] do_add; input [7:0] a; do_add = a + 1; endfunction`
+///
+/// The arguments may be written either the 1995 way, as `input` declarations
+/// *inside* the body, or the 2001 way, as a parenthesised list after the name.
+/// Both fill [`arguments`](FunctionDeclaration::arguments) in call order, so
+/// nothing downstream can tell them apart.
+#[derive(Debug, PartialEq)]
+pub struct FunctionDeclaration {
+    pub name: Identifier,
+    /// The width of the value the function returns, which is the width of the
+    /// variable its own name stands for.
+    pub range: (i64, i64),
+    pub signed: bool,
+    pub arguments: Vec<FunctionVariable>,
+    /// Body-local `reg` and `integer` declarations.
+    pub locals: Vec<FunctionVariable>,
+    pub statements: Vec<ProceduralStatements>,
+}
+
+/// The width and signedness a declaration spells out, and whether it spelled
+/// out anything at all.
+///
+/// `explicit` is what tells a declaration apart from a statement — a function
+/// item that names neither a direction nor a type is not a declaration — and
+/// what makes the 2001 argument list's `f(input [7:0] a, b)` give `b` the type
+/// of the element before it.
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct DeclaredType {
+    range: (i64, i64),
+    signed: bool,
+    explicit: bool,
+}
+
+impl Default for DeclaredType {
+    fn default() -> Self {
+        DeclaredType {
+            range: (0, 0),
+            signed: false,
+            explicit: false,
+        }
+    }
+}
+
+/// The type part of a variable declaration: an optional storage keyword, an
+/// optional `signed`, and either an `integer` or a range.
+///
+/// `integer` is written *instead of* a range and carries its own width and
+/// signedness, so a declaration never has both.
+fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
+    let (input, storage) = opt(alt((
+        |i| keyword(i, "reg"),
+        |i| keyword(i, "wire"),
+        |i| keyword(i, "time"),
+    )))(input)?;
+    let (input, integer) = opt(|i| keyword(i, "integer"))(input)?;
+    let (input, _) = ws_and_comments(input)?;
+    let (input, signed) = signedness(input)?;
+    let (input, _) = ws_and_comments(input)?;
+    let (input, declared) = opt(range)(input)?;
+
+    Ok((
+        input,
+        DeclaredType {
+            range: match (integer.is_some(), declared) {
+                (true, _) => (31, 0),
+                (false, Some(declared)) => declared,
+                (false, None) => (0, 0),
+            },
+            // An `integer` is signed by being an `integer`.
+            signed: signed || integer.is_some(),
+            explicit: storage.is_some() || integer.is_some() || declared.is_some() || signed,
+        },
+    ))
+}
+
+/// The `input` keyword that marks a function argument.
+///
+/// A function has inputs and nothing else — its result is its name — so an
+/// `output` or `inout` in one is not a function this parser knows how to read.
+fn function_input(input: &str) -> IResult<&str, ()> {
+    keyword(input, "input")
+}
+
+/// One item inside a function body: `input [7:0] a;`, `reg [3:0] tmp;`,
+/// `integer i;`. The `bool` is whether it is an argument.
+fn function_item(input: &str) -> IResult<&str, (bool, Vec<FunctionVariable>)> {
+    let (input, argument) = opt(function_input)(input)?;
+    let (input, declared) = declared_type(input)?;
+    // Neither a direction nor a type: this is a statement, not a declaration.
+    if argument.is_none() && !declared.explicit {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let (input, names) = identifier_list(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        (
+            argument.is_some(),
+            names
+                .into_iter()
+                .map(|name| FunctionVariable {
+                    name,
+                    range: declared.range,
+                    signed: declared.signed,
+                })
+                .collect(),
+        ),
+    ))
+}
+
+/// One element of a 2001 argument list: `input [7:0] a`, or a bare `b` that
+/// inherits the element before it.
+fn ansi_function_argument(input: &str) -> IResult<&str, (DeclaredType, Identifier)> {
+    let (input, _) = opt(function_input)(input)?;
+    let (input, declared) = declared_type(input)?;
+    let (input, name) = ws(identifier)(input)?;
+    Ok((input, (declared, name)))
+}
+
+/// `(input [7:0] a, b, input c)` — the 2001 argument list. An element that
+/// declares neither a direction nor a type takes both from the element before
+/// it, which is what makes `a` and `b` above the same width.
+fn ansi_function_arguments(input: &str) -> IResult<&str, Vec<FunctionVariable>> {
+    let (input, elements) = delimited(
+        ws(char('(')),
+        separated_list0(char(','), ws(ansi_function_argument)),
+        ws(char(')')),
+    )(input)?;
+
+    let mut inherited = DeclaredType::default();
+    let mut arguments = Vec::with_capacity(elements.len());
+    for (declared, name) in elements {
+        if declared.explicit {
+            inherited = declared;
+        }
+        arguments.push(FunctionVariable {
+            name,
+            range: inherited.range,
+            signed: inherited.signed,
+        });
+    }
+    Ok((input, arguments))
+}
+
+/// `function [range] name; <declarations> <statements> endfunction`.
+///
+/// The return type may be a range, an `integer`, or nothing at all — a
+/// function that declares no width returns one bit.
+pub fn parse_function_declaration(input: &str) -> IResult<&str, FunctionDeclaration> {
+    let (input, _) = keyword(input, "function")?;
+    // `automatic` says a call gets its own copy of the locals, which is what a
+    // frame per call already gives every function here.
+    let (input, _) = opt(|i| keyword(i, "automatic"))(input)?;
+    let (input, returns) = declared_type(input)?;
+    let (input, name) = ws(identifier)(input)?;
+    let (input, ansi) = opt(ansi_function_arguments)(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    let (input, items) = many0(function_item)(input)?;
+    // The LRM allows one statement, which is a `begin`…`end` block when the
+    // body does more than one thing; `many0` also lets an empty function be
+    // written, and a body that runs several statements without a block.
+    let (input, statements) = alt((parse_block, many0(procedural_statement)))(input)?;
+    let (input, _) = ws(tag("endfunction"))(input)?;
+
+    let mut arguments = ansi.unwrap_or_default();
+    let mut locals = Vec::new();
+    for (is_argument, variables) in items {
+        if is_argument {
+            arguments.extend(variables);
+        } else {
+            locals.extend(variables);
+        }
+    }
+
+    Ok((
+        input,
+        FunctionDeclaration {
+            name,
+            range: returns.range,
+            signed: returns.signed,
+            arguments,
+            locals,
+            statements,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1132,5 +1336,94 @@ mod tests {
             "for /*a*/ ( /*b*/ i = 0 /*c*/ ; /*d*/ i < 4 ; i = i + 1 ) /*e*/ a = i;",
         );
         assert_parses(procedural_statement, "repeat /*n*/ (4) a = 1;");
+    }
+
+    /// The 1995 form: the arguments are `input` declarations *inside* the
+    /// body, and the function returns by assigning to its own name.
+    #[test]
+    fn test_parse_function_declaration_1995_style() {
+        let function = assert_parses(
+            parse_function_declaration,
+            "function [7:0] do_add; input [7:0] a; do_add = a + 1; endfunction",
+        );
+
+        assert_eq!(function.name, "do_add".into());
+        assert_eq!(function.range, (7, 0));
+        assert_eq!(function.arguments.len(), 1);
+        assert_eq!(function.arguments[0].name, "a".into());
+        assert_eq!(function.arguments[0].range, (7, 0));
+        assert!(function.locals.is_empty());
+        assert_eq!(function.statements.len(), 1);
+    }
+
+    /// The 2001 form puts the same arguments in a header list, and an element
+    /// that declares no type of its own takes the one before it.
+    #[test]
+    fn test_parse_function_declaration_2001_style() {
+        let function = assert_parses(
+            parse_function_declaration,
+            "function [3:0] pick(input [3:0] a, b); pick = a & b; endfunction",
+        );
+
+        assert_eq!(function.arguments.len(), 2);
+        assert_eq!(function.arguments[0].name, "a".into());
+        assert_eq!(function.arguments[1].name, "b".into());
+        assert!(function.arguments.iter().all(|a| a.range == (3, 0)));
+    }
+
+    /// A body-local variable is a declaration, not a statement, and is kept
+    /// apart from the arguments.
+    #[test]
+    fn test_parse_function_locals_and_return_types() {
+        let function = assert_parses(
+            parse_function_declaration,
+            r#"function integer count_ones;
+                   input [3:0] value;
+                   integer i;
+                   reg [3:0] seen;
+                   begin
+                       count_ones = 0;
+                       for (i = 0; i < 4; i = i + 1) count_ones = count_ones + value[i];
+                   end
+               endfunction"#,
+        );
+
+        // `integer` is a 32 bit signed variable, written instead of a range.
+        assert_eq!(function.range, (31, 0));
+        assert!(function.signed);
+        assert_eq!(function.arguments.len(), 1);
+        assert_eq!(
+            function
+                .locals
+                .iter()
+                .map(|local| local.name.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["i", "seen"]
+        );
+        assert_eq!(function.locals[0].range, (31, 0));
+        assert_eq!(function.locals[1].range, (3, 0));
+    }
+
+    /// A function that declares no width returns one bit, and one that
+    /// declares no arguments takes none.
+    #[test]
+    fn test_parse_function_declaration_minimal() {
+        let function = assert_parses(parse_function_declaration, "function f; f = 1; endfunction");
+
+        assert_eq!(function.range, (0, 0));
+        assert!(function.arguments.is_empty());
+        assert_eq!(function.statements.len(), 1);
+    }
+
+    /// A `signed` function and a `signed` argument keep the qualifier.
+    #[test]
+    fn test_parse_function_signedness() {
+        let function = assert_parses(
+            parse_function_declaration,
+            "function signed [7:0] neg; input signed [7:0] a; neg = -a; endfunction",
+        );
+
+        assert!(function.signed);
+        assert!(function.arguments[0].signed);
     }
 }

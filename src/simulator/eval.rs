@@ -35,9 +35,11 @@ use std::fmt;
 
 use crate::parsers::constants::{VerilogBaseType, VerilogConstant};
 use crate::parsers::expr::Expression;
+use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, X, Z, ZERO};
-use crate::simulator::state_store::StateStore;
+use crate::simulator::runner::SimulationError;
+use crate::simulator::state_store::{StateStore, MAX_CALL_DEPTH};
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
 /// Verilog uses the host `integer` width, which is 32 bits.
@@ -58,8 +60,23 @@ const MAX_SELECT_WIDTH: usize = 1 << 16;
 pub enum EvalError {
     /// An identifier that has no entry in the [`StateStore`].
     UnknownIdentifier(String),
-    /// Function calls are parsed but not evaluated.
+    /// A call to a function the design does not declare, so there is no body
+    /// to run.
     UnsupportedFunctionCall(String),
+    /// A call with the wrong number of arguments for the function it names.
+    FunctionArity {
+        name: String,
+        expected: usize,
+        found: usize,
+    },
+    /// A function body that could not be run to a value. The reason is the
+    /// simulation error the body raised, which is not an [`EvalError`] — a
+    /// function body is a procedural block, and a block can fail in ways an
+    /// expression cannot.
+    FunctionFailed { name: String, reason: String },
+    /// Calls nested deeper than [`MAX_CALL_DEPTH`], which is what a recursive
+    /// function that never reaches its base case looks like.
+    FunctionCallDepth { name: String, depth: usize },
     /// A literal whose text could not be turned into bits.
     MalformedConstant(String),
     /// `{}` with nothing in it.
@@ -87,6 +104,23 @@ impl fmt::Display for EvalError {
             EvalError::UnsupportedFunctionCall(name) => {
                 write!(f, "function call `{}` is not supported", name)
             }
+            EvalError::FunctionArity {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "function `{}` takes {} arguments, but was given {}",
+                name, expected, found
+            ),
+            EvalError::FunctionFailed { name, reason } => {
+                write!(f, "function `{}` could not be evaluated: {}", name, reason)
+            }
+            EvalError::FunctionCallDepth { name, depth } => write!(
+                f,
+                "function `{}` called more than {} deep, which is runaway recursion",
+                name, depth
+            ),
             EvalError::MalformedConstant(text) => {
                 write!(f, "could not interpret constant `{}`", text)
             }
@@ -233,7 +267,10 @@ fn eval_in_context(
             let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
             Ok(Register::from_bits(bits))
         }
-        Expression::FunctionCall(id, _) => Err(EvalError::UnsupportedFunctionCall(id.name.clone())),
+        Expression::FunctionCall(id, arguments) => Ok(demoted(
+            call_function(id, arguments, store)?,
+            signed_context,
+        )),
         // `$signed(...)` is the one call that produces a signed value out of
         // nothing, so it is a leaf for this purpose too.
         Expression::SystemFunctionCall(name, arguments) => Ok(demoted(
@@ -241,6 +278,55 @@ fn eval_in_context(
             signed_context,
         )),
     }
+}
+
+/// Evaluates a call to a function the design declares.
+///
+/// The arguments are evaluated here, in the *caller's* store, because that is
+/// where the expressions that produced them were written; the body then runs
+/// against a frame of its own. Nothing it writes reaches the design, which is
+/// what lets a call happen at all from an evaluator holding a shared reference.
+fn call_function(
+    id: &Identifier,
+    arguments: &[Expression],
+    store: &StateStore,
+) -> Result<Register, EvalError> {
+    let definition = store
+        .function(&id.name)
+        .ok_or_else(|| EvalError::UnsupportedFunctionCall(id.name.clone()))?;
+    if arguments.len() != definition.arity() {
+        return Err(EvalError::FunctionArity {
+            name: id.name.clone(),
+            expected: definition.arity(),
+            found: arguments.len(),
+        });
+    }
+
+    // An argument is self-determined: the function's own declaration says how
+    // wide the variable it lands in is, and nothing around the call has a say.
+    let mut values = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        values.push(eval(argument, store)?);
+    }
+
+    let _depth = store
+        .enter_call()
+        .ok_or_else(|| EvalError::FunctionCallDepth {
+            name: id.name.clone(),
+            depth: MAX_CALL_DEPTH,
+        })?;
+    definition
+        .call(&values, store)
+        .map_err(|error| match error {
+            // A body that failed while *evaluating* something reports what it hit,
+            // rather than a wrapper per frame saying the same thing again: a chain
+            // of nested calls would otherwise name every one of them.
+            SimulationError::Eval(inner) => inner,
+            other => EvalError::FunctionFailed {
+                name: id.name.clone(),
+                reason: other.to_string(),
+            },
+        })
 }
 
 /// `value` as an unsigned one unless the context allows it to stay signed.
@@ -370,8 +456,11 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
         Expression::Concatenation(_)
         | Expression::BitSelect(_, _)
         | Expression::PartSelect(_, _, _) => false,
-        // A design's own functions are not evaluated at all yet.
-        Expression::FunctionCall(_, _) => false,
+        // A function is as signed as it was declared to be, which is a
+        // property of the declaration rather than of what it returns.
+        Expression::FunctionCall(id, _) => store
+            .function(&id.name)
+            .is_some_and(|definition| definition.result.signed),
         Expression::SystemFunctionCall(name, _) => system_function_is_signed(name),
     }
 }

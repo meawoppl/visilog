@@ -2,7 +2,10 @@ use nom::{branch::alt, combinator::map, error::context, IResult};
 
 use super::{
     assignment::{parse_continuous_assignment, ContinuousAssignment},
-    behavior::{parse_always_block, parse_initial_block, AlwaysBlock, InitialBlock},
+    behavior::{
+        parse_always_block, parse_function_declaration, parse_initial_block, AlwaysBlock,
+        FunctionDeclaration, InitialBlock,
+    },
     integer::{parse_integer_declaration, IntegerDeclaration},
     modules::{
         parse_module_instantiation_statement, parse_port_declaration, ModuleInstantiation, Port,
@@ -23,6 +26,9 @@ pub enum ModuleStatement {
     ParameterDeclaration(Vec<ParameterDeclaration>),
     InitialBlock(InitialBlock),
     AlwaysBlock(AlwaysBlock),
+    /// `function [7:0] f; … endfunction` — a function the module's
+    /// expressions may call.
+    FunctionDeclaration(FunctionDeclaration),
     Assignment(ContinuousAssignment),
     ModuleInstantiation(ModuleInstantiation),
 }
@@ -43,6 +49,9 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
                 ModuleStatement::ParameterDeclaration(d)
             }),
             map(parse_initial_block, |d| ModuleStatement::InitialBlock(d)),
+            map(parse_function_declaration, |d| {
+                ModuleStatement::FunctionDeclaration(d)
+            }),
             map(parse_always_block, |d| ModuleStatement::AlwaysBlock(d)),
             map(parse_continuous_assignment, |d| {
                 ModuleStatement::Assignment(d)
