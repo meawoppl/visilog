@@ -48,6 +48,12 @@ impl Chunk {
     pub fn zeros(&self) -> u128 {
         !self.value & !self.unknown
     }
+
+    /// The bits that are `z`.
+    #[inline]
+    pub fn high_impedance(&self) -> u128 {
+        self.value & self.unknown
+    }
 }
 
 /// Storage for a register's bit planes. Anything up to [`CHUNK_BITS`] wide —
@@ -320,6 +326,36 @@ impl Register {
     pub fn has_zero(&self) -> bool {
         (0..self.chunk_count())
             .any(|index| self.chunk(index).zeros() & chunk_mask(self.width, index) != 0)
+    }
+
+    // -- wildcard comparison -----------------------------------------------
+
+    /// `casez` matching: a `z` bit — which is also what a `?` digit writes — on
+    /// *either* side stands for any value. Every other position has to be
+    /// identical, so an `x` matches only another `x`.
+    pub fn matches_ignoring_z(&self, other: &Register) -> bool {
+        self.matches_ignoring(other, Chunk::high_impedance)
+    }
+
+    /// `casex` matching: an `x` or a `z` on either side stands for any value.
+    pub fn matches_ignoring_xz(&self, other: &Register) -> bool {
+        self.matches_ignoring(other, |chunk| chunk.unknown)
+    }
+
+    /// Whether the two registers are identical at every bit position that
+    /// neither side marks a don't-care, zero-extending the narrower one.
+    ///
+    /// `dont_care` picks the don't-care bits out of one side's chunk, so a
+    /// whole word is compared at a time rather than a bit at a time.
+    fn matches_ignoring(&self, other: &Register, dont_care: impl Fn(&Chunk) -> u128) -> bool {
+        let width = self.width.max(other.width);
+        (0..width.div_ceil(CHUNK_BITS)).all(|index| {
+            let mine = self.chunk(index);
+            let theirs = other.chunk(index);
+            let compared = chunk_mask(width, index) & !(dont_care(&mine) | dont_care(&theirs));
+            (mine.value ^ theirs.value) & compared == 0
+                && (mine.unknown ^ theirs.unknown) & compared == 0
+        })
     }
 
     /// How many bits are a known `1`.
@@ -678,6 +714,57 @@ mod tests {
             Register::from_binary("11").extend_msb(4).to_binary(),
             "0011"
         );
+    }
+
+    #[test]
+    fn test_matches_ignoring_z_reads_a_z_on_either_side_as_a_wildcard() {
+        let label = Register::from_binary("0z");
+        assert!(Register::from_binary("00").matches_ignoring_z(&label));
+        assert!(Register::from_binary("01").matches_ignoring_z(&label));
+        assert!(!Register::from_binary("10").matches_ignoring_z(&label));
+
+        // The wildcard reads the same way from the subject side.
+        let subject = Register::from_binary("z1");
+        assert!(subject.matches_ignoring_z(&Register::from_binary("01")));
+        assert!(subject.matches_ignoring_z(&Register::from_binary("11")));
+        assert!(!subject.matches_ignoring_z(&Register::from_binary("10")));
+
+        // An `x` is not a don't-care here, so it matches only another `x`.
+        assert!(!Register::from_binary("x1").matches_ignoring_z(&Register::from_binary("01")));
+        assert!(Register::from_binary("x1").matches_ignoring_z(&Register::from_binary("x1")));
+    }
+
+    #[test]
+    fn test_matches_ignoring_xz_reads_both_unknown_codes_as_wildcards() {
+        let label = Register::from_binary("1x");
+        assert!(Register::from_binary("10").matches_ignoring_xz(&label));
+        assert!(Register::from_binary("11").matches_ignoring_xz(&label));
+        assert!(!Register::from_binary("00").matches_ignoring_xz(&label));
+
+        let subject = Register::from_binary("x1");
+        assert!(subject.matches_ignoring_xz(&Register::from_binary("01")));
+        assert!(subject.matches_ignoring_xz(&Register::from_binary("11")));
+        assert!(!subject.matches_ignoring_xz(&Register::from_binary("10")));
+    }
+
+    #[test]
+    fn test_wildcard_matching_zero_extends_the_narrower_side() {
+        // The label is two bits and the subject four, so the bits above the
+        // label have to be zero: a wildcard only covers its own position.
+        let label = Register::from_binary("0z");
+        assert!(Register::from_binary("0000").matches_ignoring_z(&label));
+        assert!(!Register::from_binary("0100").matches_ignoring_z(&label));
+    }
+
+    #[test]
+    fn test_wildcard_matching_spans_more_than_one_chunk() {
+        let high = "1".to_string() + &"0".repeat(199);
+        let subject = Register::from_binary(&(high.clone() + "11"));
+
+        assert!(subject.matches_ignoring_z(&Register::from_binary(&(high + "zz"))));
+        // A mismatch above the first chunk is still caught.
+        let elsewhere = "0".repeat(200) + "zz";
+        assert!(!subject.matches_ignoring_z(&Register::from_binary(&elsewhere)));
     }
 
     #[test]

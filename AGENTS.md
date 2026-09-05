@@ -317,6 +317,15 @@ tripwire.
   list: `None` for `always begin … end`, `Implicit` for `@(*)`, and `Events(Vec<Event>)`
   for an explicit sensitivity list. The three forms simulate differently, so keep them
   distinct — don't collapse `@(*)` into an empty `Events` list.
+- **`case`, `casez` and `casex` differ only in the comparison.** One `CaseKind`
+  (`behavior.rs`) rides on `CaseStatement` and on every `Instruction::JumpIfMatch`, and
+  `program.rs`'s `case_matches` switches on it: `Exact` keeps `==` semantics, where an
+  `x`/`z` on either side is never a match, while the wildcard forms compare for *identity*
+  with the don't-care bits masked out — `Register::matches_ignoring_z` / `_xz`, which read
+  the don't-care mask straight off the `unknown` bit plane. A wildcard counts on **either
+  side**, so a `z` in the subject is as much a don't-care as one in the label; testing only
+  the label half is the easy mistake. `casez` still tells an `x` apart from a `0`.
+  The `case` tag is a prefix of both keywords, so `parse_case_keyword` tries it last.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
 - **A parser range is already `(i64, i64)`**, constant-folded at parse time, so a
