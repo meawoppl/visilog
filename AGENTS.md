@@ -374,6 +374,16 @@ tripwire.
 - **Attribute bodies are discarded.** They are synthesis metadata with no simulation
   meaning, so `ws_and_comments` skips them exactly as it skips comments. Anything that
   later wants to *read* an attribute has to stop throwing them away first.
+- **A delay may be a `min:typ:max` triple.** `#(2:10:17)` parses and `Delay` keeps all
+  three values; `Delay::ticks()` returns the *typical* one and is the single place the
+  selection happens, so a `+mindelays`/`+maxdelays` mode is a one-function change. Delay
+  values are still literal decimals — `#tPD` and `#(a:b:c)` with identifiers do not parse.
+- **System task names are decomposed, not enumerated.** `split_task_name` peels an optional
+  `f` prefix (takes a descriptor) and an optional `b`/`h`/`o` suffix (the default radix), so
+  `$display`, `$writeh`, `$fdisplayb` and friends all come from one table. `$finish` and
+  `$time` are matched as whole words first, since `finish`'s `f` is not the prefix. A
+  descriptor other than stdout is a **named error**, not a silent no-op — there is no
+  `$fopen`, so no other channel can legitimately be open.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.
