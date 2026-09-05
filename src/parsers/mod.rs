@@ -13,6 +13,7 @@ pub mod nets;
 pub mod numbers;
 pub mod operators;
 pub mod parameter;
+pub mod preprocessor;
 pub mod register;
 pub mod simple;
 pub mod source;
