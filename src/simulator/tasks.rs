@@ -1,4 +1,4 @@
-//! System tasks — `$display`, `$write`, `$finish`, `$time`.
+//! System tasks — the `$display` / `$write` families, `$finish` and `$time`.
 //!
 //! A self-checking Verilog test states its result by printing it, so a system
 //! task is not decoration: `$display("PASSED")` is *how* a test passes. The
@@ -12,6 +12,12 @@
 //! [`TaskCall::compile`], not while the design is running: an unrecognised task
 //! is an error that names it, never a silent no-op that would make a test look
 //! as though it had passed.
+//!
+//! A `$name` in this family is three decisions spelled as one word, and
+//! [`split_task_name`] takes it apart: an `f` prefix says the first argument is
+//! a file descriptor, a `b`/`h`/`o` suffix says which [`Radix`] an argument with
+//! no format specifier prints in, and what is left is the task itself. So
+//! `$fdisplayh` is "to a descriptor, one line, hex by default".
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
@@ -58,13 +64,62 @@ impl Output {
     }
 }
 
+/// The base an argument with no format specifier prints in.
+///
+/// `$display` prints such an argument in decimal; `$displayb`, `$displayh` and
+/// `$displayo` are the same task with a different default. A specifier in a
+/// format string still says what it says — `$displayh("%0d", a)` prints `a` in
+/// decimal — so this is only ever the *default*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Radix {
+    Decimal,
+    Binary,
+    Hexadecimal,
+    Octal,
+}
+
+impl Radix {
+    /// The base a `%` specifier asks for, or `None` if it is not a radix.
+    fn from_specifier(specifier: char) -> Option<Radix> {
+        match specifier {
+            'd' | 'D' => Some(Radix::Decimal),
+            'b' | 'B' => Some(Radix::Binary),
+            'h' | 'H' | 'x' | 'X' => Some(Radix::Hexadecimal),
+            'o' | 'O' => Some(Radix::Octal),
+            _ => None,
+        }
+    }
+
+    /// A value in this base, together with the width it pads to when the caller
+    /// did not ask for one: as wide as the widest value of that many bits.
+    fn render(self, value: &Register) -> (String, usize) {
+        match self {
+            Radix::Decimal => (decimal(value), decimal_width(value.width())),
+            Radix::Binary => (binary(value), value.width()),
+            Radix::Hexadecimal => (hex(value), value.width().div_ceil(4)),
+            Radix::Octal => (octal(value), value.width().div_ceil(3)),
+        }
+    }
+}
+
+/// A `$display` or `$write`, with the two things that vary between the members
+/// of the family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Print {
+    /// Whether the line is ended afterwards: `$display` does, `$write` does not.
+    newline: bool,
+    /// The base an unadorned argument prints in.
+    radix: Radix,
+    /// Whether the first argument is a file descriptor — the `$f…` half of the
+    /// family. See [`TaskContext::check_descriptor`].
+    descriptor: bool,
+}
+
 /// A system task this simulator can carry out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemTask {
-    /// Format the arguments, print them, and end the line.
-    Display,
-    /// [`SystemTask::Display`] without the newline.
-    Write,
+    /// Format the arguments and print them.
+    Print(Print),
     /// End the simulation.
     Finish,
     /// The current simulated time. Meaningful as an argument; as a statement of
@@ -100,19 +155,7 @@ impl TaskCall {
     /// a scheduling slot that does not exist here. Both report the name, so a
     /// design never prints nothing by accident.
     pub fn compile(call: &SystemTaskCall) -> Result<TaskCall, SimulationError> {
-        let task = match call.name.as_str() {
-            "display" => SystemTask::Display,
-            "write" => SystemTask::Write,
-            "finish" => SystemTask::Finish,
-            "time" => SystemTask::Time,
-            "strobe" | "monitor" => {
-                return Err(SimulationError::SystemTask(format!(
-                    "`${}` defers its output to the end of a time step, which is not scheduled",
-                    call.name
-                )))
-            }
-            other => return Err(unknown_task(other)),
-        };
+        let task = resolve_task(&call.name)?;
 
         let arguments = call
             .arguments
@@ -157,6 +200,59 @@ fn unknown_task(name: &str) -> SimulationError {
     SimulationError::SystemTask(format!("unknown system task `${}`", name))
 }
 
+/// Resolves a `$name` to the task it means.
+fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
+    // `$finish` starts with an `f` that is not the file-descriptor prefix, so
+    // the names that are whole words are matched before the family is split.
+    match name {
+        "finish" => return Ok(SystemTask::Finish),
+        "time" => return Ok(SystemTask::Time),
+        _ => {}
+    }
+
+    let (descriptor, base, radix) = split_task_name(name);
+    match base {
+        "display" => Ok(SystemTask::Print(Print {
+            newline: true,
+            radix,
+            descriptor,
+        })),
+        "write" => Ok(SystemTask::Print(Print {
+            newline: false,
+            radix,
+            descriptor,
+        })),
+        "strobe" | "monitor" => Err(SimulationError::SystemTask(format!(
+            "`${}` defers its output to the end of a time step, which is not scheduled",
+            name
+        ))),
+        _ => Err(unknown_task(name)),
+    }
+}
+
+/// Splits a printing task's name into its three parts: whether it takes a file
+/// descriptor, the task itself, and the radix its unadorned arguments print in.
+///
+/// No base name ends in `b`, `h` or `o`, so the suffix is unambiguous.
+fn split_task_name(name: &str) -> (bool, &str, Radix) {
+    let (descriptor, name) = match name.strip_prefix('f') {
+        Some(rest) => (true, rest),
+        None => (false, name),
+    };
+    let radix = match name.chars().last() {
+        Some('b') => Radix::Binary,
+        Some('h') => Radix::Hexadecimal,
+        Some('o') => Radix::Octal,
+        _ => Radix::Decimal,
+    };
+    let name = if radix == Radix::Decimal {
+        name
+    } else {
+        &name[..name.len() - 1]
+    };
+    (descriptor, name, radix)
+}
+
 /// What a system task acts on: where output goes, and whether the design has
 /// called `$finish`.
 ///
@@ -187,13 +283,25 @@ impl TaskContext {
     /// Carries out one call, appending whatever it prints to the output.
     pub fn run(&mut self, call: &TaskCall, store: &StateStore) -> Result<(), SimulationError> {
         match call.task {
-            SystemTask::Display => {
-                let text = self.render(&call.arguments, store)?;
-                self.output.push_line(&text);
-            }
-            SystemTask::Write => {
-                let text = self.render(&call.arguments, store)?;
-                self.output.push(&text);
+            SystemTask::Print(print) => {
+                let arguments = if print.descriptor {
+                    let (descriptor, rest) = call.arguments.split_first().ok_or_else(|| {
+                        SimulationError::SystemTask(
+                            "a `$f…` task needs a file descriptor as its first argument"
+                                .to_string(),
+                        )
+                    })?;
+                    self.check_descriptor(descriptor, store)?;
+                    rest
+                } else {
+                    &call.arguments
+                };
+                let text = self.render(arguments, store, print.radix)?;
+                if print.newline {
+                    self.output.push_line(&text);
+                } else {
+                    self.output.push(&text);
+                }
             }
             // `$finish` takes an optional diagnostic level, which says how much
             // the simulator should report about itself on the way out.
@@ -203,14 +311,57 @@ impl TaskContext {
         Ok(())
     }
 
+    /// Checks that a `$f…` descriptor names the one channel this simulator has.
+    ///
+    /// There is no file I/O here and the output sink is a buffer, so the only
+    /// descriptor that can be honoured is standard output: the multi-channel
+    /// descriptor `1`, or the file descriptor `32'h8000_0001`. Anything else
+    /// names a file nothing opened, and is an error saying so — writing it into
+    /// the buffer would put a design's file output where a test looks for its
+    /// terminal output, and dropping it would make a design that printed
+    /// nothing look exactly like one that passed.
+    fn check_descriptor(
+        &self,
+        argument: &TaskArgument,
+        store: &StateStore,
+    ) -> Result<(), SimulationError> {
+        let value = self.value_of(argument, store)?;
+        let channel = value
+            .to_u128()
+            .filter(|_| !value.has_unknown())
+            .ok_or_else(|| {
+                SimulationError::SystemTask(format!(
+                    "a `$f…` file descriptor must be a known value, and `{}` is not",
+                    value.to_binary()
+                ))
+            })?;
+
+        // Bit 31 marks a file descriptor; without it the value is a bit mask of
+        // multi-channel descriptors, whose bit 0 is standard output.
+        const FILE_DESCRIPTOR: u128 = 1 << 31;
+        let stdout = if channel & FILE_DESCRIPTOR != 0 {
+            channel & !FILE_DESCRIPTOR == 1
+        } else {
+            channel == 1
+        };
+        if stdout {
+            return Ok(());
+        }
+        Err(SimulationError::SystemTask(format!(
+            "a `$f…` task can only write to standard output, and descriptor `{}` names a file nothing opened",
+            channel
+        )))
+    }
+
     /// Formats an argument list the way `$display` does: a string argument is a
     /// format string and consumes as many of the arguments after it as it has
-    /// specifiers; anything left over is printed in the default format, which
-    /// is decimal.
+    /// specifiers; anything left over is printed in `radix`, the default the
+    /// task's name asked for.
     fn render(
         &self,
         arguments: &[TaskArgument],
         store: &StateStore,
+        radix: Radix,
     ) -> Result<String, SimulationError> {
         let mut text = String::new();
         let mut index = 0;
@@ -222,7 +373,8 @@ impl TaskContext {
                 }
                 argument => {
                     let value = self.value_of(argument, store)?;
-                    text.push_str(&pad(decimal(&value), decimal_width(value.width())));
+                    let (rendered, width) = radix.render(&value);
+                    text.push_str(&pad(rendered, width));
                     index += 1;
                 }
             }
@@ -289,19 +441,14 @@ impl TaskContext {
                 continue;
             }
 
+            let radix = Radix::from_specifier(specifier).ok_or_else(|| {
+                bad_format(&format!(
+                    "`%{}` is not a format this simulator understands",
+                    specifier
+                ))
+            })?;
             let value = self.value_of(argument, store)?;
-            let (rendered, default_width) = match specifier {
-                'd' | 'D' => (decimal(&value), decimal_width(value.width())),
-                'b' | 'B' => (binary(&value), value.width()),
-                'h' | 'H' | 'x' | 'X' => (hex(&value), value.width().div_ceil(4)),
-                'o' | 'O' => (octal(&value), value.width().div_ceil(3)),
-                other => {
-                    return Err(bad_format(&format!(
-                        "`%{}` is not a format this simulator understands",
-                        other
-                    )))
-                }
-            };
+            let (rendered, default_width) = radix.render(&value);
             text.push_str(&pad(rendered, width.unwrap_or(default_width)));
         }
         Ok(())
@@ -577,6 +724,115 @@ mod tests {
             drawn.trim().parse::<u32>().is_ok(),
             "expected a number, got {:?}",
             drawn
+        );
+    }
+
+    /// `$displayb` / `$displayh` / `$displayo` are `$display` with a different
+    /// default base for an argument that carries no format specifier.
+    #[test]
+    fn test_radix_variants_of_display() {
+        let store = store_with(&[("a", "10101100")]);
+        assert_eq!(printed(r#"$display(a);"#, &store), "172\n");
+        assert_eq!(printed(r#"$displayb(a);"#, &store), "10101100\n");
+        assert_eq!(printed(r#"$displayh(a);"#, &store), "ac\n");
+        assert_eq!(printed(r#"$displayo(a);"#, &store), "254\n");
+    }
+
+    /// `$write` has the same family, and still does not end the line.
+    #[test]
+    fn test_radix_variants_of_write() {
+        let store = store_with(&[("a", "10101100")]);
+        let mut context = TaskContext::new();
+        run_in(&mut context, r#"$writeb(a);"#, &store);
+        run_in(&mut context, r#"$writeh(a);"#, &store);
+        run_in(&mut context, r#"$writeo(a);"#, &store);
+        assert_eq!(context.output().text(), "10101100ac254");
+    }
+
+    /// A specifier in a format string says what it says; the task's name only
+    /// sets the default for arguments that have none.
+    #[test]
+    fn test_a_format_specifier_overrides_the_task_radix() {
+        let store = store_with(&[("a", "10101100")]);
+        assert_eq!(printed(r#"$displayh("%0d=%h", a, a);"#, &store), "172=ac\n");
+        // The trailing argument has no specifier, so it takes the default.
+        assert_eq!(printed(r#"$displayh("%0d ", a, a);"#, &store), "172 ac\n");
+    }
+
+    /// An unknown value renders in a radix variant exactly as it does under the
+    /// matching specifier: binary shows which bits are unknown, the others
+    /// report the whole value as `x`, or `z` when nothing else is left.
+    #[test]
+    fn test_unknown_values_in_each_radix_variant() {
+        let store = store_with(&[("nibble", "01x1"), ("three", "x01"), ("hiz", "zzzz")]);
+        assert_eq!(printed(r#"$displayb(nibble);"#, &store), "01x1\n");
+        assert_eq!(printed(r#"$displayh(nibble);"#, &store), "x\n");
+        assert_eq!(printed(r#"$displayo(three);"#, &store), "x\n");
+        assert_eq!(printed(r#"$display(nibble);"#, &store), " x\n");
+        assert_eq!(printed(r#"$displayb(hiz);"#, &store), "zzzz\n");
+        assert_eq!(printed(r#"$displayh(hiz);"#, &store), "z\n");
+        assert_eq!(printed(r#"$displayo(three);"#, &store), "x\n");
+    }
+
+    /// `$fdisplay` writes to a descriptor. There is no file I/O here, so the
+    /// one descriptor that can be honoured is standard output — the buffer.
+    #[test]
+    fn test_fdisplay_to_standard_output_prints_into_the_buffer() {
+        let store = store_with(&[("a", "10101100")]);
+        assert_eq!(printed(r#"$fdisplay(1, "PASSED");"#, &store), "PASSED\n");
+        // `32'h8000_0001` is the same channel written as a file descriptor.
+        assert_eq!(
+            printed(r#"$fdisplay(32'h80000001, "PASSED");"#, &store),
+            "PASSED\n"
+        );
+        assert_eq!(printed(r#"$fdisplayh(1, a);"#, &store), "ac\n");
+        let mut context = TaskContext::new();
+        run_in(&mut context, r#"$fwriteb(1, a);"#, &store);
+        assert_eq!(context.output().text(), "10101100");
+    }
+
+    /// Any other descriptor names a file nothing opened. That is an error, not
+    /// a no-op: a design whose output vanished would look like one that passed.
+    #[test]
+    fn test_fdisplay_to_a_file_is_an_error_rather_than_a_no_op() {
+        let message = error(r#"$fdisplay(4, "PASSED");"#);
+        assert!(
+            message.contains("nothing opened"),
+            "unexpected message: {}",
+            message
+        );
+        let message = error(r#"$fdisplay();"#);
+        assert!(
+            message.contains("needs a file descriptor"),
+            "unexpected message: {}",
+            message
+        );
+    }
+
+    /// The `f` of `$finish` is not the file-descriptor prefix, and the deferred
+    /// tasks stay rejected in every spelling.
+    #[test]
+    fn test_the_task_family_is_split_without_swallowing_other_names() {
+        assert_eq!(
+            resolve_task("finish").expect("finish should resolve"),
+            SystemTask::Finish
+        );
+        for name in ["strobeh", "fmonitor", "fstrobeb"] {
+            let message = resolve_task(name)
+                .expect_err("should be rejected")
+                .to_string();
+            assert!(
+                message.contains("defers its output"),
+                "unexpected message for ${}: {}",
+                name,
+                message
+            );
+        }
+        assert_eq!(
+            resolve_task("fnothing")
+                .expect_err("should be rejected")
+                .to_string(),
+            "unknown system task `$fnothing`"
         );
     }
 
