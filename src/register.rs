@@ -79,10 +79,34 @@ enum Planes {
 /// first character of [`Register::to_binary`], and the least significant bit is
 /// the last. Internally they are packed least-significant first into the two
 /// planes of a [`Chunk`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// A register also carries **how its bits are to be read** — [`is_signed`]. The
+/// bits are the value; signedness is only an instruction for the operators that
+/// can tell the difference (`/`, `%`, `>>>`, `< <= > >=`, and widening). It is
+/// deliberately *not* part of equality or hashing: `4'sb1111` and `4'b1111` are
+/// the same four bits, and a store that compared them as different would report
+/// an edge where no bit moved.
+#[derive(Clone, Debug)]
 pub struct Register {
     width: usize,
     planes: Planes,
+    /// Whether the most significant bit is a sign bit.
+    signed: bool,
+}
+
+impl PartialEq for Register {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width && self.planes == other.planes
+    }
+}
+
+impl Eq for Register {}
+
+impl std::hash::Hash for Register {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.width.hash(state);
+        self.planes.hash(state);
+    }
 }
 
 /// The mask of the bits chunk `index` actually carries for a register of
@@ -94,6 +118,19 @@ fn chunk_mask(width: usize, index: usize) -> u128 {
         u128::MAX
     } else {
         (1u128 << used) - 1
+    }
+}
+
+/// Reads the low `width` bits of `value` as a two's complement number.
+pub fn sign_extend_to_i128(value: u128, width: usize) -> i128 {
+    if width == 0 || width >= 128 {
+        return value as i128;
+    }
+    let sign = 1u128 << (width - 1);
+    if value & sign != 0 {
+        (value | !((sign << 1) - 1)) as i128
+    } else {
+        value as i128
     }
 }
 
@@ -166,6 +203,38 @@ impl Register {
         self.width
     }
 
+    // -- signedness --------------------------------------------------------
+
+    /// Whether the most significant bit is a sign bit. Every register is
+    /// unsigned unless something says otherwise, since that is what a bare bit
+    /// vector — a literal, a concatenation, a select — is in Verilog.
+    pub fn is_signed(&self) -> bool {
+        self.signed
+    }
+
+    /// The same bits, read as signed or unsigned. This is exactly what
+    /// `$signed` and `$unsigned` do: a cast that changes no bit.
+    pub fn with_signedness(mut self, signed: bool) -> Self {
+        self.signed = signed;
+        self
+    }
+
+    /// The code of the most significant bit — the sign bit of a signed value.
+    /// A zero width register has no sign bit and reports `0`.
+    fn sign_bit(&self) -> u8 {
+        match self.width.checked_sub(1) {
+            Some(msb) => self.code_at(msb),
+            None => ZERO,
+        }
+    }
+
+    /// The two's complement value, or `None` if any bit is `x`/`z` or the
+    /// register is wider than 128 bits.
+    pub fn to_i128(&self) -> Option<i128> {
+        let value = self.to_u128()?;
+        Some(sign_extend_to_i128(value, self.width))
+    }
+
     // -- bit planes --------------------------------------------------------
 
     /// How many chunks the register's bit planes span.
@@ -205,6 +274,7 @@ impl Register {
                     value: packed.value & mask,
                     unknown: packed.unknown & mask,
                 }),
+                signed: false,
             };
         }
         let count = width.div_ceil(CHUNK_BITS);
@@ -219,6 +289,7 @@ impl Register {
         Register {
             width,
             planes: Planes::Spilled { value, unknown },
+            signed: false,
         }
     }
 
@@ -421,6 +492,26 @@ impl Register {
         self.resize_with(width, fill)
     }
 
+    /// Widens to `width` by replicating the most significant bit, which is what
+    /// a *signed* value does when it is made wider. An `x` or `z` sign bit
+    /// replicates too, so a partly undriven signed net stays undriven in its
+    /// high bits rather than reading as a positive number. Truncation keeps the
+    /// least significant bits.
+    pub fn sign_extended(&self, width: usize) -> Self {
+        self.resize_with(width, self.sign_bit())
+    }
+
+    /// Fitted to `width` the way an assignment fits a value to its target: a
+    /// signed value replicates its sign bit, an unsigned one is zero extended,
+    /// and anything too wide loses its high bits.
+    pub fn coerced(&self, width: usize) -> Self {
+        if self.signed {
+            self.sign_extended(width)
+        } else {
+            self.resize(width)
+        }
+    }
+
     /// Moves every bit `amount` places toward the most significant end, keeping
     /// the width and filling the vacated positions with `0`.
     pub fn shifted_left(&self, amount: usize) -> Self {
@@ -472,6 +563,23 @@ impl Register {
                 unknown: (low.unknown >> bits) | (high.unknown << (CHUNK_BITS - bits)),
             }
         })
+    }
+
+    /// Moves every bit `amount` places toward the least significant end, keeping
+    /// the width and filling the vacated positions with the *sign* bit, which is
+    /// what `>>>` does to a signed value.
+    pub fn shifted_right_signed(&self, amount: usize) -> Self {
+        if amount == 0 {
+            return self.clone();
+        }
+        if amount >= self.width {
+            return Register::filled(self.width, self.sign_bit());
+        }
+        // Widening first puts `amount` copies of the sign bit above the value,
+        // and those are exactly the bits the shift then pulls down into it.
+        self.sign_extended(self.width + amount)
+            .shifted_right(amount)
+            .resize(self.width)
     }
 
     /// Joins registers left to right, `parts[0]` supplying the most significant
@@ -942,5 +1050,77 @@ mod tests {
 
         let reg_oct = Register::from_octal("732");
         assert_eq!(reg_oct.get_raw(), &vec![1, 1, 1, 0, 1, 1, 0, 1, 0]);
+    }
+
+    // -- signedness --------------------------------------------------------
+
+    #[test]
+    fn test_sign_extension_replicates_the_most_significant_bit() {
+        assert_eq!(
+            Register::from_binary("1000").sign_extended(8).to_binary(),
+            "11111000"
+        );
+        assert_eq!(
+            Register::from_binary("0100").sign_extended(8).to_binary(),
+            "00000100"
+        );
+        // An unknown sign bit replicates as itself.
+        assert_eq!(
+            Register::from_binary("x100").sign_extended(6).to_binary(),
+            "xxx100"
+        );
+        assert_eq!(
+            Register::from_binary("z100").sign_extended(6).to_binary(),
+            "zzz100"
+        );
+        // Narrowing keeps the least significant bits, the way it always does.
+        assert_eq!(
+            Register::from_binary("11110001")
+                .sign_extended(4)
+                .to_binary(),
+            "0001"
+        );
+    }
+
+    #[test]
+    fn test_coercion_follows_the_value_s_signedness() {
+        let bits = Register::from_binary("1001");
+        assert_eq!(bits.coerced(8).to_binary(), "00001001");
+        assert_eq!(
+            bits.with_signedness(true).coerced(8).to_binary(),
+            "11111001"
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_right_shift_fills_with_the_sign_bit() {
+        let negative = Register::from_binary("1000");
+        assert_eq!(negative.shifted_right_signed(1).to_binary(), "1100");
+        assert_eq!(negative.shifted_right_signed(3).to_binary(), "1111");
+        // Past the width the whole register is sign bits.
+        assert_eq!(negative.shifted_right_signed(9).to_binary(), "1111");
+        assert_eq!(negative.shifted_right(1).to_binary(), "0100");
+
+        let positive = Register::from_binary("0100");
+        assert_eq!(positive.shifted_right_signed(1).to_binary(), "0010");
+    }
+
+    #[test]
+    fn test_two_s_complement_value() {
+        assert_eq!(Register::from_binary("1000").to_i128(), Some(-8));
+        assert_eq!(Register::from_binary("0111").to_i128(), Some(7));
+        assert_eq!(Register::from_binary("1").to_i128(), Some(-1));
+        assert_eq!(Register::from_binary("1x00").to_i128(), None);
+    }
+
+    /// Signedness says how bits are read, so two registers holding the same
+    /// bits are the same value — a store that called them different would
+    /// report an edge where nothing moved.
+    #[test]
+    fn test_signedness_is_not_part_of_equality() {
+        let bits = Register::from_binary("1111");
+        assert_eq!(bits, bits.clone().with_signedness(true));
+        assert!(!bits.is_signed());
+        assert!(bits.with_signedness(true).is_signed());
     }
 }

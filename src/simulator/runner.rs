@@ -1293,6 +1293,40 @@ mod tests {
         );
     }
 
+    /// Signedness has to survive the whole path — parser, elaboration,
+    /// evaluation and the write back into the store — so this asserts it end to
+    /// end on a self-checking design, the way the corpus does.
+    #[test]
+    fn test_signed_declarations_simulate() {
+        let simulator = simulator_for(
+            r#"
+            module signed_arithmetic();
+                reg signed [3:0] a;
+                reg [3:0] b;
+                reg [7:0] wide;
+                reg signed [7:0] swide;
+                initial begin
+                    a = 4'b1111;
+                    b = 4'b1111;
+                    // A signed value widens by replicating its sign bit; the
+                    // same bits declared unsigned widen with zeros.
+                    wide = a;
+                    swide = b;
+                    if (wide !== 8'hff) $display("FAILED sign extension: %b", wide);
+                    else if (swide !== 8'h0f) $display("FAILED zero extension: %b", swide);
+                    else if (a >= 0) $display("FAILED comparison");
+                    else if (b < 0) $display("FAILED unsigned comparison");
+                    else if ((a >>> 1) !== 4'b1111) $display("FAILED arithmetic shift");
+                    else if ((b >>> 1) !== 4'b0111) $display("FAILED logical shift");
+                    else $display("PASSED");
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().text(), "PASSED\n");
+    }
+
     #[test]
     fn test_display_in_an_initial_block_is_readable_afterwards() {
         // Setup drains time zero, so the `initial` block has already run and

@@ -10,7 +10,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, ws},
+    simple::{range, signedness, ws},
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -33,6 +33,8 @@ pub struct Net {
     range: (i64, i64),
     net_type: NetType,
     delay: u32,
+    /// Whether the declaration carried a `signed` qualifier.
+    signed: bool,
     /// The driver a `wire a = expr;` declaration carries.
     ///
     /// A net initialiser is shorthand for a *continuous assignment*, not a
@@ -49,6 +51,7 @@ impl Net {
             range,
             net_type,
             delay,
+            signed: false,
             init: None,
         }
     }
@@ -57,6 +60,17 @@ impl Net {
     pub fn with_init(mut self, init: Expression) -> Self {
         self.init = Some(init);
         self
+    }
+
+    /// The same net, declared `signed`.
+    pub fn with_signedness(mut self, signed: bool) -> Self {
+        self.signed = signed;
+        self
+    }
+
+    /// Whether the declaration read `wire signed [3:0] a;`.
+    pub fn is_signed(&self) -> bool {
+        self.signed
     }
 
     pub fn identifier(&self) -> &Identifier {
@@ -104,6 +118,7 @@ fn declared_net(input: &str) -> IResult<&str, (Identifier, Option<Expression>)> 
 
 pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
     let (input, net_type) = net_type(input)?;
+    let (input, signed) = ws(signedness)(input)?;
     let (input, range) = ws(opt(range))(input)?;
     let (input, delay) = opt(parse_delay)(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_net))(input)?;
@@ -116,6 +131,7 @@ pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
             net_type: net_type.clone(),
             range: range.unwrap_or((0, 0)),
             delay: delay.unwrap_or(0),
+            signed,
             init,
         })
         .collect();
@@ -180,6 +196,34 @@ mod tests {
                 Net::new("y".into(), (3, 0), NetType::Tri1, 0),
                 Net::new("z".into(), (3, 0), NetType::Tri1, 0),
             ],
+        );
+    }
+
+    /// `signed` sits between the net type and the width, and belongs to the
+    /// declaration rather than to a name, so every net in the list gets it.
+    #[test]
+    fn test_net_declaration_signedness() {
+        assert_parses_to(
+            net_declaration,
+            "wire signed [7:0] a, b;",
+            vec![
+                Net::new("a".into(), (7, 0), NetType::Wire, 0).with_signedness(true),
+                Net::new("b".into(), (7, 0), NetType::Wire, 0).with_signedness(true),
+            ],
+        );
+
+        // `unsigned` is the default said out loud.
+        assert_parses_to(
+            net_declaration,
+            "wire unsigned [7:0] a;",
+            vec![Net::new("a".into(), (7, 0), NetType::Wire, 0)],
+        );
+
+        // A name that merely starts with the keyword is a name.
+        assert_parses_to(
+            net_declaration,
+            "wire signed_value;",
+            vec![Net::new("signed_value".into(), (0, 0), NetType::Wire, 0)],
         );
     }
 

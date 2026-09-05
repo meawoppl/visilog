@@ -162,7 +162,8 @@ pub fn resolve_target(
 /// Writes `value` into whatever `target` names, reporting whether the stored
 /// state actually moved. The value is resized to the width of the target the
 /// way a Verilog assignment is: wider values lose their high bits, narrower
-/// ones are zero extended.
+/// ones are zero extended — or sign extended, when the value being assigned is
+/// a signed one.
 pub fn drive(
     state: &mut StateStore,
     target: &Expression,
@@ -184,7 +185,7 @@ pub fn drive_resolved(
                 .get_signal(name)
                 .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
             let (width, range) = (signal.width(), signal.range());
-            let value = value.resize(width);
+            let value = value.coerced(width);
             if signal.register() == &value {
                 return Ok(false);
             }
@@ -210,7 +211,7 @@ fn drive_bits(
     indices: &[i64],
     value: &Register,
 ) -> Result<bool, SimulationError> {
-    let value = value.resize(indices.len());
+    let value = value.coerced(indices.len());
     let signal = state
         .get_signal_mut(name)
         .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;

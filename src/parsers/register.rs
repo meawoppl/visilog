@@ -6,7 +6,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, ws, ws_and_comments},
+    simple::{range, signedness, ws, ws_and_comments},
 };
 
 #[derive(Debug, PartialEq)]
@@ -14,6 +14,10 @@ pub struct RegisterDeclaration {
     pub name: Identifier,
     pub range: Option<(i64, i64)>,
     pub dimensions: Option<(i64, i64)>,
+    /// Whether the declaration carried a `signed` qualifier. The qualifier
+    /// belongs to the declaration, so every name in `reg signed [3:0] a, b;`
+    /// gets it.
+    pub signed: bool,
     /// The value a `reg a = expr;` declaration starts with.
     ///
     /// A variable initialiser is applied *once*, at time zero. It is not a
@@ -46,6 +50,7 @@ pub fn declared_name(
 /// is no "memory before register" ordering hazard to get wrong.
 pub fn parse_register_declaration(input: &str) -> IResult<&str, Vec<RegisterDeclaration>> {
     let (input, _) = tag("reg")(input)?;
+    let (input, signed) = ws(signedness)(input)?;
     let (input, width) = ws(opt(range))(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_name))(input)?;
     let (input, _) = ws(char(';'))(input)?;
@@ -58,6 +63,7 @@ pub fn parse_register_declaration(input: &str) -> IResult<&str, Vec<RegisterDecl
                 name,
                 range: width,
                 dimensions,
+                signed,
                 init,
             })
             .collect(),
@@ -96,6 +102,7 @@ mod tests {
                 name: "a".into(),
                 range: None,
                 dimensions: None,
+                signed: false,
                 init: None,
             }],
         );
@@ -107,6 +114,7 @@ mod tests {
                 name: "a".into(),
                 range: Some((7, 0)),
                 dimensions: None,
+                signed: false,
                 init: None,
             }],
         );
@@ -118,6 +126,7 @@ mod tests {
                 name: "a".into(),
                 range: None,
                 dimensions: Some((7, 0)),
+                signed: false,
                 init: None,
             }],
         );
@@ -130,6 +139,7 @@ mod tests {
                     name: "b".into(),
                     range: Some((15, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 }]
             ))
@@ -143,6 +153,7 @@ mod tests {
                     name: "c".into(),
                     range: None,
                     dimensions: Some((15, 0)),
+                    signed: false,
                     init: None,
                 }]
             ))
@@ -156,6 +167,7 @@ mod tests {
                     name: "d".into(),
                     range: Some((31, 0)),
                     dimensions: Some((0, 255)),
+                    signed: false,
                     init: None,
                 }]
             ))
@@ -171,6 +183,7 @@ mod tests {
                 name: "memb".into(),
                 range: Some((7, 0)),
                 dimensions: Some((0, 255)),
+                signed: false,
                 init: None,
             }],
         );
@@ -183,6 +196,7 @@ mod tests {
                     name: "mem".into(),
                     range: Some((15, 0)),
                     dimensions: Some((0, 1023)),
+                    signed: false,
                     init: None,
                 }]
             ))
@@ -196,6 +210,7 @@ mod tests {
                     name: "mem32".into(),
                     range: Some((31, 0)),
                     dimensions: Some((0, 2047)),
+                    signed: false,
                     init: None,
                 }]
             ))
@@ -209,6 +224,7 @@ mod tests {
                     name: "mem64".into(),
                     range: Some((63, 0)),
                     dimensions: Some((0, 4095)),
+                    signed: false,
                     init: None,
                 }]
             ))
@@ -226,12 +242,14 @@ mod tests {
                     name: "result".into(),
                     range: Some((4, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some((4, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
             ],
@@ -245,18 +263,21 @@ mod tests {
                     name: "a".into(),
                     range: None,
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: None,
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "c".into(),
                     range: None,
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
             ],
@@ -275,18 +296,21 @@ mod tests {
                     name: "a".into(),
                     range: Some((7, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "mem".into(),
                     range: Some((7, 0)),
                     dimensions: Some((0, 15)),
+                    signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some((7, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
             ],
@@ -304,12 +328,14 @@ mod tests {
                     name: "a".into(),
                     range: Some((3, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some((3, 0)),
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
             ],
@@ -346,6 +372,7 @@ mod tests {
                 name: "b".into(),
                 range: Some((3, 0)),
                 dimensions: None,
+                signed: false,
                 init: Some(expression("4'h5")),
             }],
         );
@@ -363,21 +390,75 @@ mod tests {
                     name: "x".into(),
                     range: None,
                     dimensions: None,
+                    signed: false,
                     init: Some(expression("1")),
                 },
                 RegisterDeclaration {
                     name: "y".into(),
                     range: None,
                     dimensions: None,
+                    signed: false,
                     init: Some(expression("2")),
                 },
                 RegisterDeclaration {
                     name: "z".into(),
                     range: None,
                     dimensions: None,
+                    signed: false,
                     init: None,
                 },
             ],
+        );
+    }
+
+    /// `signed` sits between the keyword and the width, and belongs to the
+    /// declaration, so every name in the list carries it.
+    #[test]
+    fn test_register_declaration_signedness() {
+        assert_parses_to(
+            parse_register_declaration,
+            "reg signed [3:0] a, b;",
+            vec![
+                RegisterDeclaration {
+                    name: "a".into(),
+                    range: Some((3, 0)),
+                    dimensions: None,
+                    signed: true,
+                    init: None,
+                },
+                RegisterDeclaration {
+                    name: "b".into(),
+                    range: Some((3, 0)),
+                    dimensions: None,
+                    signed: true,
+                    init: None,
+                },
+            ],
+        );
+
+        // `unsigned` is the default said out loud, and a name that merely
+        // starts with the keyword is a name.
+        assert_parses_to(
+            parse_register_declaration,
+            "reg unsigned x;",
+            vec![RegisterDeclaration {
+                name: "x".into(),
+                range: None,
+                dimensions: None,
+                signed: false,
+                init: None,
+            }],
+        );
+        assert_parses_to(
+            parse_register_declaration,
+            "reg signed_x;",
+            vec![RegisterDeclaration {
+                name: "signed_x".into(),
+                range: None,
+                dimensions: None,
+                signed: false,
+                init: None,
+            }],
         );
     }
 }
