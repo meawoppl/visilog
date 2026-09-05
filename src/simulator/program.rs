@@ -20,7 +20,9 @@
 //! [`PendingUpdate`] for [`commit_updates`](super::exec::commit_updates).
 
 use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
-use crate::parsers::behavior::{CaseLabel, CaseStatement, IfStatement, ProceduralStatements};
+use crate::parsers::behavior::{
+    CaseKind, CaseLabel, CaseStatement, IfStatement, ProceduralStatements,
+};
 use crate::parsers::expr::Expression;
 use crate::register::Register;
 use crate::simulator::elaborate::rename_expression;
@@ -61,8 +63,13 @@ pub enum Instruction {
     Jump(usize),
     /// Evaluate a `case` subject and hold it for the comparisons that follow.
     CaseSubject(Expression),
-    /// Jump to a `case` arm when `label` matches the held subject.
-    JumpIfMatch { label: Expression, target: usize },
+    /// Jump to a `case` arm when `label` matches the held subject. `kind` is
+    /// the comparison the statement's keyword asks for.
+    JumpIfMatch {
+        label: Expression,
+        target: usize,
+        kind: CaseKind,
+    },
     /// `#n` — suspend, and resume at the next instruction `n` time units later.
     Delay(i64),
     /// `$display(…)` and friends — a call to a system task.
@@ -240,6 +247,7 @@ impl Program {
                         let site = self.emit(Instruction::JumpIfMatch {
                             label: expression.clone(),
                             target: 0,
+                            kind: case.kind,
                         });
                         comparisons.push((site, arm));
                     }
@@ -344,12 +352,16 @@ pub fn resume(
                 subject = Some(eval(expression, store)?);
                 pc += 1;
             }
-            Instruction::JumpIfMatch { label, target } => {
+            Instruction::JumpIfMatch {
+                label,
+                target,
+                kind,
+            } => {
                 let held = subject
                     .as_ref()
                     .ok_or(SimulationError::Unsupported("a case arm without a subject"))?;
                 let label = eval(label, store)?;
-                pc = if case_matches(held, &label) {
+                pc = if case_matches(held, &label, *kind) {
                     *target
                 } else {
                     pc + 1
@@ -376,15 +388,25 @@ pub fn resume(
     }
 }
 
-/// Whether a `case` item matches the subject. A plain `case` compares with `==`
-/// semantics, so an `x` or `z` on either side makes the comparison unknown,
-/// which is not a match. (`casex` / `casez` are not parsed yet.)
-fn case_matches(subject: &Register, label: &Register) -> bool {
-    if subject.has_unknown() || label.has_unknown() {
-        return false;
+/// Whether a `case` item matches the subject.
+///
+/// A plain `case` compares with `==` semantics, so an `x` or `z` on either side
+/// makes the comparison unknown, which is not a match. `casez` and `casex`
+/// instead read those bits as don't-cares — on *either* side, so a subject bit
+/// is as much a wildcard as a label bit — and compare the rest for identity,
+/// which is what lets `casez` still tell an `x` apart from a `0`.
+fn case_matches(subject: &Register, label: &Register, kind: CaseKind) -> bool {
+    match kind {
+        CaseKind::Exact => {
+            if subject.has_unknown() || label.has_unknown() {
+                return false;
+            }
+            let width = subject.width().max(label.width());
+            subject.resize(width) == label.resize(width)
+        }
+        CaseKind::WildcardZ => subject.matches_ignoring_z(label),
+        CaseKind::WildcardXz => subject.matches_ignoring_xz(label),
     }
-    let width = subject.width().max(label.width());
-    subject.resize(width) == label.resize(width)
 }
 
 /// Whether a register used as a condition is true. Verilog calls a condition
@@ -721,6 +743,117 @@ mod tests {
         let mut store = store_with(&[("sel", "11"), ("q", "0000")]);
         assert!(step(&program, 0, &mut store).is_none());
         assert_eq!(value(&store, "q"), "0001");
+    }
+
+    /// Runs `program` from the start with `sel` as the subject and reports
+    /// what the arm that fired wrote to `q`.
+    fn case_arm_for(program: &Program, sel: &str) -> String {
+        let mut store = store_with(&[("sel", sel), ("q", "0000")]);
+        assert!(step(program, 0, &mut store).is_none());
+        value(&store, "q")
+    }
+
+    #[test]
+    fn test_the_case_keyword_decides_the_comparison_every_arm_uses() {
+        for (keyword, expected) in [
+            ("case", CaseKind::Exact),
+            ("casez", CaseKind::WildcardZ),
+            ("casex", CaseKind::WildcardXz),
+        ] {
+            let program = compile(&format!(
+                "begin {keyword} (sel) 2'b01: q = 4'b0001; endcase end"
+            ));
+            let kinds: Vec<CaseKind> = program
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match instruction {
+                    Instruction::JumpIfMatch { kind, .. } => Some(*kind),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(kinds, vec![expected], "{keyword}");
+        }
+    }
+
+    #[test]
+    fn test_casez_matches_every_subject_its_wildcard_label_covers() {
+        let program = compile(
+            r#"begin
+                casez (sel)
+                    2'b0?: q = 4'b0001;
+                    2'b1?: q = 4'b0010;
+                    default: q = 4'b1000;
+                endcase
+            end"#,
+        );
+
+        assert_eq!(case_arm_for(&program, "00"), "0001");
+        assert_eq!(case_arm_for(&program, "01"), "0001");
+        assert_eq!(case_arm_for(&program, "10"), "0010");
+        assert_eq!(case_arm_for(&program, "11"), "0010");
+        // An `x` is not a don't-care under `casez`, so the known bit it sits
+        // beside cannot carry the match on its own.
+        assert_eq!(case_arm_for(&program, "x0"), "1000");
+    }
+
+    #[test]
+    fn test_casez_reads_a_wildcard_in_the_subject_too() {
+        let program = compile(
+            r#"begin
+                casez (sel)
+                    2'b10: q = 4'b0001;
+                    2'b11: q = 4'b0010;
+                    default: q = 4'b1000;
+                endcase
+            end"#,
+        );
+
+        // The subject's low bit is the don't-care here, so both labels match
+        // and the first in source order wins.
+        assert_eq!(case_arm_for(&program, "1z"), "0001");
+        // The bit that is known still has to agree.
+        assert_eq!(case_arm_for(&program, "0z"), "1000");
+    }
+
+    #[test]
+    fn test_casex_matches_an_x_on_either_side() {
+        let program = compile(
+            r#"begin
+                casex (sel)
+                    2'b1x: q = 4'b0001;
+                    default: q = 4'b1000;
+                endcase
+            end"#,
+        );
+
+        assert_eq!(case_arm_for(&program, "10"), "0001");
+        assert_eq!(case_arm_for(&program, "11"), "0001");
+        // An `x` in the subject is a don't-care as well, and `casex` takes a
+        // `z` for one too.
+        assert_eq!(case_arm_for(&program, "1x"), "0001");
+        assert_eq!(case_arm_for(&program, "1z"), "0001");
+        assert_eq!(case_arm_for(&program, "x0"), "0001");
+        // The one known bit of the label still has to agree.
+        assert_eq!(case_arm_for(&program, "0x"), "1000");
+    }
+
+    #[test]
+    fn test_a_plain_case_still_does_not_match_an_unknown_bit() {
+        let program = compile(
+            r#"begin
+                case (sel)
+                    2'b1z: q = 4'b0001;
+                    2'b10: q = 4'b0010;
+                    default: q = 4'b1000;
+                endcase
+            end"#,
+        );
+
+        // An unknown bit on either side makes the comparison unknown, which is
+        // not a match — so both a `z` label and a `z` subject fall through.
+        assert_eq!(case_arm_for(&program, "1z"), "1000");
+        assert_eq!(case_arm_for(&program, "1x"), "1000");
+        assert_eq!(case_arm_for(&program, "10"), "0010");
     }
 
     #[test]

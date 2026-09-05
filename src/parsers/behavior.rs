@@ -95,8 +95,23 @@ pub struct CaseItem {
     pub statements: Vec<ProceduralStatements>,
 }
 
+/// Which of the three `case` forms a statement is, i.e. how a label is
+/// compared against the subject. The syntax is identical; only the comparison
+/// differs.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CaseKind {
+    /// `case` — an exact comparison, in which an `x` or `z` on either side
+    /// never matches.
+    Exact,
+    /// `casez` — a `z` (or `?`) bit on either side matches any value.
+    WildcardZ,
+    /// `casex` — an `x` or `z` bit on either side matches any value.
+    WildcardXz,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct CaseStatement {
+    pub kind: CaseKind,
     pub subject: Expression,
     pub items: Vec<CaseItem>,
 }
@@ -263,13 +278,30 @@ fn parse_case_item(input: &str) -> IResult<&str, CaseItem> {
     Ok((input, CaseItem { label, statements }))
 }
 
+/// The keyword that opens a `case` statement. `case` is a prefix of both
+/// wildcard forms, so it is tried last.
+fn parse_case_keyword(input: &str) -> IResult<&str, CaseKind> {
+    ws(alt((
+        value(CaseKind::WildcardZ, tag("casez")),
+        value(CaseKind::WildcardXz, tag("casex")),
+        value(CaseKind::Exact, tag("case")),
+    )))(input)
+}
+
 pub fn parse_case_statement(input: &str) -> IResult<&str, CaseStatement> {
-    let (input, _) = ws(tag("case"))(input)?;
+    let (input, kind) = parse_case_keyword(input)?;
     let (input, subject) = parenthesized_expression(input)?;
     let (input, items) = many1(parse_case_item)(input)?;
     let (input, _) = ws(tag("endcase"))(input)?;
 
-    Ok((input, CaseStatement { subject, items }))
+    Ok((
+        input,
+        CaseStatement {
+            kind,
+            subject,
+            items,
+        },
+    ))
 }
 
 fn parse_edge(input: &str) -> IResult<&str, EventTriggers> {
@@ -617,6 +649,63 @@ mod tests {
         match &statement.items[0].label {
             CaseLabel::Expressions(labels) => assert_eq!(labels.len(), 2),
             other => panic!("Expected expression labels, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_casez_statement() {
+        let statement = assert_parses(
+            parse_case_statement,
+            r#"casez (a)
+                   2'b0?: b = 1;
+                   2'b1?, 2'b?1: b = 2;
+                   default: b = 0;
+               endcase"#,
+        );
+
+        assert_eq!(statement.kind, CaseKind::WildcardZ);
+        assert_eq!(statement.items.len(), 3);
+        match &statement.items[1].label {
+            CaseLabel::Expressions(labels) => assert_eq!(labels.len(), 2),
+            other => panic!("Expected expression labels, got {:?}", other),
+        }
+        assert_eq!(statement.items[2].label, CaseLabel::Default);
+    }
+
+    #[test]
+    fn test_parse_casex_statement() {
+        let statement = assert_parses(
+            parse_case_statement,
+            r#"casex (a)
+                   2'b1x: b = 1;
+                   default: b = 0;
+               endcase"#,
+        );
+
+        assert_eq!(statement.kind, CaseKind::WildcardXz);
+        assert_eq!(statement.subject, identifier_expression("a"));
+        assert_eq!(statement.items.len(), 2);
+    }
+
+    #[test]
+    fn test_plain_case_keeps_its_exact_kind() {
+        let statement = assert_parses(
+            parse_case_statement,
+            r#"case (a)
+                   1: b = 1;
+               endcase"#,
+        );
+        assert_eq!(statement.kind, CaseKind::Exact);
+    }
+
+    #[test]
+    fn test_wildcard_case_statements_are_procedural_statements() {
+        for source in [
+            "casez (a) 2'b0?: b = 1; endcase",
+            "casex (a) 2'b1x: b = 1; endcase",
+        ] {
+            let statement = assert_parses(procedural_statement, source);
+            assert!(matches!(statement, ProceduralStatements::Case(_)));
         }
     }
 
