@@ -1,0 +1,115 @@
+name: Corpus closure
+
+# Reports how many Icarus Verilog regression tests visilog actually passes, so
+# the number is recorded per PR and a trend can be recovered later.
+#
+# This is a *reporting* job, deliberately kept out of `rust.yml`. It depends on
+# cloning an external repository, and a metric should never be able to block a
+# merge because GitHub was unreachable.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  # ivtest lives in the iverilog tree. Pinned to a tag so the denominator does
+  # not move underneath the trend line — bump deliberately, and expect the
+  # numbers to shift when you do.
+  IVTEST_REF: v13_0
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  closure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-closure"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The corpus is GPL-2.0 and this crate is MIT, so it is cloned rather
+      # than vendored. Sparse and blobless keeps it to tens of megabytes.
+      - name: Cache ivtest corpus
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/visilog/ivtest
+          key: ivtest-${{ env.IVTEST_REF }}
+
+      - name: Clone ivtest corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch "$IVTEST_REF" \
+            https://github.com/steveicarus/iverilog ~/.cache/visilog/ivtest
+          git -C ~/.cache/visilog/ivtest sparse-checkout set ivtest
+
+      - name: Measure closure
+        id: measure
+        run: |
+          cargo test --release --test ivtest_corpus -- --ignored --nocapture \
+            | tee closure.log
+          # The harness prints one stable machine-readable line; everything
+          # else in its output is free to change.
+          metrics=$(grep -m1 '^CORPUS_METRICS ' closure.log) || {
+            echo "::error::harness produced no CORPUS_METRICS line"
+            exit 1
+          }
+          echo "$metrics" | tr ' ' '\n' | grep '=' >> "$GITHUB_OUTPUT"
+          echo "metrics=$metrics" >> "$GITHUB_OUTPUT"
+
+      - name: Write job summary
+        run: |
+          p=${{ steps.measure.outputs.passed }}
+          t=${{ steps.measure.outputs.total }}
+          {
+            echo "## Corpus closure: **$p / $t** passing"
+            echo
+            echo "| stage | count |"
+            echo "| --- | ---: |"
+            echo "| parsed | ${{ steps.measure.outputs.parsed }} |"
+            echo "| elaborated | ${{ steps.measure.outputs.elaborated }} |"
+            echo "| ran without error | ${{ steps.measure.outputs.ran }} |"
+            echo "| **PASSED** | **$p** |"
+            echo "| wrong answer | ${{ steps.measure.outputs.wrong }} |"
+            echo "| silent | ${{ steps.measure.outputs.silent }} |"
+            echo
+            echo '```'
+            echo "${{ steps.measure.outputs.metrics }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A sticky comment, so a PR shows its current number rather than one
+      # comment per push. Uses the preinstalled gh CLI rather than a
+      # third-party action.
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          MARKER: "<!-- corpus-closure -->"
+        run: |
+          body=$(printf '%s\n**Corpus closure: %s / %s passing** (wrong answers: %s)\n\n```\n%s\n```\n' \
+            "$MARKER" \
+            "${{ steps.measure.outputs.passed }}" \
+            "${{ steps.measure.outputs.total }}" \
+            "${{ steps.measure.outputs.wrong }}" \
+            "${{ steps.measure.outputs.metrics }}")
+          existing=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" \
+            --jq "map(select(.body | startswith(\"$MARKER\"))) | .[0].id // empty")
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$existing" \
+              -f body="$body" >/dev/null
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/$PR/comments" \
+              -f body="$body" >/dev/null
+          fi
