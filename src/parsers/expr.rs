@@ -337,7 +337,14 @@ pub fn part_select(input: &str) -> IResult<&str, Expression> {
 // Layer 1: Unary operators
 fn unary_operator_layer(input: &str) -> IResult<&str, Expression> {
     alt((
-        map_res(
+        // `ws` wraps the unary *term*, exactly as `operand` wraps a bare one,
+        // so the whitespace on either side of `-a` belongs to the term and the
+        // operator that follows it gets a chance to match. The junction between
+        // the operator and what it applies to stays `operand_no_ws`, and that
+        // is load-bearing: allow whitespace there and `a && b` reads as
+        // `a & (&b)`, because the first `&` matches the bitwise layer and the
+        // second is then a reduction operator applied to ` b`.
+        ws(map_res(
             tuple((many1(unary_operator), operand_no_ws)),
             |(ops, exp)| {
                 let mut result = exp;
@@ -348,7 +355,7 @@ fn unary_operator_layer(input: &str) -> IResult<&str, Expression> {
                 }
                 Ok::<_, nom::Err<(&str, nom::error::ErrorKind)>>(result)
             },
-        ),
+        )),
         operand,
     ))(input)
 }
@@ -675,6 +682,74 @@ mod tests {
         }
     }
 
+    /// A unary term has to consume the whitespace *after* it, or the operator
+    /// that follows never gets a chance to match: `-1 < 0` used to leave
+    /// `" < 0"` behind while `-1<0` parsed. A module body is parsed with
+    /// `many0`, so the leftover presented as the whole module failing at
+    /// `endmodule` rather than as an expression problem.
+    #[test]
+    fn test_unary_term_consumes_the_whitespace_after_it() {
+        let a = || Expression::Identifier(Identifier::new("a".to_string()));
+        let b = || Expression::Identifier(Identifier::new("b".to_string()));
+        let unary = |op: UnaryOperator, e: Expression| Expression::Unary(op, Box::new(e));
+        let binary = |l: Expression, op: BinaryOperator, r: Expression| {
+            Expression::Binary(Box::new(l), op, Box::new(r))
+        };
+
+        let less_than = binary(
+            unary(
+                UnaryOperator::Negative,
+                Expression::Constant(VerilogConstant::from_int(1)),
+            ),
+            BinaryOperator::LessThan,
+            Expression::Constant(VerilogConstant::from_int(0)),
+        );
+        assert_parses_to(verilog_expression, "-1<0", less_than.clone());
+        assert_parses_to(verilog_expression, "-1 < 0", less_than);
+
+        let and = binary(
+            unary(UnaryOperator::BitwiseNegation, a()),
+            BinaryOperator::BitwiseAnd,
+            b(),
+        );
+        assert_parses_to(verilog_expression, "~a&b", and.clone());
+        assert_parses_to(verilog_expression, "~a & b", and);
+
+        assert_parses_to(
+            verilog_expression,
+            "-a + b",
+            binary(
+                unary(UnaryOperator::Negative, a()),
+                BinaryOperator::Addition,
+                b(),
+            ),
+        );
+    }
+
+    /// Skipping the whitespace *around* a unary term must not let any into the
+    /// junction between the operator and what it applies to. That junction is
+    /// what tells `a && b` from `a & (&b)`: the bitwise layer takes the first
+    /// `&`, and the second one is only a reduction operator if it touches its
+    /// operand.
+    #[test]
+    fn test_a_spaced_reduction_operator_does_not_shadow_the_logical_operators() {
+        let a = || Expression::Identifier(Identifier::new("a".to_string()));
+        let b = || Expression::Identifier(Identifier::new("b".to_string()));
+        for (input, op) in [
+            ("a && b", BinaryOperator::LogicalAnd),
+            ("a || b", BinaryOperator::LogicalOr),
+        ] {
+            assert_parses_to(
+                verilog_expression,
+                input,
+                Expression::Binary(Box::new(a()), op, Box::new(b())),
+            );
+        }
+        // Whitespace between a unary operator and its operand is still not an
+        // expression at all, rather than a reduction of the operand.
+        assert!(!matches!(verilog_expression("a & & b"), Ok(("", _))));
+    }
+
     #[test]
     fn test_add_subtract_constants_identifiers() {
         let expressions = vec![
@@ -810,6 +885,68 @@ mod tests {
                     "Parsed expression with whitespace did not match expected: {}",
                     expr_with_ws
                 );
+            }
+        }
+    }
+
+    /// The same injection, over a unary term followed by a binary operator —
+    /// the shape that regressed in issue #126, and the one the corpus above
+    /// cannot express.
+    ///
+    /// A unary operator and its operand are **one** token here rather than
+    /// two: whitespace inside `-a` is not legal Verilog for the reduction
+    /// operators (`a & &b`), so the boundaries a filler may land on are the
+    /// ones *between* terms.
+    #[test]
+    fn test_unary_then_binary_with_injected_whitespace_and_comments() {
+        let unary = |op: UnaryOperator, name: &str| {
+            Expression::Unary(
+                op,
+                Box::new(Expression::Identifier(Identifier::new(name.to_string()))),
+            )
+        };
+        let b = || Expression::Identifier(Identifier::new("b".to_string()));
+        let expressions = vec![
+            (
+                vec!["-a", "+", "b"],
+                Expression::Binary(
+                    Box::new(unary(UnaryOperator::Negative, "a")),
+                    BinaryOperator::Addition,
+                    Box::new(b()),
+                ),
+            ),
+            (
+                vec!["~a", "&", "b"],
+                Expression::Binary(
+                    Box::new(unary(UnaryOperator::BitwiseNegation, "a")),
+                    BinaryOperator::BitwiseAnd,
+                    Box::new(b()),
+                ),
+            ),
+        ];
+
+        let fillers = [
+            " ",
+            "\t",
+            "\n",
+            "/* c */",
+            "/*\n c\n */",
+            "// c\n",
+            "(* a *)",
+            "(* a = 3 * 4 *)",
+        ];
+
+        for (tokens, expected) in expressions {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            for _ in 0..10 {
+                let mut pieces = tokens.clone();
+                for _ in 0..pieces.len() {
+                    let pos = rng.next_u32() as usize % pieces.len();
+                    let filler = fillers[rng.next_u32() as usize % fillers.len()];
+                    pieces.insert(pos, filler);
+                }
+                let expr_with_ws: String = pieces.concat();
+                assert_parses_to(verilog_expression, &expr_with_ws, expected.clone());
             }
         }
     }
