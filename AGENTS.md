@@ -477,6 +477,30 @@ tripwire.
 - **`#` and its value are separate tokens.** `parse_delay` skips whitespace and
   comments between them, so `# 3;` and `#/* wait */5` parse. This is worth
   roughly +24 corpus files on its own.
+- **A loop is a jump, and `program.rs` already had the shape for it.** `for`, `while`,
+  `repeat` and `forever` are `ProceduralStatements` variants alongside `If` and `Case`, and
+  each compiles to the flat instruction list's own control flow: `while` is
+  `top: JumpIfFalse(c, end); B; Jump(top)`, `for` is that with the initialiser in front and
+  the step before the back-jump, `forever` is `top: B; Jump(top)`. A `#delay` in a body
+  therefore suspends and resumes by program counter like any other. A `for` header
+  assignment is an *assignment* with no `;` of its own — `parse_assignment` insists on one,
+  so `behavior.rs::for_assignment` is a separate production.
+- **`repeat` evaluates its count once, into a hidden store signal.** `Instruction::RepeatInit`
+  writes `$repeat$<index>` and `RepeatNext` counts it down, because a body that suspends
+  returns from `resume` entirely: the program counter and the `StateStore` are the only
+  state a resumption has, so a loop-local counter would be lost. A Verilog identifier
+  cannot start with `$`, and `Program::rename` qualifies the name like any other signal, so
+  two instances of one module count separately. An `x` count runs zero iterations.
+- **A zero-delay loop is bounded inside `resume`, not by the runner.** `MAX_DELTA_CYCLES`
+  and `MAX_RESUMPTIONS_PER_TIME` both count *returns* from `resume`, and `forever a = 1;`
+  never returns, so `program.rs::MAX_INSTRUCTIONS` is the bound that sees it and reports
+  `NoConvergence`. Its test uses an empty body on purpose — one that did work per iteration
+  would spend the whole budget doing it and cost the suite a second.
+- **`forever`, `while` and `repeat` need a word boundary; `for` needs its `(`.** All three
+  are followed by a *statement* rather than punctuation, so without
+  `behavior.rs::keyword`'s trailing `peek(not(identifier_char))`, `forever_more = 1;` reads
+  as `forever` plus an assignment. `for` is also a prefix of `forever`, so the longer
+  keyword is tried first in `procedural_statement`'s `alt`.
 - **`Register::to_decimal` accumulates into a machine integer**, so it overflows on
   anything wider than about 31 bits. `tasks.rs` formats decimals through `to_u128`
   instead; do the same rather than reaching for `to_decimal` on a real signal.

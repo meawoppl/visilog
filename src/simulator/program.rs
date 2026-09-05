@@ -21,7 +21,8 @@
 
 use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
 use crate::parsers::behavior::{
-    CaseKind, CaseLabel, CaseStatement, IfStatement, ProceduralStatements,
+    CaseKind, CaseLabel, CaseStatement, ForStatement, IfStatement, ProceduralStatements,
+    RepeatStatement, WhileStatement,
 };
 use crate::parsers::expr::Expression;
 use crate::register::Register;
@@ -36,6 +37,24 @@ use crate::simulator::tasks::{TaskCall, TaskContext};
 /// or because the caller cannot hold the resume point a suspension hands back.
 pub(crate) const DELAY_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a delay inside a procedural block");
+
+/// Ceiling on the instructions one [`resume`] may execute before it is called
+/// a non-terminating loop.
+///
+/// A loop with no delay in it — `forever a = 1;`, `while (1) …` — never hands
+/// control back on its own, so neither the delta-cycle limit nor the
+/// resumption limit in `runner.rs` can see it: both of those count *returns*
+/// from here. This is the equivalent bound one level down, and it is what
+/// makes a zero-delay `forever` an error rather than a hang.
+const MAX_INSTRUCTIONS: usize = 1_000_000;
+
+/// The prefix of the hidden signal a `repeat` counts down in. A Verilog
+/// identifier cannot start with `$`, so no design can name one of these.
+const REPEAT_COUNTER_PREFIX: &str = "$repeat$";
+
+/// The width of that counter. A `repeat` asking for more iterations than this
+/// holds would exhaust [`MAX_INSTRUCTIONS`] long before it ran out of count.
+const REPEAT_COUNTER_WIDTH: usize = 64;
 
 /// One step of a compiled procedural block.
 ///
@@ -70,6 +89,12 @@ pub enum Instruction {
         target: usize,
         kind: CaseKind,
     },
+    /// `repeat (n)` — evaluate `n` **once** and hold it in the hidden signal
+    /// `counter`, then fall through into the loop.
+    RepeatInit { counter: String, count: Expression },
+    /// Jump to `target` when `counter` has run out; otherwise take one off it
+    /// and fall through into the body.
+    RepeatNext { counter: String, target: usize },
     /// `#n` — suspend, and resume at the next instruction `n` time units later.
     Delay(i64),
     /// `$display(…)` and friends — a call to a system task.
@@ -143,6 +168,14 @@ impl Program {
                 Instruction::JumpIfFalse { condition, .. } => rename_expression(condition, resolve),
                 Instruction::CaseSubject(subject) => rename_expression(subject, resolve),
                 Instruction::JumpIfMatch { label, .. } => rename_expression(label, resolve),
+                // A `repeat` counter is qualified like any other signal, which
+                // is what gives two instances of the same module a counter
+                // each rather than one they trample on together.
+                Instruction::RepeatInit { counter, count } => {
+                    *counter = resolve(counter);
+                    rename_expression(count, resolve);
+                }
+                Instruction::RepeatNext { counter, .. } => *counter = resolve(counter),
                 Instruction::Task(call) => call.rename(resolve),
                 Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
             }
@@ -171,6 +204,10 @@ impl Program {
                 }
                 ProceduralStatements::If(conditional) => self.compile_if(conditional)?,
                 ProceduralStatements::Case(case) => self.compile_case(case)?,
+                ProceduralStatements::For(statement) => self.compile_for(statement)?,
+                ProceduralStatements::While(statement) => self.compile_while(statement)?,
+                ProceduralStatements::Repeat(statement) => self.compile_repeat(statement)?,
+                ProceduralStatements::Forever(statements) => self.compile_forever(statements)?,
                 // Which `$name`s exist is settled here rather than while the
                 // design runs, so an unrecognised one fails before it can look
                 // like a task that quietly printed nothing.
@@ -223,6 +260,82 @@ impl Program {
                 self.patch(branch, end);
             }
         }
+        Ok(())
+    }
+
+    /// `while (c) B` becomes
+    /// `top: JumpIfFalse(c, end); B; Jump(top); end:`.
+    ///
+    /// The condition is re-evaluated at the top of every iteration, and an `x`
+    /// or `z` one ends the loop — `JumpIfFalse` reads a condition the way `if`
+    /// does.
+    fn compile_while(&mut self, statement: &WhileStatement) -> Result<(), SimulationError> {
+        let top = self.next();
+        let branch = self.emit(Instruction::JumpIfFalse {
+            condition: statement.condition.clone(),
+            target: 0,
+        });
+        self.compile_statements(&statement.statements)?;
+        self.emit(Instruction::Jump(top));
+        let end = self.next();
+        self.patch(branch, end);
+        Ok(())
+    }
+
+    /// `for (i; c; s) B` is the `while` shape with the initialiser in front of
+    /// it and the step in front of the back-jump, so `continue`-less Verilog
+    /// runs `s` after every completed iteration and never after the test fails.
+    fn compile_for(&mut self, statement: &ForStatement) -> Result<(), SimulationError> {
+        self.compile_assignment(&statement.initializer)?;
+        let top = self.next();
+        let branch = self.emit(Instruction::JumpIfFalse {
+            condition: statement.condition.clone(),
+            target: 0,
+        });
+        self.compile_statements(&statement.statements)?;
+        self.compile_assignment(&statement.step)?;
+        self.emit(Instruction::Jump(top));
+        let end = self.next();
+        self.patch(branch, end);
+        Ok(())
+    }
+
+    /// `repeat (n) B` becomes
+    /// `RepeatInit(k, n); top: RepeatNext(k, end); B; Jump(top); end:`.
+    ///
+    /// The count is evaluated by the `RepeatInit`, which runs once, so a body
+    /// that moves one of `n`'s operands cannot change how many iterations are
+    /// left. The remaining count lives in the [`StateStore`] rather than in
+    /// this loop's stack frame because a `#delay` in the body returns from
+    /// [`resume`] entirely: the only state that survives a suspension is the
+    /// program counter and the store. The counter's name is derived from the
+    /// index of its own `RepeatInit`, so nested and sibling `repeat`s each get
+    /// their own.
+    fn compile_repeat(&mut self, statement: &RepeatStatement) -> Result<(), SimulationError> {
+        let counter = format!("{}{}", REPEAT_COUNTER_PREFIX, self.next());
+        self.emit(Instruction::RepeatInit {
+            counter: counter.clone(),
+            count: statement.count.clone(),
+        });
+
+        let top = self.next();
+        let branch = self.emit(Instruction::RepeatNext { counter, target: 0 });
+        self.compile_statements(&statement.statements)?;
+        self.emit(Instruction::Jump(top));
+        let end = self.next();
+        self.patch(branch, end);
+        Ok(())
+    }
+
+    /// `forever B` is `top: B; Jump(top)` — nothing ends it, so only a
+    /// `#delay` in `B` lets the rest of the simulation get a turn.
+    fn compile_forever(
+        &mut self,
+        statements: &[ProceduralStatements],
+    ) -> Result<(), SimulationError> {
+        let top = self.next();
+        self.compile_statements(statements)?;
+        self.emit(Instruction::Jump(top));
         Ok(())
     }
 
@@ -297,7 +410,8 @@ impl Program {
         match &mut self.instructions[site] {
             Instruction::Jump(slot)
             | Instruction::JumpIfFalse { target: slot, .. }
-            | Instruction::JumpIfMatch { target: slot, .. } => *slot = target,
+            | Instruction::JumpIfMatch { target: slot, .. }
+            | Instruction::RepeatNext { target: slot, .. } => *slot = target,
             other => unreachable!("cannot patch {:?}", other),
         }
     }
@@ -322,8 +436,16 @@ pub fn resume(
     // can only appear inside a body, so one slot is enough even when `case`
     // statements nest.
     let mut subject: Option<Register> = None;
+    // A loop with no delay in it never returns from here on its own, so the
+    // budget is what turns `forever a = 1;` into an error instead of a hang.
+    let mut steps = 0usize;
 
     loop {
+        steps += 1;
+        if steps > MAX_INSTRUCTIONS {
+            return Err(SimulationError::NoConvergence { passes: steps });
+        }
+
         let Some(instruction) = program.instructions.get(pc) else {
             return Ok(Resume::Halted { pending });
         };
@@ -366,6 +488,33 @@ pub fn resume(
                 } else {
                     pc + 1
                 };
+            }
+            // The count is read once, here, and never again: everything
+            // after this reads the counter, not the expression.
+            Instruction::RepeatInit { counter, count } => {
+                let count = eval(count, store)?;
+                // A count that is `x` or `z` runs the body zero times.
+                let count = count.to_u128().unwrap_or(0);
+                store.set(
+                    counter.clone(),
+                    Register::from_u128(count, REPEAT_COUNTER_WIDTH),
+                );
+                pc += 1;
+            }
+            Instruction::RepeatNext { counter, target } => {
+                let remaining = store
+                    .get(counter)
+                    .and_then(|register| register.to_u128())
+                    .unwrap_or(0);
+                if remaining == 0 {
+                    pc = *target;
+                } else {
+                    store.set(
+                        counter.clone(),
+                        Register::from_u128(remaining - 1, REPEAT_COUNTER_WIDTH),
+                    );
+                    pc += 1;
+                }
             }
             Instruction::Task(call) => {
                 tasks.run(call, store)?;
@@ -421,7 +570,9 @@ mod tests {
     use super::*;
 
     use crate::parsers::behavior::parse_block;
+    use crate::parsers::modules::parse_module_declaration;
     use crate::simulator::exec::commit_updates;
+    use crate::simulator::runner::Simulator;
 
     /// A store holding each named signal at the width of its binary literal,
     /// declared over `(width - 1, 0)`.
@@ -873,5 +1024,204 @@ mod tests {
             })
         );
         assert_eq!(value(&store, "a"), "0");
+    }
+
+    #[test]
+    fn test_a_for_loop_accumulates_a_known_total() {
+        // 0 + 1 + … + 9 = 45.
+        let program =
+            compile("begin total = 0; for (i = 0; i < 10; i = i + 1) total = total + i; end");
+        let mut store = store_with(&[("total", "00000000"), ("i", "00000000")]);
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(store.get("total").unwrap().to_u128(), Some(45));
+        // The loop leaves the counter at the value that failed the test.
+        assert_eq!(store.get("i").unwrap().to_u128(), Some(10));
+    }
+
+    #[test]
+    fn test_a_while_loop_terminates() {
+        let program = compile("begin while (i < 5) begin total = total + i; i = i + 1; end end");
+        let mut store = store_with(&[("total", "00000000"), ("i", "00000000")]);
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(store.get("total").unwrap().to_u128(), Some(10));
+        assert_eq!(store.get("i").unwrap().to_u128(), Some(5));
+    }
+
+    #[test]
+    fn test_a_while_loop_whose_condition_is_false_never_runs_its_body() {
+        let program = compile("begin while (go) ran = 1'b1; end");
+        let mut store = store_with(&[("go", "0"), ("ran", "0")]);
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(value(&store, "ran"), "0");
+    }
+
+    /// An `x` condition is false, the rule `if` already uses — not an
+    /// "unknown branch" that runs the body anyway.
+    #[test]
+    fn test_an_unknown_loop_condition_is_false() {
+        let program = compile("begin while (go) ran = 1'b1; end");
+        let mut store = store_with(&[("ran", "0")]);
+        store.set("go", Register::unknown(1));
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(value(&store, "ran"), "0");
+    }
+
+    #[test]
+    fn test_repeat_runs_its_body_exactly_four_times() {
+        let program = compile("begin repeat (4) count = count + 1; end");
+        let mut store = store_with(&[("count", "00000000")]);
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(store.get("count").unwrap().to_u128(), Some(4));
+    }
+
+    /// The count is read once, on entry. Under a naive compilation that
+    /// re-evaluated it every iteration, a body walking `n` down would stop
+    /// where the two met — after three iterations rather than six.
+    #[test]
+    fn test_repeat_evaluates_its_count_once() {
+        let program = compile("begin repeat (n) begin n = n - 1; count = count + 1; end end");
+        let mut store = store_with(&[("n", "0110"), ("count", "00000000")]);
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(store.get("count").unwrap().to_u128(), Some(6));
+        assert_eq!(store.get("n").unwrap().to_u128(), Some(0));
+    }
+
+    /// A `repeat` count that is `x` or `z` runs the body no times at all.
+    #[test]
+    fn test_an_unknown_repeat_count_runs_no_iterations() {
+        let program = compile("begin repeat (n) count = count + 1; end");
+        let mut store = store_with(&[("count", "00000000")]);
+        store.set("n", Register::unknown(4));
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(store.get("count").unwrap().to_u128(), Some(0));
+    }
+
+    #[test]
+    fn test_nested_repeats_each_keep_their_own_counter() {
+        let program = compile("begin repeat (3) repeat (5) count = count + 1; end");
+        let mut store = store_with(&[("count", "00000000")]);
+
+        assert!(step(&program, 0, &mut store).is_none());
+        assert_eq!(store.get("count").unwrap().to_u128(), Some(15));
+    }
+
+    /// A `repeat` counter is a signal like any other as far as flattening is
+    /// concerned, so two instances of one module count separately rather than
+    /// sharing an entry.
+    #[test]
+    fn test_a_repeat_counter_is_qualified_by_flattening() {
+        let mut program = compile("begin repeat (2) a = 1'b1; end");
+        program.rename(&|name| format!("dut.{}", name));
+
+        let counters: Vec<&str> = program
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction {
+                Instruction::RepeatInit { counter, .. }
+                | Instruction::RepeatNext { counter, .. } => Some(counter.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counters, vec!["dut.$repeat$0", "dut.$repeat$0"]);
+    }
+
+    /// A loop body is compiled inline, so a `#delay` in one suspends and
+    /// resumes by program counter exactly as a top-level delay does — and the
+    /// iteration it stopped in is not run a second time.
+    #[test]
+    fn test_a_delay_inside_a_loop_body_suspends_and_resumes() {
+        let program = compile(
+            r#"begin
+                i = 0;
+                while (i < 3) begin
+                    #5;
+                    i = i + 1;
+                end
+                done = 1'b1;
+            end"#,
+        );
+        let mut store = store_with(&[("i", "0000"), ("done", "0")]);
+
+        let mut pc = 0;
+        for expected in 0..3 {
+            let (next, delay) = step(&program, pc, &mut store).expect("should suspend");
+            assert_eq!(delay, 5);
+            assert_eq!(store.get("i").unwrap().to_u128(), Some(expected));
+            pc = next;
+        }
+
+        assert!(step(&program, pc, &mut store).is_none());
+        assert_eq!(store.get("i").unwrap().to_u128(), Some(3));
+        assert_eq!(value(&store, "done"), "1");
+    }
+
+    /// A `repeat` whose body suspends keeps its count across the suspension:
+    /// the counter lives in the store, which with the program counter is all
+    /// the state a resumption has.
+    #[test]
+    fn test_a_repeat_counter_survives_a_suspension() {
+        let program = compile("begin repeat (3) begin #5; count = count + 1; end end");
+        let mut store = store_with(&[("count", "0000")]);
+
+        let mut pc = 0;
+        for _ in 0..3 {
+            let (next, delay) = step(&program, pc, &mut store).expect("should suspend");
+            assert_eq!(delay, 5);
+            pc = next;
+        }
+
+        assert!(step(&program, pc, &mut store).is_none());
+        assert_eq!(store.get("count").unwrap().to_u128(), Some(3));
+    }
+
+    /// A loop with no delay in it never returns from `resume`, so neither of
+    /// the runner's limits can see it. The instruction budget is what turns it
+    /// into an error rather than a hang.
+    #[test]
+    fn test_a_zero_delay_loop_is_an_error_rather_than_a_hang() {
+        // An empty body, so the loop is a bare back-jump: all four forms share
+        // this path, and one that did work per iteration would spend the whole
+        // budget doing it before the test could finish.
+        let program = compile("begin forever begin end end");
+        let mut store = store_with(&[("a", "1")]);
+
+        assert!(matches!(
+            resume(&program, 0, &mut store, &mut TaskContext::new()),
+            Err(SimulationError::NoConvergence { .. })
+        ));
+    }
+
+    /// A `forever` with a delay in it is bounded by time rather than by the
+    /// budget: every iteration gives control back, and `advance` decides how
+    /// many of them run.
+    #[test]
+    fn test_a_forever_with_a_delay_runs_once_per_delay() {
+        let source = r#"
+            module ticker;
+                reg [7:0] ticks;
+                initial ticks = 0;
+                initial forever begin
+                    #5 ticks = ticks + 1;
+                end
+            endmodule"#;
+        let (remaining, module) = parse_module_declaration(source).expect("module should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = Simulator::new(module);
+        simulator.setup().unwrap();
+
+        // Ten iterations land at t = 5, 10, … 50; the eleventh is due at 55.
+        simulator.advance(52).unwrap();
+        assert_eq!(simulator.get("ticks").unwrap().to_u128(), Some(10));
+
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("ticks").unwrap().to_u128(), Some(12));
     }
 }
