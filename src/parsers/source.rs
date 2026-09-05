@@ -10,6 +10,7 @@ use nom::{
 
 use super::{
     modules::{parse_module_declaration, VerilogModule},
+    preprocessor::{PreprocessError, Preprocessed, Preprocessor, SourceMap, Timescale},
     simple::ws_and_comments,
 };
 
@@ -17,11 +18,90 @@ use super::{
 /// surrounded) by any mix of whitespace and comments. The entire input has to be
 /// consumed, so a trailing fragment that is not a module is a parse error rather
 /// than a silently ignored remainder.
+///
+/// This is the grammar alone. A backtick directive is not part of the grammar,
+/// so a file that uses one has to go through [`parse_source`] first.
 pub fn parse_verilog_source(input: &str) -> IResult<&str, Vec<VerilogModule>> {
     all_consuming(terminated(
         many0(preceded(ws_and_comments, parse_module_declaration)),
         ws_and_comments,
     ))(input)
+}
+
+/// What a source file yielded: its modules, and whatever the preprocessor
+/// learned on the way past.
+#[derive(Debug)]
+pub struct ParsedSource {
+    pub modules: Vec<VerilogModule>,
+    /// The design's `` `timescale ``, if it declared one.
+    pub timescale: Option<Timescale>,
+}
+
+/// A failure anywhere in the front end.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SourceError {
+    Preprocess(PreprocessError),
+    /// The grammar rejected the *expanded* text. `at` is the position in the
+    /// original file, recovered through the source map, so a macro-using file
+    /// still points somewhere a reader can find.
+    Parse {
+        at: String,
+        detail: String,
+    },
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceError::Preprocess(error) => write!(f, "{}", error),
+            SourceError::Parse { at, detail } => write!(f, "{}: {}", at, detail),
+        }
+    }
+}
+
+impl std::error::Error for SourceError {}
+
+/// The default front-end entry point: preprocess, then parse.
+///
+/// Preprocessing is implicit rather than opt-in because a caller holding a
+/// `.v` file has no way to know whether it uses a directive, and the answer
+/// for a file that does not is byte-for-byte the same source.
+pub fn parse_source(source: &str) -> Result<ParsedSource, SourceError> {
+    let expanded = Preprocessor::new()
+        .preprocess(source, "<source>")
+        .map_err(SourceError::Preprocess)?;
+    parse_expanded(expanded)
+}
+
+/// Parse text that has already been through a [`Preprocessor`], mapping a
+/// parse failure back to where it came from.
+pub fn parse_expanded(expanded: Preprocessed) -> Result<ParsedSource, SourceError> {
+    let modules = match parse_verilog_source(&expanded.text) {
+        Ok((_, modules)) => modules,
+        Err(error) => return Err(locate(&expanded.text, &expanded.map, error)),
+    };
+    Ok(ParsedSource {
+        modules,
+        timescale: expanded.timescale,
+    })
+}
+
+/// Turn a nom failure over expanded text into a diagnostic against the original
+/// source, using the byte offset of the input nom stopped at.
+fn locate(text: &str, map: &SourceMap, error: nom::Err<nom::error::Error<&str>>) -> SourceError {
+    let (rest, detail) = match &error {
+        nom::Err::Error(inner) | nom::Err::Failure(inner) => {
+            (Some(inner.input), format!("{:?}", inner.code))
+        }
+        nom::Err::Incomplete(_) => (None, "unexpected end of input".to_string()),
+    };
+    let offset = rest
+        .map(|rest| rest.as_ptr() as usize - text.as_ptr() as usize)
+        .unwrap_or(text.len());
+    SourceError::Parse {
+        at: map.describe(offset),
+        detail: format!("unexpected input ({})", detail),
+    }
 }
 
 /// The modules of a design, indexed by name, so an instantiation's `module_name`
@@ -30,6 +110,7 @@ pub fn parse_verilog_source(input: &str) -> IResult<&str, Vec<VerilogModule>> {
 pub struct ModuleLibrary {
     modules: Vec<VerilogModule>,
     by_name: HashMap<String, usize>,
+    timescale: Option<Timescale>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +119,8 @@ pub enum LibraryError {
     DuplicateModule(String),
     /// The source did not parse.
     Parse(String),
+    /// A backtick directive did not hold up, so there was nothing to parse.
+    Preprocess(PreprocessError),
 }
 
 impl fmt::Display for LibraryError {
@@ -47,6 +130,9 @@ impl fmt::Display for LibraryError {
                 write!(f, "duplicate module definition: {}", name)
             }
             LibraryError::Parse(message) => write!(f, "failed to parse source: {}", message),
+            LibraryError::Preprocess(error) => {
+                write!(f, "failed to preprocess source: {}", error)
+            }
         }
     }
 }
@@ -63,14 +149,27 @@ impl ModuleLibrary {
                 return Err(LibraryError::DuplicateModule(name));
             }
         }
-        Ok(ModuleLibrary { modules, by_name })
+        Ok(ModuleLibrary {
+            modules,
+            by_name,
+            timescale: None,
+        })
     }
 
-    /// Parse a source file and index every module it declares.
+    /// Preprocess a source file, parse it, and index every module it declares.
     pub fn from_source(source: &str) -> Result<Self, LibraryError> {
-        let (_, modules) =
-            parse_verilog_source(source).map_err(|err| LibraryError::Parse(err.to_string()))?;
-        ModuleLibrary::from_modules(modules)
+        let parsed = parse_source(source).map_err(|error| match error {
+            SourceError::Preprocess(error) => LibraryError::Preprocess(error),
+            SourceError::Parse { at, detail } => LibraryError::Parse(format!("{}: {}", at, detail)),
+        })?;
+        let mut library = ModuleLibrary::from_modules(parsed.modules)?;
+        library.timescale = parsed.timescale;
+        Ok(library)
+    }
+
+    /// The `` `timescale `` the source declared, if any.
+    pub fn timescale(&self) -> Option<Timescale> {
+        self.timescale
     }
 
     pub fn get(&self, name: &str) -> Option<&VerilogModule> {
@@ -279,6 +378,94 @@ mod tests {
     fn test_library_reports_parse_failures() {
         let error = ModuleLibrary::from_source("not verilog at all").unwrap_err();
         assert!(matches!(error, LibraryError::Parse(_)));
+    }
+
+    #[test]
+    fn test_parse_source_expands_directives_before_parsing() {
+        let source = r#"
+            `timescale 1ns / 1ps
+            `define WIDTH 4
+            `ifdef WIDTH
+            module sized(input [`WIDTH:0] a, output [`WIDTH:0] b);
+                assign b = a;
+            endmodule
+            `endif
+        "#;
+
+        let parsed = parse_source(source).unwrap();
+        assert_eq!(parsed.modules.len(), 1);
+        assert_eq!(parsed.modules[0].identifier, "sized".into());
+        assert_eq!(parsed.timescale.unwrap().to_string(), "1ns/1ps");
+    }
+
+    #[test]
+    fn test_a_directive_is_not_part_of_the_grammar() {
+        let source = "`define A 1\nmodule m; endmodule\n";
+        assert!(
+            parse_verilog_source(source).is_err(),
+            "the grammar itself must not know about directives"
+        );
+        assert!(parse_source(source).is_ok());
+    }
+
+    #[test]
+    fn test_the_library_preprocesses_by_default() {
+        let source = r#"
+            `define BODY assign y = ~x;
+            module inverted(input x, output y);
+                `BODY
+            endmodule
+        "#;
+
+        let library = ModuleLibrary::from_source(source).unwrap();
+        assert_eq!(library.names(), vec!["inverted"]);
+    }
+
+    #[test]
+    fn test_the_library_records_the_timescale() {
+        let library = ModuleLibrary::from_source("`timescale 10ns / 1ns\n").unwrap();
+        assert_eq!(library.timescale().unwrap().to_string(), "10ns/1ns");
+        assert_eq!(
+            ModuleLibrary::from_source("module m; endmodule")
+                .unwrap()
+                .timescale(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_the_library_reports_a_preprocessor_failure_separately() {
+        let source = "`define LOOP `LOOP\nmodule m;\nx = `LOOP;\nendmodule\n";
+        let error = ModuleLibrary::from_source(source).unwrap_err();
+        assert!(
+            // The location carries the expansion context too, which is the
+            // source map doing its job.
+            matches!(&error, LibraryError::Preprocess(inner) if inner.at.starts_with("<source>:3")),
+            "expected a located preprocessor error, got {:?}",
+            error
+        );
+        assert!(error.to_string().contains("expands to itself"));
+    }
+
+    #[test]
+    fn test_a_parse_failure_points_into_the_macro_it_came_from() {
+        let source = "`define JUNK not_a_module\nmodule m;\nendmodule\n`JUNK\n";
+        let SourceError::Parse { at, .. } = parse_source(source).unwrap_err() else {
+            panic!("expected a parse failure");
+        };
+        assert_eq!(
+            at, "<source>:4 (expanding `JUNK)",
+            "the source map must name the invocation, not an offset into expanded text"
+        );
+    }
+
+    #[test]
+    fn test_a_parse_failure_outside_a_macro_still_names_a_line() {
+        let source = "`define A 1\nmodule m;\nendmodule\nnot_a_module\n";
+        let SourceError::Parse { at, .. } = parse_source(source).unwrap_err() else {
+            panic!("expected a parse failure");
+        };
+        assert_eq!(at, "<source>:4");
     }
 
     #[test]

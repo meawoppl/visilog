@@ -21,10 +21,11 @@
 //! CI depend on the network.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use visilog::parsers::modules::VerilogModule;
-use visilog::parsers::source::parse_verilog_source;
+use visilog::parsers::preprocessor::Preprocessor;
+use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
 use visilog::parsers::statements::ModuleStatement;
 use visilog::simulator::runner::Simulator;
 
@@ -107,19 +108,6 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
         "unsupported system function ($random, $signed, $monitor, ...)",
     );
     note(
-        source.lines().any(|line| {
-            let line = line.trim_start();
-            line.starts_with("`define")
-                || line.starts_with("`include")
-                || line.starts_with("`ifdef")
-                || line.starts_with("`ifndef")
-                || line.starts_with("`timescale")
-                || line.starts_with("`undef")
-                || line.starts_with("`celldefine")
-        }),
-        "preprocessor directive (`define, `include, `timescale)",
-    );
-    note(
         body.contains("function") || body.contains("task"),
         "function / task",
     );
@@ -159,6 +147,22 @@ fn load() -> Option<(PathBuf, Vec<Entry>)> {
     Some((root, entries(&list)))
 }
 
+/// A preprocessor that can resolve the corpus's own `` `include `` paths, which
+/// are written relative to `ivtest/` and to `ivtest/ivltests/` alike.
+fn corpus_preprocessor(root: &Path) -> Preprocessor {
+    Preprocessor::new()
+        .with_include_dir(root.join("ivtest"))
+        .with_include_dir(root.join("ivtest").join("ivltests"))
+}
+
+/// The whole front end: expand the directives, then parse what comes out.
+fn front_end(preprocessor: &Preprocessor, source: &str) -> Result<ParsedSource, SourceError> {
+    let expanded = preprocessor
+        .preprocess(source, "<corpus>")
+        .map_err(SourceError::Preprocess)?;
+    parse_expanded(expanded)
+}
+
 /// How many of the standard-Verilog corpus files the front end accepts.
 ///
 /// Reports rather than asserting a rate: the number is a measurement to track,
@@ -171,6 +175,7 @@ fn ivtest_corpus_parse_rate() {
         return;
     };
     let dir = root.join("ivtest").join("ivltests");
+    let preprocessor = corpus_preprocessor(&root);
 
     let normal: Vec<&Entry> = entries
         .iter()
@@ -188,7 +193,7 @@ fn ivtest_corpus_parse_rate() {
             missing += 1;
             continue;
         };
-        match parse_verilog_source(&source) {
+        match front_end(&preprocessor, &source) {
             Ok(_) => parsed += 1,
             Err(_) => {
                 rejected += 1;
@@ -261,6 +266,7 @@ fn ivtest_corpus_compile_error_cases() {
         return;
     };
     let dir = root.join("ivtest").join("ivltests");
+    let preprocessor = corpus_preprocessor(&root);
 
     let (mut rejected, mut accepted) = (0usize, 0usize);
     let mut accepted_names: Vec<String> = Vec::new();
@@ -269,7 +275,7 @@ fn ivtest_corpus_compile_error_cases() {
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
-        match parse_verilog_source(&source) {
+        match front_end(&preprocessor, &source) {
             Ok(_) => {
                 accepted += 1;
                 accepted_names.push(entry.name.clone());
@@ -374,9 +380,16 @@ enum Outcome {
 }
 
 fn judge(source: &str) -> Outcome {
-    let Ok((_, modules)) = parse_verilog_source(source) else {
+    judge_with(&Preprocessor::new(), source)
+}
+
+/// [`judge`], with an include path — which only the corpus itself needs, since
+/// its files include one another by relative path.
+fn judge_with(preprocessor: &Preprocessor, source: &str) -> Outcome {
+    let Ok(parsed) = front_end(preprocessor, source) else {
         return Outcome::ParseFailed;
     };
+    let modules = parsed.modules;
     let Some(top) = top_module(&modules) else {
         return Outcome::ParseFailed;
     };
@@ -424,13 +437,14 @@ fn ivtest_corpus_closure_rate() {
         return;
     };
     let dir = root.join("ivtest").join("ivltests");
+    let preprocessor = corpus_preprocessor(&root);
 
     let mut outcomes: Vec<(String, Outcome)> = Vec::new();
     for entry in entries.iter().filter(|e| e.kind.starts_with("normal")) {
         let Ok(source) = std::fs::read_to_string(dir.join(format!("{}.v", entry.name))) else {
             continue;
         };
-        outcomes.push((entry.name.clone(), judge(&source)));
+        outcomes.push((entry.name.clone(), judge_with(&preprocessor, &source)));
     }
 
     let total = outcomes.len();

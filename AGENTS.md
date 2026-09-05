@@ -51,6 +51,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 
 | File | Owns |
 | --- | --- |
+| `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
 | `simple.rs` | whitespace, comments, `raw_pos_int`, `range`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
 | `numbers.rs` | raw binary / decimal / hex digit runs |
@@ -71,6 +72,52 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
 | `base.rs` | the `RawToken` trait |
+
+### The preprocessor
+
+`preprocessor.rs` is **not a nom layer** — the backtick directives are not part of the
+module grammar, they are text substitution over the file. `Preprocessor::preprocess`
+consumes source text and produces source text; `parse_verilog_source` never sees a
+backtick.
+
+`source.rs::parse_source` is the front end's default entry point and does both halves:
+preprocess, then parse. `ModuleLibrary::from_source` goes through it, so preprocessing is
+**implicit, not opt-in** — a caller holding a `.v` file has no way to know whether it uses
+a directive, and for a file that does not the output is byte-for-byte the input.
+`parse_verilog_source` is still exported as the grammar alone, which is what every inline
+parser test uses.
+
+**Expansion produces a `SourceMap` alongside the text.** Once a macro body is spliced in,
+an offset in the output does not correspond to an offset in the input, so every emission
+records its origin as it is written. `map.locate(offset)` gives back a file, a line, and —
+when the text came out of a macro — the macro's name, with the line naming the
+*invocation* rather than a position in the body. `parse_source` uses it to turn nom's
+"here is the input I stopped at" into `<file>:<line> (expanding \`MACRO)`. It was built in
+from the start deliberately: it cannot be reconstructed afterwards.
+
+Supported: `` `define `` (object-like, function-like, argument defaults, `\` line
+continuations), `` `undef ``/`` `undefineall ``, `` `ifdef ``/`` `ifndef ``/`` `elsif ``/
+`` `else ``/`` `endif `` including nesting, `` `timescale `` (recorded on `Preprocessed`
+and on `ModuleLibrary::timescale`, not discarded — #81 needs a real one), `` `include ``
+with a search path set by `Preprocessor::with_include_dir`, the `` `" ``/`` `\`" ``/`` `` ``
+escapes, and the `` `__FILE__ ``/`` `__LINE__ `` builtins. `IGNORED_DIRECTIVES` skips
+`` `begin_keywords ``, `` `celldefine ``, `` `default_nettype `` and the rest of the
+pragma-like set together with the rest of their line.
+
+Gotchas that are load-bearing:
+
+- **A backslash-newline in a macro body becomes a real newline**, not nothing. The
+  smallest corpus file has a `//` comment whose continuation backslash is *inside* the
+  comment; joining the lines without a newline would let the comment swallow the body.
+- **An undefined macro is an error naming it**, never an empty expansion. One corpus file
+  (`undef.v`) reads 1364-2001 the other way and relies on the empty expansion; it is the
+  only file that fails preprocessing for that reason, and the trade is deliberate.
+- **Recursion is caught by name**, not by a depth counter: `expanding` holds the macros
+  currently being expanded, so `` `A `` → `` `B `` → `` `A `` is `RecursiveMacro`.
+- **A parameter list has to touch the macro name.** `` `define A (x) `` defines `A` as the
+  text `(x)`; `` `define A(x) `` defines a macro of one argument.
+- **An escaped identifier is skipped whole.** `\`~!-` is a legal Verilog identifier and the
+  backtick in it is not a directive.
 
 ### Expression parsing
 
@@ -222,6 +269,12 @@ a self-checking design must reach `PASSED`, and a deliberately wrong one must be
 a wrong answer. They exist so a low corpus score can never be a harness bug misreported as
 a simulator limitation — the first draft of the closure metric read `0%`, and only a control
 distinguishes that from a real result.
+
+The harness runs the corpus through `front_end`, which is `Preprocessor` + `parse_expanded`
+rather than `parse_source`, because the corpus files `` `include `` one another by paths
+relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
+`judge(source: &str)` signature so the three control tests exercise exactly the corpus
+path; `judge_with` is the one that takes the configured preprocessor.
 
 The blocker tables in `ivtest_corpus_parse_rate` are text heuristics, not parser
 diagnostics. **They go stale as features land** — a row counting files that *contain* a
