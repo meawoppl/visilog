@@ -1,9 +1,9 @@
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_till, take_until, take_while, take_while1},
-    combinator::{map, value},
+    combinator::{map, not, value},
     multi::many0,
-    sequence::{delimited, preceded, tuple},
+    sequence::{delimited, pair, preceded, tuple},
     IResult,
 };
 
@@ -38,14 +38,41 @@ pub fn comment(input: &str) -> IResult<&str, &str> {
     alt((single_line_comment, multi_line_comment))(input)
 }
 
-/// Consume any run of whitespace and comments, including an empty one.
-pub fn ws_and_comments(input: &str) -> IResult<&str, ()> {
-    value((), many0(alt((multispace1, comment))))(input)
+/// A Verilog-2001 attribute instance, `(* full_case, parallel_case *)`.
+///
+/// An attribute is metadata addressed to a synthesis tool and carries no
+/// simulation semantics, so this **discards its body** rather than putting it
+/// on the AST — the deliberate trade that lets attributes be skipped exactly
+/// where comments are and so appear in every position the LRM allows them
+/// (before a module, a statement, a declaration, a port connection, and
+/// between the operands of an expression) for the cost of one `alt` arm. A
+/// tool that wanted to *read* attributes would have to keep them instead.
+///
+/// The terminator is the two-character `*)`, not a bare `*`, so a body may
+/// contain one: `(* a = 3 * 4 *)`.
+///
+/// `(*)` is deliberately **not** an attribute — it is the implicit sensitivity
+/// list of `always @(*)`, and an attribute instance must carry at least one
+/// specification. Without that guard the `(*` of one `@(*)` would pair with
+/// the `*)` of the next one and swallow everything between them.
+pub fn attribute(input: &str) -> IResult<&str, &str> {
+    delimited(
+        pair(tag("(*"), not(preceded(whitespace, char(')')))),
+        take_until("*)"),
+        tag("*)"),
+    )(input)
 }
 
-/// Wrap a parser so that whitespace *and comments* on either side of it are
-/// skipped. Nearly every parser in the grammar is wrapped in this, which is
-/// what makes a comment legal anywhere a token boundary is.
+/// Consume any run of whitespace, comments and attributes, including an empty
+/// one.
+pub fn ws_and_comments(input: &str) -> IResult<&str, ()> {
+    value((), many0(alt((multispace1, comment, attribute))))(input)
+}
+
+/// Wrap a parser so that whitespace, *comments and attributes* on either side
+/// of it are skipped. Nearly every parser in the grammar is wrapped in this,
+/// which is what makes a comment or an attribute legal anywhere a token
+/// boundary is.
 pub fn ws<'a, F: 'a, O>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
 where
     F: FnMut(&'a str) -> IResult<&'a str, O>,
@@ -64,6 +91,10 @@ pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsers::behavior::{parse_sensitivity_list, procedural_statement, EventControl};
+    use crate::parsers::helpers::{assert_parses, assert_parses_to};
+    use crate::parsers::modules::parse_module_instantiation_statement;
+    use crate::parsers::source::parse_verilog_source;
 
     #[test]
     fn test_comments() {
@@ -186,6 +217,132 @@ mod tests {
             Ok(("abc", ()))
         );
         assert_eq!(ws_and_comments("  // trailing"), Ok(("", ())));
+    }
+
+    #[test]
+    fn test_attribute() {
+        assert_eq!(attribute("(* keep *)rest"), Ok(("rest", " keep ")));
+        assert_eq!(attribute("(*keep*)"), Ok(("", "keep")));
+        // The terminator is `*)`, so a `*` inside the body is just a `*`.
+        assert_eq!(
+            attribute(r#"(* a = "x", b = 3 * 4 *)tail"#),
+            Ok(("tail", r#" a = "x", b = 3 * 4 "#))
+        );
+        assert_eq!(
+            attribute("(*\n full_case,\n parallel_case\n*)"),
+            Ok(("", "\n full_case,\n parallel_case\n"))
+        );
+        assert!(attribute("(a)").is_err());
+        assert!(attribute("keep").is_err());
+    }
+
+    /// `(*)` is `always @(*)`, not an empty attribute — and neither is `(* )`.
+    #[test]
+    fn test_attribute_rejects_the_implicit_sensitivity_list() {
+        assert!(attribute("(*)").is_err());
+        assert!(attribute("(* )").is_err());
+        assert!(attribute("(*\n)").is_err());
+    }
+
+    /// An attribute that is never closed is a parse error. It must not consume
+    /// to end of input, which would silently delete the rest of the file.
+    #[test]
+    fn test_unterminated_attribute_is_an_error() {
+        assert!(attribute("(* keep").is_err());
+        assert!(attribute("(* keep * ) more").is_err());
+        // `ws` cannot swallow it either: the run stops dead at the `(*`.
+        let mut parser = ws(tag("abc"));
+        assert!(parser("(* keep abc").is_err());
+        assert_eq!(ws_and_comments("(* keep"), Ok(("(* keep", ())));
+    }
+
+    #[test]
+    fn test_ws_skips_attributes() {
+        let mut parser = ws(tag("abc"));
+        assert_eq!(parser("(* keep *)abc"), Ok(("", "abc")));
+        assert_eq!(parser("abc(* keep *)"), Ok(("", "abc")));
+        assert_eq!(parser(" (* a *) /* c */ (* b *) abc"), Ok(("", "abc")));
+        assert_eq!(parser("(* a = 3 * 4 *) abc def"), Ok(("def", "abc")));
+    }
+
+    #[test]
+    fn test_ws_and_comments_skips_attributes() {
+        assert_eq!(ws_and_comments("(* keep *)abc"), Ok(("abc", ())));
+        assert_eq!(ws_and_comments("(* a *)(* b *)abc"), Ok(("abc", ())));
+        assert_eq!(ws_and_comments("  (* keep *)  // c\n abc"), Ok(("abc", ())));
+    }
+
+    /// The five positions the LRM allows an attribute in. None of the parsers
+    /// below know attributes exist — they inherit them from `ws`.
+    #[test]
+    fn test_attribute_before_a_module() {
+        let modules = assert_parses(
+            parse_verilog_source,
+            "(* keep *) module m(); endmodule\n(* keep *) module n(); endmodule",
+        );
+        assert_eq!(modules.len(), 2);
+    }
+
+    #[test]
+    fn test_attribute_before_a_port_connection() {
+        let instantiation = assert_parses(
+            parse_module_instantiation_statement,
+            "foo f ((* c *) .a(b));",
+        );
+        assert_eq!(instantiation.module_name.name, "foo");
+        assert_eq!(instantiation.instance_name.name, "f");
+    }
+
+    #[test]
+    fn test_attribute_before_a_statement() {
+        assert_parses(
+            procedural_statement,
+            "(* full_case *) case (x) 1: a = 1; endcase",
+        );
+        assert_parses(procedural_statement, "(* keep *) a = b;");
+        assert_parses(procedural_statement, "(* keep *) if (a) b = 1;");
+    }
+
+    /// A declaration parser has no leading `ws` of its own — the module body is
+    /// what wraps each statement in one — so this goes through a whole module.
+    #[test]
+    fn test_attribute_before_a_declaration() {
+        let modules = assert_parses(
+            parse_verilog_source,
+            "module m();\n\
+             (* keep *) wire a;\n\
+             (* keep *) reg [3:0] q;\n\
+             (* keep *) assign a = q;\n\
+             endmodule",
+        );
+        assert_eq!(modules[0].statements.len(), 3);
+    }
+
+    #[test]
+    fn test_attribute_with_a_string_a_comma_and_a_product() {
+        assert_parses(
+            parse_verilog_source,
+            r#"module m(); (* a = "x", b = 3 * 4 *) wire w; endmodule"#,
+        );
+    }
+
+    /// The regression risk of treating `(*` as a token: `@(*)` is the implicit
+    /// sensitivity list, and two of them in one file must not pair the `(*` of
+    /// the first with the `*)` of the second.
+    #[test]
+    fn test_implicit_sensitivity_lists_still_parse() {
+        assert_parses_to(parse_sensitivity_list, "@(*)", EventControl::Implicit);
+        let modules = assert_parses(
+            parse_verilog_source,
+            "module m(); always @(*) a = b; always @(*) c = d; endmodule",
+        );
+        assert_eq!(modules[0].statements.len(), 2);
+
+        let attributed = assert_parses(
+            parse_verilog_source,
+            "module m(); (* keep *) always @(*) a = b; always @(*) c = d; endmodule",
+        );
+        assert_eq!(attributed[0].statements.len(), 2);
     }
 
     #[test]
