@@ -193,8 +193,8 @@ unconnected input is declared `z`. `Simulator::with_modules(modules, top)` is ho
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 
-**System tasks print into a buffer, not to stdout.** `$display`, `$write`, `$finish` and
-`$time` are compiled to an `Instruction::Task` and carried out by
+**System tasks print into a buffer, not to stdout.** `$display`, `$write` and `$finish`
+are compiled to an `Instruction::Task` and carried out by
 `tasks::TaskContext`, which the `Simulator` owns: `simulator.output()` hands back
 everything the design printed, so "did this design print `PASSED`?" is a plain assertion —
 which is exactly what a self-checking corpus test needs. `$finish` sets a flag rather than
@@ -205,6 +205,30 @@ quietly printed nothing would look just like one that passed. `$strobe` and `$mo
 rejected by name for the same reason: their output is deferred to the end of a time step,
 which nothing schedules yet.
 
+**A system *function* is an expression operand, and `eval` implements it.** `$time`,
+`$stime`, `$signed`, `$unsigned`, `$random`, `$bits` and `$clog2` parse anywhere an
+operand is legal — `a = $random;`, `if ($time > 5)`, `assign y = $signed(a) | b;` — as
+`Expression::SystemFunctionCall(name, args)`, the name carried without its `$`. That is
+deliberately *not* `Expression::FunctionCall`, which names a function the design declares
+and resolves down a different path. A `$name` nothing implements is
+`EvalError::UnknownSystemFunction`, never a zero, and a wrong argument count is
+`EvalError::SystemFunctionArity`.
+
+`eval` is handed a `&StateStore` and nothing else, so the two system functions that are
+not pure functions of their arguments reach the simulation *through the store*:
+`StateStore::set_time` carries the clock `$time` reads — `Simulator::advance` moves it
+with `now`, and it is the only clock, which is why `TaskContext` no longer holds one —
+and `StateStore::next_random` / `seed_random` own the `$random` stream. The stream is a
+`RefCell<StdRng>` seeded from a fixed constant (`DEFAULT_RANDOM_SEED`, 0), so a design
+that draws random stimulus draws the *same* stimulus on every run and a self-checking
+test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
+write the seed back the way a real simulator's `inout` argument does.
+
+`$signed` / `$unsigned` are the identity on the bits today. Signedness is unmodelled
+(issue #96), so only the width half of the cast is real — this is documented rather than
+faked, which is why the corpus's `signed5`, `br_gh99r`, `br_gh199a` and `pr2138979` now
+run and honestly report a wrong answer instead of silently not parsing.
+
 Still unsupported: intra-assignment delays (`a = #5 b;` — the held right hand side does not
 fit in a program counter) and concatenation as an assignment target. Parameter overrides
 cannot change a width, because `simple.rs::range` only parses literal integers, so
@@ -213,13 +237,13 @@ cannot change a width, because `simple.rs::range` only parses literal integers, 
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock` and `rename_expression` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, including the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them |
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` — system tasks, their format strings, and the buffer they print into |
-| `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive |
+| `state_store.rs` | `StateStore` — signal name → `SignalState`, backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive, the simulated clock `$time` reads, and the `$random` stream |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -420,9 +444,15 @@ tripwire.
   store. A `TimedBlock` therefore carries its own owned `EventControl` and a precomputed
   `@(*)` read set rather than an index back into `module.statements`.
 - **A `$name` is its own token, not an identifier.** `identifier` still rejects a leading
-  `$`, so `$foo` is legal only where `procedural_statement` allows a system task. A format
-  string is likewise a `SystemTaskArgument::String`, not an `Expression` — the expression
-  grammar has no string operand — and `$time` is a `SystemTaskArgument::SystemFunction`.
+  `$`; the token parser is `expr.rs::system_name`, and `behavior.rs` shares it so there is
+  one definition of what a `$name` looks like. A format string is a
+  `SystemTaskArgument::String`, not an `Expression` — the expression grammar has no string
+  operand. A *bare* `$name` argument (`$display("%0d", $time)`) is still a
+  `SystemTaskArgument::SystemFunction`, but only because `bare_system_function` refuses one
+  followed by `(`: `$display("%0d", $signed(a))` is an ordinary expression argument.
+  `TaskCall::compile` turns the bare form into an `Expression::SystemFunctionCall` after
+  checking it against `eval::SYSTEM_FUNCTIONS`, so a name nothing implements is still
+  rejected at compile time and `$time` has exactly one implementation.
 - **A `#delay` is a statement *prefix*, not a field on an assignment.**
   `#5 a = 1;`, `#5 $display(…);`, `#5 begin … end`, `#5 if (…) …` and
   `#5 case (…) … endcase` all parse to `ProceduralStatements::Delayed { delay,

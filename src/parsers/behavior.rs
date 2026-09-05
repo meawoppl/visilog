@@ -1,10 +1,10 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while},
-    character::complete::{alpha1, char, multispace0, multispace1},
-    combinator::{map, opt, peek, recognize, value},
+    bytes::complete::tag,
+    character::complete::{char, multispace0, multispace1},
+    combinator::{map, not, opt, peek, value},
     multi::{many0, many1, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, terminated},
+    sequence::{delimited, preceded, terminated},
     IResult,
 };
 
@@ -13,7 +13,7 @@ use crate::parsers::assignment::parse_assignment;
 use super::{
     assignment::ProceduralAssignment,
     delay::{parse_delay, parse_delay_statement, Delay},
-    expr::{verilog_expression, Expression},
+    expr::{system_name, verilog_expression, Expression},
     simple::ws,
     string::parse_verilog_string,
 };
@@ -195,26 +195,19 @@ fn parenthesized_expression(input: &str) -> IResult<&str, Expression> {
     delimited(ws(char('(')), verilog_expression, ws(char(')')))(input)
 }
 
-/// `$` followed by a name. The `$` is deliberately not folded into
-/// `identifier`: a system task is legal only where a task call is, and letting
-/// `$foo` parse as a name would make it legal everywhere a signal is.
-fn system_task_name(input: &str) -> IResult<&str, String> {
-    map(
-        preceded(
-            char('$'),
-            recognize(pair(
-                alt((alpha1, tag("_"))),
-                take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '$'),
-            )),
-        ),
-        |name: &str| name.to_string(),
-    )(input)
+/// A bare `$name` argument: `$display("%0d", $time)`.
+///
+/// A `$name` that *is* followed by an argument list is a system function call
+/// and belongs to the expression grammar — `$display("%0d", $signed(a))` —
+/// so this form stops at the parenthesis and lets the expression layer take it.
+fn bare_system_function(input: &str) -> IResult<&str, String> {
+    terminated(system_name, peek(not(char('('))))(input)
 }
 
 fn system_task_argument(input: &str) -> IResult<&str, SystemTaskArgument> {
     alt((
         map(parse_verilog_string, SystemTaskArgument::String),
-        map(system_task_name, SystemTaskArgument::SystemFunction),
+        map(bare_system_function, SystemTaskArgument::SystemFunction),
         map(verilog_expression, SystemTaskArgument::Expression),
     ))(input)
 }
@@ -222,7 +215,7 @@ fn system_task_argument(input: &str) -> IResult<&str, SystemTaskArgument> {
 /// `$display("a = %0d", a);`, `$finish;` — a system task call as a statement.
 /// The argument list is optional, and may be empty.
 pub fn parse_system_task(input: &str) -> IResult<&str, SystemTaskCall> {
-    let (input, name) = ws(system_task_name)(input)?;
+    let (input, name) = ws(system_name)(input)?;
     let (input, arguments) = opt(delimited(
         ws(char('(')),
         separated_list0(char(','), ws(system_task_argument)),
@@ -886,8 +879,15 @@ mod tests {
     #[test]
     fn test_a_dollar_name_is_still_not_an_ordinary_identifier() {
         // The `$` is a token of its own, not a loosening of `identifier`: a
-        // system task is legal where a statement is, and nowhere else.
-        assert!(verilog_expression("$time").is_err());
+        // `$name` names the simulator, so it parses as a system function call
+        // and never as a signal, and it is not a target an assignment can
+        // drive.
+        assert!(crate::parsers::identifier::identifier("$time").is_err());
+        assert_parses_to(
+            verilog_expression,
+            "$time",
+            Expression::SystemFunctionCall("time".to_string(), vec![]),
+        );
         assert!(procedural_statement("$display = 1;").is_err());
     }
 }

@@ -7,9 +7,10 @@ use super::{
 };
 use nom::{
     branch::alt,
-    bytes::complete::tag,
-    combinator::{map, map_res},
-    multi::{fold_many0, many1, separated_list1},
+    bytes::complete::{tag, take_while},
+    character::complete::{alpha1, char},
+    combinator::{map, map_res, opt, recognize},
+    multi::{fold_many0, many1, separated_list0, separated_list1},
     sequence::{pair, preceded, tuple},
     IResult,
 };
@@ -25,6 +26,15 @@ pub enum Expression {
     Parenthetical(Box<Expression>),
     Concatenation(Vec<Expression>),
     FunctionCall(Identifier, Vec<Expression>),
+    /// `$time`, `$random`, `$signed(a)` — a call to one of the simulator's own
+    /// functions, named without its `$`.
+    ///
+    /// Deliberately *not* [`Expression::FunctionCall`]: that one names a
+    /// function the design declares, and resolves against the design. A
+    /// `$name` resolves against the simulator's built-in table instead, and
+    /// can never be an identifier the design wrote. An argument list is
+    /// optional, so `$time` and `$random` carry an empty one.
+    SystemFunctionCall(String, Vec<Expression>),
     BitSelect(Identifier, Box<Expression>),
     PartSelect(Identifier, Box<Expression>, Box<Expression>),
 }
@@ -61,6 +71,17 @@ impl Expression {
             Expression::FunctionCall(id, args) => format!(
                 "{}({})",
                 id.name,
+                args.iter()
+                    .map(|e| e.to_contracted_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Expression::SystemFunctionCall(name, args) if args.is_empty() => {
+                format!("${}", name)
+            }
+            Expression::SystemFunctionCall(name, args) => format!(
+                "${}({})",
+                name,
                 args.iter()
                     .map(|e| e.to_contracted_string())
                     .collect::<Vec<_>>()
@@ -133,6 +154,15 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(",\n")
             ),
+            Expression::SystemFunctionCall(name, args) => format!(
+                "{}SystemFunctionCall(${},\n{})",
+                indent_str,
+                name,
+                args.iter()
+                    .map(|e| e.to_ast_string(indent + 1))
+                    .collect::<Vec<_>>()
+                    .join(",\n")
+            ),
             Expression::BitSelect(ident, index) => format!(
                 "{}BitSelect(\n{}{},\n{}{})",
                 indent_str,
@@ -191,6 +221,45 @@ fn concatenation(input: &str) -> IResult<&str, Expression> {
     )(input)
 }
 
+/// `$` followed by a name, without the `$`.
+///
+/// The `$` is a token of its own and is deliberately not folded into
+/// [`identifier`]: `$foo` names the simulator, never a signal, so letting it
+/// parse as an identifier would make it legal everywhere a signal is. Shared
+/// with the statement form in
+/// [`behavior`](crate::parsers::behavior::parse_system_task), so there is one
+/// definition of what a `$name` looks like.
+pub fn system_name(input: &str) -> IResult<&str, String> {
+    map(
+        preceded(
+            char('$'),
+            recognize(pair(
+                alt((alpha1, tag("_"))),
+                take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '$'),
+            )),
+        ),
+        |name: &str| name.to_string(),
+    )(input)
+}
+
+/// `$time`, `$random`, `$signed(a)` — a system function used as an operand.
+///
+/// The argument list is optional because the commonest system functions —
+/// `$time` and `$random` — are written bare. An empty list and an absent one
+/// are the same thing.
+fn system_function_call(input: &str) -> IResult<&str, Expression> {
+    let (input, name) = system_name(input)?;
+    let (input, args) = opt(delimited(
+        tag("("),
+        separated_list0(tag(","), ws(verilog_expression)),
+        tag(")"),
+    ))(input)?;
+    Ok((
+        input,
+        Expression::SystemFunctionCall(name, args.unwrap_or_default()),
+    ))
+}
+
 fn fn_call(input: &str) -> IResult<&str, Expression> {
     let (input, id) = identifier(input)?;
     let (input, args) = delimited(
@@ -223,7 +292,8 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
     // fn_call has to go before identifier, as function names
     // are valid identifiers
     alt((
-        fn_call,
+        // A `$name` can start nothing else, so it is unambiguous first.
+        system_function_call,
         fn_call,
         bit_select,
         part_select,
@@ -1362,5 +1432,89 @@ mod tests {
                 expr
             );
         }
+    }
+
+    fn system_call(name: &str, args: Vec<Expression>) -> Expression {
+        Expression::SystemFunctionCall(name.to_string(), args)
+    }
+
+    fn ident(name: &str) -> Expression {
+        Expression::Identifier(Identifier::new(name.to_string()))
+    }
+
+    #[test]
+    fn test_a_bare_system_function_is_an_operand() {
+        assert_parses_to(verilog_expression, "$time", system_call("time", vec![]));
+        assert_parses_to(verilog_expression, "$random", system_call("random", vec![]));
+    }
+
+    #[test]
+    fn test_a_system_function_takes_arguments() {
+        assert_parses_to(
+            verilog_expression,
+            "$signed(b)",
+            system_call("signed", vec![ident("b")]),
+        );
+        assert_parses_to(
+            verilog_expression,
+            "$clog2(a + 1)",
+            system_call(
+                "clog2",
+                vec![Expression::Binary(
+                    Box::new(ident("a")),
+                    BinaryOperator::Addition,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+                )],
+            ),
+        );
+        // An empty list and no list at all are the same thing.
+        assert_parses_to(
+            verilog_expression,
+            "$random()",
+            system_call("random", vec![]),
+        );
+    }
+
+    #[test]
+    fn test_a_system_function_composes_like_any_other_operand() {
+        assert_parses_to(
+            verilog_expression,
+            "$time > 5",
+            Expression::Binary(
+                Box::new(system_call("time", vec![])),
+                BinaryOperator::GreaterThan,
+                Box::new(Expression::Constant(VerilogConstant::from_int(5))),
+            ),
+        );
+        assert_parses_to(
+            verilog_expression,
+            "$signed(a) + $signed(b)",
+            Expression::Binary(
+                Box::new(system_call("signed", vec![ident("a")])),
+                BinaryOperator::Addition,
+                Box::new(system_call("signed", vec![ident("b")])),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_a_system_function_is_not_a_user_function_call() {
+        // `$signed(b)` and `signed_thing(b)` take different resolution paths,
+        // so they must not share an AST node.
+        let system = assert_parses(verilog_expression, "$foo(b)");
+        assert_eq!(system, system_call("foo", vec![ident("b")]));
+        let user = assert_parses(verilog_expression, "foo(b)");
+        assert_eq!(
+            user,
+            Expression::FunctionCall(Identifier::new("foo".to_string()), vec![ident("b")])
+        );
+    }
+
+    #[test]
+    fn test_a_system_function_prints_its_dollar_back() {
+        assert_eq!(
+            assert_parses(verilog_expression, "$signed(a) + $time").to_contracted_string(),
+            "$signed(a) + $time"
+        );
     }
 }

@@ -52,6 +52,14 @@ pub enum EvalError {
     NonConstantSelectBound(String),
     /// A value too wide to evaluate; see [`MAX_ARITHMETIC_WIDTH`].
     WidthOverflow(usize),
+    /// A `$name` used as a function that this simulator does not implement.
+    UnknownSystemFunction(String),
+    /// A system function called with a number of arguments it does not take.
+    SystemFunctionArity {
+        name: String,
+        expected: String,
+        found: usize,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -73,6 +81,14 @@ impl fmt::Display for EvalError {
             EvalError::WidthOverflow(width) => {
                 write!(f, "{} bit value is too wide to evaluate", width)
             }
+            EvalError::UnknownSystemFunction(name) => {
+                write!(f, "unknown system function `${}`", name)
+            }
+            EvalError::SystemFunctionArity {
+                name,
+                expected,
+                found,
+            } => write!(f, "`${}` takes {}, but was given {}", name, expected, found),
         }
     }
 }
@@ -141,7 +157,127 @@ pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError
             Ok(Register::from_bits(bits))
         }
         Expression::FunctionCall(id, _) => Err(EvalError::UnsupportedFunctionCall(id.name.clone())),
+        Expression::SystemFunctionCall(name, arguments) => {
+            eval_system_function(name, arguments, store)
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// System functions
+// ---------------------------------------------------------------------------
+
+/// Width of what a system function that returns a number hands back: Verilog's
+/// `integer`, which is 32 bits.
+const SYSTEM_FUNCTION_WIDTH: usize = 32;
+
+/// Width `$time` reports in. Verilog's time unit is a 64 bit quantity;
+/// `$stime` is the same value truncated to an `integer`.
+const TIME_WIDTH: usize = 64;
+
+/// Every `$name` [`eval_system_function`] implements.
+///
+/// Callers that have to decide whether a `$name` is meaningful *before* running
+/// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
+/// here, so an unrecognised name is rejected in one place. A name listed but
+/// not matched below still errors rather than evaluating to anything.
+pub const SYSTEM_FUNCTIONS: [&str; 7] = [
+    "time", "stime", "signed", "unsigned", "random", "bits", "clog2",
+];
+
+/// Evaluates `$name(...)`, the simulator's own functions.
+///
+/// A name this simulator does not implement is an error that repeats the name,
+/// never a zero: a design that quietly evaluated `$foo` to `0` would look
+/// exactly like one that worked.
+fn eval_system_function(
+    name: &str,
+    arguments: &[Expression],
+    store: &StateStore,
+) -> Result<Register, EvalError> {
+    let arity = |expected: &str, allowed: &[usize]| -> Result<(), EvalError> {
+        if allowed.contains(&arguments.len()) {
+            return Ok(());
+        }
+        Err(EvalError::SystemFunctionArity {
+            name: name.to_string(),
+            expected: expected.to_string(),
+            found: arguments.len(),
+        })
+    };
+
+    match name {
+        // The store carries the timestamp the surrounding block is running at.
+        // `$stime` is the same clock as an `integer`, which is what a design
+        // that prints a timestamp with `%0d` usually wants.
+        "time" | "stime" => {
+            arity("no arguments", &[0])?;
+            let width = if name == "time" {
+                TIME_WIDTH
+            } else {
+                SYSTEM_FUNCTION_WIDTH
+            };
+            Ok(Register::from_u128(
+                store.time().unsigned_abs() as u128,
+                width,
+            ))
+        }
+        // Signedness is not modelled at all (issue #96): the AST carries none
+        // and every operator here treats its operands as unsigned. Both casts
+        // are therefore the identity on the bits, which is the *width* half of
+        // what they mean and is right for the common `$signed(a) == b` shape.
+        // The sign half — `$signed(4'b1000)` extending as -8, and `>>>` on the
+        // result being arithmetic — waits on #96 rather than being faked here.
+        "signed" | "unsigned" => {
+            arity("exactly one argument", &[1])?;
+            eval(&arguments[0], store)
+        }
+        // `$random` and `$random(seed)`. The seed restarts the stream; see
+        // [`StateStore::seed_random`].
+        "random" => {
+            arity("no arguments, or a seed", &[0, 1])?;
+            if let Some(seed) = arguments.first() {
+                match numeric(&eval(seed, store)?)? {
+                    Some(value) => store.seed_random(value as u64),
+                    // An unknown seed leaves the stream where it is; there is
+                    // no number to restart it from.
+                    None => {}
+                }
+            }
+            Ok(Register::from_u128(
+                store.next_random() as u128,
+                SYSTEM_FUNCTION_WIDTH,
+            ))
+        }
+        // The width of the operand, which every value here knows about itself.
+        "bits" => {
+            arity("exactly one argument", &[1])?;
+            let width = eval(&arguments[0], store)?.width();
+            Ok(Register::from_u128(width as u128, SYSTEM_FUNCTION_WIDTH))
+        }
+        // `$clog2(n)` is how many bits it takes to count `n` things: the
+        // ceiling of log2, and `0` for `0` and `1`.
+        "clog2" => {
+            arity("exactly one argument", &[1])?;
+            match numeric(&eval(&arguments[0], store)?)? {
+                Some(value) => Ok(Register::from_u128(
+                    clog2(value) as u128,
+                    SYSTEM_FUNCTION_WIDTH,
+                )),
+                // Unknown in, unknown out.
+                None => Ok(Register::unknown(SYSTEM_FUNCTION_WIDTH)),
+            }
+        }
+        other => Err(EvalError::UnknownSystemFunction(other.to_string())),
+    }
+}
+
+/// The number of bits an unsigned count of `value` distinct values needs.
+fn clog2(value: u128) -> u32 {
+    if value <= 1 {
+        return 0;
+    }
+    128 - (value - 1).leading_zeros()
 }
 
 fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError> {
@@ -1228,6 +1364,145 @@ mod tests {
         assert_eq!(
             EvalError::EmptyConcatenation.to_string(),
             "empty concatenation has no value"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // System functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_reads_the_store_clock() {
+        let mut store = StateStore::new();
+        assert_eq!(value_in("$time", &store), 0);
+        store.set_time(37);
+        assert_eq!(value_in("$time", &store), 37);
+        // A `$time` in the middle of an expression is an operand like any other.
+        assert_eq!(value_in("$time > 5", &store), 1);
+        assert_eq!(value_in("$time + 1", &store), 38);
+    }
+
+    #[test]
+    fn test_signed_and_unsigned_preserve_the_bits_and_the_width() {
+        let store = sample_store();
+        // Signedness is unmodelled (issue #96), so both casts are the identity
+        // on the bits today. The width half is what is being asserted here.
+        assert_eq!(bits_in("$signed(a)", &store), "10100110");
+        assert_eq!(bits_in("$unsigned(a)", &store), "10100110");
+        assert_eq!(bits_in("$signed(b)", &store), "0011");
+        assert_eq!(value_in("$signed(b) + 1", &store), 4);
+    }
+
+    #[test]
+    fn test_bits_reports_the_width_of_its_operand() {
+        let store = sample_store();
+        assert_eq!(value_in("$bits(a)", &store), 8);
+        assert_eq!(value_in("$bits(b)", &store), 4);
+        assert_eq!(value_in("$bits({a, b})", &store), 12);
+        assert_eq!(value_in("$bits(4'b1010)", &store), 4);
+    }
+
+    #[test]
+    fn test_clog2_counts_the_bits_a_count_needs() {
+        for (source, expected) in [
+            ("$clog2(0)", 0),
+            ("$clog2(1)", 0),
+            ("$clog2(2)", 1),
+            ("$clog2(3)", 2),
+            ("$clog2(4)", 2),
+            ("$clog2(5)", 3),
+            ("$clog2(255)", 8),
+            ("$clog2(256)", 8),
+            ("$clog2(257)", 9),
+        ] {
+            assert_eq!(value(source), expected, "{}", source);
+        }
+        // Unknown in, unknown out — never a plausible-looking zero.
+        let mut store = StateStore::new();
+        store.set_ranged("u", Register::from_binary("10x1"), (3, 0));
+        assert!(eval(&parse("$clog2(u)"), &store).unwrap().has_unknown());
+    }
+
+    #[test]
+    fn test_random_is_reproducible_from_the_default_seed() {
+        // Every store starts the stream from the same seed, so two runs of the
+        // same design draw the same numbers in the same order.
+        let draw = || {
+            let store = StateStore::new();
+            (0..4)
+                .map(|_| value_in("$random", &store))
+                .collect::<Vec<_>>()
+        };
+        let first = draw();
+        assert_eq!(first, draw());
+        // Within one run the numbers advance rather than repeating.
+        assert!(first.windows(2).all(|pair| pair[0] != pair[1]));
+        // `$random` is Verilog's 32 bit integer.
+        assert_eq!(bits_in("$random", &StateStore::new()).len(), 32);
+    }
+
+    #[test]
+    fn test_random_with_a_seed_restarts_the_stream() {
+        let store = StateStore::new();
+        let seeded: Vec<u128> = (0..3).map(|_| value_in("$random(7)", &store)).collect();
+        // Re-seeding with the same value gives the same number back, which is
+        // what makes a seeded design's stimulus repeatable.
+        assert_eq!(seeded[0], seeded[1]);
+        assert_eq!(seeded[1], seeded[2]);
+
+        let store = StateStore::new();
+        assert_eq!(value_in("$random(7)", &store), seeded[0]);
+        assert_ne!(value_in("$random(9)", &store), seeded[0]);
+    }
+
+    #[test]
+    fn test_every_listed_system_function_evaluates() {
+        // [`SYSTEM_FUNCTIONS`] is what `TaskCall::compile` trusts when it
+        // decides a `$name` is meaningful, so a name listed there but missing
+        // from the evaluator would be accepted and then fail late.
+        let store = sample_store();
+        for name in SYSTEM_FUNCTIONS {
+            let source = match name {
+                "time" | "stime" | "random" => format!("${}", name),
+                other => format!("${}(a)", other),
+            };
+            eval(&parse(&source), &store)
+                .unwrap_or_else(|error| panic!("{} failed to evaluate: {}", source, error));
+        }
+    }
+
+    #[test]
+    fn test_stime_is_the_clock_as_an_integer() {
+        let mut store = StateStore::new();
+        store.set_time(1234);
+        assert_eq!(value_in("$stime", &store), 1234);
+        assert_eq!(bits_in("$stime", &store).len(), 32);
+        assert_eq!(bits_in("$time", &store).len(), 64);
+    }
+
+    #[test]
+    fn test_an_unknown_system_function_is_an_error_that_names_it() {
+        let store = StateStore::new();
+        assert_eq!(
+            error("$nosuchthing(1)", &store).to_string(),
+            "unknown system function `$nosuchthing`"
+        );
+        assert_eq!(
+            error("$foo", &store),
+            EvalError::UnknownSystemFunction("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_a_system_function_checks_its_argument_count() {
+        let store = sample_store();
+        assert_eq!(
+            error("$signed(a, b)", &store).to_string(),
+            "`$signed` takes exactly one argument, but was given 2"
+        );
+        assert_eq!(
+            error("$time(a)", &store).to_string(),
+            "`$time` takes no arguments, but was given 1"
         );
     }
 }

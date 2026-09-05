@@ -630,7 +630,7 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
                 rename_expression(part, resolve);
             }
         }
-        Expression::FunctionCall(_, arguments) => {
+        Expression::FunctionCall(_, arguments) | Expression::SystemFunctionCall(_, arguments) => {
             for argument in arguments {
                 rename_expression(argument, resolve);
             }
