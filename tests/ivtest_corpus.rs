@@ -457,6 +457,13 @@ fn ivtest_corpus_closure_rate() {
         pct(silent)
     );
 
+    // One machine-readable line, so CI reports the trend by grepping a stable
+    // key rather than by scraping the table above — which is free to change.
+    println!(
+        "\nCORPUS_METRICS total={} parsed={} elaborated={} ran={} passed={} wrong={} silent={}",
+        total, parsed, elaborated, ran, passed, wrong, silent
+    );
+
     // Where the ones that never ran fell over.
     let mut stages: BTreeMap<String, usize> = BTreeMap::new();
     for (_, outcome) in &outcomes {

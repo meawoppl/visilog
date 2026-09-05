@@ -187,14 +187,24 @@ so it scores us against someone else's expectations rather than our own.
 The corpus is **GPL-2.0** and this crate is MIT, so it is cloned rather than vendored:
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse \
+git clone --depth 1 --filter=blob:none --sparse --branch v13_0 \
     https://github.com/steveicarus/iverilog ~/.cache/visilog/ivtest
 cd ~/.cache/visilog/ivtest && git sparse-checkout set ivtest
 cargo test --test ivtest_corpus -- --ignored --nocapture
 ```
 
-Every corpus test is `#[ignore]`d, so CI never depends on that clone. `VISILOG_IVTEST`
-overrides the path.
+**Clone the pinned tag.** `.github/workflows/closure.yml` pins `IVTEST_REF`, currently
+`v13_0`, so the denominator does not drift under the trend line — the corpus has 1513
+`normal` entries at `v12_0`, 1519 at `v13_0` and 1521 on `master`. A local clone at a
+different ref will disagree with CI for no interesting reason. Bump the two together.
+
+Every corpus test is `#[ignore]`d, so `rust.yml` never depends on that clone. A separate
+`closure.yml` workflow does clone it and reports the number on each PR — deliberately a
+different job, because a metric must not be able to block a merge when an external
+repository is unreachable. `VISILOG_IVTEST` overrides the path.
+
+The harness prints one machine-readable `CORPUS_METRICS …` line for CI to grep. The
+human-readable table above it is free to change; that line is the contract.
 
 **Closure — the `PASSED` count — is the headline metric, not `parsed`.** The corpus is
 self-checking: a test prints `PASSED` when it is satisfied. Parsing a file therefore says
