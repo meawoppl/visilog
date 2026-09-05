@@ -17,7 +17,7 @@ use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
 use crate::register::Register;
 use crate::simulator::elaborate::rename_expression;
-use crate::simulator::eval::eval;
+use crate::simulator::eval::{eval, SYSTEM_FUNCTIONS};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 
@@ -77,9 +77,10 @@ pub enum SystemTask {
 pub enum TaskArgument {
     /// A string literal, which is both a format string and printable text.
     Text(String),
-    /// `$time`.
-    Time,
-    /// An expression, evaluated against the store when the call runs.
+    /// An expression, evaluated against the store when the call runs. A bare
+    /// `$time` or `$random` argument is one of these too — the expression
+    /// grammar owns system functions, so there is one implementation of what
+    /// `$time` means.
     Value(Expression),
 }
 
@@ -121,8 +122,17 @@ impl TaskCall {
                 SystemTaskArgument::Expression(expression) => {
                     Ok(TaskArgument::Value(expression.clone()))
                 }
-                SystemTaskArgument::SystemFunction(name) if name == "time" => {
-                    Ok(TaskArgument::Time)
+                // A bare `$name` argument is a system function call with no
+                // arguments. Whether it means anything is settled here rather
+                // than when the design runs, so a name nothing implements is
+                // reported before it can print nothing.
+                SystemTaskArgument::SystemFunction(name)
+                    if SYSTEM_FUNCTIONS.contains(&name.as_str()) =>
+                {
+                    Ok(TaskArgument::Value(Expression::SystemFunctionCall(
+                        name.clone(),
+                        Vec::new(),
+                    )))
                 }
                 SystemTaskArgument::SystemFunction(name) => Err(unknown_task(name)),
             })
@@ -147,11 +157,14 @@ fn unknown_task(name: &str) -> SimulationError {
     SimulationError::SystemTask(format!("unknown system task `${}`", name))
 }
 
-/// What a system task acts on: where output goes, what time it is, and whether
-/// the design has called `$finish`.
+/// What a system task acts on: where output goes, and whether the design has
+/// called `$finish`.
+///
+/// What time it is lives on the [`StateStore`] instead, because
+/// [`eval`] needs it too: `$time` is an expression operand as well as a task
+/// argument, and one clock is better than two.
 #[derive(Clone, Debug, Default)]
 pub struct TaskContext {
-    time: i64,
     output: Output,
     finished: bool,
 }
@@ -164,17 +177,6 @@ impl TaskContext {
     /// Everything the design has printed.
     pub fn output(&self) -> &Output {
         &self.output
-    }
-
-    /// The time `$time` reports.
-    pub fn time(&self) -> i64 {
-        self.time
-    }
-
-    /// Tells the context what time it is. The driver does this before it
-    /// resumes a block, so `$time` reads the timestamp the block runs at.
-    pub fn set_time(&mut self, time: i64) {
-        self.time = time;
     }
 
     /// Whether the design has called `$finish`.
@@ -312,7 +314,6 @@ impl TaskContext {
     ) -> Result<Register, SimulationError> {
         match argument {
             TaskArgument::Value(expression) => Ok(eval(expression, store)?),
-            TaskArgument::Time => Ok(Register::from_u128(self.time.unsigned_abs() as u128, 64)),
             TaskArgument::Text(text) => Err(bad_format(&format!(
                 "the string \"{}\" is not a value a numeric format can take",
                 text
@@ -557,11 +558,26 @@ mod tests {
 
     #[test]
     fn test_time_is_an_argument() {
-        let store = store_with(&[]);
+        let mut store = store_with(&[]);
+        store.set_time(42);
         let mut context = TaskContext::new();
-        context.set_time(42);
         run_in(&mut context, r#"$display("t=%0d", $time);"#, &store);
         assert_eq!(context.output().text(), "t=42\n");
+    }
+
+    #[test]
+    fn test_a_bare_system_function_argument_is_evaluated() {
+        let mut store = store_with(&[]);
+        store.set_time(9);
+        assert_eq!(printed(r#"$display("%0d", $stime);"#, &store), "9\n");
+        // `$random` reads the store's stream: a bare `$name` argument is an
+        // expression like any other, not a second table of task names.
+        let drawn = printed(r#"$display("%0d", $random);"#, &store);
+        assert!(
+            drawn.trim().parse::<u32>().is_ok(),
+            "expected a number, got {:?}",
+            drawn
+        );
     }
 
     #[test]

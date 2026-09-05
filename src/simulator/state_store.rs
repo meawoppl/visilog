@@ -1,7 +1,36 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
+
 use crate::register::{Register, X};
+
+/// What the `$random` stream starts from.
+///
+/// IEEE 1364 leaves an unseeded `$random` implementation defined, so the choice
+/// is ours; a fixed constant is the one that makes a design's output the same
+/// on every run, which is what a self-checking test that prints random stimulus
+/// needs. A simulation gets a fresh [`StateStore`], so the stream restarts at
+/// this seed every time a design is set up.
+const DEFAULT_RANDOM_SEED: u64 = 0;
+
+/// The stream `$random` draws from.
+///
+/// [`eval`](crate::simulator::eval::eval) is handed a `&StateStore` and nothing
+/// else, so the one system function that is not a pure function of its
+/// arguments has to advance its state through a shared reference — hence the
+/// [`RefCell`]. Cloning a store clones the stream's position with it, so a
+/// snapshot replays the same numbers.
+#[derive(Clone, Debug)]
+pub struct RandomStream(RefCell<StdRng>);
+
+impl Default for RandomStream {
+    fn default() -> Self {
+        RandomStream(RefCell::new(StdRng::seed_from_u64(DEFAULT_RANDOM_SEED)))
+    }
+}
 
 /// A single named signal: its current four-state value plus the `(msb, lsb)`
 /// range it was declared with.
@@ -110,6 +139,9 @@ fn range_width(range: (i64, i64)) -> usize {
 /// could possibly have moved is exactly the set something wrote. Writes record
 /// the value they displaced; [`take_changes`](StateStore::take_changes) hands
 /// that list over and starts a fresh one.
+/// The store also carries the simulation context an expression can read but no
+/// signal holds — the current time and the `$random` stream — because a
+/// `&StateStore` is all [`eval`](crate::simulator::eval::eval) is given.
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
     name_to_signal: HashMap<String, SignalState>,
@@ -117,14 +149,39 @@ pub struct StateStore {
     /// that marker. `None` records a name that did not exist yet, which makes
     /// the write a declaration rather than a change.
     journal: HashMap<String, Option<Register>>,
+    /// What `$time` reads. The driver moves it as simulated time moves.
+    time: i64,
+    random: RandomStream,
 }
 
 impl StateStore {
     pub fn new() -> Self {
-        StateStore {
-            name_to_signal: HashMap::new(),
-            journal: HashMap::new(),
-        }
+        StateStore::default()
+    }
+
+    /// The simulated time `$time` reports.
+    pub fn time(&self) -> i64 {
+        self.time
+    }
+
+    /// Tells the store what time it is. The driver does this whenever
+    /// simulated time moves, so `$time` reads the timestamp the expression
+    /// around it is evaluated at.
+    pub fn set_time(&mut self, time: i64) {
+        self.time = time;
+    }
+
+    /// The next number in the `$random` stream, as Verilog's 32 bit integer.
+    pub fn next_random(&self) -> u32 {
+        self.random.0.borrow_mut().next_u32()
+    }
+
+    /// Restarts the `$random` stream from `seed`, which is what `$random(seed)`
+    /// does. Verilog's seed argument is an `inout` the simulator writes back
+    /// through; nothing here writes back, so a design that re-seeds from a
+    /// variable it never changes draws the same number every time.
+    pub fn seed_random(&self, seed: u64) {
+        *self.random.0.borrow_mut() = StdRng::seed_from_u64(seed);
     }
 
     /// Notes the value `name` holds right now, so that a write about to land on

@@ -441,6 +441,10 @@ impl Simulator {
                 break;
             }
             self.now = time;
+            // The store carries the clock `$time` reads, so it moves with
+            // `now` — both for the blocks resumed below and for the continuous
+            // assignments settled after them.
+            self.state.set_time(time);
 
             // Everything the resumptions below move is an edge for the settle
             // that follows them.
@@ -484,6 +488,7 @@ impl Simulator {
         }
 
         self.now = target;
+        self.state.set_time(target);
         Ok(())
     }
 
@@ -494,8 +499,6 @@ impl Simulator {
         id: usize,
         pc: usize,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
-        // `$time` reads the timestamp the block is being resumed at.
-        self.tasks.set_time(self.now);
         match program::resume(
             &self.blocks[id].program,
             pc,
@@ -1635,5 +1638,99 @@ mod tests {
 
         simulator.advance(5).unwrap();
         assert_eq!(simulator.output().lines(), vec!["arm at 10", "after at 10"]);
+    }
+
+    #[test]
+    fn test_time_in_an_expression_follows_simulated_time() {
+        let mut simulator = simulator_for(
+            r#"
+            module clocked(output reg [7:0] stamp, output reg late);
+                initial begin
+                    #10 stamp = $time;
+                    late = ($time > 5);
+                    #10 stamp = $time + 1;
+                end
+            endmodule
+        "#,
+        );
+
+        // Before any time passes `$time` is zero, and the block has not run.
+        assert_eq!(simulator.now(), 0);
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("stamp").unwrap().to_u128(), Some(10));
+        assert_eq!(simulator.get("late").unwrap().to_u128(), Some(1));
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("stamp").unwrap().to_u128(), Some(21));
+    }
+
+    #[test]
+    fn test_a_design_can_print_and_compare_its_own_time() {
+        let mut simulator = simulator_for(
+            r#"
+            module stamped();
+                initial begin
+                    #7 $display("t=%0d", $time);
+                    if ($time == 7) $display("PASSED");
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["t=7", "PASSED"]);
+    }
+
+    #[test]
+    fn test_random_stimulus_repeats_across_runs() {
+        let source = r#"
+            module noisy(output reg [7:0] sample);
+                initial begin
+                    #1 sample = $random;
+                    #1 sample = $random;
+                end
+            endmodule
+        "#;
+
+        let draw = || {
+            let mut simulator = simulator_for(source);
+            let mut samples = Vec::new();
+            for _ in 0..2 {
+                simulator.advance(1).unwrap();
+                samples.push(simulator.get("sample").unwrap().to_u128().unwrap());
+            }
+            samples
+        };
+
+        let first = draw();
+        // A design that seeds nothing still simulates the same way twice, which
+        // is what lets a self-checking test assert on random stimulus.
+        assert_eq!(first, draw());
+        assert_ne!(first[0], first[1]);
+    }
+
+    #[test]
+    fn test_an_unknown_system_function_is_reported_by_name() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module bogus(output reg [7:0] q);
+                initial q = $nosuchfunction(1);
+            endmodule
+        "#,
+        )
+        .expect("module should parse");
+        let mut simulator = Simulator::new(module);
+
+        // Wherever it lands — elaboration or a later timestep — an unknown
+        // `$name` is an error that repeats the name, never a silent zero.
+        let message = simulator
+            .setup()
+            .and_then(|()| simulator.advance(1))
+            .expect_err("an unknown system function should fail")
+            .to_string();
+        assert!(
+            message.contains("$nosuchfunction"),
+            "unexpected message: {}",
+            message
+        );
+        assert!(simulator.get("q").unwrap().has_unknown());
     }
 }

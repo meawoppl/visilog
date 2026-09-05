@@ -70,7 +70,10 @@ fn entries(list: &str) -> Vec<Entry> {
 /// Counting every `$` would keep reporting system tasks as a blocker after
 /// they were implemented, which is how a survey heuristic quietly goes stale.
 fn unsupported_system_names(source: &str) -> bool {
-    const SUPPORTED: [&str; 4] = ["display", "write", "finish", "time"];
+    const SUPPORTED: [&str; 10] = [
+        "display", "write", "finish", "time", "stime", "signed", "unsigned", "random", "bits",
+        "clog2",
+    ];
     source.match_indices('$').any(|(at, _)| {
         let name: String = source[at + 1..]
             .chars()
@@ -105,7 +108,7 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
 
     note(
         unsupported_system_names(source),
-        "unsupported system function ($random, $signed, $monitor, ...)",
+        "unsupported system function ($monitor, $fdisplay, $realtime, ...)",
     );
     note(
         body.contains("function") || body.contains("task"),
