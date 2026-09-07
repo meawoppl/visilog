@@ -3,13 +3,29 @@
 //! [`eval`] walks an [`Expression`] and produces a [`Register`], the repo's
 //! 0/1/x/z bit vector type, reading identifier values out of a [`StateStore`].
 //!
-//! # Deliberate simplifications
+//! # Widths
 //!
-//! Real Verilog sizes an expression using *context-determined* widths: the
-//! width of an assignment's target flows back down into the operands. Nothing
-//! here knows about an assignment target, so every operand is
-//! **self-determined**: the width of a sub-expression depends only on that
-//! sub-expression. The individual rules are documented on the helpers below.
+//! Verilog sizes most expressions **context-determined**: the width of an
+//! assignment's target flows back *down* into the operands, and the operation
+//! is carried out at that width. `reg [15:0] w; reg [7:0] a, b; w = a * b;`
+//! widens `a` and `b` to sixteen bits before multiplying, so the full product
+//! survives; sizing each operand by itself would produce an eight bit product
+//! and then zero pad a plausible wrong number.
+//!
+//! The context arrives as the `width` argument of [`eval_in_context`], and it
+//! is a **lower bound** rather than an exact size: an operand is padded out to
+//! it and is otherwise left at its own width. That is exactly Verilog's rule —
+//! an expression is evaluated at the larger of its self-determined width and
+//! its context — and it means [`SELF_DETERMINED`], a bound of zero, asks for
+//! the self-determined answer without a separate code path.
+//!
+//! Which operands the bound reaches is not uniform, and [`OperandRule`] is
+//! where that lives. It reaches the operands of `+ - * / % & | ^ ~^`, of unary
+//! `+ - ~`, the two arms of a `?:`, and the *left* operand of a shift or a
+//! `**`. It does not reach a shift's right operand, a `?:` condition, an
+//! operand of a comparison or a reduction, or anything inside a concatenation:
+//! those size themselves, and a wider context only zero pads whatever they
+//! produce.
 //!
 //! # Signedness
 //!
@@ -27,9 +43,10 @@
 //! the same bits either way. A concatenation, a bit or part select, and the
 //! result of a comparison are unsigned no matter what went into them.
 //!
-//! Sizing is still self-determined, so the one thing the operators here cannot
-//! do is let an assignment's target widen a signed operand *before* the
-//! operation: `reg [15:0] r; r = -4'd12;` still negates in four bits.
+//! Signedness and width arrive together, which is what makes
+//! `reg [15:0] r; r = -4'd12;` store `16'hfff4`: the literal is zero padded to
+//! sixteen bits by its context and *then* negated, rather than negated in four
+//! bits and padded afterwards.
 
 use std::fmt;
 
@@ -38,6 +55,7 @@ use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, X, Z, ZERO};
+use crate::simulator::exec::range_width;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{StateStore, MAX_CALL_DEPTH};
 
@@ -55,6 +73,10 @@ const MAX_ARITHMETIC_WIDTH: usize = 128;
 /// Upper bound on the width a part select may produce, so that a nonsense
 /// range such as `a[1000000:0]` reports an error instead of allocating.
 const MAX_SELECT_WIDTH: usize = 1 << 16;
+
+/// The width context of an expression nothing around it can size: a lower
+/// bound of zero, which every register already meets.
+pub const SELF_DETERMINED: usize = 0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvalError {
@@ -152,13 +174,28 @@ impl fmt::Display for EvalError {
 
 impl std::error::Error for EvalError {}
 
-/// Evaluates `expr` against the values in `store`.
+/// Evaluates `expr` against the values in `store`, self-determined: nothing
+/// outside the expression has a say in how wide it is or how its bits read.
 ///
-/// The top of an expression is self-determined — nothing outside it can change
-/// how it reads its own bits — so this is [`eval_in_context`] with a signed
-/// context.
+/// This is what a `case` subject, a condition, a task argument and every other
+/// expression that is not the right hand side of an assignment wants.
 pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError> {
-    eval_in_context(expr, store, true)
+    eval_in_context(expr, store, true, SELF_DETERMINED)
+}
+
+/// Evaluates `expr` as the right hand side of an assignment into a target
+/// `width` bits wide, so that the target's width reaches the operands *before*
+/// the operators run.
+///
+/// The width is a lower bound: an expression wider than its target is still
+/// evaluated at its own width and truncated when it is written, which is the
+/// order Verilog asks for.
+pub fn eval_sized(
+    expr: &Expression,
+    store: &StateStore,
+    width: usize,
+) -> Result<Register, EvalError> {
+    eval_in_context(expr, store, true, width)
 }
 
 /// Evaluates `expr` where `signed_context` says whether the expression around
@@ -175,41 +212,73 @@ pub fn eval(expr: &Expression, store: &StateStore) -> Result<Register, EvalError
 ///
 /// A *self-determined* operand — the operands of a comparison, a shift amount,
 /// a concatenation member, a system function argument — is evaluated with a
-/// signed context of `true`, because nothing above it has a say.
+/// signed context of `true` and a width of [`SELF_DETERMINED`], because nothing
+/// above it has a say.
+///
+/// `width` is the other half of the context: the fewest bits the result may
+/// come back in. It is threaded into exactly the operands [`OperandRule`] calls
+/// context-determined, and every other arm pads its own answer out to it
+/// instead — a comparison still produces one bit, and a concatenation is still
+/// as wide as its parts add up to.
 fn eval_in_context(
     expr: &Expression,
     store: &StateStore,
     signed_context: bool,
+    width: usize,
 ) -> Result<Register, EvalError> {
     match expr {
         // Only a *leaf* has to be told that its context is unsigned. Every
         // operator below already asks its own operands, and an operand
         // evaluated in an unsigned context comes back unsigned — so by the time
         // an operator decides its result there is nothing left to demote.
-        Expression::Constant(constant) => eval_constant(constant, signed_context),
+        Expression::Constant(constant) => {
+            widened_result(eval_constant(constant, signed_context), width)
+        }
         Expression::Identifier(id) => {
             let value = match store.get(&id.name) {
                 Some(value) => value.clone(),
                 None => return Err(unresolved(&id.name, store)),
             };
-            Ok(demoted(value, signed_context))
+            Ok(widened(demoted(value, signed_context), width))
         }
-        Expression::Parenthetical(inner) => eval_in_context(inner, store, signed_context),
+        Expression::Parenthetical(inner) => eval_in_context(inner, store, signed_context, width),
         Expression::Unary(op, operand) => {
-            let context = if unary_keeps_signedness(op) {
-                signed_context && expression_is_signed(operand, store)
+            if unary_keeps_signedness(op) {
+                // `+ - ~` hand the context straight through and keep whatever
+                // width the operand came back at, so there is nothing to pad.
+                let context = signed_context && expression_is_signed(operand, store);
+                eval_unary(op, &eval_in_context(operand, store, context, width)?)
             } else {
-                true
-            };
-            eval_unary(op, &eval_in_context(operand, store, context)?)
+                // A reduction and `!` read a self-determined operand and answer
+                // in one unsigned bit; a wider context only zero pads that.
+                let operand = eval_in_context(operand, store, true, SELF_DETERMINED)?;
+                widened_result(eval_unary(op, &operand), width)
+            }
         }
         Expression::Binary(lhs, op, rhs) => {
-            let (left, right) = operand_contexts(op, lhs, rhs, store, signed_context);
-            eval_binary(
+            let rule = operand_rule(op);
+            let (mut left, mut right) = operand_contexts(rule, lhs, rhs, store, signed_context);
+            let (mut left_width, mut right_width) = operand_widths(rule, width);
+            if matches!(rule, OperandRule::Compared) && (sized_within(lhs) || sized_within(rhs)) {
+                let (signed, common) = compared_operands(lhs, rhs, store);
+                left = signed;
+                right = signed;
+                left_width = common;
+                right_width = common;
+            }
+            let value = eval_binary(
                 op,
-                &eval_in_context(lhs, store, left)?,
-                &eval_in_context(rhs, store, right)?,
-            )
+                &eval_in_context(lhs, store, left, left_width)?,
+                &eval_in_context(rhs, store, right, right_width)?,
+            );
+            // Every context-determined rule hands the width on to an operand
+            // wide enough to satisfy it, so the result already meets it. A
+            // comparison and a `&&` answer in one bit however wide their
+            // operands were, so those are the two with padding left to do.
+            match rule {
+                OperandRule::Compared | OperandRule::SelfDetermined => widened_result(value, width),
+                _ => value,
+            }
         }
         Expression::Conditional(condition, when_true, when_false) => {
             // Only the taken branch is evaluated. When the condition is `x` both
@@ -223,12 +292,12 @@ fn eval_in_context(
                 && expression_is_signed(when_true, store)
                 && expression_is_signed(when_false, store);
             match truth(&eval(condition, store)?) {
-                Some(true) => eval_in_context(when_true, store, arms),
-                Some(false) => eval_in_context(when_false, store, arms),
+                Some(true) => eval_in_context(when_true, store, arms, width),
+                Some(false) => eval_in_context(when_false, store, arms, width),
                 None => {
                     let (when_true, when_false) = (
-                        eval_in_context(when_true, store, arms)?,
-                        eval_in_context(when_false, store, arms)?,
+                        eval_in_context(when_true, store, arms, width)?,
+                        eval_in_context(when_false, store, arms, width)?,
                     );
                     Ok(merge(&when_true, &when_false).with_signedness(arms))
                 }
@@ -242,25 +311,29 @@ fn eval_in_context(
             for part in parts {
                 values.push(eval(part, store)?);
             }
-            Ok(Register::concatenated(&values))
+            // A concatenation sizes itself out of its parts, and a context
+            // cannot reach into them: `c = { a**b };` is the four bit power
+            // even when `c` is sixteen bits wide.
+            Ok(widened(Register::concatenated(&values), width))
         }
         Expression::BitSelect(id, index) => {
             // An index that is unknown, or too large to be a bit number, selects `x`.
             let index = numeric(&eval(index, store)?)?.and_then(|value| i64::try_from(value).ok());
-            match store.get_signal(&id.name) {
+            let value = match store.get_signal(&id.name) {
                 // `a[3]` where `a` is a vector: one bit of it.
                 Some(signal) => match index {
-                    Some(index) => Ok(logic_bit(signal.bit(index))),
-                    None => Ok(Register::unknown(1)),
+                    Some(index) => logic_bit(signal.bit(index)),
+                    None => Register::unknown(1),
                 },
                 // `m[3]` where `m` is a memory: one whole word of it. The two
                 // are the same syntax, and the only thing that tells them apart
                 // is which map the declaration put the name in.
                 None => match store.memory(&id.name) {
-                    Some(memory) => Ok(demoted(memory.word(index), signed_context)),
-                    None => Err(EvalError::UnknownIdentifier(id.name.clone())),
+                    Some(memory) => demoted(memory.word(index), signed_context),
+                    None => return Err(EvalError::UnknownIdentifier(id.name.clone())),
                 },
-            }
+            };
+            Ok(widened(value, width))
         }
         Expression::PartSelect(id, first, second) => {
             let Some(signal) = store.get_signal(&id.name) else {
@@ -268,9 +341,9 @@ fn eval_in_context(
             };
             let first = select_bound(first, store)?;
             let second = select_bound(second, store)?;
-            let width = (first - second).unsigned_abs() as usize + 1;
-            if width > MAX_SELECT_WIDTH {
-                return Err(EvalError::WidthOverflow(width));
+            let selected = (first - second).unsigned_abs() as usize + 1;
+            if selected > MAX_SELECT_WIDTH {
+                return Err(EvalError::WidthOverflow(selected));
             }
             // The result runs from the first bound to the second, so a select
             // out of an ascending vector (`a[0:3]`) comes back in source order.
@@ -280,18 +353,22 @@ fn eval_in_context(
                 (first..=second).collect()
             };
             let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
-            Ok(Register::from_bits(bits))
+            Ok(widened(Register::from_bits(bits), width))
         }
-        Expression::FunctionCall(id, arguments) => Ok(demoted(
-            call_function(id, arguments, store)?,
-            signed_context,
-        )),
+        // A call is as wide as its function was declared, and a context can
+        // only pad that — it cannot reach the arguments, which the function's
+        // own declaration sizes.
+        Expression::FunctionCall(id, arguments) => widened_result(
+            call_function(id, arguments, store).map(|value| demoted(value, signed_context)),
+            width,
+        ),
         // `$signed(...)` is the one call that produces a signed value out of
         // nothing, so it is a leaf for this purpose too.
-        Expression::SystemFunctionCall(name, arguments) => Ok(demoted(
-            eval_system_function(name, arguments, store)?,
-            signed_context,
-        )),
+        Expression::SystemFunctionCall(name, arguments) => widened_result(
+            eval_system_function(name, arguments, store)
+                .map(|value| demoted(value, signed_context)),
+            width,
+        ),
     }
 }
 
@@ -354,7 +431,44 @@ fn call_function(
         })
 }
 
+/// `value` padded out to a context that asked for at least `width` bits.
+///
+/// A signed value replicates its sign bit and an unsigned one is zero padded,
+/// the same widening two operands of different widths get when they meet. A
+/// value already that wide is handed straight back, so a [`SELF_DETERMINED`]
+/// context costs one comparison. The signedness is restamped because
+/// [`Register::coerced`] builds a fresh register, and a fresh register is
+/// unsigned.
+#[inline(always)]
+fn widened(value: Register, width: usize) -> Register {
+    // A [`SELF_DETERMINED`] context takes this branch every time, so the
+    // padding itself is kept out of line and out of the hot path.
+    if value.width() >= width {
+        return value;
+    }
+    pad(&value, width)
+}
+
+/// [`widened`] for a value that has still to be unwrapped.
+///
+/// A [`SELF_DETERMINED`] context hands the result straight back rather than
+/// taking the value out and putting it back, which is what the overwhelmingly
+/// common case costs.
+#[inline(always)]
+fn widened_result(value: Result<Register, EvalError>, width: usize) -> Result<Register, EvalError> {
+    if width == SELF_DETERMINED {
+        return value;
+    }
+    Ok(widened(value?, width))
+}
+
+#[cold]
+fn pad(value: &Register, width: usize) -> Register {
+    value.coerced(width).with_signedness(value.is_signed())
+}
+
 /// `value` as an unsigned one unless the context allows it to stay signed.
+#[inline(always)]
 fn demoted(value: Register, signed_context: bool) -> Register {
     if signed_context {
         value
@@ -364,14 +478,18 @@ fn demoted(value: Register, signed_context: bool) -> Register {
 }
 
 // ---------------------------------------------------------------------------
-// Signedness
+// Signedness and width
 // ---------------------------------------------------------------------------
 
-/// Where a binary operator's operands take their signedness from.
+/// Where a binary operator's operands take their signedness and their width
+/// from.
 ///
 /// The distinction is not about the operator's arithmetic — it is about which
 /// operands are *context-determined*, meaning the expression around them can
-/// make them unsigned, and which decide for themselves.
+/// make them unsigned and can make them wider, and which decide for
+/// themselves. Both halves of the context follow the same split, which is why
+/// there is one rule rather than two.
+#[derive(Clone, Copy)]
 enum OperandRule {
     /// `+ - * / % & | ^ ^~`: both operands are context-determined, and the
     /// result is signed only when both of them are.
@@ -383,8 +501,15 @@ enum OperandRule {
     /// `<< >> <<< >>>`: the value being shifted is context-determined and alone
     /// decides the result; the shift amount is self-determined.
     ShiftedValue,
-    /// `< <= > >= == != === !== && ||`: both operands are self-determined and
-    /// the one-bit result is unsigned however they compared.
+    /// `< <= > >= == != === !==`: the one-bit result is unsigned however the
+    /// operands compared, so nothing *outside* the comparison reaches them —
+    /// but the two operands are context-determined **with respect to each
+    /// other**. They are sized to the wider of the two and read signed only
+    /// when both of them are, which is why `a/b` compared against a sixteen
+    /// bit net divides in sixteen bits rather than eight.
+    Compared,
+    /// `&& ||`: each operand is collapsed to a truth value on its own, so
+    /// neither the expression around them nor the other operand has any say.
     SelfDetermined,
 }
 
@@ -405,19 +530,27 @@ fn operand_rule(op: &BinaryOperator) -> OperandRule {
         | BinaryOperator::ShiftRight
         | BinaryOperator::ArithmeticShiftLeft
         | BinaryOperator::ArithmeticShiftRight => OperandRule::ShiftedValue,
-        _ => OperandRule::SelfDetermined,
+        BinaryOperator::LessThan
+        | BinaryOperator::LessThanOrEqual
+        | BinaryOperator::GreaterThan
+        | BinaryOperator::GreaterThanOrEqual
+        | BinaryOperator::LogicalEquality
+        | BinaryOperator::LogicalInequality
+        | BinaryOperator::CaseEquality
+        | BinaryOperator::CaseInequality => OperandRule::Compared,
+        BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => OperandRule::SelfDetermined,
     }
 }
 
 /// The signed context each operand of `op` is evaluated in.
 fn operand_contexts(
-    op: &BinaryOperator,
+    rule: OperandRule,
     lhs: &Expression,
     rhs: &Expression,
     store: &StateStore,
     signed_context: bool,
 ) -> (bool, bool) {
-    match operand_rule(op) {
+    match rule {
         OperandRule::Shared => {
             let signed = signed_context
                 && expression_is_signed(lhs, store)
@@ -431,7 +564,33 @@ fn operand_contexts(
             (signed, true)
         }
         OperandRule::ShiftedValue => (signed_context && expression_is_signed(lhs, store), true),
-        OperandRule::SelfDetermined => (true, true),
+        // A comparison is unsigned whatever it compared, so the context above
+        // it has nothing to say. Its two operands do decide together — see
+        // [`compared_operands`] — but only an operand that reads its own
+        // signedness *inside* an operation can tell, and for the rest
+        // `align_numeric` reaches the same answer from the values.
+        OperandRule::Compared | OperandRule::SelfDetermined => (true, true),
+    }
+}
+
+/// The width context each operand of `op` is evaluated in, given the `width`
+/// the whole operation was asked for.
+///
+/// The bound reaches every context-determined operand unchanged, because the
+/// operation is carried out at the width its operands come back at: widening
+/// them *is* how the operation is widened. Everything else gets
+/// [`SELF_DETERMINED`] — a shift amount and the operands of a comparison size
+/// themselves, and no context can make them wider.
+fn operand_widths(rule: OperandRule, width: usize) -> (usize, usize) {
+    match rule {
+        OperandRule::Shared => (width, width),
+        // `**` takes its left operand's width, so that is the one the context
+        // reaches; an exponent cannot change the result's width.
+        OperandRule::BaseAndExponent | OperandRule::ShiftedValue => (width, SELF_DETERMINED),
+        // Both operands of a comparison are sized to the wider of the two,
+        // which is the one place a width has to be worked out rather than
+        // handed down. `&&` and `||` read each side on its own.
+        OperandRule::Compared | OperandRule::SelfDetermined => (SELF_DETERMINED, SELF_DETERMINED),
     }
 }
 
@@ -471,7 +630,7 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
                 expression_is_signed(lhs, store) && expression_is_signed(rhs, store)
             }
             OperandRule::ShiftedValue => expression_is_signed(lhs, store),
-            OperandRule::SelfDetermined => false,
+            OperandRule::Compared | OperandRule::SelfDetermined => false,
         },
         Expression::Conditional(_, when_true, when_false) => {
             expression_is_signed(when_true, store) && expression_is_signed(when_false, store)
@@ -487,6 +646,111 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
             .function(&id.name)
             .is_some_and(|definition| definition.result.signed),
         Expression::SystemFunctionCall(name, _) => system_function_is_signed(name),
+    }
+}
+
+/// The signedness and the width a comparison's two operands share.
+///
+/// A comparison is self-determined as far as the expression *around* it is
+/// concerned — its answer is one unsigned bit however wide its operands were —
+/// but the two operands are context-determined with respect to **each other**:
+/// they are sized to the wider of the two, and read signed only when both of
+/// them are. `assign wide = a / b;` compared against `a / b` therefore divides
+/// in the net's width on one side and in the operands' width on the other, and
+/// a signed operand beside an unsigned one is zero padded rather than sign
+/// extended.
+fn compared_operands(lhs: &Expression, rhs: &Expression, store: &StateStore) -> (bool, usize) {
+    let signed = expression_is_signed(lhs, store) && expression_is_signed(rhs, store);
+    let width = expression_width(lhs, store).max(expression_width(rhs, store));
+    (signed, width)
+}
+
+/// Whether widening `expr` *before* it is evaluated can give different bits
+/// from widening the value it produces afterwards.
+///
+/// Only an expression that carries out an operation at its own width can tell:
+/// `~a` inverts four bits and then pads with zeros, or pads to eight and
+/// inverts those. A literal, a signal, a select, a concatenation, a call, a
+/// reduction and a nested comparison all produce their bits once and are padded
+/// the same way whichever end it happens at — and [`align_numeric`] and
+/// [`equal_values`] already pad them. That is what lets a comparison of two
+/// plain signals skip measuring anything, which is most comparisons a design
+/// writes.
+fn sized_within(expr: &Expression) -> bool {
+    match expr {
+        Expression::Parenthetical(inner) => sized_within(inner),
+        // A reduction and `!` answer in one unsigned bit; `+ - ~` work at the
+        // width they are given.
+        Expression::Unary(op, _) => unary_keeps_signedness(op),
+        Expression::Binary(_, op, _) => !matches!(
+            operand_rule(op),
+            OperandRule::Compared | OperandRule::SelfDetermined
+        ),
+        Expression::Conditional(_, _, _) => true,
+        _ => false,
+    }
+}
+
+/// How wide `expr` is when nothing around it has a say — its *self-determined*
+/// width.
+///
+/// [`eval_in_context`] hands a width down rather than working one out, so this
+/// is needed in exactly one place: a comparison, whose two operands size each
+/// other and so have to be measured before either is evaluated. It reads the
+/// same sources the evaluator does — a literal's own size, a signal's
+/// declaration, a function's declared result — so the two cannot disagree.
+///
+/// A name the store does not have, and a part select whose bounds are not
+/// constants, report one bit rather than an error: evaluating the same
+/// expression is about to fail and say why, and a width guessed here never
+/// reaches the answer.
+fn expression_width(expr: &Expression, store: &StateStore) -> usize {
+    match expr {
+        Expression::Constant(constant) => constant.size().unwrap_or(UNSIZED_CONSTANT_WIDTH),
+        Expression::Identifier(id) => store
+            .get_signal(&id.name)
+            .map_or(1, |signal| signal.width()),
+        Expression::Parenthetical(inner) => expression_width(inner, store),
+        // `+ - ~` are as wide as what they act on; a reduction and `!` answer
+        // in one bit.
+        Expression::Unary(op, operand) => {
+            if unary_keeps_signedness(op) {
+                expression_width(operand, store)
+            } else {
+                1
+            }
+        }
+        Expression::Binary(lhs, op, rhs) => match operand_rule(op) {
+            OperandRule::Shared => expression_width(lhs, store).max(expression_width(rhs, store)),
+            OperandRule::BaseAndExponent | OperandRule::ShiftedValue => {
+                expression_width(lhs, store)
+            }
+            OperandRule::Compared | OperandRule::SelfDetermined => 1,
+        },
+        Expression::Conditional(_, when_true, when_false) => {
+            expression_width(when_true, store).max(expression_width(when_false, store))
+        }
+        Expression::Concatenation(parts) => {
+            parts.iter().map(|part| expression_width(part, store)).sum()
+        }
+        Expression::BitSelect(_, _) => 1,
+        Expression::PartSelect(_, first, second) => {
+            match (select_bound(first, store), select_bound(second, store)) {
+                (Ok(first), Ok(second)) => (first - second).unsigned_abs() as usize + 1,
+                _ => 1,
+            }
+        }
+        Expression::FunctionCall(id, _) => store
+            .function(&id.name)
+            .map_or(1, |definition| range_width(definition.result.range)),
+        Expression::SystemFunctionCall(name, arguments) => match name.as_str() {
+            "time" => TIME_WIDTH,
+            // A cast changes no bit and no width.
+            "signed" | "unsigned" => arguments.first().map_or(SYSTEM_FUNCTION_WIDTH, |argument| {
+                expression_width(argument, store)
+            }),
+            _ => SYSTEM_FUNCTION_WIDTH,
+        },
     }
 }
 
