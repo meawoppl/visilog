@@ -152,6 +152,24 @@ pub fn edges_from_changes(changes: Vec<(String, Register)>, after: &StateStore) 
         .collect()
 }
 
+/// The edges a round's memory writes produce.
+///
+/// A memory is journalled per name rather than per word — see
+/// [`StateStore::set_word`](crate::simulator::state_store::StateStore::set_word)
+/// — so an edge here says "a word of this memory moved, from that value to this
+/// one" rather than naming the address. That is enough for a sensitivity list,
+/// which matches on the name.
+pub fn memory_edges(changes: Vec<(String, Register, Register)>) -> Vec<SignalEdge> {
+    changes
+        .into_iter()
+        .map(|(name, before, after)| SignalEdge {
+            name,
+            before,
+            after,
+        })
+        .collect()
+}
+
 /// Whether an `always` block's event control fires given the edges observed.
 ///
 /// `implicit_reads` is only consulted for [`EventControl::Implicit`]; it is the

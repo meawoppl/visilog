@@ -180,6 +180,31 @@ are queued at time zero; edge-triggered blocks are woken by `settle` instead, so
 deliberately skipped in the time wheel (`EventControl::None` reports as firing on *every*
 edge, so a free-running block must not also be edge-driven).
 
+**A memory is stored apart from the signals, and that is what tells a bit select
+from a word select.** `reg [7:0] mem [0:255];` declares 256 registers, and
+`elaborate` puts them in the `StateStore`'s *memory* map rather than its signal
+map — a name is in one or the other, never both. `a[3]` and `m[3]` are the same
+syntax and only the declaration says which is meant, so that is exactly how the
+declaration reaches `eval`: the `BitSelect` arm looks the name up as a signal
+first and reads a *bit*, and only a miss looks in the memory map and reads a
+whole *word*. An ordinary bit select therefore costs the one hash it always
+cost. `exec::resolve_target` asks the same question the other way round —
+`StateStore::any_memory` answers for a design that declares no memory without
+hashing anything — and produces a `ResolvedTarget::Word` instead of
+`ResolvedTarget::Bits`. An unwritten word reads `x` like any undriven register,
+and an address outside the declared range reads `x` and discards a write, which
+is what an out-of-range *bit* select already did. `integer i [0:3];` is a memory
+of 32-bit signed words by the same path.
+
+A memory write **is** journalled, in a list of its own: `always @(bus[index[0]])`
+has to wake when `index[0]` moves. The journal keeps one before/after pair per
+memory *name* rather than per word, which over-approximates in the direction
+`event_fires` already does — a block may wake more often than it should, never
+less. `$readmemh` / `$readmemb` are **not** implemented: a system task is run
+against a `&StateStore` and so cannot write one. They are a named error saying
+so, never a silent no-op that would leave a memory `x` and look like a design
+that ran.
+
 **Module hierarchy is flattened at elaboration, in `elaborate.rs`.** `Simulator::setup`
 walks the instantiation tree and inlines every child into the *same* flat `StateStore`,
 assignment list and block list, so nothing about hierarchy survives into the run loop and
@@ -289,7 +314,7 @@ but still unwired.
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` — system tasks, their format strings, and the buffer they print into |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`, plus the change journal `take_changes` / `clear_changes` drive, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -595,6 +620,15 @@ tripwire.
   `many0` stop at the first statement of the body. A body is then a `begin`…`end` block or
   a bare list of statements, the same `alt` `initial` uses. A function's range is a
   `simple.rs::range` like any other, so `function [WIDTH-1:0] f;` still does not parse.
+- **A memory and a signal cannot share a name, and nothing else tells `m[3]`
+  from `a[3]`.** `StateStore` keeps two maps and `elaborate` decides which one a
+  declaration lands in by whether it carried an address dimension. Anything that
+  wants to know whether a name is a memory has to ask the store — the
+  `Expression` says nothing, and a `BitSelect` on a memory is not distinguishable
+  from one on a vector in the AST. A bare memory name, or a part select of one,
+  is `EvalError::MemoryAsValue` rather than `UnknownIdentifier`: the name does
+  exist. `MAX_MEMORY_DEPTH` in `elaborate.rs` makes a nonsense dimension a named
+  error rather than an allocation nothing survives.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

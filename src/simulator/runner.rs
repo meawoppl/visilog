@@ -366,7 +366,13 @@ impl Simulator {
             // Taking the changes here, before the blocks run, is what makes the
             // next round's edges exactly what this round moves.
             let changes = self.state.take_changes();
-            let edges = events::edges_from_changes(changes, &self.state);
+            let mut edges = events::edges_from_changes(changes, &self.state);
+            // A memory keeps a journal of its own, since one displaced
+            // `Register` per name cannot say which word moved. A design that
+            // declares no memory skips it on a flag rather than on a lookup.
+            if self.state.any_memory() {
+                edges.extend(events::memory_edges(self.state.take_memory_changes()));
+            }
             if edges.is_empty() {
                 return Ok(delta - 1);
             }
@@ -2118,6 +2124,252 @@ mod tests {
                 })
             ),
             "unexpected error: {:?}",
+            error
+        );
+    }
+    /// The test that catches "every word is secretly one word": several
+    /// addresses are written with different values and all of them are read
+    /// back.
+    #[test]
+    fn test_a_memory_holds_a_different_value_at_every_address() {
+        let simulator = simulator_for(
+            r#"
+            module memory_holds_words();
+                reg [7:0] mem [0:3];
+                initial begin
+                    mem[0] = 8'd10;
+                    mem[1] = 8'd20;
+                    mem[2] = 8'd30;
+                    mem[3] = 8'd40;
+                    $display("%0d %0d %0d %0d", mem[0], mem[1], mem[2], mem[3]);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["10 20 30 40"]);
+    }
+
+    /// A word nothing has written reads `x`, like any undriven register. This
+    /// is `meminit` in the ivtest corpus.
+    #[test]
+    fn test_an_unwritten_memory_word_reads_unknown() {
+        let simulator = simulator_for(
+            r#"
+            module memory_starts_unknown();
+                reg [3:0] mem [0:1];
+                initial begin
+                    if (mem[0] !== 4'bxxxx) $display("FAILED -- mem[0] == %b", mem[0]);
+                    else if (mem[1] !== 4'bxxxx) $display("FAILED -- mem[1] == %b", mem[1]);
+                    else $display("PASSED");
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["PASSED"]);
+    }
+
+    /// A variable address on both sides, which is the whole point of a memory:
+    /// a constant index could have been a signal each.
+    #[test]
+    fn test_a_memory_is_addressed_by_a_variable() {
+        let simulator = simulator_for(
+            r#"
+            module memory_variable_index();
+                reg [7:0] mem [0:7];
+                integer i;
+                initial begin
+                    for (i = 0; i < 8; i = i + 1) mem[i] = i * 3;
+                    for (i = 7; i >= 0; i = i - 1) $write("%0d ", mem[i]);
+                    $display("");
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["21 18 15 12 9 6 3 0 "]);
+    }
+
+    /// A clocked memory: the address and the data both move, and the word
+    /// written under one address must still be there after another is written.
+    #[test]
+    fn test_a_clocked_memory_keeps_every_word_it_was_given() {
+        let mut simulator = simulator_for(
+            r#"
+            module ram(
+                input clk,
+                input [2:0] addr,
+                input [7:0] data,
+                output reg [7:0] q
+            );
+                reg [7:0] mem [0:7];
+                always @(posedge clk) begin
+                    mem[addr] <= data;
+                    q <= mem[addr];
+                end
+            endmodule
+        "#,
+        );
+
+        let write = |simulator: &mut Simulator, address: u128, value: u128| {
+            simulator
+                .set_input("addr", Register::from_u128(address, 3))
+                .unwrap();
+            simulator
+                .set_input("data", Register::from_u128(value, 8))
+                .unwrap();
+            simulator.tick("clk").unwrap();
+        };
+        write(&mut simulator, 2, 0xAA);
+        write(&mut simulator, 5, 0x55);
+
+        // Reading back address 2 must still see what was written there, not the
+        // later write to address 5.
+        simulator
+            .set_input("addr", Register::from_u128(2, 3))
+            .unwrap();
+        simulator
+            .set_input("data", Register::from_u128(0, 8))
+            .unwrap();
+        simulator.tick("clk").unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_binary(), "10101010");
+    }
+
+    /// `reg [7:0] m [15:8];` — neither zero based nor ascending.
+    #[test]
+    fn test_a_memory_with_a_descending_non_zero_based_range_addresses_correctly() {
+        let simulator = simulator_for(
+            r#"
+            module descending_memory();
+                reg [7:0] m [15:8];
+                initial begin
+                    m[15] = 8'd1;
+                    m[8] = 8'd2;
+                    $display("%0d %0d %b %b", m[15], m[8], m[7], m[16]);
+                end
+            endmodule
+        "#,
+        );
+
+        // Both ends of the declared range hold their own value, and an address
+        // outside it reads `x`.
+        assert_eq!(simulator.output().lines(), vec!["1 2 xxxxxxxx xxxxxxxx"]);
+    }
+
+    /// The regression risk: `a[3]` on a plain vector is still a *bit*.
+    #[test]
+    fn test_a_plain_vector_still_bit_selects() {
+        let simulator = simulator_for(
+            r#"
+            module vector_and_memory();
+                reg [7:0] a;
+                reg m [0:7];
+                initial begin
+                    a = 8'b00001000;
+                    m[3] = 1'b0;
+                    m[7] = 1'b1;
+                    // `a[3]` is one bit of a byte; `m[3]` is one word of an array.
+                    $display("%b %b %b %b", a[3], a[2], m[3], m[7]);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["1 0 0 1"]);
+    }
+
+    /// An address outside the declared range reads `x` and swallows a write,
+    /// which is what an out-of-range bit select already did.
+    #[test]
+    fn test_an_out_of_range_memory_address_reads_x_and_discards_a_write() {
+        let simulator = simulator_for(
+            r#"
+            module out_of_range_memory();
+                reg [3:0] mem [0:1];
+                initial begin
+                    mem[0] = 4'd1;
+                    mem[9] = 4'd2;
+                    $display("%b %b", mem[0], mem[9]);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["0001 xxxx"]);
+    }
+
+    /// A continuous assignment reading a memory word settles against it, which
+    /// is the shape of the corpus file `pr2890322`.
+    #[test]
+    fn test_a_continuous_assignment_reads_a_memory_word() {
+        let mut simulator = simulator_for(
+            r#"
+            module memory_through_a_wire();
+                reg [7:0] mem [0:1];
+                wire [7:0] sum = mem[0] + mem[1];
+                initial begin
+                    mem[0] = 1;
+                    mem[1] = 2;
+                    #1 if (sum === 3) $display("PASSED");
+                       else $display("FAILED %b", sum);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(2).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["PASSED"]);
+    }
+
+    /// A memory write is an edge, so a block sensitive to what a word feeds
+    /// wakes on it. Without this, `pr2011429` in the corpus goes wrong.
+    #[test]
+    fn test_a_block_wakes_when_a_memory_word_moves() {
+        let mut simulator = simulator_for(
+            r#"
+            module wake_on_memory();
+                reg [7:0] bus;
+                reg picked;
+                integer index [0:0];
+                always @(bus[index[0]]) picked = bus[index[0]];
+                initial begin
+                    bus = 8'b10101010;
+                    index[0] = 0;
+                    #1 $display("%b", picked);
+                    index[0] = 1;
+                    #1 $display("%b", picked);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(5).unwrap();
+        assert_eq!(simulator.output().lines(), vec!["0", "1"]);
+    }
+
+    /// A memory has no value of its own, and saying so by name beats reporting
+    /// it as an identifier that does not exist.
+    #[test]
+    fn test_a_memory_used_as_a_value_is_reported_as_a_memory() {
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module memory_as_value();
+                reg [7:0] mem [0:1];
+                wire [7:0] q;
+                assign q = mem;
+            endmodule
+        "#,
+        )
+        .unwrap();
+        assert!(remaining.trim().is_empty());
+
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("design should elaborate");
+        let error = simulator.run().expect_err("mem has no value");
+        assert!(
+            format!("{}", error).contains("memory `mem`"),
+            "unexpected error: {}",
             error
         );
     }

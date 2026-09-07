@@ -60,6 +60,10 @@ const MAX_SELECT_WIDTH: usize = 1 << 16;
 pub enum EvalError {
     /// An identifier that has no entry in the [`StateStore`].
     UnknownIdentifier(String),
+    /// A memory read as though it were a value: a bare `mem`, or a part select
+    /// of one. Only a word select (`mem[addr]`) reads a memory, so this is a
+    /// name that exists reported as what it is rather than as unknown.
+    MemoryAsValue(String),
     /// A call to a function the design does not declare, so there is no body
     /// to run.
     UnsupportedFunctionCall(String),
@@ -100,6 +104,9 @@ impl fmt::Display for EvalError {
         match self {
             EvalError::UnknownIdentifier(name) => {
                 write!(f, "no value for identifier `{}`", name)
+            }
+            EvalError::MemoryAsValue(name) => {
+                write!(f, "memory `{}` has no value without a word select", name)
             }
             EvalError::UnsupportedFunctionCall(name) => {
                 write!(f, "function call `{}` is not supported", name)
@@ -181,10 +188,10 @@ fn eval_in_context(
         // an operator decides its result there is nothing left to demote.
         Expression::Constant(constant) => eval_constant(constant, signed_context),
         Expression::Identifier(id) => {
-            let value = store
-                .get(&id.name)
-                .cloned()
-                .ok_or_else(|| EvalError::UnknownIdentifier(id.name.clone()))?;
+            let value = match store.get(&id.name) {
+                Some(value) => value.clone(),
+                None => return Err(unresolved(&id.name, store)),
+            };
             Ok(demoted(value, signed_context))
         }
         Expression::Parenthetical(inner) => eval_in_context(inner, store, signed_context),
@@ -238,19 +245,27 @@ fn eval_in_context(
             Ok(Register::concatenated(&values))
         }
         Expression::BitSelect(id, index) => {
-            let signal = store
-                .get_signal(&id.name)
-                .ok_or_else(|| EvalError::UnknownIdentifier(id.name.clone()))?;
             // An index that is unknown, or too large to be a bit number, selects `x`.
-            match numeric(&eval(index, store)?)?.and_then(|value| i64::try_from(value).ok()) {
-                Some(index) => Ok(logic_bit(signal.bit(index))),
-                None => Ok(Register::unknown(1)),
+            let index = numeric(&eval(index, store)?)?.and_then(|value| i64::try_from(value).ok());
+            match store.get_signal(&id.name) {
+                // `a[3]` where `a` is a vector: one bit of it.
+                Some(signal) => match index {
+                    Some(index) => Ok(logic_bit(signal.bit(index))),
+                    None => Ok(Register::unknown(1)),
+                },
+                // `m[3]` where `m` is a memory: one whole word of it. The two
+                // are the same syntax, and the only thing that tells them apart
+                // is which map the declaration put the name in.
+                None => match store.memory(&id.name) {
+                    Some(memory) => Ok(demoted(memory.word(index), signed_context)),
+                    None => Err(EvalError::UnknownIdentifier(id.name.clone())),
+                },
             }
         }
         Expression::PartSelect(id, first, second) => {
-            let signal = store
-                .get_signal(&id.name)
-                .ok_or_else(|| EvalError::UnknownIdentifier(id.name.clone()))?;
+            let Some(signal) = store.get_signal(&id.name) else {
+                return Err(unresolved(&id.name, store));
+            };
             let first = select_bound(first, store)?;
             let second = select_bound(second, store)?;
             let width = (first - second).unsigned_abs() as usize + 1;
@@ -277,6 +292,16 @@ fn eval_in_context(
             eval_system_function(name, arguments, store)?,
             signed_context,
         )),
+    }
+}
+
+/// The error for a name that produced no value: a memory used where a value was
+/// wanted is reported as the memory it is, and anything else is simply unknown.
+fn unresolved(name: &str, store: &StateStore) -> EvalError {
+    if store.memory(name).is_some() {
+        EvalError::MemoryAsValue(name.to_string())
+    } else {
+        EvalError::UnknownIdentifier(name.to_string())
     }
 }
 
