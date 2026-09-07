@@ -49,6 +49,9 @@ pub enum ResolvedTarget {
     /// A bit or part select, held as the declared bit indices it names, most
     /// significant first: `q[3:1] <= d;` resolves to `[3, 2, 1]`.
     Bits { name: String, indices: Vec<i64> },
+    /// One word of a memory, as in `mem[addr] <= d;`. Written the same way as a
+    /// bit select and told apart from one by the declaration alone.
+    Word { name: String, index: i64 },
 }
 
 impl ResolvedTarget {
@@ -57,6 +60,7 @@ impl ResolvedTarget {
         match self {
             ResolvedTarget::Whole(name) => name,
             ResolvedTarget::Bits { name, .. } => name,
+            ResolvedTarget::Word { name, .. } => name,
         }
     }
 }
@@ -134,10 +138,21 @@ pub fn resolve_target(
             }
             Ok(ResolvedTarget::Whole(id.name.clone()))
         }
-        Expression::BitSelect(id, index) => Ok(ResolvedTarget::Bits {
-            name: id.name.clone(),
-            indices: vec![target_index(state, index)?],
-        }),
+        Expression::BitSelect(id, index) => {
+            // `a[3] = …` writes a bit and `m[3] = …` writes a word; the syntax
+            // is the same and the declaration is what decides. `any_memory`
+            // answers for a design that declares none without hashing the name.
+            if state.any_memory() && state.memory(&id.name).is_some() {
+                return Ok(ResolvedTarget::Word {
+                    name: id.name.clone(),
+                    index: target_index(state, index)?,
+                });
+            }
+            Ok(ResolvedTarget::Bits {
+                name: id.name.clone(),
+                indices: vec![target_index(state, index)?],
+            })
+        }
         Expression::PartSelect(id, first, second) => {
             let first = target_index(state, first)?;
             let second = target_index(state, second)?;
@@ -193,7 +208,21 @@ pub fn drive_resolved(
             Ok(true)
         }
         ResolvedTarget::Bits { name, indices } => drive_bits(state, name, indices, value),
+        ResolvedTarget::Word { name, index } => drive_word(state, name, *index, value),
     }
+}
+
+/// Writes one word of a memory. An address outside the declared range discards
+/// the write, matching what an out-of-range bit select does.
+fn drive_word(
+    state: &mut StateStore,
+    name: &str,
+    index: i64,
+    value: &Register,
+) -> Result<bool, SimulationError> {
+    state
+        .set_word(name, index, value)
+        .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))
 }
 
 /// A bit index on the left of an assignment has to be a constant, so anything

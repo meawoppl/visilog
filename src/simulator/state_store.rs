@@ -168,6 +168,113 @@ fn range_width(range: (i64, i64)) -> usize {
     ((range.0 - range.1).abs() + 1) as usize
 }
 
+/// A memory: `reg [7:0] mem [0:255];` — an array of words, each one a register
+/// of its own.
+///
+/// A memory is kept in a map of its own rather than as a wider [`SignalState`],
+/// and that separation is the whole disambiguation between a *bit* select and a
+/// *word* select. `a[3]` and `m[3]` are the same syntax; which one is meant
+/// depends only on how the name was declared, and the declaration reaches
+/// [`eval`](crate::simulator::eval::eval) as *which map the name landed in*.
+/// A name is a signal or a memory, never both.
+///
+/// A word that has never been written reads `x`, exactly like an undriven
+/// register, and an address outside the declared range reads `x` and swallows a
+/// write — the same thing [`SignalState::bit`] and [`SignalState::set_bit`] do
+/// with an out-of-range bit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Memory {
+    words: Vec<Register>,
+    /// The declared address range: `(0, 255)` for `mem [0:255]`, `(15, 8)` for
+    /// `mem [15:8]`.
+    addresses: (i64, i64),
+    /// The `(msb, lsb)` range of one word.
+    range: (i64, i64),
+}
+
+impl Memory {
+    /// A memory of `addresses` words, each `range` wide and every bit `x`.
+    pub fn new(addresses: (i64, i64), range: (i64, i64), signed: bool) -> Self {
+        let word = Register::unknown(range_width(range)).with_signedness(signed);
+        Memory {
+            words: vec![word; range_width(addresses)],
+            addresses,
+            range,
+        }
+    }
+
+    /// How many words the memory holds.
+    pub fn depth(&self) -> usize {
+        self.words.len()
+    }
+
+    /// The declared address range.
+    pub fn addresses(&self) -> (i64, i64) {
+        self.addresses
+    }
+
+    /// The `(msb, lsb)` range of one word.
+    pub fn range(&self) -> (i64, i64) {
+        self.range
+    }
+
+    /// How wide one word is.
+    pub fn width(&self) -> usize {
+        range_width(self.range)
+    }
+
+    /// Whether the declaration carried a `signed` qualifier.
+    pub fn is_signed(&self) -> bool {
+        self.words[0].is_signed()
+    }
+
+    /// Translates a declared address into an offset into `words`, counting from
+    /// the address written first — so `mem [0:255]` and `mem [15:8]` both run in
+    /// the order their declarations read. `None` is an address outside the
+    /// declared range.
+    pub fn word_position(&self, address: i64) -> Option<usize> {
+        let (first, last) = self.addresses;
+        let offset = if first <= last {
+            if address < first || address > last {
+                return None;
+            }
+            address - first
+        } else {
+            if address > first || address < last {
+                return None;
+            }
+            first - address
+        };
+        Some(offset as usize)
+    }
+
+    /// The word at `address`. An address that is unknown — `None`, which is what
+    /// an `x` index evaluates to — or outside the declared range reads `x`.
+    pub fn word(&self, address: Option<i64>) -> Register {
+        match address.and_then(|address| self.word_position(address)) {
+            Some(offset) => self.words[offset].clone(),
+            None => Register::unknown(self.width()).with_signedness(self.is_signed()),
+        }
+    }
+
+    /// Writes a word, resized to the memory's own width, and reports whether the
+    /// stored value moved. A write outside the declared range is discarded.
+    pub fn set_word(&mut self, address: i64, value: &Register) -> bool {
+        let Some(offset) = self.word_position(address) else {
+            return false;
+        };
+        // Signedness is the *declaration's*, so it is re-stamped on every write
+        // exactly as `SignalState` does it: a value cannot bring its own.
+        let signed = self.words[offset].is_signed();
+        let value = value.coerced(self.width()).with_signedness(signed);
+        if self.words[offset] == value {
+            return false;
+        }
+        self.words[offset] = value;
+        true
+    }
+}
+
 /// Name to value map for every signal in a simulation, together with a journal
 /// of everything written since the last marker.
 ///
@@ -183,6 +290,22 @@ fn range_width(range: (i64, i64)) -> usize {
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
     name_to_signal: HashMap<String, SignalState>,
+    /// The memories the design declares, keyed by qualified name.
+    ///
+    /// Deliberately a second map rather than a field on [`SignalState`]: a
+    /// memory needs `n` words where a signal needs one, and the lookup that
+    /// every bit select goes through is the hot path. A name is in one map or
+    /// the other, so an ordinary select still costs one hash and only a miss
+    /// looks here.
+    name_to_memory: HashMap<String, Memory>,
+    /// For every memory written since the last marker, the first word the round
+    /// displaced and the last word written into it. See
+    /// [`set_word`](StateStore::set_word).
+    ///
+    /// A list rather than a map: a design has a handful of memories at most, so
+    /// a linear scan beats hashing a name, and taking an empty one costs
+    /// nothing — which matters because every delta cycle asks.
+    memory_journal: Vec<(String, Register, Register)>,
     /// For every signal written since the last marker, the value it held at
     /// that marker. `None` records a name that did not exist yet, which makes
     /// the write a declaration rather than a change.
@@ -207,6 +330,11 @@ pub struct StateStore {
     /// "no" for a design that declares nothing signed is most of what that walk
     /// would otherwise cost.
     any_signed: bool,
+    /// Whether the design declares any memory at all, on the same terms as
+    /// `any_signed`. `resolve_target` has to ask "is this name a memory?" of
+    /// every bit-select write, and for a design with no memories this answers
+    /// it without hashing the name.
+    any_memory: bool,
 }
 
 impl StateStore {
@@ -232,12 +360,15 @@ impl StateStore {
     pub fn frame(&self) -> StateStore {
         StateStore {
             name_to_signal: HashMap::new(),
+            name_to_memory: HashMap::new(),
+            memory_journal: Vec::new(),
             journal: HashMap::new(),
             time: self.time,
             random: RandomStream::default(),
             functions: Rc::clone(&self.functions),
             call_depth: Cell::new(self.call_depth.get()),
             any_signed: false,
+            any_memory: false,
         }
     }
 
@@ -330,6 +461,7 @@ impl StateStore {
     /// measured against.
     pub fn clear_changes(&mut self) {
         self.journal.clear();
+        self.memory_journal.clear();
     }
 
     /// Declares a signal over `(msb, lsb)`, initialized to all `x` the way an
@@ -349,6 +481,71 @@ impl StateStore {
             name,
             SignalState::with_range(register, range).with_signedness(signed),
         );
+    }
+
+    /// Declares a memory of `addresses` words, each over `range`, every bit
+    /// `x` the way an unassigned Verilog `reg` starts out.
+    ///
+    /// The name goes into the memory map instead of the signal map, and that is
+    /// the only record anything downstream has of the declaration having had an
+    /// address dimension — it is what makes `mem[3]` a word select and `a[3]` a
+    /// bit select.
+    pub fn declare_memory(
+        &mut self,
+        name: impl Into<String>,
+        addresses: (i64, i64),
+        range: (i64, i64),
+        signed: bool,
+    ) {
+        self.any_signed |= signed;
+        self.any_memory = true;
+        self.name_to_memory
+            .insert(name.into(), Memory::new(addresses, range, signed));
+    }
+
+    /// Whether the design declares any memory. `false` is exact.
+    pub fn any_memory(&self) -> bool {
+        self.any_memory
+    }
+
+    /// The memory `name` declares, if it is a memory rather than a signal.
+    pub fn memory(&self, name: &str) -> Option<&Memory> {
+        self.name_to_memory.get(name)
+    }
+
+    /// Writes one word of a memory, reporting whether the stored value moved —
+    /// or `None` when `name` is not a memory at all.
+    ///
+    /// The write is journalled, because a block may be sensitive to a memory
+    /// (`always @(vco_tap[index])` wakes when `index` is a memory word that
+    /// moves). It is journalled *per name* rather than per word: the pair kept
+    /// is the first word displaced this round and the last word written, which
+    /// over-approximates in exactly the direction `event_fires` already does —
+    /// a block may be woken more often than it should, never less.
+    pub fn set_word(&mut self, name: &str, address: i64, value: &Register) -> Option<bool> {
+        let memory = self.name_to_memory.get_mut(name)?;
+        let before = memory.word(Some(address));
+        if !memory.set_word(address, value) {
+            return Some(false);
+        }
+        let after = memory.word(Some(address));
+        match self
+            .memory_journal
+            .iter_mut()
+            .find(|(written, _, _)| written == name)
+        {
+            Some((_, _, latest)) => *latest = after,
+            None => self.memory_journal.push((name.to_string(), before, after)),
+        }
+        Some(true)
+    }
+
+    /// Every memory written since the last call, as `(name, before, after)`,
+    /// clearing the journal so the next round is measured from here.
+    pub fn take_memory_changes(&mut self) -> Vec<(String, Register, Register)> {
+        let mut changes = std::mem::take(&mut self.memory_journal);
+        changes.sort_by(|left, right| left.0.cmp(&right.0));
+        changes
     }
 
     /// The signedness a write to `name` has to keep: the one the signal was
@@ -557,6 +754,121 @@ mod tests {
         // Out of range writes are discarded.
         assert!(!signal.set_bit(3, 1));
         assert_eq!(signal.register().to_binary(), "1xx0");
+    }
+
+    #[test]
+    fn test_memory_holds_one_register_per_declared_address() {
+        let mut store = StateStore::new();
+        store.declare_memory("mem", (0, 255), (7, 0), false);
+
+        let memory = store.memory("mem").expect("mem should be a memory");
+        assert_eq!(memory.depth(), 256);
+        assert_eq!(memory.width(), 8);
+        assert_eq!(memory.addresses(), (0, 255));
+        assert_eq!(memory.range(), (7, 0));
+        // A name is a signal or a memory, never both — which is exactly what
+        // tells a word select from a bit select.
+        assert!(store.get_signal("mem").is_none());
+        assert!(store.any_memory());
+    }
+
+    #[test]
+    fn test_memory_words_start_unknown_and_are_independent() {
+        let mut store = StateStore::new();
+        store.declare_memory("mem", (0, 3), (7, 0), false);
+
+        assert_eq!(
+            store.memory("mem").unwrap().word(Some(0)).to_binary(),
+            "xxxxxxxx"
+        );
+
+        store.set_word("mem", 1, &Register::from_binary("00000001"));
+        store.set_word("mem", 2, &Register::from_binary("00000010"));
+
+        let memory = store.memory("mem").unwrap();
+        assert_eq!(memory.word(Some(0)).to_binary(), "xxxxxxxx");
+        assert_eq!(memory.word(Some(1)).to_binary(), "00000001");
+        assert_eq!(memory.word(Some(2)).to_binary(), "00000010");
+        assert_eq!(memory.word(Some(3)).to_binary(), "xxxxxxxx");
+    }
+
+    #[test]
+    fn test_memory_addresses_run_ascending_or_descending() {
+        let ascending = Memory::new((0, 3), (7, 0), false);
+        assert_eq!(ascending.word_position(0), Some(0));
+        assert_eq!(ascending.word_position(3), Some(3));
+        assert_eq!(ascending.word_position(4), None);
+        assert_eq!(ascending.word_position(-1), None);
+
+        // `reg [7:0] m [15:8];` addresses 15 down to 8, and nothing else.
+        let descending = Memory::new((15, 8), (7, 0), false);
+        assert_eq!(descending.word_position(15), Some(0));
+        assert_eq!(descending.word_position(8), Some(7));
+        assert_eq!(descending.word_position(7), None);
+        assert_eq!(descending.word_position(16), None);
+    }
+
+    #[test]
+    fn test_memory_out_of_range_reads_x_and_discards_a_write() {
+        let mut store = StateStore::new();
+        store.declare_memory("mem", (0, 3), (3, 0), false);
+
+        assert_eq!(
+            store.set_word("mem", 9, &Register::from_binary("1111")),
+            Some(false)
+        );
+        let memory = store.memory("mem").unwrap();
+        assert_eq!(memory.word(Some(9)).to_binary(), "xxxx");
+        // An index that did not evaluate to a number reads `x` as well.
+        assert_eq!(memory.word(None).to_binary(), "xxxx");
+        assert!(memory.words.iter().all(|word| word.to_binary() == "xxxx"));
+    }
+
+    #[test]
+    fn test_memory_write_is_resized_and_keeps_the_declared_signedness() {
+        let mut store = StateStore::new();
+        store.declare_memory("mem", (0, 1), (31, 0), true);
+
+        store.set_word("mem", 0, &Register::from_binary("1010"));
+        let word = store.memory("mem").unwrap().word(Some(0));
+        assert_eq!(word.width(), 32);
+        assert!(word.is_signed(), "a value may not change a declaration");
+    }
+
+    #[test]
+    fn test_memory_writes_are_journalled_so_a_block_can_wake_on_them() {
+        let mut store = StateStore::new();
+        store.declare_memory("mem", (0, 3), (3, 0), false);
+        store.clear_changes();
+
+        // Rewriting the same value is not a change and is not journalled.
+        store.set_word("mem", 0, &Register::from_binary("0001"));
+        store.set_word("mem", 0, &Register::from_binary("0001"));
+        store.set_word("mem", 1, &Register::from_binary("0010"));
+
+        // One entry per *name*, not per word: the pair is the first word the
+        // round displaced and the last word written.
+        let changes = store.take_memory_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "mem");
+        assert_eq!(changes[0].1.to_binary(), "xxxx");
+        assert_eq!(changes[0].2.to_binary(), "0010");
+        assert!(store.take_memory_changes().is_empty());
+    }
+
+    #[test]
+    fn test_writing_a_word_of_something_that_is_not_a_memory_is_reported() {
+        let mut store = StateStore::new();
+        store.declare("plain", (7, 0));
+
+        assert_eq!(
+            store.set_word("plain", 0, &Register::from_binary("1")),
+            None
+        );
+        assert_eq!(
+            store.set_word("absent", 0, &Register::from_binary("1")),
+            None
+        );
     }
 
     #[test]

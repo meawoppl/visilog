@@ -226,6 +226,15 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
             "`${}` defers its output to the end of a time step, which is not scheduled",
             name
         ))),
+        // `$readmemh` and `$readmemb` load a memory from a file. A task is run
+        // against a `&StateStore` — it prints, it does not write — so loading
+        // one needs a task path that can write, which is a bigger change than
+        // the file reading itself. Named rather than silently doing nothing: a
+        // design whose memory quietly stayed `x` would look like one that ran.
+        "readmem" => Err(SimulationError::SystemTask(format!(
+            "`${}` loads a memory from a file, which needs a system task that can write the store",
+            name
+        ))),
         _ => Err(unknown_task(name)),
     }
 }
@@ -869,6 +878,10 @@ mod tests {
     #[test]
     fn test_an_unknown_task_is_an_error_that_names_it() {
         assert_eq!(error("$nosuchthing;"), "unknown system task `$nosuchthing`");
+        // `$readmemh` is recognised and refused by name, not mistaken for a
+        // task nobody has heard of.
+        assert!(error("$readmemh(\"f.hex\", mem);").contains("`$readmemh` loads a memory"));
+        assert!(error("$readmemb(\"f.bin\", mem);").contains("`$readmemb` loads a memory"));
         assert_eq!(
             error(r#"$display("%0d", $nosuchfunction);"#),
             "unknown system task `$nosuchfunction`"

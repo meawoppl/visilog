@@ -81,6 +81,17 @@ const FUNCTION_SIDE_EFFECT_UNSUPPORTED: SimulationError =
 const FUNCTION_RANDOM_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("`$random` inside a function");
 
+/// The most words a memory may declare.
+///
+/// A memory is `n` real registers, so a nonsense dimension is an allocation the
+/// host has to make before anything can go wrong with it. This is well past any
+/// memory a design plausibly declares and well short of exhausting memory.
+const MAX_MEMORY_DEPTH: usize = 1 << 20;
+
+/// A memory bigger than [`MAX_MEMORY_DEPTH`] words.
+const MEMORY_TOO_LARGE: SimulationError =
+    SimulationError::Unsupported("a memory with more words than can be allocated");
+
 /// What kind of procedural block a compiled program came from.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -374,12 +385,22 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::RegisterDeclaration(registers) => {
                 for register in registers {
-                    self.declare_local(
-                        &register.name.name,
-                        register.range.unwrap_or((0, 0)),
-                        register.signed,
-                        scope,
-                    );
+                    let range = register.range.unwrap_or((0, 0));
+                    // The address dimension is what makes the name a memory
+                    // rather than a vector, and it is the only place that
+                    // distinction is ever recorded.
+                    match register.dimensions {
+                        Some(addresses) => self.declare_memory(
+                            &register.name.name,
+                            addresses,
+                            range,
+                            register.signed,
+                            scope,
+                        )?,
+                        None => {
+                            self.declare_local(&register.name.name, range, register.signed, scope)
+                        }
+                    }
                 }
             }
             ModuleStatement::IntegerDeclaration(integers) => {
@@ -387,7 +408,16 @@ impl<'m> Elaborator<'m> {
                     // An `integer` is a 32 bit *signed* variable. Signedness is
                     // part of what the keyword means, so there is no qualifier
                     // to read here — it is always true.
-                    self.declare_local(&declaration.name.name, (31, 0), true, scope);
+                    match declaration.dimensions {
+                        Some(addresses) => self.declare_memory(
+                            &declaration.name.name,
+                            addresses,
+                            (31, 0),
+                            true,
+                            scope,
+                        )?,
+                        None => self.declare_local(&declaration.name.name, (31, 0), true, scope),
+                    }
                 }
             }
             ModuleStatement::ParameterDeclaration(parameters) => {
@@ -427,6 +457,27 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .declare_signed(scope.qualified(local), range, signed);
+    }
+
+    /// Declares a memory local to this instance: `reg [7:0] mem [0:255];`.
+    ///
+    /// A memory cannot be a port, so there is no aliasing to reconcile the way
+    /// [`declare_local`](Elaborator::declare_local) has to.
+    fn declare_memory(
+        &mut self,
+        local: &str,
+        addresses: (i64, i64),
+        range: (i64, i64),
+        signed: bool,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        if range_width(addresses) > MAX_MEMORY_DEPTH {
+            return Err(MEMORY_TOO_LARGE);
+        }
+        self.out
+            .state
+            .declare_memory(scope.qualified(local), addresses, range, signed);
+        Ok(())
     }
 
     /// Applies a variable initialiser: `reg a = expr;` and `integer i = expr;`.
@@ -1934,5 +1985,86 @@ mod tests {
         simulator.poke("a", Register::from_u128(6, 4)).unwrap();
         assert_eq!(simulator.get("dut.doubled").unwrap().to_u128(), Some(12));
         assert_eq!(simulator.get("out").unwrap().to_u128(), Some(12));
+    }
+    /// A memory declares one word per address, not one signal for the whole
+    /// array — which is what makes every word read `x` rather than the whole
+    /// memory being a single `x` register.
+    #[test]
+    fn test_a_memory_elaborates_to_one_word_per_address() {
+        let modules = parse_all(&[r#"
+            module has_memory();
+                reg [7:0] mem [0:255];
+            endmodule
+        "#]);
+        let elaborated = elaborate(&modules, 0).expect("design should elaborate");
+
+        let memory = elaborated
+            .state
+            .memory("mem")
+            .expect("mem should elaborate as a memory");
+        assert_eq!(memory.depth(), 256);
+        assert_eq!(memory.width(), 8);
+        // Not a signal: the two maps are what tell a word select from a bit one.
+        assert!(elaborated.state.get_signal("mem").is_none());
+    }
+
+    /// An `integer` array is a memory of 32 bit signed words. `meminit2` in the
+    /// ivtest corpus is exactly this declaration.
+    #[test]
+    fn test_an_integer_array_elaborates_to_a_signed_memory() {
+        let modules = parse_all(&[r#"
+            module integer_array();
+                integer mem [0:1];
+            endmodule
+        "#]);
+        let elaborated = elaborate(&modules, 0).expect("design should elaborate");
+
+        let memory = elaborated
+            .state
+            .memory("mem")
+            .expect("mem should be a memory");
+        assert_eq!(memory.depth(), 2);
+        assert_eq!(memory.width(), 32);
+        assert!(memory.is_signed());
+    }
+
+    /// A memory inside an instance is qualified like any other name, so two
+    /// instances have a memory each.
+    #[test]
+    fn test_each_instance_gets_its_own_memory() {
+        let modules = parse_all(&[
+            r#"
+            module leaf();
+                reg [3:0] mem [0:7];
+            endmodule
+        "#,
+            r#"
+            module top();
+                leaf a ();
+                leaf b ();
+            endmodule
+        "#,
+        ]);
+        let elaborated = elaborate(&modules, 1).expect("design should elaborate");
+
+        assert_eq!(elaborated.state.memory("a.mem").unwrap().depth(), 8);
+        assert_eq!(elaborated.state.memory("b.mem").unwrap().depth(), 8);
+        assert!(elaborated.state.memory("mem").is_none());
+    }
+
+    /// A dimension nothing could allocate is a named error rather than an
+    /// attempt to reserve it.
+    #[test]
+    fn test_an_absurd_memory_dimension_is_reported() {
+        let modules = parse_all(&[r#"
+            module huge();
+                reg [7:0] mem [0:99999999];
+            endmodule
+        "#]);
+
+        assert!(matches!(
+            elaborate(&modules, 0),
+            Err(SimulationError::Unsupported(_))
+        ));
     }
 }
