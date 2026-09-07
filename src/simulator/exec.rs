@@ -29,7 +29,7 @@
 use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
 use crate::register::Register;
-use crate::simulator::eval::eval;
+use crate::simulator::eval::{eval, SELF_DETERMINED};
 use crate::simulator::program::{resume, Program, Resume, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
@@ -61,6 +61,27 @@ impl ResolvedTarget {
             ResolvedTarget::Whole(name) => name,
             ResolvedTarget::Bits { name, .. } => name,
             ResolvedTarget::Word { name, .. } => name,
+        }
+    }
+
+    /// How many bits the target holds, which is the width context the right
+    /// hand side of the assignment is evaluated in.
+    ///
+    /// A name the store does not have reports [`SELF_DETERMINED`] rather than
+    /// a guess: the write is about to fail with
+    /// [`SimulationError::UnknownSignal`] anyway, and a made up width would
+    /// change the value it failed with.
+    pub fn width(&self, state: &StateStore) -> usize {
+        match self {
+            ResolvedTarget::Whole(name) => state
+                .get_signal(name)
+                .map_or(SELF_DETERMINED, |signal| signal.width()),
+            ResolvedTarget::Bits { indices, .. } => indices.len(),
+            // A word is as wide as the memory's element, which is a property of
+            // the declaration rather than of the address being written.
+            ResolvedTarget::Word { name, .. } => state
+                .memory(name)
+                .map_or(SELF_DETERMINED, |memory| memory.width()),
         }
     }
 }

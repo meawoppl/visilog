@@ -35,10 +35,10 @@ use std::fmt;
 use crate::parsers::{assignment::ContinuousAssignment, modules::VerilogModule};
 use crate::register::Register;
 use crate::simulator::elaborate::{elaborate, BlockKind, TimedBlock};
-use crate::simulator::eval::{eval, EvalError};
+use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events;
-use crate::simulator::exec::{commit_updates, drive, PendingUpdate};
+use crate::simulator::exec::{commit_updates, drive_resolved, resolve_target, PendingUpdate};
 use crate::simulator::program::{self, Resume};
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{Output, TaskContext};
@@ -526,8 +526,12 @@ impl Simulator {
         for pass in 1..=limit {
             let mut changed = false;
             for assignment in &self.assignments {
-                let value = eval(assignment.rhs(), &self.state)?;
-                changed |= drive(&mut self.state, assignment.lhs(), &value)?;
+                // The net being driven sizes the expression driving it, the
+                // same way a procedural assignment's target does, so the
+                // target is resolved before the right hand side is evaluated.
+                let target = resolve_target(&self.state, assignment.lhs())?;
+                let value = eval_sized(assignment.rhs(), &self.state, target.width(&self.state))?;
+                changed |= drive_resolved(&mut self.state, &target, &value)?;
             }
             if !changed {
                 return Ok(pass);
@@ -1299,6 +1303,194 @@ mod tests {
         );
     }
 
+    /// The unsigned value of a signal, which is what a width test is about.
+    fn number(simulator: &Simulator, name: &str) -> u128 {
+        simulator
+            .get(name)
+            .unwrap_or_else(|_| panic!("no signal `{}`", name))
+            .to_u128()
+            .unwrap_or_else(|| panic!("`{}` has unknown bits", name))
+    }
+
+    /// The headline of context-determined widths: the target widens the
+    /// operands *before* the operator runs, so the whole sixteen bit product of
+    /// two eight bit numbers survives. Sizing each operand by itself multiplies
+    /// in eight bits — 600 truncates to 88 — and then pads a plausible wrong
+    /// number out to sixteen.
+    ///
+    /// Both assignment flavours go through the same instruction, so the
+    /// non-blocking one is here to say the deferred write is sized by the
+    /// target it was resolved against rather than by the value it carried.
+    #[test]
+    fn test_multiplication_widens_to_its_target() {
+        let simulator = simulator_for(
+            r#"
+            module widening_multiply();
+                reg [15:0] blocking, deferred;
+                reg [7:0] a, b;
+                initial begin
+                    a = 8'd200;
+                    b = 8'd3;
+                    blocking = a * b;
+                    deferred <= a * b;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(number(&simulator, "blocking"), 600);
+        assert_eq!(number(&simulator, "deferred"), 600);
+    }
+
+    /// A continuous assignment is an assignment too: the net being driven sizes
+    /// the expression driving it, which is the `propagate` half of the same
+    /// rule.
+    #[test]
+    fn test_continuous_assignment_widens_to_its_net() {
+        let mut simulator = simulator_for(
+            r#"
+            module widening_assign();
+                reg [7:0] a, b;
+                wire [15:0] product;
+                assign product = a * b;
+                initial begin
+                    a = 8'd200;
+                    b = 8'd3;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        assert_eq!(number(&simulator, "product"), 600);
+    }
+
+    /// A shift's two operands are sized by opposite rules, and this is the pair
+    /// that tells them apart.
+    ///
+    /// The *value* is context-determined, so `8'h81 << 3` into a sixteen bit
+    /// target keeps the bits that would have fallen off the top — that is the
+    /// corpus `shift_pad` case. The *amount* is self-determined, so the two bit
+    /// sum `3 + 2` still wraps to 1 rather than reaching 5 because the target is
+    /// wide: shifting by one gives 2, shifting by five would give 32.
+    #[test]
+    fn test_a_shift_widens_its_value_but_not_its_amount() {
+        let simulator = simulator_for(
+            r#"
+            module shift_widths();
+                reg [15:0] shifted, by_sum;
+                reg [7:0] a;
+                reg [1:0] s, t;
+                initial begin
+                    a = 8'h81;
+                    s = 2'd3;
+                    t = 2'd2;
+                    shifted = a << s;
+                    by_sum = 8'h01 << (s + t);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(number(&simulator, "shifted"), 0x0408);
+        assert_eq!(number(&simulator, "by_sum"), 2);
+    }
+
+    /// A comparison answers in one bit however wide the target is, and the
+    /// target's width does not reach its operands: `9 + 8` still wraps to 1 in
+    /// four bits, so the answer is false. An operand widened to the eight bit
+    /// target would hold 17 and compare true.
+    ///
+    /// The two operands do size *each other*, which is a separate rule — both
+    /// are four bits here, so there is nothing for it to do.
+    #[test]
+    fn test_a_comparison_is_one_bit_and_sizes_its_own_operands() {
+        let simulator = simulator_for(
+            r#"
+            module comparison_widths();
+                reg [7:0] answer;
+                reg [3:0] a;
+                initial begin
+                    a = 4'd9;
+                    answer = (a + 4'd8 > 4'd2);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(number(&simulator, "answer"), 0);
+        assert_eq!(simulator.get("answer").unwrap().width(), 8);
+    }
+
+    /// A concatenation sizes itself out of its parts and a context cannot reach
+    /// into them, so wrapping an expression in `{}` is how a design *asks* for
+    /// the self-determined answer. The pair is the point: the same addition
+    /// wraps at eight bits inside the braces and survives at sixteen without
+    /// them.
+    #[test]
+    fn test_a_concatenation_is_not_widened_by_its_target() {
+        let simulator = simulator_for(
+            r#"
+            module concatenation_widths();
+                reg [15:0] braced, plain;
+                reg [7:0] a, b;
+                initial begin
+                    a = 8'hff;
+                    b = 8'h01;
+                    braced = {a + b};
+                    plain = a + b;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(number(&simulator, "braced"), 0x0000);
+        assert_eq!(number(&simulator, "plain"), 0x0100);
+    }
+
+    /// Corpus `pr2823711`, which names the rule outright: `**` takes its left
+    /// operand's width, widened to the context, so `4'hf ** 6'ha` is a sixteen
+    /// bit power when it is assigned to a sixteen bit register and a four bit
+    /// one when a concatenation cuts the context off.
+    #[test]
+    fn test_power_takes_the_width_of_its_context() {
+        let simulator = simulator_for(
+            r#"
+            module power_widths();
+                reg [15:0] contextual, braced;
+                reg [3:0] a;
+                reg [5:0] b;
+                initial begin
+                    a = 4'hf;
+                    b = 6'ha;
+                    contextual = a ** b;
+                    braced = { a ** b };
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(number(&simulator, "contextual"), 0xac61);
+        assert_eq!(number(&simulator, "braced"), 0x0001);
+    }
+
+    /// Unary `-` is context-determined too, so the literal is padded out to the
+    /// target *first* and negated there. Negating in four bits and padding
+    /// afterwards would store `16'h0004`.
+    #[test]
+    fn test_negation_widens_before_it_negates() {
+        let simulator = simulator_for(
+            r#"
+            module negation_width();
+                reg [15:0] negated;
+                initial negated = -4'd12;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(number(&simulator, "negated"), 0xfff4);
+    }
+
     /// Signedness has to survive the whole path — parser, elaboration,
     /// evaluation and the write back into the store — so this asserts it end to
     /// end on a self-checking design, the way the corpus does.
@@ -1322,7 +1514,12 @@ mod tests {
                     else if (swide !== 8'h0f) $display("FAILED zero extension: %b", swide);
                     else if (a >= 0) $display("FAILED comparison");
                     else if (b < 0) $display("FAILED unsigned comparison");
-                    else if ((a >>> 1) !== 4'b1111) $display("FAILED arithmetic shift");
+                    // The literal is `4'sb1111`, not `4'b1111`: a comparison
+                    // reads both its operands unsigned the moment either one
+                    // is, and an unsigned `a` would make the `>>>` a plain
+                    // `>>`. Comparing against a *signed* literal is what keeps
+                    // this a question about the shift.
+                    else if ((a >>> 1) !== 4'sb1111) $display("FAILED arithmetic shift");
                     else if ((b >>> 1) !== 4'b0111) $display("FAILED logical shift");
                     else $display("PASSED");
                 end

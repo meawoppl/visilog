@@ -29,7 +29,7 @@ use crate::parsers::behavior::{
 use crate::parsers::expr::Expression;
 use crate::register::Register;
 use crate::simulator::elaborate::rename_expression;
-use crate::simulator::eval::eval;
+use crate::simulator::eval::{eval, eval_sized};
 use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate, ResolvedTarget};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
@@ -553,15 +553,18 @@ pub fn resume(
         match instruction {
             Instruction::Blocking { target, value } => {
                 // The target is resolved before the right hand side is
-                // evaluated, so a bad target is reported ahead of a bad value.
+                // evaluated, so a bad target is reported ahead of a bad value —
+                // and so that the target's width is known in time to size the
+                // right hand side, which is what makes an assignment
+                // context-determined.
                 let target = resolve_target(store, target)?;
-                let value = eval(value, store)?;
+                let value = eval_sized(value, store, target.width(store))?;
                 drive_resolved(store, &target, &value)?;
                 pc += 1;
             }
             Instruction::NonBlocking { target, value } => {
                 let target = resolve_target(store, target)?;
-                let value = eval(value, store)?;
+                let value = eval_sized(value, store, target.width(store))?;
                 pending.push(PendingUpdate::new(target, value));
                 pc += 1;
             }

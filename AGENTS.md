@@ -249,7 +249,7 @@ that draws random stimulus draws the *same* stimulus on every run and a self-che
 test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
 write the seed back the way a real simulator's `inout` argument does.
 
-**Signedness is modelled, widths are still self-determined.** `reg signed [3:0] a;`,
+**Signedness is modelled.** `reg signed [3:0] a;`,
 `wire signed`, `input signed`, an `integer`, `4'sd12` and a bare decimal like `42` are all
 signed; everything else is unsigned. It rides on the `Register` a lookup produces — a
 register is bits *plus how to read them* — and `$signed` / `$unsigned` are real casts that
@@ -257,12 +257,52 @@ set that bit and change nothing else. It changes the answer in exactly five plac
 `%`, `>>>`, the relational operators, and the widening that happens when two operands of
 different widths meet or when a value is written into a wider target.
 
-What is *not* modelled is context-determined **width**: an assignment's target cannot
-widen the operands of the expression on its right before it is evaluated, so
-`reg [15:0] r; r = -4'd12;` still negates in four bits and stores `16'h0004`. That is what
-`signed2`, `signed3`, `shift_pad` and `pr2823711` are still waiting on. Sign extension *at*
-the assignment is real, which is why `assign y = $signed(a) | $signed(b);` into a wider `y`
-does come out right.
+**Widths are context-determined, and the target is where the context comes from.**
+Verilog sizes most expressions by the thing being assigned to: `reg [15:0] w; reg [7:0] a,
+b; w = a * b;` widens `a` and `b` to sixteen bits *before* multiplying, so the whole
+product survives. Sizing each operand by itself gives an eight bit product and then pads a
+plausible wrong number, which is why these were silent failures rather than loud ones.
+
+The target's width reaches `eval` through `eval_sized(expr, store, width)`. Both callers
+resolve the left hand side *first* and ask it how wide it is —
+`ResolvedTarget::width(&store)` — so `program.rs`'s `Blocking` / `NonBlocking` and
+`runner.rs`'s `propagate` push the same number down the same path. Everything else
+(`case` subjects, conditions, task arguments, function arguments) still goes through
+`eval`, which is self-determined.
+
+Inside `eval_in_context` the width is a **lower bound**, not an exact size: an operand is
+padded out to it and otherwise left alone. That is exactly Verilog's "the larger of the
+self-determined width and the context", and it makes `SELF_DETERMINED` — a bound of zero —
+the same code path rather than a second one. Which operands the bound reaches is
+`OperandRule`, the same table signedness uses: it reaches `+ - * / % & | ^ ~^`, unary
+`+ - ~`, both arms of a `?:`, and the *left* operand of a shift or a `**`; it does not
+reach a shift's right operand, a `?:` condition, or anything inside a concatenation —
+`c = { a**b };` is the four bit power, `c = a**b;` is the sixteen bit one (corpus
+`pr2823711`).
+
+**A comparison is the exception that needs measuring.** Its answer is one unsigned bit
+whatever the context, but its two operands are context-determined *with respect to each
+other*: sized to the wider of the two and read signed only when both are. `assign wide =
+a/b;` checked against `a/b` therefore divides in sixteen bits on both sides — without that
+rule a division by zero is sixteen `x`s on one side and eight padded with zeros on the
+other (corpus `pr2722339a`). This is the one place `expression_width` — the self-determined
+width walk — is called, and `sized_within` keeps it off the hot path: only an operand that
+carries out an operation at its own width can tell being widened before from being widened
+after, so `state == 3'b010` measures nothing.
+
+The same mutual context is why an unsigned operand demotes a signed one *before* the
+widening, and that reaches all the way down: `(a >>> 1) === 4'b1111` is false for a signed
+`a`, because the unsigned literal makes the whole comparison unsigned and an unsigned
+`>>>` is a plain `>>`. Compare against `4'sb1111` when the arithmetic shift is the point.
+
+`eval` still tops out at `MAX_ARITHMETIC_WIDTH` (128 bits), and now that a target's width
+actually reaches the operator that limit is *reported* rather than quietly ignored:
+`reg signed [128:0] res; res = in1 ** in2;` is `EvalError::WidthOverflow(129)` where it
+used to compute a wrong answer in 32 bits (corpus `pr2352834`).
+
+Still not modelled: a `?:` whose arms disagree about signedness takes the "signed only if
+both" rule, where iverilog reads `1 ? ~a >>> 5 : 0` as signed (corpus `br_gh37`,
+`pr1913937`). The widths in that expression are right; only the sign is not.
 
 **A design's own functions are compiled at elaboration and called from `eval`.**
 `function [7:0] f; input [7:0] a; f = a + 1; endfunction` parses in both the 1995 form
@@ -308,7 +348,7 @@ but still unwired.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression` and the compiling of a `function` into a `FunctionDefinition` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, including signedness (`expression_is_signed` / `operand_rule`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
@@ -596,6 +636,24 @@ tripwire.
   `eval_in_context` rather than in a shared epilogue — an operand evaluated in an unsigned
   context already comes back unsigned, so there is nothing for an operator to demote.
   Putting it in the epilogue instead costs about 40% on `bench eval`.
+- **A width propagates down the same way a sign does, and through the same table.**
+  `eval_in_context` carries a `width` beside `signed_context`, and `operand_rule` decides
+  which operands each reaches — so an operator can never be context-determined for one and
+  self-determined for the other. The width is a *lower bound*, which is what makes
+  `SELF_DETERMINED` (zero) the ordinary case rather than a second code path, and
+  `eval_sized` the only way a target's width gets in. Keeping the padding cheap is
+  deliberate: `widened` is `#[inline(always)]` over a `#[cold] pad`, `widened_result` hands
+  a `Result` straight back rather than unwrapping and rewrapping a 70-odd byte `Register`,
+  and `sized_within` stops a comparison of two plain signals from measuring anything.
+  Undoing any of those costs 5–10% on `bench eval` on its own.
+- **A comparison sizes and signs its two operands against *each other*.** It is
+  self-determined as far as the expression around it goes — one unsigned bit, always — but
+  `a/b` beside a sixteen bit net divides in sixteen bits, and a signed operand beside an
+  unsigned one is zero padded rather than sign extended. That mutual context reaches all
+  the way down, so `(a >>> 1) === 4'b1111` is *false* for a signed `a`: the unsigned
+  literal makes the comparison unsigned and an unsigned `>>>` is a plain `>>`. Write
+  `4'sb1111` when the arithmetic shift is what is being tested — that is why
+  `test_signed_declarations_simulate` does.
 - **`Register::to_decimal` accumulates into a machine integer**, so it overflows on
   anything wider than about 31 bits. `tasks.rs` formats decimals through `to_u128`
   instead; do the same rather than reaching for `to_decimal` on a real signal.
