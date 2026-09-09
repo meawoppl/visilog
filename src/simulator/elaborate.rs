@@ -46,7 +46,9 @@ use crate::parsers::{
     expr::Expression,
     gates::{GateInstantiation, GateKind},
     identifier::Identifier,
-    modules::{ModuleInitArguments, ModuleInstantiation, Port, PortDirection, VerilogModule},
+    modules::{
+        ModuleInitArguments, ModuleInstantiation, NetType, Port, PortDirection, VerilogModule,
+    },
     simple::Range,
     statements::ModuleStatement,
 };
@@ -377,9 +379,7 @@ impl<'m> Elaborator<'m> {
             Some(Binding::Driven(expression)) => {
                 let name = scope.qualified(local);
                 let range = self.resolve_range(&port.range, scope)?;
-                self.out
-                    .state
-                    .declare_signed(name.clone(), range, port.signed);
+                self.out.state.declare_net(name.clone(), range, port.signed);
                 self.out.assignments.push(ContinuousAssignment::new(
                     Expression::Identifier(Identifier::new(name)),
                     expression.clone(),
@@ -391,9 +391,17 @@ impl<'m> Elaborator<'m> {
 
         let name = scope.qualified(local);
         let range = self.resolve_range(&port.range, scope)?;
-        self.out
-            .state
-            .declare_signed(name.clone(), range, port.signed);
+        // `output reg q` is a variable and starts at `x`; a plain port is a
+        // net and starts at `z`. A `reg` in the *body* naming a port says the
+        // same thing, and that declaration runs after this one and overwrites
+        // the fill, so both spellings land on `x`.
+        if port_is_variable(port) {
+            self.out
+                .state
+                .declare_signed(name.clone(), range, port.signed);
+        } else {
+            self.out.state.declare_net(name.clone(), range, port.signed);
+        }
 
         if !matches!(port.direction, PortDirection::Input) {
             return Ok(());
@@ -593,7 +601,7 @@ impl<'m> Elaborator<'m> {
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
                     let range = self.resolve_range(net.range(), scope)?;
-                    self.declare_local(&net.identifier().name, range, net.is_signed(), scope);
+                    self.declare_local_net(&net.identifier().name, range, net.is_signed(), scope);
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -728,6 +736,17 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .declare_signed(scope.qualified(local), range, signed);
+    }
+
+    /// [`declare_local`](Elaborator::declare_local) for a net, which starts at
+    /// `z` rather than `x` — see [`StateStore::declare_net`].
+    fn declare_local_net(&mut self, local: &str, range: (i64, i64), signed: bool, scope: &Scope) {
+        if matches!(scope.bindings.get(local), Some(Binding::Alias(_))) {
+            return;
+        }
+        self.out
+            .state
+            .declare_net(scope.qualified(local), range, signed);
     }
 
     /// Declares a memory local to this instance: `reg [7:0] mem [0:255];`.
@@ -1247,6 +1266,15 @@ fn analyse_function_body(
     // What the function declares itself is not something a call has to copy in.
     names.reads.retain(|name| !own.contains(name));
     Ok(names)
+}
+
+/// Whether a port names a variable rather than a net.
+///
+/// `output reg q` is a variable, so an undriven one holds `x` because nothing
+/// has said what it is. Every other port is a net, so an undriven one holds
+/// `z` because nothing is driving it.
+fn port_is_variable(port: &Port) -> bool {
+    matches!(port.net_type, Some(NetType::Reg))
 }
 
 /// The signal an assignment target writes, or `None` when the target is not

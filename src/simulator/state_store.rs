@@ -711,10 +711,32 @@ impl StateStore {
     /// [`declare`](StateStore::declare) for a signal whose declaration carried
     /// a `signed` qualifier.
     pub fn declare_signed(&mut self, name: impl Into<String>, range: (i64, i64), signed: bool) {
+        self.declare_filled(name, range, signed, Register::unknown);
+    }
+
+    /// Declares a *net* — a `wire`, `tri` or a port backed by one — which
+    /// starts at `z` rather than `x`.
+    ///
+    /// The difference is not cosmetic: a variable with no assignment holds `x`
+    /// because nothing has said what it is, while a net with no driver holds
+    /// `z` because nothing is driving it, and `z` is what a reader sees. So an
+    /// undriven bit of `out` reads `z` where an untouched `reg` reads `x` —
+    /// which is what iverilog prints, and what a three-state bus depends on.
+    pub fn declare_net(&mut self, name: impl Into<String>, range: (i64, i64), signed: bool) {
+        self.declare_filled(name, range, signed, Register::high_impedance);
+    }
+
+    fn declare_filled(
+        &mut self,
+        name: impl Into<String>,
+        range: (i64, i64),
+        signed: bool,
+        fill: fn(usize) -> Register,
+    ) {
         let name = name.into();
         self.record(&name);
         self.any_signed |= signed;
-        let register = Register::unknown(range_width(range));
+        let register = fill(range_width(range));
         self.name_to_signal.insert(
             name,
             SignalState::with_range(register, range).with_signedness(signed),
