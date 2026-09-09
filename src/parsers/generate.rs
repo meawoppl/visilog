@@ -158,6 +158,28 @@ fn generate_items(input: &str) -> IResult<&str, Vec<GenerateItem>> {
     Ok((input, items.into_iter().flatten().collect()))
 }
 
+/// A generate `for`, `if` or `case` written at module level, with no enclosing
+/// `generate`/`endgenerate`.
+///
+/// IEEE 1364-2005 permits the keywords to be omitted and iverilog accepts it;
+/// a `genvar` declaration and a loop beside it, with nothing wrapping them, is
+/// the common corpus spelling.
+///
+/// Only the *control* forms are accepted here. A bare declaration inside a
+/// region is already an ordinary module statement, and admitting the whole of
+/// [`generate_item`] would make `parse_module_statement` recurse through
+/// itself with nothing consumed in between.
+pub fn parse_bare_generate_item(input: &str) -> IResult<&str, Vec<GenerateItem>> {
+    map(
+        alt((
+            map(generate_loop, GenerateItem::Loop),
+            map(generate_if, GenerateItem::If),
+            map(generate_case, GenerateItem::Case),
+        )),
+        |item| vec![item],
+    )(input)
+}
+
 fn generate_item(input: &str) -> IResult<&str, GenerateItem> {
     // Every module statement parser expects to start on its first token —
     // `parse_module_declaration` wraps them in `ws` from the outside — so the

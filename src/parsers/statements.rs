@@ -8,8 +8,8 @@ use super::{
     },
     gates::{parse_gate_instantiation, GateInstantiation},
     generate::{
-        parse_defparam, parse_generate_region, parse_genvar_declaration, DefparamAssignment,
-        GenerateItem,
+        parse_bare_generate_item, parse_defparam, parse_generate_region, parse_genvar_declaration,
+        DefparamAssignment, GenerateItem,
     },
     identifier::Identifier,
     integer::{
@@ -104,6 +104,13 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
                 ModuleStatement::GenvarDeclaration(d)
             }),
             map(parse_generate_region, |d| {
+                ModuleStatement::GenerateRegion(d)
+            }),
+            // A generate control form written without the keywords around it.
+            // It has to come before the keyword-led statements it resembles
+            // nothing of, but after `parse_generate_region`, so the wrapped
+            // spelling is still read whole.
+            map(parse_bare_generate_item, |d| {
                 ModuleStatement::GenerateRegion(d)
             }),
             map(parse_defparam, |d| ModuleStatement::Defparam(d)),
