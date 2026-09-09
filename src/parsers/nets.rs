@@ -1,10 +1,6 @@
 use nom::{
-    bytes::complete::tag,
-    character::complete::char,
-    combinator::opt,
-    multi::separated_list1,
-    sequence::{pair, preceded},
-    IResult,
+    bytes::complete::tag, character::complete::char, combinator::opt, multi::separated_list1,
+    sequence::preceded, IResult,
 };
 
 use super::{

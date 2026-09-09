@@ -317,6 +317,7 @@ fn eval_in_context(
                 }
             }
         }
+        Expression::StringLiteral(text) => Ok(widened(string_bits(text), width)),
         Expression::Concatenation(parts) => {
             if parts.is_empty() {
                 return Err(EvalError::EmptyConcatenation);
@@ -694,7 +695,8 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
         }
         // A concatenation and a select are bit vectors, not numbers: unsigned
         // however signed the things that went into them were.
-        Expression::Concatenation(_)
+        Expression::StringLiteral(_)
+        | Expression::Concatenation(_)
         | Expression::Replication(_, _)
         | Expression::BitSelect(_, _)
         | Expression::PartSelect(_, _, _)
@@ -789,6 +791,7 @@ pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
         Expression::Conditional(_, when_true, when_false) => {
             expression_width(when_true, store).max(expression_width(when_false, store))
         }
+        Expression::StringLiteral(text) => string_width(text),
         Expression::Concatenation(parts) => {
             parts.iter().map(|part| expression_width(part, store)).sum()
         }
@@ -1016,6 +1019,30 @@ pub fn indexed_select_indices(
         (base, base - span + 1)
     };
     Ok(Some((low..=high).rev().collect()))
+}
+
+/// How wide a string literal is: eight bits per character, most significant
+/// character first.
+///
+/// An empty string is one NUL byte rather than nothing — `$bits("")` is 8, as
+/// iverilog agrees — so it still has a value to be compared against.
+fn string_width(text: &str) -> usize {
+    8 * text.len().max(1)
+}
+
+/// A string literal as bits. Unsigned: it is a vector of bytes, not a number
+/// anyone declared a sign for.
+fn string_bits(text: &str) -> Register {
+    let mut bits = Vec::with_capacity(string_width(text));
+    if text.is_empty() {
+        return Register::from_u128(0, 8);
+    }
+    for byte in text.bytes() {
+        for offset in (0..8).rev() {
+            bits.push((byte >> offset) & 1);
+        }
+    }
+    Register::from_bits(bits)
 }
 
 fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError> {
@@ -2614,5 +2641,38 @@ mod tests {
         let store = StateStore::new();
         assert_eq!(expression_width(&parse("a[0 +: 4]"), &store), 4);
         assert_eq!(expression_width(&parse("a[15 -: 8]"), &store), 8);
+    }
+
+    /// A string used as a *value* is an unsigned bit vector of eight bits per
+    /// character, most significant character first. Every expectation here is
+    /// what `iverilog` 12.0 prints for the same expression.
+    #[test]
+    fn test_string_literals_are_bit_vectors() {
+        assert_eq!(value("\"FOO\""), 0x46_4f_4f);
+        assert_eq!(value("\"A\""), 0x41);
+        // Concatenation composes them the obvious way.
+        assert_eq!(value("{\"ab\", \"cd\"}"), 0x61_62_63_64);
+        // And they compare as the numbers those bytes make.
+        assert_eq!(bits("\"A\" < \"B\""), "1");
+    }
+
+    /// Eight bits per character, and an empty string is one NUL byte rather
+    /// than nothing — `$bits("")` is 8, which iverilog agrees with.
+    #[test]
+    fn test_string_literal_widths() {
+        let store = StateStore::new();
+        assert_eq!(expression_width(&parse("\"test\""), &store), 32);
+        assert_eq!(expression_width(&parse("\"A\""), &store), 8);
+        assert_eq!(expression_width(&parse("\"\""), &store), 8);
+        assert_eq!(value("\"\""), 0);
+    }
+
+    /// A string is a vector of bytes, not a number anyone declared a sign for.
+    #[test]
+    fn test_string_literals_are_unsigned() {
+        assert!(!expression_is_signed(
+            &parse("\"\\377\""),
+            &StateStore::new()
+        ));
     }
 }

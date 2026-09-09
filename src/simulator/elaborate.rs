@@ -2081,7 +2081,7 @@ impl BodyNames {
 
     fn expression(&mut self, expression: &Expression) {
         match expression {
-            Expression::Constant(_) => {}
+            Expression::Constant(_) | Expression::StringLiteral(_) => {}
             Expression::Identifier(id) => {
                 self.reads.insert(id.name.clone());
             }
@@ -2248,7 +2248,7 @@ fn renamed(expression: &Expression, scope: &Scope) -> Expression {
 /// select arms walk their subexpressions and leave the name alone.
 fn substitute_genvars(expression: &mut Expression, genvars: &HashMap<String, i64>) {
     match expression {
-        Expression::Constant(_) => {}
+        Expression::Constant(_) | Expression::StringLiteral(_) => {}
         Expression::Identifier(id) => {
             if let Some(value) = genvars.get(&id.name) {
                 *expression = Expression::Constant(VerilogConstant::from_int(*value));
@@ -2383,7 +2383,7 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
 /// a signal is: a function belongs to the instance that declares it.
 pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> String) {
     match expression {
-        Expression::Constant(_) => {}
+        Expression::Constant(_) | Expression::StringLiteral(_) => {}
         Expression::Identifier(id) => id.name = resolve(&id.name),
         Expression::Unary(_, inner) | Expression::Parenthetical(inner) => {
             rename_expression(inner, resolve)

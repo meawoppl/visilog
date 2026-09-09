@@ -4,6 +4,7 @@ use super::{
     identifier::{hierarchical_identifier, Identifier},
     operators::{unary_operator, BinaryOperator, UnaryOperator},
     simple::{ws, ws_and_comments},
+    string::parse_verilog_string,
 };
 use nom::{
     branch::alt,
@@ -32,6 +33,14 @@ pub enum Expression {
     /// parameter, so it is not known until elaboration. `{16384{4'b1001}}` is
     /// also a reminder that expanding eagerly would be expensive.
     Replication(Box<Expression>, Vec<Expression>),
+    /// `"FOO"` used as a value — an unsigned bit vector of eight bits per
+    /// character, most significant character first.
+    ///
+    /// Distinct from a `$display` format string, which is a
+    /// [`SystemTaskArgument::String`](crate::parsers::behavior::SystemTaskArgument)
+    /// and never an expression: the two are told apart by where they appear,
+    /// and a task tries the format-string reading first.
+    StringLiteral(String),
     /// `a[base +: width]` and `a[base -: width]` — an indexed part select.
     ///
     /// Distinct from [`Expression::PartSelect`] because only the *width* has
@@ -87,6 +96,7 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Expression::StringLiteral(text) => format!("{:?}", text),
             Expression::Replication(count, exprs) => format!(
                 "{{{}{{{}}}}}",
                 count.to_contracted_string(),
@@ -185,6 +195,9 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(",\n")
             ),
+            Expression::StringLiteral(text) => {
+                format!("{}StringLiteral({:?})", indent_str, text)
+            }
             Expression::Replication(count, exprs) => format!(
                 "{}Replication(\n{},\n{})",
                 indent_str,
@@ -384,6 +397,9 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         part_select,
         map(hierarchical_identifier, Expression::Identifier),
         map(verilog_const, Expression::Constant),
+        // A string is unambiguous — nothing else starts with `"` — so it may
+        // sit anywhere an operand may.
+        map(parse_verilog_string, Expression::StringLiteral),
         parenthetical,
         concatenation,
     ))(input)
