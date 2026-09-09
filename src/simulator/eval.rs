@@ -113,6 +113,8 @@ pub enum EvalError {
     EmptyConcatenation,
     /// A part select bound that did not evaluate to a usable constant.
     NonConstantSelectBound(String),
+    /// A `{N{…}}` whose `N` did not evaluate to a usable constant.
+    NonConstantReplicationCount(String),
     /// A value too wide to evaluate; see [`MAX_ARITHMETIC_WIDTH`].
     WidthOverflow(usize),
     /// A `$name` used as a function that this simulator does not implement.
@@ -161,6 +163,11 @@ impl fmt::Display for EvalError {
                 write!(f, "could not interpret constant `{}`", text)
             }
             EvalError::EmptyConcatenation => write!(f, "empty concatenation has no value"),
+            EvalError::NonConstantReplicationCount(text) => write!(
+                f,
+                "replication count `{}` is not a constant this simulator can evaluate",
+                text
+            ),
             EvalError::NonConstantSelectBound(text) => {
                 write!(f, "part select bound `{}` is not a constant", text)
             }
@@ -322,6 +329,28 @@ fn eval_in_context(
             // cannot reach into them: `c = { a**b };` is the four bit power
             // even when `c` is sixteen bits wide.
             Ok(widened(Register::concatenated(&values), width))
+        }
+        Expression::Replication(count, parts) => {
+            if parts.is_empty() {
+                return Err(EvalError::EmptyConcatenation);
+            }
+            let times = replication_count(count, store).ok_or_else(|| {
+                EvalError::NonConstantReplicationCount(count.to_contracted_string())
+            })?;
+            let mut once = Vec::with_capacity(parts.len());
+            for part in parts {
+                once.push(eval(part, store)?);
+            }
+            let inner = Register::concatenated(&once);
+            // `{0{x}}` is zero bits, which is legal only inside a wider
+            // concatenation — and that is exactly where it lands, contributing
+            // nothing. The guard is on the *product*, so a large count over a
+            // narrow part is caught before it allocates.
+            if inner.width().saturating_mul(times) > MAX_SELECT_WIDTH {
+                return Err(EvalError::WidthOverflow(inner.width() * times));
+            }
+            let repeated = vec![inner; times];
+            Ok(widened(Register::concatenated(&repeated), width))
         }
         Expression::BitSelect(id, index) => {
             // An index that is unknown, or too large to be a bit number, selects `x`.
@@ -647,6 +676,7 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
         // A concatenation and a select are bit vectors, not numbers: unsigned
         // however signed the things that went into them were.
         Expression::Concatenation(_)
+        | Expression::Replication(_, _)
         | Expression::BitSelect(_, _)
         | Expression::PartSelect(_, _, _) => false,
         // A function is as signed as it was declared to be, which is a
@@ -741,6 +771,14 @@ fn expression_width(expr: &Expression, store: &StateStore) -> usize {
         }
         Expression::Concatenation(parts) => {
             parts.iter().map(|part| expression_width(part, store)).sum()
+        }
+        // The count multiplies the width of the inner concatenation. A count
+        // that is not a constant reports the inner width alone rather than an
+        // error, for the reason the doc comment gives: evaluating the same
+        // expression is about to fail and say so.
+        Expression::Replication(count, parts) => {
+            let inner: usize = parts.iter().map(|part| expression_width(part, store)).sum();
+            replication_count(count, store).map_or(inner, |times| inner * times)
         }
         Expression::BitSelect(_, _) => 1,
         Expression::PartSelect(_, first, second) => {
@@ -900,6 +938,18 @@ fn clog2(value: u128) -> u32 {
         return 0;
     }
     128 - (value - 1).leading_zeros()
+}
+
+/// How many times a `{N{…}}` repeats its parts, or `None` when `N` is not a
+/// usable constant.
+///
+/// `None` rather than an error so that [`expression_width`] can fall back
+/// without one; the evaluator turns the same `None` into a named error, which
+/// is where a design that wrote something unusable finds out.
+fn replication_count(expr: &Expression, store: &StateStore) -> Option<usize> {
+    numeric(&eval(expr, store).ok()?)
+        .ok()?
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError> {
@@ -2398,6 +2448,62 @@ mod tests {
                 .sign_extended(6)
                 .to_binary(),
             "zzz010"
+        );
+    }
+
+    /// `{N{…}}` repeats the inner concatenation `N` times. Every expectation
+    /// here is what `iverilog` 12.0 prints for the same expression.
+    #[test]
+    fn test_replication() {
+        assert_eq!(bits("{2{2'b01}}"), "0101");
+        assert_eq!(bits("{{4{1'b1}}, 4'b0000}"), "11110000");
+        assert_eq!(bits("{3{1'bx}}"), "xxx");
+        // Sign extension is the idiom this operator exists for.
+        let store = sample_store();
+        assert_eq!(bits_in("{{2{a[7]}}, a[3:0]}", &store), "110110");
+    }
+
+    /// A count of zero produces no bits at all. That is legal only inside a
+    /// wider concatenation, which is exactly where it can appear.
+    #[test]
+    fn test_zero_replication_contributes_nothing() {
+        assert_eq!(bits("{{0{1'b1}}, 3'b101}"), "101");
+    }
+
+    /// A replication is a bit vector, so it is unsigned however signed its
+    /// parts were — and it is as wide as the count times the parts.
+    #[test]
+    fn test_replication_is_unsigned_and_sized_by_its_count() {
+        let store = StateStore::new();
+        let expression = parse("{3{2'b10}}");
+        assert!(!expression_is_signed(&expression, &store));
+        assert_eq!(expression_width(&expression, &store), 6);
+    }
+
+    /// A count that is not a constant is reported by name rather than guessed
+    /// at: a replication silently sized wrong would be a plausible-looking
+    /// pattern of bits.
+    #[test]
+    fn test_non_constant_replication_count_is_named() {
+        let error = eval(&parse("{missing{1'b1}}"), &StateStore::new())
+            .expect_err("an unknown count cannot be evaluated");
+        assert!(
+            matches!(error, EvalError::NonConstantReplicationCount(_)),
+            "expected a named count error, got {:?}",
+            error
+        );
+    }
+
+    /// A count large enough to allocate absurdly is refused, the same way a
+    /// nonsense part select is.
+    #[test]
+    fn test_absurd_replication_count_is_refused() {
+        let error = eval(&parse("{1000000{8'hFF}}"), &StateStore::new())
+            .expect_err("a million bytes is not a value to build");
+        assert!(
+            matches!(error, EvalError::WidthOverflow(_)),
+            "expected a width overflow, got {:?}",
+            error
         );
     }
 }

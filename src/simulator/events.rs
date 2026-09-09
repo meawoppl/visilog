@@ -387,6 +387,12 @@ fn collect_expression_reads(expression: &Expression, names: &mut BTreeSet<String
             }
         }
         // The called function is not a signal, but its arguments are read.
+        Expression::Replication(count, parts) => {
+            collect_expression_reads(count, names);
+            for part in parts {
+                collect_expression_reads(part, names);
+            }
+        }
         Expression::FunctionCall(_, arguments) | Expression::SystemFunctionCall(_, arguments) => {
             for argument in arguments {
                 collect_expression_reads(argument, names);
