@@ -7,7 +7,7 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
 use crate::parsers::expr::Expression;
-use crate::register::{Register, X};
+use crate::register::{Register, REAL_WIDTH, X};
 use crate::simulator::program::FunctionDefinition;
 
 /// What the `$random` stream starts from.
@@ -50,6 +50,11 @@ impl Default for RandomStream {
         RandomStream(RefCell::new(StdRng::seed_from_u64(DEFAULT_RANDOM_SEED)))
     }
 }
+
+/// The declared range of a `real`, which is what a sixty-four bit value's
+/// range always is. A `real` has no declarable width of its own — the type is
+/// the whole of it — so this is a constant rather than something parsed.
+pub const REAL_RANGE: (i64, i64) = (REAL_WIDTH as i64 - 1, 0);
 
 /// A single named signal: its current four-state value plus the `(msb, lsb)`
 /// range it was declared with.
@@ -99,6 +104,14 @@ impl SignalState {
     /// Whether the signal was declared `signed`.
     pub fn is_signed(&self) -> bool {
         self.register.is_signed()
+    }
+
+    /// Whether the signal was declared `real`, which is what says its bits are
+    /// a double. It rides on the stored value for the same reason signedness
+    /// does: there is one copy of it, and the store re-stamps it on every
+    /// write so a value cannot bring its own.
+    pub fn is_real(&self) -> bool {
+        self.register.is_real()
     }
 
     pub fn register(&self) -> &Register {
@@ -209,11 +222,17 @@ impl Memory {
         Memory::filled(addresses, range, signed, Register::high_impedance)
     }
 
+    /// An array of `real`s. A real has no `x`, so an unwritten word is `0.0`
+    /// rather than unknown — the same rule a scalar `real` follows.
+    pub fn of_reals(addresses: (i64, i64)) -> Self {
+        Memory::filled(addresses, REAL_RANGE, true, |_| Register::from_f64(0.0))
+    }
+
     fn filled(
         addresses: (i64, i64),
         range: (i64, i64),
         signed: bool,
-        fill: fn(usize) -> Register,
+        fill: impl Fn(usize) -> Register,
     ) -> Self {
         let word = fill(range_width(range)).with_signedness(signed);
         Memory {
@@ -248,6 +267,11 @@ impl Memory {
         self.words[0].is_signed()
     }
 
+    /// Whether this is an array of `real`s.
+    pub fn is_real(&self) -> bool {
+        self.words[0].is_real()
+    }
+
     /// Translates a declared address into an offset into `words`, counting from
     /// the address written first — so `mem [0:255]` and `mem [15:8]` both run in
     /// the order their declarations read. `None` is an address outside the
@@ -273,6 +297,10 @@ impl Memory {
     pub fn word(&self, address: Option<i64>) -> Register {
         match address.and_then(|address| self.word_position(address)) {
             Some(offset) => self.words[offset].clone(),
+            // An array of reals has no unknown to read: `0.0` is what an
+            // unwritten word of one holds, so it is what an unreachable one
+            // reads too.
+            None if self.is_real() => Register::from_f64(0.0),
             None => Register::unknown(self.width()).with_signedness(self.is_signed()),
         }
     }
@@ -284,9 +312,16 @@ impl Memory {
             return false;
         };
         // Signedness is the *declaration's*, so it is re-stamped on every write
-        // exactly as `SignalState` does it: a value cannot bring its own.
+        // exactly as `SignalState` does it: a value cannot bring its own. So is
+        // realness, and a word of an array of reals is *converted* rather than
+        // re-stamped: the bits of a double are not the bits of the integer that
+        // denotes the same number.
         let signed = self.words[offset].is_signed();
-        let value = value.coerced(self.width()).with_signedness(signed);
+        let value = if self.words[offset].is_real() {
+            Register::from_f64(value.to_f64())
+        } else {
+            value.coerced(self.width()).with_signedness(signed)
+        };
         if self.words[offset] == value {
             return false;
         }
@@ -420,6 +455,11 @@ pub struct StateStore {
     /// "no" for a design that declares nothing signed is most of what that walk
     /// would otherwise cost.
     any_signed: bool,
+    /// Whether any signal here was declared `real`, on the same terms as
+    /// `any_signed`: a hint that is exact when it says `false`. It is what
+    /// keeps the integer-to-real conversion every write would otherwise have
+    /// to consider off a design that has no real in it.
+    any_real: bool,
     /// Whether the design declares any memory at all, on the same terms as
     /// `any_signed`. `resolve_target` has to ask "is this name a memory?" of
     /// every bit-select write, and for a design with no memories this answers
@@ -472,6 +512,12 @@ impl StateStore {
         self.any_signed
     }
 
+    /// Whether any signal in the store was declared `real`. `false` is exact —
+    /// nothing here is a real — while `true` only means something once was.
+    pub fn any_real(&self) -> bool {
+        self.any_real
+    }
+
     /// A store for the body of a function called against this one: the same
     /// function table and the same clock, but no signals — a call's variables
     /// are its own, and nothing it writes is allowed to reach the design.
@@ -492,6 +538,7 @@ impl StateStore {
             functions: Rc::clone(&self.functions),
             call_depth: Cell::new(self.call_depth.get()),
             any_signed: false,
+            any_real: false,
             any_memory: false,
             events: HashSet::new(),
             triggers: Vec::new(),
@@ -728,6 +775,29 @@ impl StateStore {
         self.declare_filled(name, range, signed, Register::high_impedance);
     }
 
+    /// Declares a `real`: sixty-four bits read as a double, starting at `0.0`.
+    ///
+    /// It is the one variable that does **not** start unknown, and that is a
+    /// property of the type rather than a choice — a double has no `x` to hold.
+    /// An unwritten `real` reads `0.000000`, which is what iverilog prints.
+    pub fn declare_real(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        self.record(&name);
+        self.any_signed = true;
+        self.any_real = true;
+        self.name_to_signal.insert(
+            name,
+            SignalState::with_range(Register::from_f64(0.0), REAL_RANGE),
+        );
+    }
+
+    /// Declares an array of `real`s: `real samples [0:3];`.
+    pub fn declare_real_memory(&mut self, name: impl Into<String>, addresses: (i64, i64)) {
+        self.any_signed = true;
+        self.any_real = true;
+        self.insert_memory(name, Memory::of_reals(addresses), true);
+    }
+
     fn declare_filled(
         &mut self,
         name: impl Into<String>,
@@ -825,15 +895,36 @@ impl StateStore {
         changes
     }
 
-    /// The signedness a write to `name` has to keep: the one the signal was
-    /// declared with, since a value cannot change a declaration. A name that
-    /// does not exist yet is being declared by this very write, so it takes the
-    /// signedness of the value instead.
-    fn declared_signedness(&self, name: &str, register: &Register) -> bool {
-        self.name_to_signal
-            .get(name)
-            .map(|signal| signal.is_signed())
-            .unwrap_or_else(|| register.is_signed())
+    /// How a write to `name` has to be *read* — signed or not, real or not —
+    /// which is the declaration's business rather than the value's, since a
+    /// value cannot change a declaration. A name that does not exist yet is
+    /// being declared by this very write, so it takes the value's own reading
+    /// instead. Both flags come out of one lookup because a write asks for
+    /// both and hashing the name twice would be the cost of asking.
+    fn declared_reading(&self, name: &str, register: &Register) -> (bool, bool) {
+        match self.name_to_signal.get(name) {
+            Some(signal) => (signal.is_signed(), signal.is_real()),
+            None => (register.is_signed(), register.is_real()),
+        }
+    }
+
+    /// `register` as the declaration of `name` says it is to be read.
+    ///
+    /// A real declaration *converts* rather than re-stamps: the bits of a
+    /// double are not the bits of the integer that denotes the same number, so
+    /// a write of `3` into a `real` has to become `3.0` and a write of `2.5`
+    /// into an `integer` has to become `3`. Everything else only re-stamps.
+    fn as_declared(&self, name: &str, register: Register) -> (Register, bool) {
+        let (signed, real) = self.declared_reading(name, &register);
+        if real != register.is_real() {
+            let converted = if real {
+                Register::from_f64(register.to_f64())
+            } else {
+                Register::integer_from_f64(register.to_f64().round(), register.width())
+            };
+            return (converted.with_signedness(signed), signed);
+        }
+        (register.with_signedness(signed).with_realness(real), signed)
     }
 
     /// Sets a signal's value. A previously declared range is preserved when the
@@ -841,8 +932,9 @@ impl StateStore {
     pub fn set(&mut self, name: impl Into<String>, register: Register) {
         let name = name.into();
         self.record(&name);
-        let signed = self.declared_signedness(&name, &register);
+        let (register, signed) = self.as_declared(&name, register);
         self.any_signed |= signed;
+        self.any_real |= register.is_real();
         let range = self
             .name_to_signal
             .get(&name)
@@ -852,20 +944,18 @@ impl StateStore {
             Some(range) => SignalState::with_range(register, range),
             None => SignalState::new(register),
         };
-        self.name_to_signal
-            .insert(name, signal.with_signedness(signed));
+        self.name_to_signal.insert(name, signal);
     }
 
     /// Sets a signal's value and declared range in one step.
     pub fn set_ranged(&mut self, name: impl Into<String>, register: Register, range: (i64, i64)) {
         let name = name.into();
         self.record(&name);
-        let signed = self.declared_signedness(&name, &register);
+        let (register, signed) = self.as_declared(&name, register);
         self.any_signed |= signed;
-        self.name_to_signal.insert(
-            name,
-            SignalState::with_range(register, range).with_signedness(signed),
-        );
+        self.any_real |= register.is_real();
+        self.name_to_signal
+            .insert(name, SignalState::with_range(register, range));
     }
 
     pub fn get(&self, name: &str) -> Option<&Register> {

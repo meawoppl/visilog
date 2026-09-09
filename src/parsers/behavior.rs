@@ -901,6 +901,7 @@ fn block_item(input: &str) -> IResult<&str, Vec<FunctionVariable>> {
                 name,
                 range: declared.range.clone(),
                 signed: declared.signed,
+                real: declared.real,
             })
             .collect(),
     ))
@@ -964,6 +965,9 @@ pub struct FunctionVariable {
     pub name: Identifier,
     pub range: Range,
     pub signed: bool,
+    /// Whether it was declared `real`, which is what makes its sixty-four bits
+    /// a double rather than an integer.
+    pub real: bool,
 }
 
 /// `function [7:0] do_add; input [7:0] a; do_add = a + 1; endfunction`
@@ -979,6 +983,8 @@ pub struct FunctionDeclaration {
     /// variable its own name stands for.
     pub range: Range,
     pub signed: bool,
+    /// Whether the function returns a `real`: `function real half;`.
+    pub real: bool,
     pub arguments: Vec<FunctionVariable>,
     /// Body-local `reg` and `integer` declarations.
     pub locals: Vec<FunctionVariable>,
@@ -994,6 +1000,9 @@ pub struct FunctionDeclaration {
 /// of the element before it.
 #[derive(Debug, PartialEq, Clone)]
 struct DeclaredType {
+    /// Whether the keyword was `real` (or `realtime`), which carries its own
+    /// sixty-four bits the way `integer` and `time` carry theirs.
+    real: bool,
     range: Range,
     signed: bool,
     explicit: bool,
@@ -1002,6 +1011,7 @@ struct DeclaredType {
 impl Default for DeclaredType {
     fn default() -> Self {
         DeclaredType {
+            real: false,
             range: Range::SINGLE_BIT,
             signed: false,
             explicit: false,
@@ -1022,6 +1032,10 @@ fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
         value(true, |i| keyword(i, "time")),
     )))(input)?;
     let (input, integer) = opt(|i| keyword(i, "integer"))(input)?;
+    // `realtime` is `real` under a longer name, so the longer keyword is tried
+    // first — otherwise `real` matches and leaves `time` looking like a name.
+    let (input, is_real) = opt(alt((|i| keyword(i, "realtime"), |i| keyword(i, "real"))))(input)?;
+    let is_real = is_real.is_some();
     let (input, _) = ws_and_comments(input)?;
     let (input, signed) = signedness(input)?;
     let (input, _) = ws_and_comments(input)?;
@@ -1030,17 +1044,24 @@ fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
     Ok((
         input,
         DeclaredType {
+            real: is_real,
             // `storage` is `Some(true)` for a `time`, whose 64 bits are what
-            // the keyword means rather than a range it was written with.
-            range: match (integer.is_some(), storage, &declared) {
-                (true, _, _) => Range::Constant(31, 0),
-                (false, _, Some(declared)) => declared.clone(),
-                (false, Some(true), None) => Range::Constant(63, 0),
-                (false, _, None) => Range::SINGLE_BIT,
+            // the keyword means rather than a range it was written with, and a
+            // `real` is sixty-four bits on the same terms.
+            range: match (integer.is_some(), is_real, storage, &declared) {
+                (true, _, _, _) => Range::Constant(31, 0),
+                (false, true, _, _) => Range::Constant(63, 0),
+                (false, false, _, Some(declared)) => declared.clone(),
+                (false, false, Some(true), None) => Range::Constant(63, 0),
+                (false, false, _, None) => Range::SINGLE_BIT,
             },
-            // An `integer` is signed by being an `integer`.
-            signed: signed || integer.is_some(),
-            explicit: storage.is_some() || integer.is_some() || declared.is_some() || signed,
+            // An `integer` is signed by being an `integer`, and so is a `real`.
+            signed: signed || integer.is_some() || is_real,
+            explicit: storage.is_some()
+                || integer.is_some()
+                || is_real
+                || declared.is_some()
+                || signed,
         },
     ))
 }
@@ -1078,6 +1099,7 @@ fn function_item(input: &str) -> IResult<&str, (bool, Vec<FunctionVariable>)> {
                     name,
                     range: declared.range.clone(),
                     signed: declared.signed,
+                    real: declared.real,
                 })
                 .collect(),
         ),
@@ -1113,6 +1135,7 @@ fn ansi_function_arguments(input: &str) -> IResult<&str, Vec<FunctionVariable>> 
             name,
             range: inherited.range.clone(),
             signed: inherited.signed,
+            real: inherited.real,
         });
     }
     Ok((input, arguments))
@@ -1154,6 +1177,7 @@ pub fn parse_function_declaration(input: &str) -> IResult<&str, FunctionDeclarat
             name,
             range: returns.range,
             signed: returns.signed,
+            real: returns.real,
             arguments,
             locals,
             statements,
@@ -1243,6 +1267,7 @@ fn task_item(input: &str) -> IResult<&str, (Option<TaskDirection>, Vec<FunctionV
                     name,
                     range: declared.range.clone(),
                     signed: declared.signed,
+                    real: declared.real,
                 })
                 .collect(),
         ),
@@ -1290,6 +1315,7 @@ fn ansi_task_arguments(input: &str) -> IResult<&str, Vec<TaskArgument>> {
                 name,
                 range: inherited.range.clone(),
                 signed: inherited.signed,
+                real: inherited.real,
             },
         });
     }

@@ -2,6 +2,7 @@ use super::{
     base::RawToken,
     constants::{verilog_const, VerilogConstant},
     identifier::{hierarchical_identifier, Identifier},
+    numbers::real_number,
     operators::{unary_operator, BinaryOperator, UnaryOperator},
     simple::{ws, ws_and_comments},
     string::parse_verilog_string,
@@ -20,6 +21,12 @@ use nom::{combinator::peek, sequence::delimited};
 #[derive(PartialEq, Clone)]
 pub enum Expression {
     Constant(VerilogConstant),
+    /// `0.5`, `1e3`, `1.5e-3` — a real literal, held as the double it denotes.
+    ///
+    /// Deliberately not a [`VerilogConstant`]: that type is a size, a base and
+    /// a run of digits, none of which a real number has. A real is the one
+    /// operand whose value is not a pattern of bits the source wrote out.
+    RealLiteral(f64),
     Identifier(Identifier),
     Unary(UnaryOperator, Box<Expression>),
     Binary(Box<Expression>, BinaryOperator, Box<Expression>),
@@ -71,6 +78,7 @@ impl Expression {
     pub fn to_contracted_string(&self) -> String {
         match self {
             Expression::Constant(c) => format!("{}", c),
+            Expression::RealLiteral(value) => format!("{}", value),
             Expression::Identifier(id) => format!("{}", id.name),
             Expression::Unary(op, expr) => {
                 format!("{}{}", op.raw_token(), expr.to_contracted_string())
@@ -153,6 +161,7 @@ impl Expression {
         let indent_str = "  ".repeat(indent);
         match self {
             Expression::Constant(c) => format!("{}Constant({})", indent_str, c),
+            Expression::RealLiteral(value) => format!("{}Real({})", indent_str, value),
             Expression::Identifier(id) => format!("{}Identifier(\"{}\")", indent_str, id.name),
             Expression::Unary(op, expr) => format!(
                 "{}Unary{}(\n{},\n{})",
@@ -396,6 +405,9 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         indexed_part_select,
         part_select,
         map(hierarchical_identifier, Expression::Identifier),
+        // Before the integer grammar, which would otherwise read `0.9` as the
+        // constant `0` and leave `.9` behind.
+        real_literal,
         map(verilog_const, Expression::Constant),
         // A string is unambiguous — nothing else starts with `"` — so it may
         // sit anywhere an operand may.
@@ -403,6 +415,21 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         parenthetical,
         concatenation,
     ))(input)
+}
+
+/// `0.5`, `1e3`, `1.5e-3` — a real literal.
+///
+/// The text is read by [`numbers::real_number`], the one place a real number is
+/// spelled out, and converted here: an [`Expression`] carries the value rather
+/// than the digits, because nothing downstream has any use for the spelling.
+/// The `_` separators Verilog allows are dropped before the conversion, which
+/// is the only thing `f64::from_str` will not do itself.
+fn real_literal(input: &str) -> IResult<&str, Expression> {
+    map_res(real_number, |text: &str| {
+        text.replace('_', "")
+            .parse::<f64>()
+            .map(Expression::RealLiteral)
+    })(input)
 }
 
 /// `a[i]` — a single-bit select. The index is a full expression, so
@@ -738,6 +765,47 @@ mod tests {
     use crate::parsers::helpers::{assert_parses, assert_parses_to};
 
     use super::*;
+
+    /// A real literal parses in both of IEEE 1364's spellings, and it is tried
+    /// *before* the integer grammar — which would otherwise read `0.9` as the
+    /// constant `0` and leave `.9` behind.
+    #[test]
+    fn test_real_literals() {
+        assert_parses_to(verilog_expression, "0.5", Expression::RealLiteral(0.5));
+        assert_parses_to(verilog_expression, "1e3", Expression::RealLiteral(1000.0));
+        assert_parses_to(verilog_expression, "1E3", Expression::RealLiteral(1000.0));
+        assert_parses_to(
+            verilog_expression,
+            "1.5e-3",
+            Expression::RealLiteral(0.0015),
+        );
+        assert_parses_to(
+            verilog_expression,
+            "1.5e+3",
+            Expression::RealLiteral(1500.0),
+        );
+        // The `_` separators a Verilog number may carry are part of the token
+        // and not part of the value.
+        assert_parses_to(
+            verilog_expression,
+            "1_000.5",
+            Expression::RealLiteral(1000.5),
+        );
+    }
+
+    /// The two halves a real number is *not*: an exponent with no digits after
+    /// it, and a based literal whose size looks like the start of one. Both
+    /// have to fall through to the integer grammar with nothing consumed.
+    #[test]
+    fn test_a_number_that_is_not_real_still_parses_as_one() {
+        let (remaining, expression) = verilog_expression("1e").expect("`1` is still a constant");
+        assert_eq!(remaining, "e");
+        assert!(matches!(expression, Expression::Constant(_)));
+        assert!(matches!(
+            assert_parses(verilog_expression, "8'hFF"),
+            Expression::Constant(_)
+        ));
+    }
 
     #[test]
     fn test_constant_expression() {

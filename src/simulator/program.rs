@@ -618,6 +618,37 @@ impl Program {
         }
     }
 
+    /// Puts the instance path in front of the block path every `%m` in this
+    /// program carries, which is the half of a scope name only `elaborate`
+    /// knows.
+    ///
+    /// It leaves a spliced task body alone for the reason
+    /// [`rename_local`](Program::rename_local) does: that body was qualified
+    /// when the task was compiled, and doing it twice would put the instance
+    /// path on twice.
+    pub fn qualify_scopes(&mut self, hierarchy: &dyn Fn(&str) -> String) {
+        let skip: Vec<(usize, usize)> = self.inlined.clone();
+        let mut skipping = skip.iter().peekable();
+        let mut index = 0;
+        while index < self.instructions.len() {
+            if let Some((start, end)) = skipping.peek() {
+                if index >= *end {
+                    skipping.next();
+                    continue;
+                }
+                if index == *start {
+                    index = *end;
+                    skipping.next();
+                    continue;
+                }
+            }
+            if let Instruction::Task(call) = &mut self.instructions[index] {
+                call.qualify_scope(hierarchy);
+            }
+            index += 1;
+        }
+    }
+
     /// Rewrites the names this program's *own* statements use, leaving the
     /// instructions spliced in from a task's body untouched.
     ///
@@ -802,7 +833,11 @@ impl Program {
                 // design runs, so an unrecognised one fails before it can look
                 // like a task that quietly printed nothing.
                 ProceduralStatements::SystemTask(call) => {
-                    let call = TaskCall::compile(call)?;
+                    let mut call = TaskCall::compile(call)?;
+                    // The block path this statement sits in is what `%m`
+                    // prints, and this is the only place it is known: the
+                    // scope walks down with the named blocks as they compile.
+                    call.set_scope(scope);
                     self.emit(Instruction::Task(call));
                 }
             }
@@ -1401,6 +1436,9 @@ pub struct FrameVariable {
     pub name: String,
     pub range: (i64, i64),
     pub signed: bool,
+    /// Whether it was declared `real`, which is what makes the frame declare
+    /// it as a double rather than as sixty-four bits of integer.
+    pub real: bool,
 }
 
 /// A function the design declares, compiled into the shape a call needs.
@@ -1455,13 +1493,18 @@ impl FunctionDefinition {
             }
         }
 
-        frame.declare_signed(
-            self.result.name.clone(),
-            self.result.range,
-            self.result.signed,
-        );
-        for variable in self.arguments.iter().chain(&self.locals) {
-            frame.declare_signed(variable.name.clone(), variable.range, variable.signed);
+        for variable in std::iter::once(&self.result)
+            .chain(&self.arguments)
+            .chain(&self.locals)
+        {
+            // A `real` frame variable starts at `0.0` like any other real; the
+            // rest start unknown. It is the same split `declare` makes in the
+            // design's own store.
+            if variable.real {
+                frame.declare_real(variable.name.clone());
+            } else {
+                frame.declare_signed(variable.name.clone(), variable.range, variable.signed);
+            }
         }
         for (variable, value) in self.arguments.iter().zip(arguments) {
             let target = ResolvedTarget::Whole(variable.name.clone());

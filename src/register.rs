@@ -13,6 +13,10 @@ pub const Z: u8 = 3;
 /// Bits carried by one chunk of a bit plane.
 const CHUNK_BITS: usize = 128;
 
+/// How many bits a `real` occupies: IEEE-754 double precision, which is what
+/// `$realtobits` and `$bitstoreal` both assume.
+pub const REAL_WIDTH: usize = 64;
+
 /// One `CHUNK_BITS` wide slice of a register's two bit planes, least
 /// significant bit first.
 ///
@@ -80,18 +84,22 @@ enum Planes {
 /// the last. Internally they are packed least-significant first into the two
 /// planes of a [`Chunk`].
 ///
-/// A register also carries **how its bits are to be read** — [`is_signed`]. The
-/// bits are the value; signedness is only an instruction for the operators that
-/// can tell the difference (`/`, `%`, `>>>`, `< <= > >=`, and widening). It is
-/// deliberately *not* part of equality or hashing: `4'sb1111` and `4'b1111` are
-/// the same four bits, and a store that compared them as different would report
-/// an edge where no bit moved.
+/// A register also carries **how its bits are to be read** — [`is_signed`] and
+/// [`is_real`]. The bits are the value; the two flags are only instructions for
+/// the operators that can tell the difference. Signedness matters to `/`, `%`,
+/// `>>>`, `< <= > >=` and widening; realness says the sixty-four bits are an
+/// IEEE-754 double rather than an integer, which changes every arithmetic
+/// operator and the way the value prints. Neither is part of equality or
+/// hashing: `4'sb1111` and `4'b1111` are the same four bits, and a store that
+/// compared them as different would report an edge where no bit moved.
 #[derive(Clone, Debug)]
 pub struct Register {
     width: usize,
     planes: Planes,
     /// Whether the most significant bit is a sign bit.
     signed: bool,
+    /// Whether the bits are the IEEE-754 encoding of a double.
+    real: bool,
 }
 
 impl PartialEq for Register {
@@ -219,6 +227,75 @@ impl Register {
         self
     }
 
+    // -- reals -------------------------------------------------------------
+
+    /// Whether the bits are the IEEE-754 encoding of a double rather than an
+    /// integer. Every register is an integer unless something says otherwise.
+    pub fn is_real(&self) -> bool {
+        self.real
+    }
+
+    /// [`REAL_WIDTH`] bits holding `value`, read as a real.
+    ///
+    /// A real is deliberately built out of the same two bit planes everything
+    /// else is: it is a value the store can hold, journal and compare without
+    /// a second kind of storage. What makes it a real is the flag, which is
+    /// the only thing that says the bits are a double.
+    pub fn from_f64(value: f64) -> Self {
+        Register {
+            real: true,
+            // A double is signed, and saying so is what keeps an *integer*
+            // beside it signed: `-1 / c` for a real `c` is signed division
+            // only if both operands are, and reading the `-1` as unsigned
+            // would make it four billion (corpus `pr2818823`).
+            signed: true,
+            ..Register::from_u128(value.to_bits() as u128, REAL_WIDTH)
+        }
+    }
+
+    /// The value as a double.
+    ///
+    /// A real hands its own bits back. Anything else is *converted*, which is
+    /// what happens whenever an integer meets a real: it is read as a number —
+    /// signed or not, as its own flag says — and an `x` or `z` bit counts as
+    /// `0`, which is what IEEE 1364 asks for when a four-state value reaches a
+    /// real.
+    pub fn to_f64(&self) -> f64 {
+        if self.real {
+            return f64::from_bits(self.chunk(0).value as u64);
+        }
+        // The known bits alone: `to_u128` refuses a value with any `x` in it,
+        // and a conversion to real has an answer for one.
+        let known = self.chunk(0).ones();
+        if self.signed {
+            sign_extend_to_i128(known, self.width.min(128)) as f64
+        } else {
+            known as f64
+        }
+    }
+
+    /// The same bits, read as a real or as an integer. A cast, like
+    /// [`with_signedness`](Register::with_signedness): it changes no bit.
+    pub fn with_realness(mut self, real: bool) -> Self {
+        self.real = real;
+        self
+    }
+
+    /// The whole number `value` as a `width` bit two's complement integer.
+    ///
+    /// The caller rounds or truncates first, because the two conversions
+    /// Verilog has differ in exactly that and nothing else: an assignment to
+    /// an `integer` rounds (`1.5` is 2, `-1.5` is -2) while `$rtoi` truncates
+    /// toward zero (`2.7` is 2). A value with no whole number at all —
+    /// infinity, or a NaN — is `x`, which is the only four-state answer there
+    /// is for one.
+    pub fn integer_from_f64(value: f64, width: usize) -> Self {
+        if !value.is_finite() {
+            return Register::unknown(width).with_signedness(true);
+        }
+        Register::from_u128(value as i128 as u128, width).with_signedness(true)
+    }
+
     /// The code of the most significant bit — the sign bit of a signed value.
     /// A zero width register has no sign bit and reports `0`.
     fn sign_bit(&self) -> u8 {
@@ -275,6 +352,7 @@ impl Register {
                     unknown: packed.unknown & mask,
                 }),
                 signed: false,
+                real: false,
             };
         }
         let count = width.div_ceil(CHUNK_BITS);
@@ -290,6 +368,7 @@ impl Register {
             width,
             planes: Planes::Spilled { value, unknown },
             signed: false,
+            real: false,
         }
     }
 
@@ -1122,5 +1201,59 @@ mod tests {
         assert_eq!(bits, bits.clone().with_signedness(true));
         assert!(!bits.is_signed());
         assert!(bits.with_signedness(true).is_signed());
+    }
+
+    // -- reals -------------------------------------------------------------
+
+    /// A real is sixty-four bits and the IEEE-754 encoding of them, which is
+    /// the encoding `$realtobits` hands back: `1.5` is `64'h3ff8000000000000`,
+    /// measured from iverilog 12.0.
+    #[test]
+    fn test_a_real_is_its_ieee_754_bits() {
+        let value = Register::from_f64(1.5);
+        assert!(value.is_real());
+        assert_eq!(value.width(), REAL_WIDTH);
+        assert_eq!(value.to_hex().unwrap().to_lowercase(), "3ff8000000000000");
+        assert_eq!(value.to_f64(), 1.5);
+    }
+
+    /// An integer reaching a real is *converted*, and its own signedness is
+    /// what says which number it was: `8'hFF` is 255 and a signed `-1` is -1.
+    #[test]
+    fn test_an_integer_converts_to_a_real_by_its_signedness() {
+        assert_eq!(Register::from_binary("11111111").to_f64(), 255.0);
+        assert_eq!(
+            Register::from_binary("11111111")
+                .with_signedness(true)
+                .to_f64(),
+            -1.0
+        );
+    }
+
+    /// IEEE 1364 reads an `x` or a `z` as `0` when a four-state value is
+    /// converted to a real, which is the one reading that produces a number at
+    /// all — a double has no unknown.
+    #[test]
+    fn test_unknown_bits_convert_to_zero() {
+        assert_eq!(Register::from_binary("1x1").to_f64(), 5.0);
+        assert_eq!(Register::from_binary("xxxx").to_f64(), 0.0);
+    }
+
+    /// The value type is moved on every operation, so its size matters: the
+    /// two bit planes align to sixteen bytes, which is what leaves room for
+    /// both of the flags that say how to read them without costing a byte.
+    #[test]
+    fn test_a_reading_flag_costs_no_space() {
+        assert_eq!(std::mem::size_of::<Register>(), 64);
+    }
+
+    /// Realness says how bits are read, exactly as signedness does, so it is
+    /// no more part of equality than signedness is.
+    #[test]
+    fn test_realness_is_not_part_of_equality() {
+        let real = Register::from_f64(1.5);
+        let bits = real.clone().with_realness(false);
+        assert_eq!(real, bits);
+        assert!(!bits.is_real());
     }
 }

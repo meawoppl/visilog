@@ -54,7 +54,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
 | `simple.rs` | whitespace, comments, `raw_pos_int`, `Range` and the `range` parser, `signedness`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
-| `numbers.rs` | raw binary / decimal / hex digit runs |
+| `numbers.rs` | raw binary / decimal / hex digit runs, and `real_number` — the one place a real number is spelled out |
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
 | `string.rs` | double-quoted string literals |
 | `identifier.rs` | `Identifier`, identifier lists, bit/part select |
@@ -68,7 +68,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `primitive.rs` | `primitive … endprimitive` — a user-defined primitive and its truth table |
 | `specify.rs` | `specify … endspecify` — path delays, timing checks and `specparam` |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
-| `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
+| `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real`/`realtime` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength and its optional `#delay`, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
 | `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end` and `fork…join` — named or not — `if`/`else`, `case`, `wait`, a statement-level event control, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
@@ -934,16 +934,16 @@ whose *checks* are about timing does then fail honestly: corpus `specify2` print
 dst changed too fast`, where before it did not parse at all.
 
 Two things inside the block are not inert and are not treated as though they were. A
-`specparam` is a **real constant the whole module may name**, so `elaborate` declares it
-beside the parameters — except one whose value is a *real number*, which is kept as the text
-it was written as and declares nothing, since a four-state `Register` cannot hold one. A
+`specparam` is a **constant the whole module may name**, so `elaborate` declares it beside
+the parameters; one whose value is a real number is kept by the parser as the text it was
+written as — a path delay has no evaluator behind it — and declared as a `real`. A
 **timing check** (`$setup`, `$hold`, `$width`, …) reports a violation, which needs the same
 model the paths would; one is recorded and never run, so no violation is invented and none
 is claimed to have been checked. Every form is parsed *structurally* — there is no "skip to
 the next `;`" fallback, so anything inside a `specify` block the grammar does not recognise
 is a parse error rather than something swallowed.
 
-**`time` is a variable, `event` is not, and `real` is a named refusal.** `time t;` is a 64
+**`time` is a variable and `event` is not.** `time t;` is a 64
 bit *unsigned* register and nothing else — `elaborate` declares it at a fixed width the way
 it declares an `integer` at 32 — so it round-trips through the store, through the memory
 map (`time marks [0:3];`) and through `$display` with no other machinery. A named event has
@@ -954,24 +954,111 @@ each entry into a synthesised one-bit `0 -> 1` edge under the event's own name. 
 what makes `always @(e)` fire **exactly once** per `-> e;` — the round that takes the
 trigger is the only round that can see it, where a value left standing in the store would
 wake the block again on every delta cycle. Reading an event is `EvalError::EventAsValue`,
-the same shape as `MemoryAsValue`: the name exists, it simply is not a value. A `real`
-**parses and then stops** — `elaborate` reports an `Unsupported` naming it — because
-IEEE-754 floating point is not what a `Register` holds (there is no `x` in a float) and the
-expression grammar has no floating point literal to feed one with anyway. The declaration
-is read regardless so that a design using one says that is why it stopped, rather than
-dying on unfamiliar syntax several lines earlier.
+the same shape as `MemoryAsValue`: the name exists, it simply is not a value.
+
+**A `real` is sixty-four bits plus a flag saying to read them as a double**, which is
+exactly the shape signedness already had. `Register` carries `real` beside `signed`, and it
+is the only copy: `Register::from_f64` / `to_f64` are the two ends of it, `SignalState`
+re-stamps the declared flag on every write, and — like signedness — realness is *not* part
+of equality, so a store never journals an edge over how a value is read. `real r;`,
+`realtime t;`, `real samples [0:3];`, `parameter real PI = 3.14;`, `function real f;`,
+`input real x;` inside a function or a task, and `specparam tRise = 0.9;` all declare one;
+`0.5`, `1e3` and `1.5e-3` are the literal.
+
+**A real has no `x` and no `z`**, and that is the one place it is not like every other type
+here: `StateStore::declare_real` fills with `0.0` rather than with `Register::unknown`, so
+an untouched `real` reads `0.000000` where an untouched `reg` reads `x`. An unwritten word
+of an array of reals reads `0.0` too. A four-state value converted to one reads its `x` and
+`z` bits as `0`, which is what IEEE 1364 asks for.
+
+**Realness travels *up* from the operands, where signedness travels down.** That asymmetry
+is the whole of the model and it is deliberate: signedness has to be decided before an
+operand is evaluated because it changes *how* the operand is evaluated, while realness
+changes only what is done with the result — so `eval_binary` reads it off the two values it
+was handed. One real operand makes the operation real (`7/2.0` is 3.5 where `7/2` is 3) and
+nothing pushes back down, which is why `7/2 + 0.5` is 3.5: an integer division and then a
+real addition. It is also why `real r; reg [7:0] a, b; r = a * b;` multiplies in *eight*
+bits — `ResolvedTarget::width` reports `SELF_DETERMINED` for a real target, because a real
+is not a number of bits and has no width to impose.
+
+`expression_is_real` exists for the two places that *do* have to know before evaluating,
+and both are about width. A comparison sizes its operands against each other, and a real
+has no width to share — `(a + b) != 254.0` for two eight bit `255`s is true because the
+addition wraps in eight bits before it is converted, where widening it to sixty-four first
+gives 510 (corpus `pr2918095`). And a `?:` evaluates only the arm it takes, so which arm is
+real could not be read off a value: `c ? 1 : 2.5` is `1.0`, and `(c ? 1 : 2.5) / 2` is 0.5
+where an integer `1` would give 0 (corpus `pr2453002`). An unknown condition has no `x` to
+produce, so it gives what the arms agree on and `0.0` when they do not. Both callers ask
+`StateStore::any_real` first — `false` is exact, the same shape `any_signed` and
+`any_memory` use — so a design with no real in it never walks anything and `bench eval`
+does not move.
+
+**A conversion happens where the value meets the target, in `exec::drive_at`**, before the
+resize that would destroy it, and while the value still carries its own signedness — `-1`
+in eight bits is `-1.0` and not `255.0`. An assignment **rounds half away from zero** (`i =
+1.5;` is 2, `i = -1.5;` is -2) where `$rtoi` **truncates** toward zero (`$rtoi(2.7)` is 2),
+and `$itor` rounds because its argument is an integer (`$itor(10.5)` is 11.0). The
+conversion is made at the *target's* width, so a `reg [64:0]` holds `2**64` (corpus
+`pr2913404`), and an infinity or a NaN converts to `x` — the only four-state answer for a
+value with no whole number in it. It also happens *before* a `ResolvedTarget::Parts` is
+split, because a concatenation is a run of bits however its parts were declared:
+`{a, b} = 2.5;` splits the integer 3, where slicing the IEEE-754 encoding would put a piece
+of an exponent in each part. `$realtime`, `$realtobits` and `$bitstoreal` round out the
+set; `$bits` of a real reports **64**, where iverilog reports 1, because sixty-four is what
+`$realtobits` hands back.
+
+**An operator that reads a pattern of bits is refused by name.** `& | ^ ~^`, the shifts,
+`===`/`!==`, `~` and the reductions are all `EvalError::RealOperand` naming the operator,
+because iverilog rejects each of them at compile time and converting to an integer behind
+the design's back is the kind of wrong answer that looks right. `%` is the exception: the
+LRM leaves it illegal and iverilog computes `fmod`, which is what corpus
+`mixed_type_div_mod` asserts, so that is what it does.
+
+**Formatting is C's.** `%f` is six decimals, `%e` a mantissa and a two digit exponent, `%g`
+six significant figures with the trailing zeros dropped, `%E`/`%G` the same in capitals, and
+`%5.2f` is the precision field — which only these three read. An argument printed with *no*
+specifier is C's `%#g`: six significant figures with the trailing zeros **kept**, so
+`$display(1.5)` is `1.50000` and `400.0` is `400.000`. A real in a radix is rounded to a
+whole number and printed as narrowly as it goes, and decimal renders the *number* while
+every other base renders the sixty-four bit two's complement integer — `%0d` of `-0.4` is
+`-0` and `%0x` of it is `0` (corpus `br1029a`). `%s` of a real is an error: there are no
+characters in an IEEE-754 encoding.
+
+**`%c`, `%v` and `%m` are the three specifiers that are not about a number.** `%c` is the
+low eight bits as a character. `%m` is the *hierarchical name of the scope the call sits
+in* — `top`, `top.dut`, `top.dut.blk`, `top.dut.load` inside a task — and it takes no
+argument at all, so it is answered before one is fetched. It is settled when the design is
+elaborated and is a constant from then on, which is why it arrives in two halves: `Program`
+stamps the *block* path it is already carrying as it compiles, and `elaborate` puts the
+instance path in front through `Program::qualify_scopes` once it knows which instance the
+block belongs to. A spliced task body is skipped there for the reason `rename_local` skips
+it — it was qualified when the task was compiled, and doing it twice would prefix it twice.
+
+**`%v` is a strength, and only two of them can be told from a value.** A `z` bit is driven
+by nothing, which is `HiZ`; every other bit reports `St`, because an ordinary continuous
+assignment and a gate both drive at `strong`. A `pullup`, a `tri0`/`tri1` or an
+`assign (pull1, strong0)` really is weaker and this prints `St1` where iverilog prints
+`Pu1` — `StateStore` keeps a *value* per signal and not a strength, so there is nothing to
+read the difference from. Corpus `multi_bit_strength` is exactly that gap, and closing it
+means carrying a strength per bit through `resolve_contributions`.
+
+**A string is a value wherever a number is wanted.** `$display("%d", "A")` is 65:
+`TaskArgument::Text` reaches a numeric format as its own bytes, eight bits a character.
+A string argument is held as text rather than as an expression because a task has to try
+the *format string* reading of one first, and that is the only reason the two ever needed
+telling apart.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
-| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -1449,11 +1536,13 @@ tripwire.
   tree rather than an error. `specify.rs::terminal` is a name with an optional bit or part
   select and nothing else. The delay on the right of the `=` *is* an expression, which is
   how `= (tRise, tFall)` names two `specparam`s.
-- **A real number is parsed in exactly one place.** `specify.rs::real_number` reads the
-  fixed-point spelling (`0.9`, `0.500`) for a delay and a `specparam`, and it is tried
-  *before* the expression grammar — which would otherwise read `0.9` as `0` and leave `.9`
-  behind. There is still no real number anywhere else: `real` is a named refusal at
-  elaboration and the expression grammar has no floating point operand.
+- **A real number is parsed in exactly one place.** `numbers.rs::real_number` reads both of
+  IEEE 1364's spellings — fixed point (`0.9`, `0.500`) and exponent (`1e3`, `1.5e-3`) — and
+  three productions come to it: `expr.rs::real_literal`, a `specify` path delay and a
+  `specparam` value. It is tried *before* the integer grammar, which would otherwise read
+  `0.9` as `0` and leave `.9` behind. Digits are required on **both** sides of the `.`, so
+  `a[3].b` is still a hierarchical name, and an exponent with no digits after it is not one,
+  so `1e` is the constant `1`.
 - **An event control has five spellings and one of them is a bare identifier.**
   `@(posedge clk)`, `@(a or b)`, `@(*)`, `@*` and `@ev` all parse to an
   `EventControl`, and the bare form is tried last because it is the loosest. It
