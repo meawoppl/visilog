@@ -3906,11 +3906,13 @@ mod tests {
         assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
     }
 
-    /// With nothing underneath it, a `release` puts back the value the force
-    /// displaced — which is still the variable's last *procedural* value,
-    /// because the write at time 10 was discarded rather than stored.
+    /// A `release` puts nothing back. A **variable** has no driver, so it
+    /// keeps the value the force left it holding.
+    ///
+    /// iverilog 12.0 prints `1` for this design after the release, not the
+    /// `0` the variable held before the force.
     #[test]
-    fn test_release_with_nothing_underneath_restores_the_last_written_value() {
+    fn test_release_leaves_a_variable_holding_the_forced_value() {
         let mut simulator = simulator_for(
             r#"
             module released();
@@ -3934,8 +3936,37 @@ mod tests {
         simulator.advance(5).expect("time should advance");
         assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
 
+        // The release changes nothing: `v` is a variable, so it holds `1`.
         simulator.advance(5).expect("time should advance");
-        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+    }
+
+    /// A **net**, unlike a variable, does revert when released — not because
+    /// anything is put back, but because its continuous driver reaches it
+    /// again on the next pass.
+    #[test]
+    fn test_release_lets_a_net_return_to_its_driver() {
+        let mut simulator = simulator_for(
+            r#"
+            module released(input d);
+                wire w;
+                assign w = d;
+                initial begin
+                    #5 force w = 1'b0;
+                    #5 release w;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.poke("d", one()).unwrap();
+        assert_eq!(simulator.get("w").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("w").unwrap().to_binary(), "0");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("w").unwrap().to_binary(), "1");
     }
 
     /// A force is a *continuous* drive: it is re-evaluated whenever an operand
