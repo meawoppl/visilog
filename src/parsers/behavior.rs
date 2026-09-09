@@ -642,7 +642,14 @@ pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
     let (input, _) = ws(tag("begin"))(input)?;
     let (input, _) = multispace0(input)?;
     let (input, assignments) = statement_run(input)?;
-    let (input, _) = ws(tag("end"))(input)?;
+    // `begin` has been consumed, so nothing else can match this text: a
+    // missing `end` is a hard failure, and the position it carries points at
+    // the first statement in the block the grammar could not read rather than
+    // at the `begin` itself.
+    let (input, _) = ws(tag("end"))(input).map_err(|error: nom::Err<_>| match error {
+        nom::Err::Error(inner) => nom::Err::Failure(inner),
+        other => other,
+    })?;
     Ok((input, assignments))
 }
 

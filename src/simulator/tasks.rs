@@ -235,6 +235,15 @@ fn unknown_task(name: &str) -> SimulationError {
     SimulationError::SystemTask(format!("unknown system task `${}`", name))
 }
 
+/// Whether `$name` names a system task or function this simulator implements.
+///
+/// Backed by the real resolvers rather than by a list kept alongside them: a
+/// survey that maintains its own copy reports a feature as missing for ever
+/// after it ships, which is how a triage heuristic quietly goes stale.
+pub fn is_supported_system_name(name: &str) -> bool {
+    resolve_task(name).is_ok() || SYSTEM_FUNCTIONS.contains(&name)
+}
+
 /// Resolves a `$name` to the task it means.
 fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
     // `$finish` starts with an `f` that is not the file-descriptor prefix and

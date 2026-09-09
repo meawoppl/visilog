@@ -33,6 +33,7 @@ use visilog::parsers::preprocessor::Preprocessor;
 use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
 use visilog::parsers::statements::ModuleStatement;
 use visilog::simulator::runner::Simulator;
+use visilog::simulator::tasks::is_supported_system_name;
 
 /// Where the corpus lives. `VISILOG_IVTEST` overrides the default cache path.
 fn corpus_root() -> Option<PathBuf> {
@@ -84,17 +85,15 @@ fn entries(list: &str) -> Vec<Entry> {
 ///
 /// Counting every `$` would keep reporting system tasks as a blocker after
 /// they were implemented, which is how a survey heuristic quietly goes stale.
+/// The question is put to the simulator's own resolver for the same reason —
+/// a list maintained here would drift out of step with the one that decides.
 fn unsupported_system_names(source: &str) -> bool {
-    const SUPPORTED: [&str; 10] = [
-        "display", "write", "finish", "time", "stime", "signed", "unsigned", "random", "bits",
-        "clog2",
-    ];
     source.match_indices('$').any(|(at, _)| {
         let name: String = source[at + 1..]
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        !name.is_empty() && !SUPPORTED.contains(&name.as_str())
+        !name.is_empty() && !is_supported_system_name(&name)
     })
 }
 
@@ -125,28 +124,15 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
         unsupported_system_names(source),
         "unsupported system function ($monitor, $fdisplay, $realtime, ...)",
     );
-    // `function` has shipped; a row that counts a feature the front end has
-    // would keep reporting it as a blocker for ever.
+    // Only features the front end still lacks get a row. `function`, the loop
+    // statements, `casez`/`casex`, `integer` and `signed` have all shipped;
+    // counting them would keep reporting them as blockers for ever.
     note(body.contains("task"), "task");
-    note(
-        body.contains("for (")
-            || body.contains("for(")
-            || body.contains("while")
-            || body.contains("repeat")
-            || body.contains("forever"),
-        "loop statement",
-    );
-    note(
-        body.contains("integer ") || body.contains("real "),
-        "integer / real declaration",
-    );
+    note(body.contains("real "), "real declaration");
     note(body.contains("generate"), "generate block");
-    note(
-        body.contains("casez") || body.contains("casex"),
-        "casez / casex",
-    );
     note(body.contains("fork"), "fork / join");
-    note(body.contains("signed"), "signed types");
+    note(body.contains("specify"), "specify block");
+    note(body.contains("primitive"), "user-defined primitive");
     found
 }
 
@@ -833,4 +819,124 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
         judge_with(&Preprocessor::new(), mute, Some(""), &[]),
         Outcome::Silent
     );
+}
+
+/// What the parser *actually* chokes on, grouped by the token it stopped at.
+///
+/// The blocker survey above is a set of text heuristics, and it can only count
+/// features somebody thought to name — which is why its "none of the above"
+/// bucket is the largest row. This asks the parser instead: every rejection
+/// carries the position it gave up at, so the first word of the unconsumed
+/// remainder is a real diagnostic. Grouping those says where the grammar ends,
+/// with no guessing and nothing to keep in step as features ship.
+#[test]
+#[ignore]
+fn ivtest_rejection_sites() {
+    let Some((root, entries)) = load() else {
+        return;
+    };
+    let dir = root.join("ivtest").join("ivltests");
+    let preprocessor = corpus_preprocessor(&root);
+
+    let mut sites: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples: BTreeMap<String, String> = BTreeMap::new();
+    let mut preprocess_failures = 0usize;
+    let mut rejected = 0usize;
+
+    for entry in entries.iter().filter(|e| e.kind.starts_with("normal")) {
+        let path = dir.join(format!("{}.v", entry.name));
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match front_end(&preprocessor, &source) {
+            Ok(_) => {}
+            Err(SourceError::Preprocess(_)) => {
+                rejected += 1;
+                preprocess_failures += 1;
+            }
+            Err(SourceError::Parse { at, .. }) => {
+                rejected += 1;
+                let token = match line_of(&at, &source) {
+                    Some(line) => first_token(line),
+                    None => "<unknown>".to_string(),
+                };
+                *sites.entry(token.clone()).or_default() += 1;
+                // The ranked table below groups by leading token, which answers
+                // "what kind of statement" but not "what about it". Setting
+                // `VISILOG_DUMP_SITES` emits every failing line as TSV so a
+                // one-off `awk`/`grep` can cluster them any other way.
+                if std::env::var_os("VISILOG_DUMP_SITES").is_some() {
+                    println!(
+                        "SITE\t{}\t{}",
+                        entry.name,
+                        line_of(&at, &source).unwrap_or("")
+                    );
+                }
+                examples
+                    .entry(token)
+                    .or_insert_with(|| format!("{} ({})", entry.name, at));
+            }
+        }
+    }
+
+    let mut ranked: Vec<_> = sites.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    println!("\n=== where the grammar gives up, by first unconsumed token ===");
+    println!("rejected            : {}", rejected);
+    println!("preprocessor errors : {}", preprocess_failures);
+    println!("\n--- top rejection sites (first-blocker, so these *are* additive) ---");
+    for (token, count) in ranked.iter().take(30) {
+        println!(
+            "{:>5}  {:>5.1}%  {:<24} e.g. {}",
+            count,
+            100.0 * *count as f64 / rejected.max(1) as f64,
+            token,
+            examples[token]
+        );
+    }
+    let tail: usize = ranked.iter().skip(30).map(|(_, n)| n).sum();
+    println!(
+        "{:>5}  {:>5.1}%  everything else ({} more distinct tokens)",
+        tail,
+        100.0 * tail as f64 / rejected.max(1) as f64,
+        ranked.len().saturating_sub(30)
+    );
+}
+
+/// The source line a `SourceError::Parse` position names.
+///
+/// The position is rendered as `<file>:<line>`, one-based, and may carry a
+/// trailing macro note — so the line number is the digits of the last
+/// colon-separated field that starts with one.
+fn line_of<'a>(at: &str, source: &'a str) -> Option<&'a str> {
+    let digits: String = at
+        .rsplit(':')
+        .next()?
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let line: usize = digits.parse().ok()?;
+    source.lines().nth(line.checked_sub(1)?)
+}
+
+/// The first whitespace-delimited word of a line, trimmed to something
+/// groupable: an identifier or a keyword stands for itself, while punctuation
+/// is kept whole so `@(` and `#(` stay distinct.
+fn first_token(remainder: &str) -> String {
+    let text = remainder.trim_start();
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return "<end of input>".to_string();
+    };
+    if first.is_alphabetic() || first == '_' || first == '$' || first == '`' {
+        let word: String = text
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$' || *c == '`')
+            .collect();
+        word
+    } else {
+        text.chars().take(2).collect()
+    }
 }

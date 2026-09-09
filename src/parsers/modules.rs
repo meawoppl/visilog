@@ -237,7 +237,15 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     })(input)?;
     let (input, _) = ws(tag(";"))(input)?;
     let (input, body) = many0(ws(parse_module_statement))(input)?;
-    let (input, _) = ws(tag("endmodule"))(input)?;
+    // Past `module <name>;` no other production can match this text, so a
+    // missing `endmodule` is a hard failure rather than a backtrack. That is
+    // also what makes the diagnostic useful: the position it carries is where
+    // the body stopped — the first statement the grammar could not read —
+    // instead of the `module` keyword the caller would otherwise report.
+    let (input, _) = ws(tag("endmodule"))(input).map_err(|error: nom::Err<_>| match error {
+        nom::Err::Error(inner) => nom::Err::Failure(inner),
+        other => other,
+    })?;
 
     // A body port declaration *is* a port, so it is lifted out of the body
     // rather than left in it as a second description of the same thing.
