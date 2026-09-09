@@ -3969,6 +3969,41 @@ mod tests {
         assert_eq!(simulator.get("w").unwrap().to_binary(), "1");
     }
 
+    /// Drive precedence is per **bit**, not per signal name.
+    ///
+    /// iverilog 12.0, forcing `r[1]` of a `reg [3:0] r` that starts `0000`:
+    /// `r = 4'b1100` gives `1110` (the write is masked, not refused),
+    /// `r[0] = 1` gives `1111`, and `r[1] = 0` leaves `1111`.
+    #[test]
+    fn test_force_holds_only_the_bits_it_names() {
+        let mut simulator = simulator_for(
+            r#"
+            module held();
+                reg [3:0] r;
+                initial begin
+                    r = 4'b0000;
+                    force r[1] = 1'b1;
+                    #5 r = 4'b1100;
+                    #5 r[0] = 1'b1;
+                    #5 r[1] = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+
+        // A whole-signal write lands everywhere except the forced bit.
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("r").unwrap().to_binary(), "1110");
+
+        // An unforced bit takes its write.
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("r").unwrap().to_binary(), "1111");
+
+        // The forced bit does not.
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("r").unwrap().to_binary(), "1111");
+    }
+
     /// A force is a *continuous* drive: it is re-evaluated whenever an operand
     /// of its right hand side moves, not once when the statement ran.
     #[test]
