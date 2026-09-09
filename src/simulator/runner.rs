@@ -1510,6 +1510,34 @@ mod tests {
         );
     }
 
+    /// A generate `for` or `if` may be written at module level with no
+    /// `generate`/`endgenerate` around it, which iverilog accepts and the
+    /// corpus uses freely.
+    ///
+    /// iverilog 12.0 prints `0 1 3 1` for this design.
+    #[test]
+    fn test_bare_generate_items() {
+        let mut simulator = simulator_for(
+            r#"
+            module tb;
+                wire [2:0] idx[7:0];
+                genvar g;
+                for (g = 0; g < 4; g=g+1)
+                    assign idx[g] = g;
+                if (1) begin : yes
+                    wire w = 1'b1;
+                end
+                initial begin
+                    #1 $display("%0d %0d %0d %b", idx[0], idx[1], idx[3], yes.w);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 1 3 1\n");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
