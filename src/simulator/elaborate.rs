@@ -430,12 +430,24 @@ impl<'m> Elaborator<'m> {
                         None => eval(&renamed(&parameter.value, scope), &self.out.state)?,
                     };
                     let name = scope.qualified(local);
+                    // A `signed` qualifier (or an `integer` type) overrides
+                    // whatever signedness the value arrived with; an
+                    // unqualified parameter keeps its value's own.
+                    //
+                    // The flag is applied on both sides of `coerced`
+                    // deliberately: it is read *before*, to widen by sign
+                    // extension rather than zero extension, and rebuilding a
+                    // register does not carry it, so it has to be restated
+                    // *after* or the stored parameter reads unsigned.
+                    let signed = parameter.signed || value.is_signed();
+                    let value = value.with_signedness(signed);
+                    let value = match parameter.range {
+                        Some(range) => value.coerced(range_width(range)),
+                        None => value,
+                    }
+                    .with_signedness(signed);
                     match parameter.range {
-                        Some(range) => self.out.state.set_ranged(
-                            name,
-                            value.coerced(range_width(range)),
-                            range,
-                        ),
+                        Some(range) => self.out.state.set_ranged(name, value, range),
                         None => self.out.state.set(name, value),
                     }
                 }
@@ -1471,6 +1483,53 @@ mod tests {
         // And the floating value propagates the way any other would.
         simulator.run().unwrap();
         assert_eq!(simulator.get("out").unwrap().to_binary(), "zzzz");
+    }
+
+    /// A `signed` qualifier on a parameter has to survive being stored, which
+    /// is not automatic: widening a register rebuilds it and does not carry the
+    /// flag, so it is applied both before the coercion (to sign extend rather
+    /// than zero extend) and after it (to persist).
+    #[test]
+    fn test_a_signed_parameter_compares_as_two_s_complement() {
+        let mut simulator = simulator_for(
+            &[r#"
+            module main;
+                parameter signed [7:0] neg = -1;
+                parameter [7:0] pos = 8'hff;
+                reg below_zero;
+                reg unsigned_below_zero;
+                initial begin
+                    below_zero = neg < 0;
+                    unsigned_below_zero = pos < 0;
+                end
+            endmodule
+        "#],
+            "main",
+        );
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("below_zero").unwrap().to_binary(), "1");
+        assert_eq!(
+            simulator.get("unsigned_below_zero").unwrap().to_binary(),
+            "0",
+            "the same bits without the qualifier are unsigned"
+        );
+    }
+
+    /// `integer` names a signed type, so it implies the qualifier.
+    #[test]
+    fn test_an_integer_parameter_is_signed() {
+        let mut simulator = simulator_for(
+            &[r#"
+            module main;
+                parameter integer n = -1;
+                reg below_zero;
+                initial below_zero = n < 0;
+            endmodule
+        "#],
+            "main",
+        );
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("below_zero").unwrap().to_binary(), "1");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, ws},
+    simple::{range, signedness, ws},
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -24,6 +24,10 @@ pub struct ParameterDeclaration {
     pub kind: ParameterKind,
     pub name: Identifier,
     pub range: Option<(i64, i64)>,
+    /// Whether the declaration carried a `signed` qualifier, or a type that
+    /// implies one. An unqualified parameter takes its value's signedness
+    /// instead, which is why this is a plain `bool` rather than an `Option`.
+    pub signed: bool,
     pub value: Expression,
 }
 
@@ -48,7 +52,13 @@ fn parameter_assignment(input: &str) -> IResult<&str, (Identifier, Expression)> 
 /// `parameter [7:0] WIDTH = 8, DEPTH = 16;`
 pub fn parse_parameter_declaration(input: &str) -> IResult<&str, Vec<ParameterDeclaration>> {
     let (input, kind) = ws(parameter_kind)(input)?;
+    // `parameter integer p = 1;` — a type name stands where `signed` would,
+    // and `integer` is signed by definition. `real` is not accepted here; it
+    // is a different value type entirely (issue #93).
+    let (input, typed) = opt(ws(tag("integer")))(input)?;
+    let (input, signed) = ws(signedness)(input)?;
     let (input, range) = opt(ws(range))(input)?;
+    let signed = signed || typed.is_some();
     let (input, assignments) = separated_list1(ws(char(',')), parameter_assignment)(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
@@ -58,6 +68,7 @@ pub fn parse_parameter_declaration(input: &str) -> IResult<&str, Vec<ParameterDe
             kind: kind.clone(),
             name,
             range,
+            signed,
             value,
         })
         .collect();
@@ -79,6 +90,7 @@ mod tests {
                 kind: ParameterKind::LocalParam,
                 name: "IDLE".into(),
                 range: None,
+                signed: false,
                 value: verilog_expression("2'b00").unwrap().1,
             }],
         );
@@ -93,6 +105,7 @@ mod tests {
                 kind: ParameterKind::Parameter,
                 name: "WIDTH".into(),
                 range: Some((7, 0)),
+                signed: false,
                 value: verilog_expression("8").unwrap().1,
             }],
         );
@@ -123,5 +136,31 @@ mod tests {
     #[test]
     fn test_parameter_declaration_requires_semicolon() {
         assert!(parse_parameter_declaration("localparam IDLE = 2'b00").is_err());
+    }
+
+    /// A `signed` qualifier, or an `integer` type name standing where it would.
+    /// An unqualified parameter is left alone — it takes its value's
+    /// signedness, which is why the field is a plain `bool`.
+    #[test]
+    fn test_parameter_signedness_qualifiers() {
+        let signed = assert_parses(
+            parse_parameter_declaration,
+            "parameter signed [7:0] p = -1;",
+        );
+        assert!(signed[0].signed);
+        assert_eq!(signed[0].range, Some((7, 0)));
+
+        let integer = assert_parses(parse_parameter_declaration, "parameter integer p = 1;");
+        assert!(integer[0].signed, "`integer` is signed by definition");
+
+        let local = assert_parses(
+            parse_parameter_declaration,
+            "localparam signed [3:0] q = -2;",
+        );
+        assert!(local[0].signed);
+        assert_eq!(local[0].kind, ParameterKind::LocalParam);
+
+        let plain = assert_parses(parse_parameter_declaration, "parameter p = 1;");
+        assert!(!plain[0].signed);
     }
 }
