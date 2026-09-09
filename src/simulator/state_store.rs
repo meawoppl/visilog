@@ -26,10 +26,14 @@ const DEFAULT_RANDOM_SEED: u64 = 0;
 /// take the process down with it. This is the bound that makes runaway
 /// recursion a named error instead.
 ///
-/// It is deliberately well under what the stack holds: an unoptimised build
-/// runs out somewhere between 96 and 128 nested calls, and a call whose
-/// expressions nest deeply costs more than the plain ones that measurement used.
-pub const MAX_CALL_DEPTH: usize = 64;
+/// It is deliberately well under what the stack holds, and the margin has to
+/// be generous: the earlier bound of 64 was measured against a *plain* chain of
+/// calls, and a recursion reached from the continuous-assignment fixpoint —
+/// `assign y = fact(n);` settled with `n` undriven — overflows a 2 MiB test
+/// thread well before 64. A guard whose whole job is to prevent a stack
+/// overflow must fire with room to spare, so this is set from the depth that
+/// survives *that* path rather than the cheapest one.
+pub const MAX_CALL_DEPTH: usize = 32;
 
 /// The stream `$random` draws from.
 ///

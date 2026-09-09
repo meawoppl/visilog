@@ -384,6 +384,9 @@ pub struct Simulator {
     /// value its right hand side had when the statement ran, so nothing about
     /// it is re-read when it lands. Empty for a design that writes none.
     scheduled: Vec<(i64, PendingUpdate)>,
+    /// Whether the continuous assignments have been settled once, before the
+    /// first block ran. See [`Simulator::advance`].
+    settled_once: bool,
     /// The design's gate primitives, which are continuous drivers and settle
     /// in the same fixpoint the assignments do.
     gates: Vec<Gate>,
@@ -437,6 +440,7 @@ impl Simulator {
             assignments: Vec::new(),
             delays: Vec::new(),
             scheduled: Vec::new(),
+            settled_once: false,
             gates: Vec::new(),
             udps: Vec::new(),
             resolved_nets: HashSet::new(),
@@ -468,6 +472,7 @@ impl Simulator {
         self.udps.clear();
         self.resolved_nets.clear();
         self.scheduled.clear();
+        self.settled_once = false;
         self.pulled_nets.clear();
         self.blocks.clear();
         self.waiting.clear();
@@ -822,6 +827,24 @@ impl Simulator {
         // where it stopped.
         if self.finished() {
             return Ok(());
+        }
+
+        // The continuous assignments settle **before** the first block runs:
+        // `assign y = 3;` read from an `initial` block reads 3, not the `z` of
+        // a net nothing drives, which is what iverilog prints.
+        //
+        // Here rather than in `setup` because a right hand side is only worth
+        // evaluating once the inputs have been written — settling at setup
+        // evaluates every `assign` against undriven inputs, which for a design
+        // whose assignment calls a recursive function means recursing on `z`
+        // until the call-depth guard stops it, at every setup.
+        //
+        // Whatever this pass reports is deliberately **dropped**: a module
+        // that never converges should fail when someone runs it, and the same
+        // error is raised again by the first real propagation below.
+        if !self.settled_once {
+            self.settled_once = true;
+            let _ = self.propagate();
         }
 
         let target = self.now + duration;
@@ -1446,9 +1469,11 @@ mod tests {
     fn test_simple_module_example() {
         let mut simulator = simulator_for_example("simple_module.v");
 
-        // `sum` is a net with nothing driving it yet, so it starts `z` at its
-        // declared width. A variable would start `x` instead.
-        assert_eq!(simulator.get("sum").unwrap().to_binary(), "zzzz");
+        // The continuous assignments have settled before anything ran, so
+        // `sum` already holds `a + b` — and `a` and `b` are undriven nets, so
+        // that is `x`, not the `z` they themselves read. iverilog prints
+        // `sum=xxxx a=zzzz` for the same design.
+        assert_eq!(simulator.get("sum").unwrap().to_binary(), "xxxx");
 
         simulator.set_input("a", Register::from_u128(3, 4)).unwrap();
         simulator.set_input("b", Register::from_u128(5, 4)).unwrap();
@@ -1982,6 +2007,30 @@ mod tests {
             simulator.output().text(),
             "a=0101 b=10 c=1\na=0111 b=00\nc=1 a=0011\n"
         );
+    }
+
+    /// The continuous assignments settle **before** the first block runs, so
+    /// an `initial` block reading a net reads what drives it rather than the
+    /// `z` of a net nothing has reached yet.
+    ///
+    /// iverilog 12.0 prints `t0: y=0011 a=0` for this design — at time zero,
+    /// before any delay.
+    #[test]
+    fn test_continuous_assignments_settle_before_time_zero() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                wire [3:0] y;
+                wire a;
+                assign y = 3;
+                assign a = 1'b0;
+                initial $display("t0: y=%b a=%b", y, a);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "t0: y=0011 a=0\n");
     }
 
     #[test]
