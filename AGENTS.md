@@ -386,30 +386,71 @@ different job, because a metric must not be able to block a merge when an extern
 repository is unreachable. `VISILOG_IVTEST` overrides the path.
 
 The harness prints one machine-readable `CORPUS_METRICS …` line for CI to grep. The
-human-readable table above it is free to change; that line is the contract.
+human-readable table above it is free to change; that line is the contract. Its keys are
+`total parsed elaborated ran passed wrong silent gold gold_match gold_mismatch gold_silent
+closure`. **Only ever add a key** — CI greps for them by name, so renaming or dropping one
+breaks the trend line.
 
-**Closure — the `PASSED` count — is the headline metric, not `parsed`.** The corpus is
-self-checking: a test prints `PASSED` when it is satisfied. Parsing a file therefore says
-nothing about whether the simulator got the right answer, and counting parses overstates
-progress by roughly a factor of two. `ivtest_corpus_closure_rate` reports the whole funnel
-— parsed, elaborated, ran, then `PASSED` / wrong answer / silent.
+**Closure — `PASSED` plus gold match — is the headline metric, not `parsed`.** Parsing a
+file says nothing about whether the simulator got the right answer, and counting parses
+overstates progress by roughly a factor of two. `ivtest_corpus_closure_rate` reports the
+whole funnel — parsed, elaborated, ran, then closure / wrong answer / gold mismatch /
+silent. The `closure=` key on the `CORPUS_METRICS` line is the number.
+
+**The corpus validates a test one of two ways, and the list says which.** Most entries are
+self-checking and print `PASSED` when satisfied. The other 357 carry a fourth or fifth
+field `gold=<file>`, and are validated by comparing their output to
+`<corpus>/ivtest/gold/<file>` — they never print `PASSED` at all, so scoring them by that
+word alone undercounted closure by 45. `Entry` therefore keeps the gold filename, and the
+two populations get outcomes of their own (`GoldMatch` / `GoldMismatch`) so they stay
+distinguishable in the report. `gold=` is scanned for across every field past the
+directory, not read from a fixed position, because the optional top-module name comes
+first when an entry has one (`shellho1 normal ivltests top gold=shellho1.gold`).
+
+Three rules make a gold comparison mean something (`gold_lines` / `first_difference`):
+
+- **Trailing whitespace is trimmed per line, leading whitespace is not.** Column alignment
+  is exactly what a lot of these `$display` tests check.
+- **`VCD info: dumpfile … opened for output.` is dropped from both sides.** Seven gold
+  files carry it; visilog has no waveform dumper, so keeping it would fail those on an
+  unimplemented side effect rather than on the output the test is about.
+- **A trailing newline is not a difference**, which comes free from `str::lines`.
+
+**A design that printed nothing is `Silent`, never a gold match** — not even against an
+empty gold file, since "produced exactly the right emptiness" and "never reached its own
+checks" are indistinguishable from the harness's side. No `normal` entry names an empty
+gold file today, so in practice the rule only reroutes designs that printed nothing against
+a gold file that expected something; `gold_silent=` counts them so the choice is visible
+rather than an invisible subtraction from closure.
 
 **A wrong answer is worth more attention than a parse failure.** A file that runs and
-prints `FAILED` is one the simulator understood well enough to execute and still got wrong,
-which is a correctness bug rather than a missing feature. Those are printed **by name** for
-exactly that reason.
+prints `FAILED`, or that runs and produces output differing from its gold file, is one the
+simulator understood well enough to execute and still got wrong — a correctness bug rather
+than a missing feature. Both lists are printed **by name** for exactly that reason, and the
+gold mismatches carry a first-difference line (`line N: expected … got …`) for the leading
+few, which is what makes them actionable without reading the corpus by hand.
 
-Three control tests are *not* ignored and run in normal CI: a known-good design must parse,
-a self-checking design must reach `PASSED`, and a deliberately wrong one must be reported as
-a wrong answer. They exist so a low corpus score can never be a harness bug misreported as
-a simulator limitation — the first draft of the closure metric read `0%`, and only a control
-distinguishes that from a real result.
+Not every gold mismatch is a simulator bug: seven of them (`br1007`, `br_gh127a`…`f`)
+have gold files whose first lines are iverilog's own *compiler warnings*
+(`./ivltests/br1007.v:15: warning: …`), which visilog has no diagnostic channel to emit.
+They are left in the list rather than filtered out, because a rule that dropped anything
+looking like a diagnostic would also drop real output — but read the first-difference line
+before treating one as a correctness bug.
+
+Four control tests are *not* ignored and run in normal CI: a known-good design must parse,
+a self-checking design must reach `PASSED`, a deliberately wrong one must be reported as a
+wrong answer, and a fourth drives both halves of the gold comparator — matching output
+scores `GoldMatch`, differing output scores `GoldMismatch` and names the line. They exist
+so a low corpus score can never be a harness bug misreported as a simulator limitation —
+the first draft of the closure metric read `0%`, and only a control distinguishes that from
+a real result. A comparator stuck on "match" would invent 357 passes; one stuck on
+"mismatch" would look exactly like 357 genuine wrong answers.
 
 The harness runs the corpus through `front_end`, which is `Preprocessor` + `parse_expanded`
 rather than `parse_source`, because the corpus files `` `include `` one another by paths
 relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
-`judge(source: &str)` signature so the three control tests exercise exactly the corpus
-path; `judge_with` is the one that takes the configured preprocessor.
+`judge(source: &str)` signature so the control tests exercise exactly the corpus
+path; `judge_with` is the one that takes the configured preprocessor and the gold text.
 
 The blocker tables in `ivtest_corpus_parse_rate` are text heuristics, not parser
 diagnostics. **They go stale as features land** — a row counting files that *contain* a
