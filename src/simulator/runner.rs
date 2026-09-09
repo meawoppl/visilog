@@ -1573,6 +1573,45 @@ mod tests {
         assert_eq!(simulator.output().text(), "q=a5\n");
     }
 
+    /// `#` and its parameter block are separate tokens, and a named
+    /// connection may be left blank: a blank *parameter* takes its default and
+    /// a blank *port* is unconnected.
+    ///
+    /// iverilog 12.0 prints `a=4 b=2 c=5` then `a=1 b=2 c=3` — `b` falls back
+    /// to its default in the first instance, and the second overrides nothing.
+    #[test]
+    fn test_blank_named_connections_and_spaced_parameter_block() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module dut #(parameter a = 1, b = 2, c = 3) (input x, output y);
+                assign y = x;
+                initial $display("a=%0d b=%0d c=%0d", a, b, c);
+            endmodule
+            module tb;
+                reg x;
+                wire y1, y2;
+                dut # (.a(4), .b(), .c(5)) u1 (x, y1);
+                dut u2 (.x(x), .y());
+                initial begin
+                    x = 1;
+                    #1 $display("y1=%b", y1);
+                end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(2).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().text(),
+            "a=4 b=2 c=5\na=1 b=2 c=3\ny1=1\n"
+        );
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(

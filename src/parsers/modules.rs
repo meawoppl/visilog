@@ -386,10 +386,17 @@ pub fn parse_positional_arguments(input: &str) -> IResult<&str, ModuleInitArgume
     Ok((rest, ModuleInitArguments::Positional(args)))
 }
 
-fn kw_arg(input: &str) -> IResult<&str, (Identifier, Expression)> {
+/// `.name(expr)`, or `.name()` — a named connection left blank.
+///
+/// A blank one is `None` rather than an error: for a port it means
+/// *unconnected*, and for a parameter override it means *take the default*.
+/// Both are expressed by the name simply not reaching the map, which is why
+/// the caller drops it rather than storing an absence.
+fn kw_arg(input: &str) -> IResult<&str, (Identifier, Option<Expression>)> {
     let (input, _) = tag(".")(input)?;
     let (input, identifier) = identifier(input)?;
-    let (input, expression) = delimited(tag("("), ws(verilog_expression), tag(")"))(input)?;
+    let (input, expression) =
+        delimited(ws(char('(')), opt(ws(verilog_expression)), ws(char(')')))(input)?;
     Ok((input, (identifier, expression)))
 }
 
@@ -397,7 +404,12 @@ pub fn parse_keyword_arguments(input: &str) -> IResult<&str, ModuleInitArguments
     map(separated_list1(tag(","), ws(kw_arg)), |args| {
         let mut map = HashMap::new();
         for (id, expr) in args {
-            map.insert(id, expr);
+            // A blank connection is the *absence* of a binding, so it is
+            // dropped rather than stored: an unconnected port and a parameter
+            // left at its default are both "this name was never bound".
+            if let Some(expr) = expr {
+                map.insert(id, expr);
+            }
         }
         ModuleInitArguments::Keyword(map)
     })(input)
@@ -428,6 +440,9 @@ fn argument_block(input: &str) -> IResult<&str, ModuleInitArguments> {
 
 fn param_block(input: &str) -> IResult<&str, ModuleInitArguments> {
     let (input, _) = tag("#")(input)?;
+    // `#` and its block are separate tokens, the same way `#` and a delay
+    // value are: `bar # (.WIDTH(8)) u (…)` is legal.
+    let (input, _) = ws_and_comments(input)?;
     argument_block(input)
 }
 
