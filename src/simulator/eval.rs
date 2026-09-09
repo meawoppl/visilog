@@ -1021,7 +1021,7 @@ const TIME_WIDTH: usize = 64;
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 13] = [
+pub const SYSTEM_FUNCTIONS: [&str; 22] = [
     "time",
     "stime",
     "realtime",
@@ -1035,6 +1035,17 @@ pub const SYSTEM_FUNCTIONS: [&str; 13] = [
     "realtobits",
     "bitstoreal",
     "fopen",
+    // The real math library. Every one takes and returns a real, and an
+    // integer argument converts on the way in — `$sqrt(9)` is `3.0`.
+    "sqrt",
+    "ln",
+    "log10",
+    "exp",
+    "pow",
+    "floor",
+    "ceil",
+    "hypot",
+    "fabs",
 ];
 
 /// Evaluates `$name(...)`, the simulator's own functions.
@@ -1135,6 +1146,36 @@ fn eval_system_function_bits(
                 descriptor as u128,
                 SYSTEM_FUNCTION_WIDTH,
             ))
+        }
+        // The real math library. Each is its `f64` counterpart, with the
+        // argument converted on the way in — `$sqrt(9)` is `3.0`, because an
+        // integer operand of a real function is a real. Checked against
+        // iverilog 12.0 rather than assumed.
+        "sqrt" | "ln" | "log10" | "exp" | "floor" | "ceil" | "fabs" => {
+            arity("exactly one argument", &[1])?;
+            let value = eval(&arguments[0], store)?.to_f64();
+            let result = match name {
+                "sqrt" => value.sqrt(),
+                "ln" => value.ln(),
+                "log10" => value.log10(),
+                "exp" => value.exp(),
+                "floor" => value.floor(),
+                "ceil" => value.ceil(),
+                "fabs" => value.abs(),
+                _ => unreachable!("the arm matched one of these names"),
+            };
+            Ok(Register::from_f64(result))
+        }
+        "pow" | "hypot" => {
+            arity("exactly two arguments", &[2])?;
+            let left = eval(&arguments[0], store)?.to_f64();
+            let right = eval(&arguments[1], store)?.to_f64();
+            let result = match name {
+                "pow" => left.powf(right),
+                "hypot" => left.hypot(right),
+                _ => unreachable!("the arm matched one of these names"),
+            };
+            Ok(Register::from_f64(result))
         }
         // The IEEE-754 encoding, and back. They are a pair of casts over the
         // same sixty-four bits: `$realtobits(1.5)` is `64'h3ff8000000000000`
@@ -2754,6 +2795,8 @@ mod tests {
                 // The empty path names no file, so this exercises `$fopen`
                 // without leaving one behind.
                 "fopen" => "$fopen(\"\")".to_string(),
+                // The two-argument members of the real math library.
+                "pow" | "hypot" => format!("${}(a, a)", name),
                 other => format!("${}(a)", other),
             };
             eval(&parse(&source), &store)
@@ -3081,5 +3124,35 @@ mod tests {
             &parse("\"\\377\""),
             &StateStore::new()
         ));
+    }
+
+    /// The real math library. Every expectation is what `iverilog` 12.0 prints
+    /// through `%f` for the same call.
+    #[test]
+    fn test_real_math_functions() {
+        let store = StateStore::new();
+        let called = |source: &str| {
+            eval(&parse(source), &store)
+                .expect("should evaluate")
+                .to_f64()
+        };
+
+        assert!((called("$sqrt(2.0)") - 1.414214).abs() < 1e-6);
+        assert!((called("$ln(2.718281828)") - 1.0).abs() < 1e-6);
+        assert!((called("$log10(100.0)") - 2.0).abs() < 1e-9);
+        assert!((called("$exp(1.0)") - 2.718282).abs() < 1e-6);
+        assert!((called("$pow(2.0, 10.0)") - 1024.0).abs() < 1e-9);
+        assert!((called("$floor(2.7)") - 2.0).abs() < 1e-9);
+        assert!((called("$ceil(2.1)") - 3.0).abs() < 1e-9);
+    }
+
+    /// An integer argument to a real function converts on the way in, so
+    /// `$sqrt(9)` is `3.0` rather than an integer square root.
+    #[test]
+    fn test_real_math_converts_an_integer_argument() {
+        let store = StateStore::new();
+        let value = eval(&parse("$sqrt(9)"), &store).expect("should evaluate");
+        assert!(value.is_real());
+        assert!((value.to_f64() - 3.0).abs() < 1e-9);
     }
 }
