@@ -33,6 +33,7 @@ use visilog::parsers::preprocessor::Preprocessor;
 use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
 use visilog::parsers::statements::ModuleStatement;
 use visilog::simulator::runner::Simulator;
+use visilog::simulator::tasks::is_supported_system_name;
 
 /// Where the corpus lives. `VISILOG_IVTEST` overrides the default cache path.
 fn corpus_root() -> Option<PathBuf> {
@@ -84,17 +85,15 @@ fn entries(list: &str) -> Vec<Entry> {
 ///
 /// Counting every `$` would keep reporting system tasks as a blocker after
 /// they were implemented, which is how a survey heuristic quietly goes stale.
+/// The question is put to the simulator's own resolver for the same reason —
+/// a list maintained here would drift out of step with the one that decides.
 fn unsupported_system_names(source: &str) -> bool {
-    const SUPPORTED: [&str; 10] = [
-        "display", "write", "finish", "time", "stime", "signed", "unsigned", "random", "bits",
-        "clog2",
-    ];
     source.match_indices('$').any(|(at, _)| {
         let name: String = source[at + 1..]
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        !name.is_empty() && !SUPPORTED.contains(&name.as_str())
+        !name.is_empty() && !is_supported_system_name(&name)
     })
 }
 
@@ -125,28 +124,15 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
         unsupported_system_names(source),
         "unsupported system function ($monitor, $fdisplay, $realtime, ...)",
     );
-    // `function` has shipped; a row that counts a feature the front end has
-    // would keep reporting it as a blocker for ever.
+    // Only features the front end still lacks get a row. `function`, the loop
+    // statements, `casez`/`casex`, `integer` and `signed` have all shipped;
+    // counting them would keep reporting them as blockers for ever.
     note(body.contains("task"), "task");
-    note(
-        body.contains("for (")
-            || body.contains("for(")
-            || body.contains("while")
-            || body.contains("repeat")
-            || body.contains("forever"),
-        "loop statement",
-    );
-    note(
-        body.contains("integer ") || body.contains("real "),
-        "integer / real declaration",
-    );
+    note(body.contains("real "), "real declaration");
     note(body.contains("generate"), "generate block");
-    note(
-        body.contains("casez") || body.contains("casex"),
-        "casez / casex",
-    );
     note(body.contains("fork"), "fork / join");
-    note(body.contains("signed"), "signed types");
+    note(body.contains("specify"), "specify block");
+    note(body.contains("primitive"), "user-defined primitive");
     found
 }
 
