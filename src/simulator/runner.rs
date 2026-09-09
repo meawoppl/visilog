@@ -898,22 +898,46 @@ impl Simulator {
             let mut resumptions = 0;
 
             // Everything due at this timestamp runs before time moves on,
-            // including anything re-queued for this same instant.
+            // including anything re-queued for this same instant — but a block
+            // re-queued by a `#0` belongs to a *later* round, after the
+            // continuous assignments have caught up with what this round
+            // wrote. `#0` is the idiom for "let everything settle, then look",
+            // so a round that ran and then read a net without re-propagating
+            // would read what the net held before the block moved anything.
+            //
+            // Non-blocking updates deliberately do **not** commit between
+            // rounds: they land once, at the end of the timestep, which is
+            // what makes `a <= b; b <= a;` across two blocks a swap.
             while self.queue.peek_time() == Some(time) {
-                resumptions += 1;
+                let mut round = Vec::new();
+                while self.queue.peek_time() == Some(time) {
+                    let (_, cursor) = self.queue.pop().expect("peeked time must pop");
+                    round.push(cursor);
+                }
+                resumptions += round.len();
                 if resumptions > MAX_RESUMPTIONS_PER_TIME {
                     return Err(SimulationError::NoConvergence {
                         passes: resumptions,
                     });
                 }
 
-                let (_, cursor) = self.queue.pop().expect("peeked time must pop");
-                let (updates, _) = self.resume_block(cursor)?;
-                pending.extend(updates);
+                for cursor in round {
+                    let (updates, _) = self.resume_block(cursor)?;
+                    pending.extend(updates);
 
+                    if self.finished() {
+                        break;
+                    }
+                }
                 if self.finished() {
                     break;
                 }
+                // Whatever this reports is dropped, for the same reason the
+                // pre-pass in front of the loop drops its result: a design
+                // that does not converge should be reported by the settle that
+                // ends the timestep, not by an intermediate one that has only
+                // seen part of the round's writes.
+                let _ = self.propagate();
             }
 
             commit_updates(pending, &mut self.state)?;
@@ -2179,6 +2203,45 @@ mod tests {
 
         simulator.advance(1).expect("time should advance");
         assert_eq!(simulator.output().text(), "a=0 b=3\na=0 b=3\n");
+    }
+
+    /// A mid-block `#0` sees the continuous assignments caught up with what
+    /// the block just wrote — that is the whole idiom: "let everything settle,
+    /// then look".
+    ///
+    /// The non-blocking swap in the same design is the guard on the other
+    /// side: updates must still land once, at the end of the timestep, so two
+    /// blocks writing each other's values exchange them rather than both
+    /// taking one. iverilog 12.0 prints `y=00000110` and `p=2 q=1`.
+    #[test]
+    fn test_zero_delay_settles_without_committing_non_blocking_updates() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [7:0] a;
+                wire [7:0] y;
+                assign y = a + 1;
+                reg [7:0] p, q;
+                initial begin
+                    a = 5;
+                    #0;
+                    $display("y=%b", y);
+                end
+                initial begin
+                    p = 1;
+                    q = 2;
+                end
+                initial begin
+                    #1 p <= q;
+                    q <= p;
+                    #1 $display("p=%0d q=%0d", p, q);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.output().text(), "y=00000110\np=2 q=1\n");
     }
 
     #[test]
