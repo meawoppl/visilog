@@ -829,6 +829,12 @@ fn sequential_block(input: &str) -> IResult<&str, BlockStatement> {
 }
 
 /// `fork [: name] [declarations] statements join`.
+///
+/// The closing keyword needs a word boundary, which is what keeps
+/// SystemVerilog's `join_any` and `join_none` out: both start with `join`, and
+/// without the boundary a `fork … join_any` would read as a plain `join` with
+/// a stray `_any` left over — a design silently given the semantics it did not
+/// ask for. They are a parse error naming the position instead.
 fn parallel_block(input: &str) -> IResult<&str, BlockStatement> {
     block_between(input, "fork", "join")
 }
@@ -855,10 +861,11 @@ fn block_between<'a>(
         None => (input, Vec::new()),
     };
     let (input, statements) = statement_run(input)?;
-    let (input, _) = ws(tag(close))(input).map_err(|error: nom::Err<_>| match error {
+    let (input, _) = keyword(input, close).map_err(|error: nom::Err<_>| match error {
         nom::Err::Error(inner) => nom::Err::Failure(inner),
         other => other,
     })?;
+    let (input, _) = ws_and_comments(input)?;
 
     Ok((
         input,
@@ -2424,6 +2431,21 @@ mod tests {
         assert_eq!(block.name, Some("f".into()));
         assert_eq!(block.locals.len(), 1);
         assert_eq!(block.statements.len(), 2);
+    }
+
+    /// SystemVerilog's `join_any` and `join_none` are not implemented, and the
+    /// closing keyword's word boundary is what stops one being read as a plain
+    /// `join` with a stray `_any` after it — which would hand the design the
+    /// semantics it did not ask for.
+    #[test]
+    fn test_join_any_and_join_none_are_rejected() {
+        for source in ["fork a = 1; b = 2; join_any", "fork a = 1; join_none"] {
+            assert!(
+                procedural_statement(source).is_err(),
+                "`{}` should not parse",
+                source
+            );
+        }
     }
 
     #[test]

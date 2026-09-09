@@ -8,11 +8,31 @@ use std::collections::VecDeque;
 pub struct ExecutionCursor {
     pub block: usize,
     pub pc: usize,
+    /// The `fork`…`join` this cursor is running as a *branch* of, if it is one.
+    ///
+    /// A branch is an ordinary cursor in every other respect — same block, same
+    /// instruction list, same suspensions — and this is the identity that tells
+    /// the join which arrivals it is still waiting for. `None` is a cursor
+    /// running the block itself.
+    pub fork: Option<usize>,
 }
 
 impl ExecutionCursor {
     pub fn new(block: usize, pc: usize) -> Self {
-        ExecutionCursor { block, pc }
+        ExecutionCursor {
+            block,
+            pc,
+            fork: None,
+        }
+    }
+
+    /// A cursor running one branch of `fork`.
+    pub fn branch(block: usize, pc: usize, fork: usize) -> Self {
+        ExecutionCursor {
+            block,
+            pc,
+            fork: Some(fork),
+        }
     }
 }
 
@@ -48,6 +68,12 @@ impl EventQueue {
     /// it means taking that cursor out before the clock reaches it.
     pub fn retain(&mut self, mut discard: impl FnMut(&ExecutionCursor) -> bool) {
         self.entries.retain(|(_, cursor)| !discard(cursor));
+    }
+
+    /// Every queued cursor, in queue order — for a question that has to be
+    /// asked of all of them before any is removed.
+    pub fn cursors(&self) -> impl Iterator<Item = &ExecutionCursor> {
+        self.entries.iter().map(|(_, cursor)| cursor)
     }
 
     /// The time of the earliest cursor, without consuming it.

@@ -48,7 +48,7 @@ use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
 use crate::simulator::gates::{resolve_bit, Gate};
-use crate::simulator::program::{self, Resume, WaitReason};
+use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
@@ -366,6 +366,22 @@ impl DelayedDrive {
     }
 }
 
+/// One `fork`…`join` that is currently running.
+///
+/// The branches are ordinary [`ExecutionCursor`]s carrying this fork's index;
+/// what the record adds is the two things a branch cannot know for itself —
+/// where the block picks up afterwards, and how many siblings have still to
+/// arrive.
+#[derive(Clone, Copy, Debug)]
+struct ForkJoin {
+    /// Where the block that wrote the `fork` carries on, and — through its own
+    /// `fork` field — which outer join *it* is a branch of. That chain is what
+    /// makes a `fork` nested inside a branch work with no second mechanism.
+    parent: ExecutionCursor,
+    /// Branches that have not reached their `join` yet.
+    outstanding: usize,
+}
+
 /// A parsed design, elaborated into signals and runnable blocks.
 pub struct Simulator {
     /// Every module the design may draw on. Only the top one is walked
@@ -408,6 +424,12 @@ pub struct Simulator {
     /// round measures. Empty for a design that waits on nothing, which is what
     /// keeps the question off that round's hot path.
     waiting: Vec<Waiting>,
+    /// The `fork`…`join`s currently running, indexed by the number a branch
+    /// cursor carries. A retired slot is `None` and is handed out again, so a
+    /// `fork` inside a loop does not grow this without bound. Empty for a
+    /// design whose forks all finish in zero time, which are compiled as plain
+    /// blocks and never reach here.
+    forks: Vec<Option<ForkJoin>>,
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
     aliases: HashMap<String, String>,
@@ -447,6 +469,7 @@ impl Simulator {
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
             waiting: Vec::new(),
+            forks: Vec::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
             now: 0,
@@ -476,6 +499,7 @@ impl Simulator {
         self.pulled_nets.clear();
         self.blocks.clear();
         self.waiting.clear();
+        self.forks.clear();
         self.aliases.clear();
         self.queue = EventQueue::new();
         self.now = 0;
@@ -676,7 +700,8 @@ impl Simulator {
                 if self.blocks[id].kind != BlockKind::Always || self.blocks[id].free_running {
                     continue;
                 }
-                // A block part way through a `wait` has not finished the run it
+                // A block part way through a `wait` — or part way through a
+                // `fork`, waiting at its `join` — has not finished the run it
                 // is on, and an `always` block does not start again until it
                 // does. Starting a second copy of it here would give the design
                 // two writers of everything the block assigns.
@@ -684,11 +709,12 @@ impl Simulator {
                     .waiting
                     .iter()
                     .any(|waiting| waiting.cursor.block == id)
+                    || self.is_forking(id)
                 {
                     continue;
                 }
                 if self.blocks[id].fires(&edges) {
-                    let (updates, _) = self.resume_block(id, 0)?;
+                    let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
                     pending.extend(updates);
                 }
                 if self.finished() {
@@ -750,7 +776,7 @@ impl Simulator {
         self.waiting = still_waiting;
 
         for cursor in woken {
-            let (updates, _) = self.resume_block(cursor.block, cursor.pc)?;
+            let (updates, _) = self.resume_block(cursor)?;
             pending.extend(updates);
             if self.finished() {
                 break;
@@ -882,7 +908,7 @@ impl Simulator {
                 }
 
                 let (_, cursor) = self.queue.pop().expect("peeked time must pop");
-                let (updates, _) = self.resume_block(cursor.block, cursor.pc)?;
+                let (updates, _) = self.resume_block(cursor)?;
                 pending.extend(updates);
 
                 if self.finished() {
@@ -993,10 +1019,10 @@ impl Simulator {
     /// its deferred updates and whether it ran to the end.
     fn resume_block(
         &mut self,
-        id: usize,
-        pc: usize,
+        cursor: ExecutionCursor,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
-        let mut pc = pc;
+        let id = cursor.block;
+        let mut pc = cursor.pc;
         let mut carried = Vec::new();
         // A `disable` of another block does not suspend the block that wrote
         // it: the driver cancels what it named and control comes straight back
@@ -1015,7 +1041,7 @@ impl Simulator {
                 pending,
             } = outcome
             else {
-                let (mut updates, halted) = self.settled_resume(id, outcome)?;
+                let (mut updates, halted) = self.settled_resume(cursor, outcome)?;
                 carried.append(&mut updates);
                 // A scheduled write leaves the block here and waits on the
                 // time wheel instead of committing with this delta cycle's
@@ -1028,6 +1054,50 @@ impl Simulator {
             self.cancel_scope(&scope)?;
             pc = next;
         }
+    }
+
+    /// Records that one branch of `fork` has reached its `join`, and re-queues
+    /// the block that wrote the `fork` once the last of them has.
+    ///
+    /// Re-queueing at the current time rather than resuming inline is what
+    /// makes the join resume at the **maximum** of the branch finish times:
+    /// each branch arrives at whatever instant its own delays took it to, and
+    /// the one that arrives last is by definition the latest.
+    fn branch_arrived(&mut self, fork: usize) {
+        let Some(Some(record)) = self.forks.get_mut(fork) else {
+            return;
+        };
+        record.outstanding -= 1;
+        if record.outstanding > 0 {
+            return;
+        }
+        let parent = record.parent;
+        self.forks[fork] = None;
+        self.queue.insert(self.now, parent);
+    }
+
+    /// Takes a slot for a new `fork`, reusing one a finished fork gave back.
+    fn open_fork(&mut self, record: ForkJoin) -> usize {
+        match self.forks.iter().position(Option::is_none) {
+            Some(free) => {
+                self.forks[free] = Some(record);
+                free
+            }
+            None => {
+                self.forks.push(Some(record));
+                self.forks.len() - 1
+            }
+        }
+    }
+
+    /// Whether `id` already has a thread of execution in flight, which is what
+    /// stops `settle` starting a second copy of an `always` block part way
+    /// through a `fork`.
+    fn is_forking(&self, id: usize) -> bool {
+        self.forks
+            .iter()
+            .flatten()
+            .any(|record| record.parent.block == id)
     }
 
     /// Cancels every suspended block currently inside `scope`, re-queueing each
@@ -1053,35 +1123,50 @@ impl Simulator {
             return Err(SimulationError::UnknownScope(scope.to_string()));
         }
 
-        let blocks = &self.blocks;
-        let mut cancelled = Vec::new();
-        self.queue.retain(|cursor| {
-            match blocks[cursor.block]
+        // Which blocks have a thread inside the scope, and where each of them
+        // carries on. A block has one activation at a time, so a `fork` inside
+        // the scope contributes several cursors and they all belong to the one
+        // activation being cancelled — which is why what is collected here is a
+        // *block*, and why every one of that block's cursors then goes.
+        // A block parked at a `join` is on neither the queue nor the waiting
+        // list — the fork record is the only thing holding it — so a `disable`
+        // naming the scope the fork sits in has to look there as well or the
+        // block would simply be lost.
+        let live = self
+            .queue
+            .cursors()
+            .copied()
+            .chain(self.waiting.iter().map(|waiting| waiting.cursor))
+            .chain(self.forks.iter().flatten().map(|record| record.parent));
+        let mut cancelled: Vec<(usize, usize)> = Vec::new();
+        for cursor in live {
+            let Some(end) = self.blocks[cursor.block]
                 .program
                 .scope_end_containing(scope, cursor.pc)
-            {
-                Some(end) => {
-                    cancelled.push(ExecutionCursor::new(cursor.block, end));
-                    true
-                }
-                None => false,
+            else {
+                continue;
+            };
+            if !cancelled.iter().any(|(id, _)| *id == cursor.block) {
+                cancelled.push((cursor.block, end));
             }
-        });
-        self.waiting.retain(|waiting| {
-            match blocks[waiting.cursor.block]
-                .program
-                .scope_end_containing(scope, waiting.cursor.pc)
-            {
-                Some(end) => {
-                    cancelled.push(ExecutionCursor::new(waiting.cursor.block, end));
-                    false
-                }
-                None => true,
-            }
-        });
+        }
 
-        for cursor in cancelled {
-            self.queue.insert(self.now, cursor);
+        if cancelled.is_empty() {
+            return Ok(());
+        }
+        let doomed: Vec<usize> = cancelled.iter().map(|(block, _)| *block).collect();
+        self.queue.retain(|cursor| doomed.contains(&cursor.block));
+        self.waiting
+            .retain(|waiting| !doomed.contains(&waiting.cursor.block));
+        for record in self.forks.iter_mut() {
+            if record.is_some_and(|it| doomed.contains(&it.parent.block)) {
+                *record = None;
+            }
+        }
+
+        for (block, end) in cancelled {
+            self.queue
+                .insert(self.now, ExecutionCursor::new(block, end));
         }
         Ok(())
     }
@@ -1091,23 +1176,29 @@ impl Simulator {
     /// free-running block that ran off its end.
     fn settled_resume(
         &mut self,
-        id: usize,
+        cursor: ExecutionCursor,
         outcome: Resume,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
+        let id = cursor.block;
         match outcome {
             // A free-running `always` restarts the moment it finishes, which
             // is how `always begin #50 … end` keeps going forever — and how
             // `always value = @(ev) 5;` waits for the event again after the
-            // one it was woken by.
+            // one it was woken by. A *branch* running off the end of the block
+            // is that thread ending, never the block restarting.
             Resume::Halted { pending } => {
-                if self.blocks[id].free_running {
-                    self.queue.insert(self.now, ExecutionCursor::new(id, 0));
+                match cursor.fork {
+                    Some(fork) => self.branch_arrived(fork),
+                    None if self.blocks[id].free_running => {
+                        self.queue.insert(self.now, ExecutionCursor::new(id, 0));
+                    }
+                    None => {}
                 }
                 Ok((pending, true))
             }
             Resume::Suspended { pc, delay, pending } => {
                 self.queue
-                    .insert(self.now + delay, ExecutionCursor::new(id, pc));
+                    .insert(self.now + delay, ExecutionCursor { pc, ..cursor });
                 Ok((pending, false))
             }
             // Nothing schedules this one: it goes on the waiting list and
@@ -1118,10 +1209,39 @@ impl Simulator {
                     WaitReason::Event(control) => Some(EventWatch::arm(control, &self.state)),
                 };
                 self.waiting.push(Waiting {
-                    cursor: ExecutionCursor::new(id, pc),
+                    cursor: ExecutionCursor { pc, ..cursor },
                     watch,
                 });
                 Ok((pending, false))
+            }
+            // One thread per branch, each queued at this instant so they all
+            // get their turn before time moves. The block itself is held in
+            // the fork record — it is on no queue and on no waiting list until
+            // the last branch arrives.
+            Resume::Forked {
+                branches,
+                pc,
+                pending,
+            } => {
+                let fork = self.open_fork(ForkJoin {
+                    parent: ExecutionCursor { pc, ..cursor },
+                    outstanding: branches.len(),
+                });
+                for branch in branches {
+                    self.queue
+                        .insert(self.now, ExecutionCursor::branch(id, branch, fork));
+                }
+                Ok((pending, false))
+            }
+            Resume::BranchDone { pending } => {
+                match cursor.fork {
+                    Some(fork) => self.branch_arrived(fork),
+                    // A `JoinBranch` is only ever reached by a thread the
+                    // driver started, so a cursor without a fork here means the
+                    // compiled layout and the scheduler have parted company.
+                    None => return Err(FORK_TIMING_UNSUPPORTED),
+                }
+                Ok((pending, true))
             }
             // `resume_block` takes this one before it gets here.
             Resume::Disabled { scope, .. } => Err(SimulationError::UnknownScope(scope)),
@@ -5583,19 +5703,190 @@ mod tests {
         assert_eq!(simulator.get("c").expect("declared").to_u128(), Some(3));
     }
 
-    /// A branch that consumes time gives the others a turn while it waits, and
-    /// running those in sequence would put their writes in an order the design
-    /// never asked for. That is refused by name rather than approximated.
+    /// A branch that consumes time gives the others a turn while it waits, so
+    /// the block goes on only once the *last* branch has finished — the
+    /// maximum of their finish times, not the sum. Measured against iverilog
+    /// 12.0.
     #[test]
-    fn test_a_fork_whose_branches_consume_time_is_a_named_error() {
-        let error = setup_error(
+    fn test_a_fork_resumes_at_the_last_branch_to_finish() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer a, b;
+                initial begin
+                    a = 0; b = 0;
+                    fork begin #10 a = 1; end  begin #5 b = 2; end join
+                    $display("t=%0d a=%0d b=%0d", $time, a, b);
+                    fork #3 a = 7;  #1 b = 9; join
+                    $display("t=%0d a=%0d b=%0d", $time, a, b);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(simulator.output().text(), "t=10 a=1 b=2\nt=13 a=7 b=9\n");
+    }
+
+    /// A branch runs *while* its siblings do, not after them: a shorter branch
+    /// finishes at its own time rather than being pushed out by a longer one.
+    #[test]
+    fn test_fork_branches_keep_their_own_timelines() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    fork
+                        begin #10 $display("one at %0t", $time); end
+                        begin #20 $display("two at %0t", $time); end
+                        begin #1  $display("three at %0t", $time); end
+                    join
+                    $display("join at %0t", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "three at 1\none at 10\ntwo at 20\njoin at 20\n"
+        );
+    }
+
+    /// A `fork` inside a branch of another one needs nothing new: the inner
+    /// join's parent is the branch cursor, which carries the outer join's
+    /// identity. Measured against iverilog 12.0.
+    #[test]
+    fn test_a_fork_nested_inside_a_branch_joins_in_order() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer c;
+                initial begin
+                    fork
+                        begin
+                            fork
+                                #7 c = 1;
+                                #3 c = 2;
+                            join
+                            $display("inner join at %0t c=%0d", $time, c);
+                        end
+                        #2 $display("sibling at %0t", $time);
+                    join
+                    $display("outer join at %0t", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "sibling at 2\ninner join at 7 c=1\nouter join at 7\n"
+        );
+    }
+
+    /// A `fork` written in a task's body is spliced into whatever enabled it,
+    /// so its branch program counters have to be the spliced ones. Measured
+    /// against iverilog 12.0.
+    #[test]
+    fn test_a_fork_inside_an_enabled_task_runs_its_branches() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer a, b;
+                task t;
+                    begin
+                        fork
+                            begin #10 a = 1; end
+                            begin #5  b = 2; end
+                        join
+                        $display("task join at %0t a=%0d b=%0d", $time, a, b);
+                    end
+                endtask
+                initial begin
+                    t;
+                    $display("after task at %0t", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "task join at 10 a=1 b=2\nafter task at 10\n"
+        );
+    }
+
+    /// `disable` of a scope holding a running `fork` cancels *every* branch and
+    /// the block parked at the join — nothing after the join runs. Measured
+    /// against iverilog 12.0.
+    #[test]
+    fn test_disable_cancels_every_branch_of_a_running_fork() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer a, b;
+                initial begin : blk
+                    fork
+                        begin #10 a = 1; $display("branch one at %0t", $time); end
+                        begin #20 b = 2; $display("branch two at %0t", $time); end
+                    join
+                    $display("after join at %0t", $time);
+                end
+                initial begin
+                    #5 disable blk;
+                    $display("disabled at %0t", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(simulator.output().text(), "disabled at 5\n");
+    }
+
+    /// A `fork` whose branches consume no time cannot tell concurrent from
+    /// sequential, so it is still compiled as a plain block — which is what
+    /// keeps one legal inside a `function`, where there is no driver to hand
+    /// out threads.
+    #[test]
+    fn test_a_zero_delay_fork_still_runs_as_a_block() {
+        let mut simulator = simulator_for(
             r#"
             module main();
                 reg [7:0] a, b;
                 initial begin
                     fork
-                        #5 a = 1;
+                        a = 1;
                         b = 2;
+                    join
+                    $display("a=%0d b=%0d at %0t", a, b, $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "a=1 b=2 at 0\n");
+    }
+
+    /// A `disable` written inside a branch, naming a scope the `fork` itself
+    /// sits in, would stop only the one thread that ran it and leave the join
+    /// waiting for an arrival that can never come. It is named rather than
+    /// approximated.
+    #[test]
+    fn test_a_disable_escaping_its_own_fork_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module main();
+                integer a;
+                initial begin : blk
+                    fork
+                        begin #5 disable blk; end
+                        begin #10 a = 1; end
                     join
                 end
             endmodule
@@ -5604,8 +5895,90 @@ mod tests {
 
         assert_eq!(
             error,
-            SimulationError::Unsupported("a `fork`/`join` branch that consumes time")
+            SimulationError::Unsupported(
+                "a `disable` inside a `fork` branch naming a scope around the `fork`"
+            )
         );
+    }
+
+    /// A branch that never arrives holds the join for ever, which is what the
+    /// LRM says — but it must not hold the *simulator*: the other branches
+    /// still run and time still moves.
+    #[test]
+    fn test_a_branch_that_never_finishes_leaves_the_join_waiting() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    fork
+                        begin #10 $display("finished at %0t", $time); end
+                        begin wait (0); $display("never"); end
+                    join
+                    $display("never either");
+                end
+                initial #30 $display("clock still moves at %0t", $time);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "finished at 10\nclock still moves at 30\n"
+        );
+    }
+
+    /// A `fork` that neither waits nor lets time move is a spinning block, and
+    /// the resumption budget is what sees it — an error rather than a hang.
+    #[test]
+    fn test_a_zero_delay_fork_in_a_forever_loop_is_reported_not_hung() {
+        let error = setup_error(
+            r#"
+            module main();
+                reg [7:0] a, b;
+                initial forever begin
+                    fork
+                        begin #0 a = 1; end
+                        begin #0 b = 2; end
+                    join
+                end
+            endmodule
+        "#,
+        );
+
+        assert!(matches!(error, SimulationError::NoConvergence { .. }));
+    }
+
+    /// An `always` block part way through a `fork` has not finished the run it
+    /// is on, so an edge arriving meanwhile must not start a second copy of it.
+    #[test]
+    fn test_an_edge_does_not_restart_a_block_waiting_at_a_join() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg clk;
+                integer runs;
+                initial begin
+                    runs = 0;
+                    clk = 0;
+                    #1 clk = 1;
+                    #1 clk = 0;
+                    #1 clk = 1;
+                end
+                always @(posedge clk) begin
+                    runs = runs + 1;
+                    fork
+                        #10 ;
+                        #20 ;
+                    join
+                end
+                initial #40 $display("runs=%0d", runs);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(simulator.output().text(), "runs=1\n");
     }
 
     /// An event control written in front of a statement suspends the block it
