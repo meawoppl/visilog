@@ -1118,7 +1118,8 @@ fn assigned_name(target: &Expression) -> Option<&str> {
     match target {
         Expression::Identifier(id)
         | Expression::BitSelect(id, _)
-        | Expression::PartSelect(id, _, _) => Some(&id.name),
+        | Expression::PartSelect(id, _, _)
+        | Expression::IndexedPartSelect { id, .. } => Some(&id.name),
         Expression::Parenthetical(inner) => assigned_name(inner),
         _ => None,
     }
@@ -1184,6 +1185,10 @@ impl BodyNames {
                 self.expression(first);
                 self.expression(second);
             }
+            Expression::IndexedPartSelect { base, width, .. } => {
+                self.expression(base);
+                self.expression(width);
+            }
             other => self.expression(other),
         }
     }
@@ -1237,6 +1242,13 @@ impl BodyNames {
                 self.reads.insert(id.name.clone());
                 self.expression(first);
                 self.expression(second);
+            }
+            Expression::IndexedPartSelect {
+                id, base, width, ..
+            } => {
+                self.reads.insert(id.name.clone());
+                self.expression(base);
+                self.expression(width);
             }
         }
     }
@@ -1389,6 +1401,13 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
             id.name = resolve(&id.name);
             rename_expression(msb, resolve);
             rename_expression(lsb, resolve);
+        }
+        Expression::IndexedPartSelect {
+            id, base, width, ..
+        } => {
+            id.name = resolve(&id.name);
+            rename_expression(base, resolve);
+            rename_expression(width, resolve);
         }
     }
 }

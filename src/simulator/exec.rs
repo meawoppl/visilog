@@ -29,7 +29,10 @@
 use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
 use crate::register::Register;
-use crate::simulator::eval::{eval, eval_sized, EvalError, SELF_DETERMINED};
+use crate::simulator::eval::{
+    eval, eval_sized, indexed_select_indices, indexed_select_width, EvalError, MAX_SELECT_WIDTH,
+    SELF_DETERMINED,
+};
 use crate::simulator::program::{resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{Drive, DriveLevel, StateStore};
@@ -193,6 +196,15 @@ pub fn resolve_target(
         Expression::PartSelect(id, first, second) => {
             let first = target_index(state, first)?;
             let second = target_index(state, second)?;
+            // A nonsense range — `a[1000000:0]`, or one whose bounds came out
+            // of a parameter that is not what the design meant — names more
+            // bits than any register has. Refusing it here is what stops the
+            // `collect` below from trying to allocate the whole span; the
+            // evaluator has always guarded its own copy of this.
+            let selected = (first - second).unsigned_abs() as usize + 1;
+            if selected > MAX_SELECT_WIDTH {
+                return Err(EvalError::WidthOverflow(selected).into());
+            }
             // Indices run most significant bit first, matching the bit order of
             // the register being written.
             let indices: Vec<i64> = if first >= second {
@@ -200,6 +212,23 @@ pub fn resolve_target(
             } else {
                 (first..=second).collect()
             };
+            Ok(ResolvedTarget::Bits {
+                name: id.name.clone(),
+                indices,
+            })
+        }
+        Expression::IndexedPartSelect {
+            id,
+            base,
+            width,
+            upward,
+        } => {
+            let span = indexed_select_width(width, state)?;
+            // A write through an unknown base has nowhere to land. Reporting it
+            // rather than writing somewhere arbitrary keeps the rule that a
+            // wrong answer is never produced quietly.
+            let indices = indexed_select_indices(base, span, *upward, state)?
+                .ok_or_else(|| SimulationError::UnsupportedTarget(target.to_contracted_string()))?;
             Ok(ResolvedTarget::Bits {
                 name: id.name.clone(),
                 indices,
@@ -783,5 +812,24 @@ mod tests {
             }
         );
         assert_eq!(resolved.name(), "q");
+    }
+
+    /// A part select naming an absurd number of bits is refused rather than
+    /// allocated. The evaluator has always guarded this; the write path had
+    /// not, so a design whose bounds came out wrong tried to build a vector of
+    /// four billion indices and aborted the process.
+    #[test]
+    fn test_absurd_part_select_target_is_refused() {
+        let state = store_with(&[("a", "1010")]);
+        let target = assignment_lhs("a[1000000:0]")
+            .expect("a part select should parse")
+            .1;
+        let error =
+            resolve_target(&state, &target).expect_err("a million bits is not a target to build");
+        assert!(
+            matches!(error, SimulationError::Eval(EvalError::WidthOverflow(_))),
+            "expected a width overflow, got {:?}",
+            error
+        );
     }
 }
