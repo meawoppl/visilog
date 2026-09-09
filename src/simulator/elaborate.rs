@@ -2094,6 +2094,8 @@ impl BodyNames {
             | Instruction::Task(_)
             | Instruction::Delay(_)
             | Instruction::Disable(_)
+            | Instruction::Fork { .. }
+            | Instruction::JoinBranch
             | Instruction::Halt => {}
         }
     }

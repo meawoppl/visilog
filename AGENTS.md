@@ -626,14 +626,60 @@ division of labour `declare_tasks` and `compile_task` already had. An **unnamed*
 grouping and nothing else, so `parse_block` flattens it into the statements it holds and
 nothing downstream learns it was written.
 
-**`fork`/`join` runs its branches in sequence, and refuses to when that could differ.**
-Branches that consume no time cannot tell sequential from concurrent — each runs to
-completion without giving another a turn either way — so a `fork` of plain assignments is
-compiled exactly as a `begin`…`end` is, sharing `compile_block` for its name and its
-variables. A branch that *can* suspend can tell, so a `fork` of more than one branch
-containing a `Delay`, a `Wait` or an `EventWait` is `Unsupported("a `fork`/`join` branch
-that consumes time")` — corpus `fork3.19A` is exactly that design, and running it in
-sequence would put its writes in an order the design never asked for.
+**`fork`/`join` is one thread per branch, and the join resumes at the *maximum* of their
+finish times.** `Instruction::Fork { branches, join }` names the instruction each branch
+starts at and the one the block carries on at, and the branch bodies are laid out between
+the two, each ending in an `Instruction::JoinBranch`. So a branch is an ordinary run of the
+same instruction list, and a `#delay`, a `wait`, an event control or a nested `fork` inside
+one needs nothing new: a branch is a program counter like any other.
+
+The driver owns the threads, because it owns the queue they go on. `Resume::Forked` hands
+the branch entry points out; `Simulator::settled_resume` opens a `ForkJoin` record — where
+the block picks up, and how many branches have still to arrive — and queues one
+`ExecutionCursor::branch` per branch *at the current time*. `ExecutionCursor` therefore
+carries a `fork: Option<usize>`, which is the identity a branch signals its arrival with;
+`Resume::BranchDone` decrements, and the last arrival re-queues the parent, again at the
+current time. That is what makes the join the maximum rather than the sum — each branch
+arrives at whatever instant its own delays took it to, and the one that arrives last is by
+definition the latest.
+
+**A `fork` nested inside a branch needs no second mechanism**, because the record holds a
+whole *cursor* rather than a program counter: the inner join's parent is the branch cursor,
+`fork` field and all, so arriving at the inner join re-queues a thread that is still a
+branch of the outer one.
+
+**Branches that consume no time are still compiled as a plain block**, and that is a
+deliberate two-pass shape rather than a leftover. Such branches cannot tell sequential from
+concurrent — each runs to completion without giving another a turn either way — so
+`compile_fork` compiles the block first, asks whether what came out contains anything that
+suspends, and only then throws it away (`Program::mark` / `rewind`) and compiles it again as
+threads. That keeps the common case free of the driver round trip a thread costs, and it
+keeps a `fork` legal inside a `function` and inside `exec::execute_statements`, neither of
+which has a driver to spawn anything (both report `FORK_TIMING_UNSUPPORTED` if one reaches
+them). Asking the *instructions* rather than the statements is what makes a branch that
+suspends inside an enabled task's body count — the body is already spliced in by then.
+
+Three seams keep it consistent with what was already there. `Program::splice` offsets a
+`Fork`'s branch targets like any other jump, so a `fork` inside a task works. `settle` skips
+a block that `is_forking`, for the same reason it skips one part way through a `wait` — it
+has not finished the run it is on. And `Simulator::cancel_scope` is **block oriented**: a
+`disable` naming a scope with a running `fork` in it has to cancel every branch and the
+block parked at the join, so it collects the *blocks* with a thread inside the scope, drops
+every cursor of each — queued, waiting, and the fork records, which are the only thing
+holding a parent at a join — and re-queues one cursor at the scope's end. A block has one
+activation at a time, which is what makes "every cursor of that block" the right set.
+
+`join_any` and `join_none` are not implemented, and `block_between` closing on a
+word-boundary `keyword` rather than a bare `tag` is what keeps them out: without it,
+`fork … join_any` would read as a plain `join` with a stray `_any` after it and hand the
+design semantics it did not ask for. They are a parse error instead. A `disable` written
+inside a branch naming a scope the `fork` itself sits in is `Unsupported` by name
+(`Program::check_fork_disables`, a post-pass because the enclosing block's range is not
+recorded until the block around the `fork` has finished compiling): the jump a local
+`disable` compiles to would stop the one thread that ran it and leave the join waiting for
+an arrival that can never come. A branch that genuinely never arrives holds *its own* join
+for ever, which is what the LRM says, and holds nothing else — the other branches still run
+and time still moves.
 
 **An intra-assignment timing control holds its right hand side in the store.**
 `a = #5 b;`, `a = @(posedge clk) b;` and `a = repeat (3) @(ev) b;` all evaluate `b` *now*
@@ -922,11 +968,11 @@ dying on unfamiliar syntax several lines earlier.
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, and `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, and `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
-| `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain`, FIFO within one timestamp |
+| `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
 

@@ -68,14 +68,15 @@ pub(crate) const NONBLOCKING_TIMING_UNSUPPORTED: SimulationError =
 pub(crate) const EMPTY_IMPLICIT_EVENT_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("an `@(*)` event control that reads nothing");
 
-/// What a `fork`…`join` whose branches consume time reports.
+/// What a `fork`…`join` whose branches consume time reports where there is no
+/// driver behind the caller to run them on: inside a `function`, and from
+/// [`exec::execute_statements`](super::exec::execute_statements).
 ///
 /// Branches that never suspend finish in the order they are run whichever way
-/// a simulator schedules them, so running them one after another is exactly
-/// concurrent execution. A branch that waits gives the others a turn while it
-/// is waiting, and running those in sequence would put their writes in an
-/// order the design did not ask for — a wrong answer that looks like a right
-/// one, which is worth less than stopping.
+/// a simulator schedules them, so those are compiled as a plain block and
+/// never get here. One that waits gives the others a turn while it is waiting,
+/// and that needs a thread each — which only [`Simulator`](super::runner::Simulator)
+/// can hand out.
 pub(crate) const FORK_TIMING_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a `fork`/`join` branch that consumes time");
 
@@ -216,6 +217,18 @@ pub enum Instruction {
     /// ends. When it is not, the scope belongs to some other block and only
     /// the driver can reach it, which is what [`Resume::Disabled`] is for.
     Disable(String),
+    /// `fork … join` whose branches consume time — start one thread of
+    /// execution per branch and suspend until every one of them has finished.
+    ///
+    /// `branches` holds the instruction each branch starts at and `join` the
+    /// instruction the block carries on at. The branch bodies are laid out
+    /// between the two, each ending in a [`Instruction::JoinBranch`], so a
+    /// branch is an ordinary run of this same instruction list and a
+    /// `#delay` inside one suspends exactly as it does anywhere else.
+    Fork { branches: Vec<usize>, join: usize },
+    /// The end of one `fork` branch. It ends *that thread*, not the block, and
+    /// the last one to arrive is what lets the block past its `join`.
+    JoinBranch,
     /// The end of the block.
     Halt,
 }
@@ -251,6 +264,15 @@ pub struct Program {
     scopes: Vec<ScopeRange>,
 }
 
+/// How far a [`Program`] had been built, so that a compilation step can be
+/// unwound and taken a second way.
+#[derive(Clone, Copy, Debug)]
+struct ProgramMark {
+    instructions: usize,
+    scopes: usize,
+    inlined: usize,
+}
+
 /// Why [`resume`] gave control back.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Resume {
@@ -278,6 +300,17 @@ pub enum Resume {
         pc: usize,
         pending: Vec<PendingUpdate>,
     },
+    /// Hit a `fork` whose branches consume time. Start one thread at each of
+    /// `branches` and hold this one at `pc` — the `join` — until the last of
+    /// them arrives.
+    Forked {
+        branches: Vec<usize>,
+        pc: usize,
+        pending: Vec<PendingUpdate>,
+    },
+    /// Reached the end of one `fork` branch. The thread is over; the block it
+    /// is a branch of carries on once its siblings are over too.
+    BranchDone { pending: Vec<PendingUpdate> },
 }
 
 /// What a suspended block is waiting for, which is what decides how the driver
@@ -354,7 +387,11 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
         // A `disable` names a scope rather than a signal, so it is renamed
         // beside the scope table it points into — see
         // [`Program::rename_scopes`] — and never through a map of variables.
-        Instruction::Jump(_) | Instruction::Disable(_) | Instruction::Halt => {}
+        Instruction::Jump(_)
+        | Instruction::Disable(_)
+        | Instruction::Fork { .. }
+        | Instruction::JoinBranch
+        | Instruction::Halt => {}
     }
 }
 
@@ -408,6 +445,8 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
         | Instruction::Disable(_)
+        | Instruction::Fork { .. }
+        | Instruction::JoinBranch
         | Instruction::Halt => {}
     }
 }
@@ -420,7 +459,41 @@ impl Program {
     ) -> Result<Program, SimulationError> {
         let mut program = Program::compile_body(statements, tasks, "")?;
         program.emit(Instruction::Halt);
+        program.check_fork_disables()?;
         Ok(program)
+    }
+
+    /// Rejects a `disable` written inside a `fork` branch that names a scope
+    /// the `fork` itself is inside.
+    ///
+    /// Terminating such a scope has to stop *every* branch and the block parked
+    /// at the join, and the jump a local `disable` compiles to would stop only
+    /// the one thread that ran it — leaving its siblings running and the join
+    /// waiting for an arrival that can never come. That is a wrong answer with
+    /// no symptom, so it is named here instead. The check is a post-pass rather
+    /// than part of `compile_fork` because the enclosing block's own range is
+    /// not recorded until the block around the `fork` has finished compiling.
+    fn check_fork_disables(&self) -> Result<(), SimulationError> {
+        for (site, instruction) in self.instructions.iter().enumerate() {
+            let Instruction::Fork { join, .. } = instruction else {
+                continue;
+            };
+            for (pc, inner) in self.instructions[site + 1..*join].iter().enumerate() {
+                let Instruction::Disable(scope) = inner else {
+                    continue;
+                };
+                let pc = site + 1 + pc;
+                if self
+                    .scope_end_containing(scope, pc)
+                    .is_some_and(|end| end >= *join)
+                {
+                    return Err(SimulationError::Unsupported(
+                        "a `disable` inside a `fork` branch naming a scope around the `fork`",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The same, without the trailing [`Instruction::Halt`] — a task's body,
@@ -596,6 +669,14 @@ impl Program {
                 | Instruction::JumpIfFalse { target, .. }
                 | Instruction::JumpIfMatch { target, .. }
                 | Instruction::RepeatNext { target, .. } => *target += offset,
+                // A `fork` inside a task's body points at branch bodies in the
+                // same list, so its targets move with everything else.
+                Instruction::Fork { branches, join } => {
+                    for branch in branches.iter_mut() {
+                        *branch += offset;
+                    }
+                    *join += offset;
+                }
                 _ => {}
             }
             match &mut instruction {
@@ -877,24 +958,113 @@ impl Program {
         Ok(())
     }
 
-    /// `fork … join` — the branches, run one after another.
+    /// `fork … join` — the branches, run at once, with the block carrying on
+    /// once the last of them has finished.
     ///
-    /// Branches that consume no time cannot tell that apart from running at
-    /// once: each runs to completion without giving another a turn either way.
-    /// One that *does* consume time can, so it is refused by name rather than
-    /// approximated.
+    /// Branches that consume no time cannot tell concurrent from sequential:
+    /// each runs to completion without giving another a turn either way. So a
+    /// `fork` is compiled exactly as a `begin`…`end` is *first*, and only if
+    /// what came out can suspend is it thrown away and compiled again as real
+    /// threads. That keeps the common case free of the driver round trip a
+    /// thread costs, and it keeps a `fork` legal inside a `function`, where
+    /// there is no driver to spawn anything.
+    ///
+    /// Whether it can suspend is asked of the compiled instructions rather than
+    /// of the statements, so a branch that suspends inside an enabled *task's*
+    /// body counts — the body is already spliced in by then.
     fn compile_fork(
         &mut self,
         block: &BlockStatement,
         tasks: &TaskTable,
         scope: &str,
     ) -> Result<(), SimulationError> {
-        let start = self.next();
+        let mark = self.mark();
         self.compile_block(block, tasks, scope)?;
-        if block.statements.len() > 1 && self.instructions[start..].iter().any(instruction_suspends)
+        if block.statements.len() < 2
+            || !self.instructions[mark.instructions..]
+                .iter()
+                .any(instruction_suspends)
         {
-            return Err(FORK_TIMING_UNSUPPORTED);
+            return Ok(());
         }
+        self.rewind(mark);
+        self.compile_threaded_fork(block, tasks, scope)
+    }
+
+    /// The concurrent layout:
+    ///
+    /// ```text
+    ///     Fork { branches: [b0, b1], join: J }
+    /// b0: <branch 0>  JoinBranch
+    /// b1: <branch 1>  JoinBranch
+    /// J:  <after the join>
+    /// ```
+    ///
+    /// Each branch is an ordinary run of this same list, so a `#delay`, a
+    /// `wait` or a nested `fork` inside one needs nothing new: a branch is a
+    /// program counter like any other.
+    fn compile_threaded_fork(
+        &mut self,
+        block: &BlockStatement,
+        tasks: &TaskTable,
+        scope: &str,
+    ) -> Result<(), SimulationError> {
+        let inner = match &block.name {
+            Some(name) => block_scope(scope, &name.name),
+            None => scope.to_string(),
+        };
+
+        let start = self.next();
+        let site = self.emit(Instruction::Fork {
+            branches: Vec::new(),
+            join: 0,
+        });
+        let mut branches = Vec::with_capacity(block.statements.len());
+        for statement in &block.statements {
+            branches.push(self.next());
+            self.compile_statements(std::slice::from_ref(statement), tasks, &inner)?;
+            self.emit(Instruction::JoinBranch);
+        }
+        let join = self.next();
+        match &mut self.instructions[site] {
+            Instruction::Fork {
+                branches: slot,
+                join: target,
+            } => {
+                *slot = branches;
+                *target = join;
+            }
+            other => unreachable!("cannot patch {:?}", other),
+        }
+
+        if block.name.is_none() {
+            return Ok(());
+        }
+        // The label is a scope a `disable` may name, and it covers the `Fork`
+        // itself as well as the branches — cancelling it has to reach the
+        // parent parked at the join, not only the threads.
+        self.scopes.push(ScopeRange {
+            name: inner.trim_end_matches('.').to_string(),
+            start,
+            end: join,
+        });
+        if block.locals.is_empty() {
+            return Ok(());
+        }
+        let locals: HashMap<&str, String> = block
+            .locals
+            .iter()
+            .map(|local| {
+                (
+                    local.name.name.as_str(),
+                    format!("{}{}", inner, local.name.name),
+                )
+            })
+            .collect();
+        self.rename_range(start, join, &|name| match locals.get(name) {
+            Some(qualified) => qualified.clone(),
+            None => name.to_string(),
+        });
         Ok(())
     }
 
@@ -1141,6 +1311,26 @@ impl Program {
         Ok(())
     }
 
+    /// Everything a compilation step appends to, so that a step can be
+    /// unwound and taken again.
+    ///
+    /// Only `fork` needs this: whether its branches consume time is a question
+    /// about the instructions they compile to, and the honest way to ask it is
+    /// to compile them.
+    fn mark(&self) -> ProgramMark {
+        ProgramMark {
+            instructions: self.instructions.len(),
+            scopes: self.scopes.len(),
+            inlined: self.inlined.len(),
+        }
+    }
+
+    fn rewind(&mut self, mark: ProgramMark) {
+        self.instructions.truncate(mark.instructions);
+        self.scopes.truncate(mark.scopes);
+        self.inlined.truncate(mark.inlined);
+    }
+
     fn emit(&mut self, instruction: Instruction) -> usize {
         self.instructions.push(instruction);
         self.instructions.len() - 1
@@ -1288,6 +1478,12 @@ impl FunctionDefinition {
             Resume::Suspended { .. } => return Err(FUNCTION_DELAY_UNSUPPORTED),
             Resume::Waiting { .. } => return Err(FUNCTION_EVENT_UNSUPPORTED),
             Resume::Disabled { scope, .. } => return Err(SimulationError::UnknownScope(scope)),
+            // A frame has no driver behind it to run threads on. A `fork` of
+            // branches that consume no time never gets here — it is compiled
+            // as a plain block.
+            Resume::Forked { .. } | Resume::BranchDone { .. } => {
+                return Err(FORK_TIMING_UNSUPPORTED)
+            }
         }
 
         frame
@@ -1503,6 +1699,17 @@ pub fn resume(
                     })
                 }
             },
+            // Spawning is the driver's to do — it owns the queue the threads
+            // go on — so this hands the branch entry points out and parks the
+            // block at the join.
+            Instruction::Fork { branches, join } => {
+                return Ok(Resume::Forked {
+                    branches: branches.clone(),
+                    pc: *join,
+                    pending,
+                })
+            }
+            Instruction::JoinBranch => return Ok(Resume::BranchDone { pending }),
             Instruction::Halt => return Ok(Resume::Halted { pending }),
         }
     }
@@ -1563,7 +1770,13 @@ fn implicit_control(body: &[ProceduralStatements]) -> Result<EventControl, Simul
 fn instruction_suspends(instruction: &Instruction) -> bool {
     matches!(
         instruction,
-        Instruction::Delay(_) | Instruction::Wait(_) | Instruction::EventWait(_)
+        Instruction::Delay(_)
+            | Instruction::Wait(_)
+            | Instruction::EventWait(_)
+            // A `fork` of branches that consume time gives control back to the
+            // driver, so a `fork` written inside another one makes the outer
+            // one time-consuming as well.
+            | Instruction::Fork { .. }
     )
 }
 
@@ -1638,7 +1851,10 @@ mod tests {
                 commit_updates(pending, store).unwrap();
                 Some((pc, delay))
             }
-            Resume::Waiting { pending, .. } | Resume::Disabled { pending, .. } => {
+            Resume::Waiting { pending, .. }
+            | Resume::Disabled { pending, .. }
+            | Resume::Forked { pending, .. }
+            | Resume::BranchDone { pending } => {
                 commit_updates(pending, store).unwrap();
                 None
             }

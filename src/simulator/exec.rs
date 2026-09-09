@@ -34,7 +34,8 @@ use crate::simulator::eval::{
     SELF_DETERMINED,
 };
 use crate::simulator::program::{
-    resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED, WAIT_UNSUPPORTED,
+    resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED, FORK_TIMING_UNSUPPORTED,
+    WAIT_UNSUPPORTED,
 };
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{Drive, DriveLevel, StateStore};
@@ -197,6 +198,9 @@ pub fn execute_statements(
         // jump. One naming anything else reaches for a block only the driver
         // holds, and this entry point has no driver behind it.
         Resume::Disabled { scope, .. } => Err(SimulationError::UnknownScope(scope)),
+        // Threads are the driver's to hand out, and this is the entry point
+        // with no driver behind it.
+        Resume::Forked { .. } | Resume::BranchDone { .. } => Err(FORK_TIMING_UNSUPPORTED),
     }
 }
 
