@@ -89,6 +89,12 @@ impl Delay {
         [&mut self.minimum, &mut self.typical, &mut self.maximum]
     }
 
+    /// The three expressions, for a pass that only reads them — collecting the
+    /// signals a delay depends on, say.
+    pub fn expressions(&self) -> [&Expression; 3] {
+        [&self.minimum, &self.typical, &self.maximum]
+    }
+
     /// The `min` of a `min:typ:max` triple; the value itself for a plain delay.
     pub fn minimum(&self) -> &Expression {
         &self.minimum

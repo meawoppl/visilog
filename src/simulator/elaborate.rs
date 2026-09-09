@@ -1942,7 +1942,12 @@ fn analyse_function_body(
                     ))
                 }
             },
-            Instruction::NonBlocking { .. } => return Err(FUNCTION_NONBLOCKING_UNSUPPORTED),
+            // A scheduled write is a non-blocking assignment with a delay on
+            // it, so it fails for both reasons at once; the non-blocking one
+            // is the more specific.
+            Instruction::NonBlocking { .. } | Instruction::ScheduleWrite { .. } => {
+                return Err(FUNCTION_NONBLOCKING_UNSUPPORTED)
+            }
             // A drive outlives the call that installed it, and the frame it
             // would be installed on is thrown away when the call returns.
             Instruction::Assign { .. }
@@ -2071,6 +2076,17 @@ impl BodyNames {
                 self.expression(value);
             }
             Instruction::WriteHeld { target, .. } => self.target(target),
+            Instruction::ScheduleWrite {
+                target,
+                value,
+                delay,
+            } => {
+                self.target(target);
+                self.expression(value);
+                for expression in delay.expressions() {
+                    self.expression(expression);
+                }
+            }
             // A `disable` names a scope rather than a signal, so there is
             // nothing in one for a frame to copy in.
             Instruction::Jump(_)

@@ -104,12 +104,42 @@ impl ResolvedTarget {
 pub struct PendingUpdate {
     target: ResolvedTarget,
     value: Register,
+    /// When the write lands, for the one form that is not "at the end of this
+    /// delta cycle": `a <= #5 b;`, whose right hand side is read now and whose
+    /// write is scheduled without suspending the block.
+    ///
+    /// `None` is the ordinary non-blocking update, committed by
+    /// [`commit_updates`] as soon as the block that queued it stops.
+    at: Option<i64>,
 }
 
 impl PendingUpdate {
-    /// Queues `value` to be written into `target`.
+    /// Queues `value` to be written into `target` at the end of this delta
+    /// cycle.
     pub fn new(target: ResolvedTarget, value: Register) -> Self {
-        PendingUpdate { target, value }
+        PendingUpdate {
+            target,
+            value,
+            at: None,
+        }
+    }
+
+    /// Queues `value` to be written into `target` at simulated time `at`.
+    ///
+    /// The value is the one the right hand side had when the statement ran —
+    /// that is the whole point of an intra-assignment control — so it is
+    /// carried here rather than re-read when the write lands.
+    pub fn scheduled(target: ResolvedTarget, value: Register, at: i64) -> Self {
+        PendingUpdate {
+            target,
+            value,
+            at: Some(at),
+        }
+    }
+
+    /// When the write lands, or `None` for an ordinary non-blocking update.
+    pub fn at(&self) -> Option<i64> {
+        self.at
     }
 
     /// Where the update will be written.
@@ -158,6 +188,12 @@ pub fn commit_updates(
 ) -> Result<bool, SimulationError> {
     let mut changed = false;
     for update in updates {
+        // A scheduled write is not this delta cycle's business; the runner
+        // holds it until its time comes. Committing it here would land it
+        // immediately and lose the delay entirely.
+        if update.at.is_some() {
+            continue;
+        }
         changed |= drive_resolved(store, &update.target, &update.value)?;
     }
     Ok(changed)
