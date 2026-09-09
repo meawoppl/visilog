@@ -12,7 +12,7 @@ use crate::parsers::expr::{
     bit_select, indexed_part_select, part_select, verilog_expression, Expression,
 };
 use crate::parsers::gates::{drive_strength, DriveStrength};
-use crate::parsers::identifier::identifier;
+use crate::parsers::identifier::hierarchical_identifier;
 
 use super::{
     behavior::{assignment_timing, EventControl},
@@ -243,7 +243,10 @@ pub fn assignment_lhs(input: &str) -> IResult<&str, Expression> {
         bit_select,
         indexed_part_select,
         part_select,
-        map(identifier, Expression::Identifier),
+        // A hierarchical name is writable, not just readable: a testbench
+        // reaching into a design writes `top.pass = 1'b1;`, and elaboration
+        // has already flattened the store to exactly those dotted names.
+        map(hierarchical_identifier, Expression::Identifier),
         parse_concatenation,
     ))(input)
 }

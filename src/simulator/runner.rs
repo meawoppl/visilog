@@ -2338,6 +2338,41 @@ mod tests {
         assert_eq!(simulator.output().text(), "e=0 f=1 g=1 h=0\n");
     }
 
+    /// A hierarchical name is **writable**, not just readable: a testbench
+    /// reaching into a design writes `d.pass = 1'b1;`, and a bit of one.
+    ///
+    /// Elaboration has already flattened the store to exactly those dotted
+    /// names, so this is a front-end gap rather than a model one. iverilog
+    /// 12.0 prints `pass=1 v=0100`.
+    #[test]
+    fn test_hierarchical_assignment_targets() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module dut;
+                reg pass;
+                reg [3:0] v;
+                initial begin pass = 1'b0; v = 0; end
+            endmodule
+            module top;
+                dut d();
+                initial begin
+                    #1 d.pass = 1'b1;
+                    d.v[2] = 1'b1;
+                    #1 $display("pass=%b v=%b", d.pass, d.v);
+                end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("should set up");
+        simulator.advance(3).expect("time should advance");
+
+        assert_eq!(simulator.output().text(), "pass=1 v=0100\n");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
