@@ -1,6 +1,22 @@
-use nom::{bytes::complete::tag, character::complete::char, multi::separated_list1, IResult};
+//! The keyword-led variable declarations: `integer`, `time`, `real` and
+//! `event`.
+//!
+//! All four share one shape — a keyword, then a comma separated list of names,
+//! each with an optional array dimension and an optional initialiser — and
+//! differ only in what the keyword means to the simulator. `integer` is a
+//! signed 32-bit variable, `time` an unsigned 64-bit one, `real` a value this
+//! simulator does not model, and `event` a name with no value at all.
 
-use super::{expr::Expression, identifier::Identifier, register::declared_name, simple::ws};
+use nom::{
+    branch::alt, bytes::complete::tag, character::complete::char, multi::separated_list1, IResult,
+};
+
+use super::{
+    expr::Expression,
+    identifier::{identifier, Identifier},
+    register::declared_name,
+    simple::ws,
+};
 
 /// One name from an `integer a, b[0:3];` declaration.
 ///
@@ -17,10 +33,57 @@ pub struct IntegerDeclaration {
     pub init: Option<Expression>,
 }
 
-pub fn parse_integer_declaration(input: &str) -> IResult<&str, Vec<IntegerDeclaration>> {
-    let (input, _) = tag("integer")(input)?;
+/// One name from a `time t, stamps[0:3];` declaration.
+///
+/// A `time` is a fixed 64-bit *unsigned* value — the width simulated time is
+/// counted in — so like an `integer` it carries no width of its own.
+#[derive(Debug, PartialEq)]
+pub struct TimeDeclaration {
+    pub name: Identifier,
+    pub dimensions: Option<(i64, i64)>,
+    pub init: Option<Expression>,
+}
+
+/// One name from a `real r, samples[2:1];` declaration.
+///
+/// A `real` is IEEE-754 floating point, which is not what a
+/// [`Register`](crate::register::Register) holds: there is no `x` in a float
+/// and none of the arithmetic is the same. The front end reads the declaration
+/// anyway so that the simulator can reject it *by name* — a file that uses a
+/// `real` should say that is why it stopped, rather than dying on unfamiliar
+/// syntax several lines earlier.
+#[derive(Debug, PartialEq)]
+pub struct RealDeclaration {
+    pub name: Identifier,
+    pub dimensions: Option<(i64, i64)>,
+    pub init: Option<Expression>,
+}
+
+/// One name from an `event a, b;` declaration.
+///
+/// A named event is a synchronisation object, not a variable: it has no width,
+/// no value and no initialiser — only a name that `-> a;` triggers and
+/// `always @(a)` waits on. That is why this carries a name and nothing else.
+#[derive(Debug, PartialEq)]
+pub struct EventDeclaration {
+    pub name: Identifier,
+}
+
+/// The shape every one of these declarations shares: the keyword, then the
+/// comma separated list of names that `register::declared_name` already reads
+/// for `reg`.
+fn variable_declaration<'a>(
+    keyword: &'static str,
+    input: &'a str,
+) -> IResult<&'a str, Vec<(Identifier, Option<(i64, i64)>, Option<Expression>)>> {
+    let (input, _) = tag(keyword)(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_name))(input)?;
     let (input, _) = ws(char(';'))(input)?;
+    Ok((input, names))
+}
+
+pub fn parse_integer_declaration(input: &str) -> IResult<&str, Vec<IntegerDeclaration>> {
+    let (input, names) = variable_declaration("integer", input)?;
 
     Ok((
         input,
@@ -31,6 +94,61 @@ pub fn parse_integer_declaration(input: &str) -> IResult<&str, Vec<IntegerDeclar
                 dimensions,
                 init,
             })
+            .collect(),
+    ))
+}
+
+pub fn parse_time_declaration(input: &str) -> IResult<&str, Vec<TimeDeclaration>> {
+    let (input, names) = variable_declaration("time", input)?;
+
+    Ok((
+        input,
+        names
+            .into_iter()
+            .map(|(name, dimensions, init)| TimeDeclaration {
+                name,
+                dimensions,
+                init,
+            })
+            .collect(),
+    ))
+}
+
+/// `real r;` and `realtime t;`, which are the same declaration under two
+/// spellings. The longer keyword is tried first, since `real` is a prefix of
+/// it.
+pub fn parse_real_declaration(input: &str) -> IResult<&str, Vec<RealDeclaration>> {
+    let (input, names) = alt((
+        |input| variable_declaration("realtime", input),
+        |input| variable_declaration("real", input),
+    ))(input)?;
+
+    Ok((
+        input,
+        names
+            .into_iter()
+            .map(|(name, dimensions, init)| RealDeclaration {
+                name,
+                dimensions,
+                init,
+            })
+            .collect(),
+    ))
+}
+
+/// `event a, b;` — a list of names and nothing else. An event has no value, so
+/// unlike the declarations above it takes neither a dimension nor an
+/// initialiser.
+pub fn parse_event_declaration(input: &str) -> IResult<&str, Vec<EventDeclaration>> {
+    let (input, _) = tag("event")(input)?;
+    let (input, names) = separated_list1(ws(char(',')), ws(identifier))(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        names
+            .into_iter()
+            .map(|name| EventDeclaration { name })
             .collect(),
     ))
 }
@@ -156,6 +274,113 @@ mod tests {
                 },
             ],
         );
+    }
+
+    /// A `time` declaration has the shape an `integer` does — a name list, an
+    /// optional array dimension, an optional initialiser — because the keyword
+    /// is the whole of the type.
+    #[test]
+    fn test_parse_time_declaration() {
+        use crate::parsers::helpers::assert_parses_to;
+
+        assert_parses_to(
+            parse_time_declaration,
+            "time phdelay;",
+            vec![TimeDeclaration {
+                name: "phdelay".into(),
+                dimensions: None,
+                init: None,
+            }],
+        );
+
+        assert_parses_to(
+            parse_time_declaration,
+            "time first, marks [0:3];",
+            vec![
+                TimeDeclaration {
+                    name: "first".into(),
+                    dimensions: None,
+                    init: None,
+                },
+                TimeDeclaration {
+                    name: "marks".into(),
+                    dimensions: Some((0, 3)),
+                    init: None,
+                },
+            ],
+        );
+    }
+
+    /// `real array3[2:1];` is the corpus shape: a real *array*, whose address
+    /// dimension belongs to the name exactly as a memory's does.
+    #[test]
+    fn test_parse_real_declaration() {
+        use crate::parsers::helpers::assert_parses_to;
+
+        assert_parses_to(
+            parse_real_declaration,
+            "real r;",
+            vec![RealDeclaration {
+                name: "r".into(),
+                dimensions: None,
+                init: None,
+            }],
+        );
+
+        assert_parses_to(
+            parse_real_declaration,
+            "real array3[2:1];",
+            vec![RealDeclaration {
+                name: "array3".into(),
+                dimensions: Some((2, 1)),
+                init: None,
+            }],
+        );
+
+        // `realtime` is the same declaration under a longer keyword, so it must
+        // not read as `real` followed by a name of `time`.
+        assert_parses_to(
+            parse_real_declaration,
+            "realtime t;",
+            vec![RealDeclaration {
+                name: "t".into(),
+                dimensions: None,
+                init: None,
+            }],
+        );
+    }
+
+    /// An event has no width, no dimension and no value, so the declaration is
+    /// a list of bare names.
+    #[test]
+    fn test_parse_event_declaration() {
+        use crate::parsers::helpers::assert_parses_to;
+
+        assert_parses_to(
+            parse_event_declaration,
+            "event event_ident;",
+            vec![EventDeclaration {
+                name: "event_ident".into(),
+            }],
+        );
+
+        assert_parses_to(
+            parse_event_declaration,
+            "event a, b;",
+            vec![
+                EventDeclaration { name: "a".into() },
+                EventDeclaration { name: "b".into() },
+            ],
+        );
+    }
+
+    /// A keyword only introduces a declaration when what follows it is a name
+    /// of its own: `timer t1;` is not a `time`, and `realm x;` is not a `real`.
+    #[test]
+    fn test_keywords_do_not_swallow_longer_identifiers() {
+        assert!(parse_time_declaration("timer t1;").is_err());
+        assert!(parse_real_declaration("realm x;").is_err());
+        assert!(parse_event_declaration("eventual e1;").is_err());
     }
 
     #[test]

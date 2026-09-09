@@ -64,7 +64,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `delay.rs` | `#<n>` delay terms |
 | `nets.rs` | `wire`/`tri`/... declarations → `Net` |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
-| `integer.rs` | `integer a, b;` declarations |
+| `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
 | `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction` |
@@ -434,16 +434,33 @@ target. Parameter overrides cannot change a width, because `simple.rs::range` on
 literal integers, so `output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built
 but still unwired.
 
+**`time` is a variable, `event` is not, and `real` is a named refusal.** `time t;` is a 64
+bit *unsigned* register and nothing else — `elaborate` declares it at a fixed width the way
+it declares an `integer` at 32 — so it round-trips through the store, through the memory
+map (`time marks [0:3];`) and through `$display` with no other machinery. A named event has
+no value at all: `StateStore` keeps a third namespace for the names, and the whole of an
+event's state is the *trigger journal*, the list of events fired since the last marker.
+`settle` takes it beside the change and memory journals, and `events::trigger_edges` turns
+each entry into a synthesised one-bit `0 -> 1` edge under the event's own name. That is
+what makes `always @(e)` fire **exactly once** per `-> e;` — the round that takes the
+trigger is the only round that can see it, where a value left standing in the store would
+wake the block again on every delta cycle. Reading an event is `EvalError::EventAsValue`,
+the same shape as `MemoryAsValue`: the name exists, it simply is not a value. A `real`
+**parses and then stops** — `elaborate` reports an `Unsupported` naming it — because
+IEEE-754 floating point is not what a `Register` holds (there is no `x` in a float) and the
+expression grammar has no floating point literal to feed one with anyway. The declaration
+is read regardless so that a design using one says that is why it stopped, rather than
+dying on unfamiliar syntax several lines earlier.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression` and the compiling of a `function` into a `FunctionDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
-| `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
+| `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -843,6 +860,14 @@ tripwire.
   every later connection to the wrong port. A single blank is `NoArgs` — `()` is an empty
   argument list, not a one-element list with a gap. A blank *named* connection (`.a()`) and
   a blank in a module *header* (`module m(a,);`) are still parse errors.
+- **`-> e;` is parsed as an assignment to the event's name.** There is no statement kind
+  for a trigger and no instruction for one: a trigger and an ordinary write reach the
+  simulator down the same path, and `exec::resolve_target` is where the store is asked
+  which it is — `ResolvedTarget::Event` for a name declared `event`, which
+  `drive_resolved` fires while dropping the value that was evaluated for it. Assigning to
+  an event is illegal Verilog, so nothing that was already legal is given a second
+  meaning. The trigger is deliberately reported as **not** a change: saying otherwise
+  would keep the continuous assignment fixpoint from ever settling.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

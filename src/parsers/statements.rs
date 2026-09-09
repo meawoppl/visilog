@@ -6,7 +6,11 @@ use super::{
         parse_always_block, parse_function_declaration, parse_initial_block, AlwaysBlock,
         FunctionDeclaration, InitialBlock,
     },
-    integer::{parse_integer_declaration, IntegerDeclaration},
+    integer::{
+        parse_event_declaration, parse_integer_declaration, parse_real_declaration,
+        parse_time_declaration, EventDeclaration, IntegerDeclaration, RealDeclaration,
+        TimeDeclaration,
+    },
     modules::{
         parse_module_instantiation_statement, parse_port_declaration, ModuleInstantiation, Port,
     },
@@ -22,6 +26,12 @@ pub enum ModuleStatement {
     PortDeclaration(Vec<Port>),
     RegisterDeclaration(Vec<RegisterDeclaration>),
     IntegerDeclaration(Vec<IntegerDeclaration>),
+    /// `time t;` — a 64-bit unsigned variable.
+    TimeDeclaration(Vec<TimeDeclaration>),
+    /// `real r;` — parsed so that the simulator can reject it by name.
+    RealDeclaration(Vec<RealDeclaration>),
+    /// `event e;` — a named event, which has no value.
+    EventDeclaration(Vec<EventDeclaration>),
     WireDeclaration(Vec<Net>),
     ParameterDeclaration(Vec<ParameterDeclaration>),
     InitialBlock(InitialBlock),
@@ -43,6 +53,15 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
             }),
             map(parse_integer_declaration, |d| {
                 ModuleStatement::IntegerDeclaration(d)
+            }),
+            map(parse_time_declaration, |d| {
+                ModuleStatement::TimeDeclaration(d)
+            }),
+            map(parse_real_declaration, |d| {
+                ModuleStatement::RealDeclaration(d)
+            }),
+            map(parse_event_declaration, |d| {
+                ModuleStatement::EventDeclaration(d)
             }),
             map(net_declaration, |d| ModuleStatement::WireDeclaration(d)),
             map(parse_parameter_declaration, |d| {

@@ -12,6 +12,7 @@ use crate::parsers::assignment::parse_assignment;
 
 use super::{
     assignment::{assignment_lhs, ProceduralAssignment, ProceduralAssignmentType},
+    constants::VerilogConstant,
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
@@ -209,12 +210,37 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
         map(parse_while_statement, |w| ProceduralStatements::While(w)),
         map(parse_repeat_statement, |r| ProceduralStatements::Repeat(r)),
         map(parse_system_task, |t| ProceduralStatements::SystemTask(t)),
+        parse_event_trigger,
         map(parse_assignment, |a| ProceduralStatements::Assignment(a)),
         // `#5;` is a statement in its own right, so it is tried before the
         // prefix form, whose body would have nothing to match.
         map(parse_delay_statement, |d| ProceduralStatements::Delay(d)),
         parse_delayed_statement,
     ))(input)
+}
+
+/// `-> e;` — trigger a named event.
+///
+/// It is lowered to a blocking assignment to the event's name rather than to a
+/// statement kind of its own, because a trigger and a write then reach the
+/// simulator down the same path: `exec::resolve_target` asks the store what a
+/// name is, and only the store knows this one was declared `event`. The value
+/// assigned is never read. Assigning to an event is illegal Verilog, so
+/// nothing that was already legal is given a second meaning here.
+fn parse_event_trigger(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, _) = ws(tag("->"))(input)?;
+    let (input, name) = ws(identifier)(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        ProceduralStatements::Assignment(ProceduralAssignment::new(
+            Expression::Identifier(name),
+            ProceduralAssignmentType::Blocking,
+            None,
+            Expression::Constant(VerilogConstant::from_int(1)),
+        )),
+    ))
 }
 
 /// `#5 <statement>` — a delay prefixing any procedural statement, including a

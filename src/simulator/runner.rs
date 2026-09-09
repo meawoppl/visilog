@@ -378,6 +378,13 @@ impl Simulator {
             if self.state.any_memory() {
                 edges.extend(events::memory_edges(self.state.take_memory_changes()));
             }
+            // A named event has no value, so it cannot appear in either
+            // journal above: a trigger is recorded as the bare fact that it
+            // happened, and taking it here is what makes it wake a block
+            // exactly once.
+            if self.state.any_event() {
+                edges.extend(events::trigger_edges(self.state.take_triggers()));
+            }
             if edges.is_empty() {
                 return Ok(delta - 1);
             }
@@ -2837,5 +2844,162 @@ mod tests {
                 "narrow[7.00 ns]",
             ]
         );
+    }
+
+    /// The error a design stops elaborating with, for the constructs the
+    /// simulator rejects by name.
+    fn setup_error(source: &str) -> SimulationError {
+        let (remaining, module) = parse_module_declaration(source).expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator
+            .setup()
+            .expect_err("setup should have been rejected")
+    }
+
+    /// A `time` is sixty-four bits wide and unsigned, which is what makes it
+    /// different from an `integer`: it holds a value no thirty-two bit variable
+    /// could, and an array of them indexes like any other memory.
+    #[test]
+    fn test_time_holds_sixty_four_bits() {
+        let mut simulator = simulator_for(
+            r#"
+            module timed();
+                time stamp;
+                time marks [0:1];
+                initial begin
+                    stamp = 64'hDEADBEEFCAFEBABE;
+                    marks[1] = 64'h100000000;
+                    stamp = marks[1] + 1;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("stamp").expect("declared").width(), 64);
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.get("stamp").expect("declared").to_u128(),
+            Some(0x1_0000_0001)
+        );
+    }
+
+    /// A `time` variable round-trips a value through a simulation: it records
+    /// the moment the statement that wrote it ran.
+    #[test]
+    fn test_time_records_the_moment_a_block_ran() {
+        let mut simulator = simulator_for(
+            r#"
+            module timed();
+                time stamp;
+                initial #7 stamp = $time;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(simulator.get("stamp").expect("declared").to_u128(), Some(7));
+    }
+
+    /// A named event wakes a block waiting on it exactly once per trigger.
+    ///
+    /// The count is the point: a trigger is momentary, so it has to wake the
+    /// block on the round that takes it and on no round after — a value left
+    /// standing in the store would wake it again on every delta cycle.
+    #[test]
+    fn test_event_wakes_a_block_once_per_trigger() {
+        let mut simulator = simulator_for(
+            r#"
+            module signalled();
+                event tick;
+                integer count;
+                initial begin
+                    count = 0;
+                    #1 -> tick;
+                    #1 -> tick;
+                    #1 -> tick;
+                end
+                always @(tick) count = count + 1;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.get("count").expect("declared").to_u128(), Some(1));
+
+        // Time passing without a trigger wakes nothing.
+        simulator.advance(0).expect("time should advance");
+        assert_eq!(simulator.get("count").expect("declared").to_u128(), Some(1));
+
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(simulator.get("count").expect("declared").to_u128(), Some(3));
+    }
+
+    /// One trigger wakes every block waiting on the event, and each of them
+    /// once.
+    #[test]
+    fn test_one_trigger_wakes_every_waiting_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module signalled();
+                event tick;
+                integer here;
+                integer there;
+                initial begin
+                    here = 0;
+                    there = 0;
+                    #1 -> tick;
+                end
+                always @(tick) here = here + 1;
+                always @(tick) there = there + 10;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("here").expect("declared").to_u128(), Some(1));
+        assert_eq!(
+            simulator.get("there").expect("declared").to_u128(),
+            Some(10)
+        );
+    }
+
+    /// An event has no value, so reading one is an error naming it rather than
+    /// a plausible pattern of bits.
+    #[test]
+    fn test_event_used_as_a_value_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module signalled();
+                event tick;
+                reg [3:0] q;
+                initial q = tick;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "event `tick` has no value; it can only be triggered"
+        );
+    }
+
+    /// A `real` is IEEE-754 floating point, which this simulator does not
+    /// model. The declaration parses so that the design stops with a message
+    /// saying so, rather than on a parse error somewhere inside it.
+    #[test]
+    fn test_real_is_rejected_by_name() {
+        for source in [
+            "module floating(); real r; endmodule",
+            "module floating(); real array3[2:1]; endmodule",
+            "module floating(); realtime t; endmodule",
+        ] {
+            assert_eq!(
+                setup_error(source).to_string(),
+                "a `real` variable is not supported by the simulator",
+                "{}",
+                source
+            );
+        }
     }
 }
