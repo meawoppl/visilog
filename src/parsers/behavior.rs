@@ -16,6 +16,7 @@ use super::{
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
+    keywords::is_reserved_word,
     simple::{range, signedness, ws, ws_and_comments, Range},
     string::parse_verilog_string,
 };
@@ -214,6 +215,15 @@ pub enum ProceduralStatements {
     /// ends it, so only a `#delay` in it lets time move.
     Forever(Vec<ProceduralStatements>),
     SystemTask(SystemTaskCall),
+    /// `my_task(a, b);` or a bare `my_task;` — a task enable.
+    ///
+    /// A task returns nothing, so this is a statement rather than an
+    /// [`Expression`]: the values it produces come back through its `output`
+    /// and `inout` arguments.
+    TaskEnable {
+        name: Identifier,
+        arguments: Vec<Expression>,
+    },
 }
 
 pub enum ProceduralBlock {
@@ -243,6 +253,7 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
         // prefix form, whose body would have nothing to match.
         map(parse_delay_statement, |d| ProceduralStatements::Delay(d)),
         parse_delayed_statement,
+        parse_task_enable,
     ))(input)
 }
 
@@ -267,6 +278,38 @@ fn parse_event_trigger(input: &str) -> IResult<&str, ProceduralStatements> {
             None,
             Expression::Constant(VerilogConstant::from_int(1)),
         )),
+    ))
+}
+
+/// `my_task(a, b);`, or a bare `my_task;` for a task that takes no arguments.
+///
+/// It is tried after every other statement form because a bare identifier
+/// followed by `;` is the loosest shape a statement has: everything else is
+/// led by a keyword, by a `$name`, or by an assignment's `=`.
+fn parse_task_enable(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, name) = ws(identifier)(input)?;
+    // `wait (a);` has exactly this shape, and so does every statement form the
+    // grammar has yet to learn. A task's name is an identifier, and a reserved
+    // word is not one.
+    if is_reserved_word(&name.name) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let (input, arguments) = opt(delimited(
+        ws(char('(')),
+        separated_list0(char(','), ws(verilog_expression)),
+        ws(char(')')),
+    ))(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        ProceduralStatements::TaskEnable {
+            name,
+            arguments: arguments.unwrap_or_default(),
+        },
     ))
 }
 
@@ -653,7 +696,8 @@ pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
     Ok((input, assignments))
 }
 
-/// One variable a `function` declares: an argument or a body-local.
+/// One variable a `function` or a `task` declares: an argument or a
+/// body-local.
 ///
 /// A function's *own name* is one of these too — it is the variable the body
 /// assigns to return a value — which is why the return width and the width of
@@ -711,13 +755,14 @@ impl Default for DeclaredType {
 /// The type part of a variable declaration: an optional storage keyword, an
 /// optional `signed`, and either an `integer` or a range.
 ///
-/// `integer` is written *instead of* a range and carries its own width and
-/// signedness, so a declaration never has both.
+/// `integer` and `time` are written *instead of* a range and carry their own
+/// width — 32 bits signed and 64 bits unsigned respectively — so a declaration
+/// never has both.
 fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
     let (input, storage) = opt(alt((
-        |i| keyword(i, "reg"),
-        |i| keyword(i, "wire"),
-        |i| keyword(i, "time"),
+        value(false, |i| keyword(i, "reg")),
+        value(false, |i| keyword(i, "wire")),
+        value(true, |i| keyword(i, "time")),
     )))(input)?;
     let (input, integer) = opt(|i| keyword(i, "integer"))(input)?;
     let (input, _) = ws_and_comments(input)?;
@@ -728,10 +773,13 @@ fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
     Ok((
         input,
         DeclaredType {
-            range: match (integer.is_some(), &declared) {
-                (true, _) => Range::Constant(31, 0),
-                (false, Some(declared)) => declared.clone(),
-                (false, None) => Range::SINGLE_BIT,
+            // `storage` is `Some(true)` for a `time`, whose 64 bits are what
+            // the keyword means rather than a range it was written with.
+            range: match (integer.is_some(), storage, &declared) {
+                (true, _, _) => Range::Constant(31, 0),
+                (false, _, Some(declared)) => declared.clone(),
+                (false, Some(true), None) => Range::Constant(63, 0),
+                (false, _, None) => Range::SINGLE_BIT,
             },
             // An `integer` is signed by being an `integer`.
             signed: signed || integer.is_some(),
@@ -849,6 +897,197 @@ pub fn parse_function_declaration(input: &str) -> IResult<&str, FunctionDeclarat
             name,
             range: returns.range,
             signed: returns.signed,
+            arguments,
+            locals,
+            statements,
+        },
+    ))
+}
+
+/// Which way a task argument is copied.
+///
+/// A function has inputs and nothing else; a task is a statement, so it hands
+/// results back through its arguments instead of through a return value.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TaskDirection {
+    Input,
+    Output,
+    Inout,
+}
+
+impl TaskDirection {
+    /// Whether the caller's expression is copied *into* the argument when the
+    /// task starts.
+    pub fn copies_in(self) -> bool {
+        matches!(self, TaskDirection::Input | TaskDirection::Inout)
+    }
+
+    /// Whether the argument is copied *back* to the caller when the task
+    /// returns.
+    pub fn copies_back(self) -> bool {
+        matches!(self, TaskDirection::Output | TaskDirection::Inout)
+    }
+}
+
+/// One argument of a task: a variable, plus which way it is copied.
+#[derive(Debug, PartialEq, Clone)]
+pub struct TaskArgument {
+    pub direction: TaskDirection,
+    pub variable: FunctionVariable,
+}
+
+/// `task load; input [7:0] a; output [7:0] b; b = a + 1; endtask`
+///
+/// The arguments may be written either the 1995 way, as direction declarations
+/// *inside* the body, or the 2001 way, as a parenthesised list after the name.
+/// Both fill [`arguments`](TaskDeclaration::arguments) in call order.
+#[derive(Debug, PartialEq)]
+pub struct TaskDeclaration {
+    pub name: Identifier,
+    pub arguments: Vec<TaskArgument>,
+    /// Body-local `reg` and `integer` declarations.
+    pub locals: Vec<FunctionVariable>,
+    pub statements: Vec<ProceduralStatements>,
+}
+
+/// The direction keyword that marks a task argument.
+fn task_direction(input: &str) -> IResult<&str, TaskDirection> {
+    alt((
+        value(TaskDirection::Input, |i| keyword(i, "input")),
+        value(TaskDirection::Output, |i| keyword(i, "output")),
+        value(TaskDirection::Inout, |i| keyword(i, "inout")),
+    ))(input)
+}
+
+/// One item inside a task body: `input [7:0] a;`, `reg [3:0] tmp;`. The
+/// direction is `None` for a body-local.
+///
+/// Like [`function_item`] this gives up unless it saw a direction or a type,
+/// which is what lets `many0` stop at the first statement of the body.
+fn task_item(input: &str) -> IResult<&str, (Option<TaskDirection>, Vec<FunctionVariable>)> {
+    let (input, direction) = opt(task_direction)(input)?;
+    let (input, declared) = declared_type(input)?;
+    if direction.is_none() && !declared.explicit {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let (input, names) = identifier_list(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        (
+            direction,
+            names
+                .into_iter()
+                .map(|name| FunctionVariable {
+                    name,
+                    range: declared.range.clone(),
+                    signed: declared.signed,
+                })
+                .collect(),
+        ),
+    ))
+}
+
+/// One element of a 2001 task argument list: `output [7:0] b`, or a bare `c`
+/// that inherits the element before it.
+fn ansi_task_argument(
+    input: &str,
+) -> IResult<&str, (Option<TaskDirection>, DeclaredType, Identifier)> {
+    let (input, direction) = opt(task_direction)(input)?;
+    let (input, declared) = declared_type(input)?;
+    let (input, name) = ws(identifier)(input)?;
+    Ok((input, (direction, declared, name)))
+}
+
+/// `(input [7:0] a, b, output c)` — the 2001 argument list.
+///
+/// An element that names neither a direction nor a type takes both from the
+/// element before it, so `a` and `b` above are both eight bits. Naming a
+/// direction *resets* the type, which is why `c` is one bit rather than eight
+/// — the same reading iverilog takes.
+fn ansi_task_arguments(input: &str) -> IResult<&str, Vec<TaskArgument>> {
+    let (input, elements) = delimited(
+        ws(char('(')),
+        separated_list0(char(','), ws(ansi_task_argument)),
+        ws(char(')')),
+    )(input)?;
+
+    let mut inherited = DeclaredType::default();
+    let mut direction = TaskDirection::Input;
+    let mut arguments = Vec::with_capacity(elements.len());
+    for (declared_direction, declared, name) in elements {
+        if let Some(declared_direction) = declared_direction {
+            direction = declared_direction;
+            inherited = DeclaredType::default();
+        }
+        if declared.explicit {
+            inherited = declared;
+        }
+        arguments.push(TaskArgument {
+            direction,
+            variable: FunctionVariable {
+                name,
+                range: inherited.range.clone(),
+                signed: inherited.signed,
+            },
+        });
+    }
+    Ok((input, arguments))
+}
+
+/// `task name; <declarations> <statements> endtask`.
+///
+/// A name declared twice — `input [7:0] x;` followed by `reg [7:0] x;`, which
+/// is how the 1995 form spells out an argument's data type — is one argument,
+/// not an argument and a local: the later declaration refines the type the
+/// direction introduced.
+pub fn parse_task_declaration(input: &str) -> IResult<&str, TaskDeclaration> {
+    let (input, _) = keyword(input, "task")?;
+    let (input, _) = opt(|i| keyword(i, "automatic"))(input)?;
+    let (input, name) = ws(identifier)(input)?;
+    let (input, ansi) = opt(ansi_task_arguments)(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    let (input, items) = many0(task_item)(input)?;
+    let (input, statements) = alt((parse_block, statement_run))(input)?;
+    let (input, _) = ws(tag("endtask"))(input)?;
+
+    let mut arguments = ansi.unwrap_or_default();
+    let mut locals: Vec<FunctionVariable> = Vec::new();
+    for (direction, variables) in items {
+        for variable in variables {
+            let declared = arguments
+                .iter()
+                .position(|argument| argument.variable.name == variable.name);
+            match (declared, direction) {
+                // A direction the argument already has: the type it names is
+                // the one that counts.
+                (Some(index), None) => arguments[index].variable = variable,
+                (Some(index), Some(direction)) => arguments[index].direction = direction,
+                // A direction for something already declared as a local: it was
+                // an argument all along, and takes its position here.
+                (None, Some(direction)) => {
+                    let variable = match locals.iter().position(|l| l.name == variable.name) {
+                        Some(index) => locals.remove(index),
+                        None => variable,
+                    };
+                    arguments.push(TaskArgument {
+                        direction,
+                        variable,
+                    });
+                }
+                (None, None) => locals.push(variable),
+            }
+        }
+    }
+
+    Ok((
+        input,
+        TaskDeclaration {
+            name,
             arguments,
             locals,
             statements,
@@ -1655,6 +1894,150 @@ mod tests {
 
         assert!(function.signed);
         assert!(function.arguments[0].signed);
+    }
+
+    /// A task reads its arguments the 1995 way, as direction declarations
+    /// inside the body, and keeps them in call order.
+    #[test]
+    fn test_parse_task_declaration_1995_style() {
+        let task = assert_parses(
+            parse_task_declaration,
+            r#"task load;
+                 input [7:0] a;
+                 output [7:0] b;
+                 inout c;
+                 reg [7:0] tmp;
+                 begin
+                   tmp = a;
+                   b = tmp + 1;
+                 end
+               endtask"#,
+        );
+
+        assert_eq!(task.name, "load".into());
+        assert_eq!(task.arguments.len(), 3);
+        assert_eq!(task.arguments[0].direction, TaskDirection::Input);
+        assert_eq!(task.arguments[0].variable.range, Range::Constant(7, 0));
+        assert_eq!(task.arguments[1].direction, TaskDirection::Output);
+        assert_eq!(task.arguments[2].direction, TaskDirection::Inout);
+        assert_eq!(task.arguments[2].variable.range, Range::SINGLE_BIT);
+        assert_eq!(task.locals.len(), 1);
+        assert_eq!(task.locals[0].name, "tmp".into());
+        assert_eq!(task.statements.len(), 2);
+    }
+
+    /// The 2001 form puts the arguments in a parenthesised list. A bare name
+    /// inherits the element before it; naming a direction *resets* the type,
+    /// so `c` below is one bit rather than eight — which is how iverilog reads
+    /// it too.
+    #[test]
+    fn test_parse_task_declaration_2001_style() {
+        let task = assert_parses(
+            parse_task_declaration,
+            "task load(input [7:0] a, b, output c); c = a + b; endtask",
+        );
+
+        assert_eq!(task.arguments.len(), 3);
+        assert_eq!(task.arguments[0].variable.range, Range::Constant(7, 0));
+        assert_eq!(task.arguments[1].variable.name, "b".into());
+        assert_eq!(task.arguments[1].variable.range, Range::Constant(7, 0));
+        assert_eq!(task.arguments[1].direction, TaskDirection::Input);
+        assert_eq!(task.arguments[2].direction, TaskDirection::Output);
+        assert_eq!(task.arguments[2].variable.range, Range::SINGLE_BIT);
+    }
+
+    /// A task that takes nothing may still be written with an empty argument
+    /// list, and one with an empty body parses to no statements at all.
+    #[test]
+    fn test_parse_task_declaration_minimal() {
+        let task = assert_parses(parse_task_declaration, "task foo(); endtask");
+
+        assert!(task.arguments.is_empty());
+        assert!(task.locals.is_empty());
+        assert!(task.statements.is_empty());
+    }
+
+    /// The 1995 form may spell an argument's data type out separately, which
+    /// makes one argument rather than an argument and a local.
+    #[test]
+    fn test_parse_task_argument_declared_twice_is_one_argument() {
+        let task = assert_parses(
+            parse_task_declaration,
+            "task t; input x; reg [7:0] x; t = x; endtask",
+        );
+
+        assert_eq!(task.arguments.len(), 1);
+        assert_eq!(task.arguments[0].direction, TaskDirection::Input);
+        assert_eq!(task.arguments[0].variable.range, Range::Constant(7, 0));
+        assert!(task.locals.is_empty());
+    }
+
+    /// A `time` variable is 64 bits by being a `time`, the way an `integer` is
+    /// 32 by being an `integer`.
+    #[test]
+    fn test_parse_task_time_argument_is_sixty_four_bits() {
+        let task = assert_parses(
+            parse_task_declaration,
+            "task t; output time stamp; integer i; stamp = 0; endtask",
+        );
+
+        assert_eq!(task.arguments[0].variable.range, Range::Constant(63, 0));
+        assert!(!task.arguments[0].variable.signed);
+        assert_eq!(task.locals[0].range, Range::Constant(31, 0));
+        assert!(task.locals[0].signed);
+    }
+
+    /// A task enable is a statement, with or without an argument list.
+    #[test]
+    fn test_parse_task_enable() {
+        assert_parses_to(
+            procedural_statement,
+            "my_task(a, 1);",
+            ProceduralStatements::TaskEnable {
+                name: "my_task".into(),
+                arguments: vec![
+                    Expression::Identifier("a".into()),
+                    Expression::Constant(VerilogConstant::from_int(1)),
+                ],
+            },
+        );
+
+        assert_parses_to(
+            procedural_statement,
+            "my_task;",
+            ProceduralStatements::TaskEnable {
+                name: "my_task".into(),
+                arguments: Vec::new(),
+            },
+        );
+    }
+
+    /// A bare identifier followed by `;` is the loosest statement shape there
+    /// is, so the enable has to be tried last: every keyword-led statement and
+    /// every assignment still reads as itself.
+    #[test]
+    fn test_task_enable_does_not_shadow_other_statements() {
+        let statements = assert_parses(
+            parse_block,
+            r#"begin
+                 a = 1;
+                 forever_more = 2;
+                 $display("x");
+                 disable_me;
+                 #5;
+               end"#,
+        );
+
+        assert!(matches!(
+            statements.as_slice(),
+            [
+                ProceduralStatements::Assignment(_),
+                ProceduralStatements::Assignment(_),
+                ProceduralStatements::SystemTask(_),
+                ProceduralStatements::TaskEnable { .. },
+                ProceduralStatements::Delay(_),
+            ]
+        ));
     }
 
     /// `assign` inside a block is a *procedural* continuous assignment, and it

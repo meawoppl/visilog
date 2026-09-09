@@ -58,7 +58,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
 | `string.rs` | double-quoted string literals |
 | `identifier.rs` | `Identifier`, identifier lists, bit/part select |
-| `keywords.rs` | the `VerilogKeyword` enum and lookup |
+| `keywords.rs` | the `VerilogKeyword` enum and lookup for what SystemVerilog added, and `is_reserved_word` for the IEEE 1364-2005 set |
 | `operators.rs` | `UnaryOperator` / `BinaryOperator` and their token parsers |
 | `expr.rs` | the expression grammar — the biggest and trickiest file |
 | `delay.rs` | `#<n>` delay terms |
@@ -67,7 +67,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
-| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction`, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
+| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
@@ -471,11 +471,57 @@ value, since writes made while it was forced never landed — unless a procedura
 is still installed, in which case that one takes over. iverilog reads the LRM the other
 way for a variable and leaves the forced value in place (corpus `pr1477190`).
 
-Still unsupported: **tasks** (`task … endtask` and a call to one) — a task may consume
-time, so a call to one is a suspendable statement and interacts with `resume` the way a
-delay does, which a function never has to; intra-assignment delays (`a = #5 b;` — the held
-right hand side does not fit in a program counter); and concatenation as an assignment
-target. A drive is also tracked per signal *name* rather than per bit, so
+**A task is inlined where it is enabled, which is what makes a `#delay` inside one
+work.** `task load; input [7:0] a; output [7:0] b; b = a + 1; endtask` parses in the same
+two forms a `function` does, and `my_task(x, y);` — or a bare `my_task;` — is a
+`ProceduralStatements::TaskEnable`, a *statement*: a task returns nothing, so its results
+come back through its `output` and `inout` arguments rather than through a value. It is
+deliberately not the shape a function takes. A function is compiled once and *called*
+against a frame; a task may consume time, and the only state a suspension keeps is a
+program counter and the `StateStore`, so a call that could suspend has nowhere to leave
+itself. `Program::splice` therefore copies the compiled body into the caller's own
+instruction list, with every jump target and every `$repeat$` counter shifted by where it
+landed — after which a delay inside a task is the delay machinery that was already there,
+and nothing in `resume` had to learn about tasks at all.
+
+An enable is the copy-in, the body, and the copy-out: an `input` or `inout` argument is
+written before the body runs, an `output` or `inout` one is written back to the caller's
+variable *after* it, which is where the LRM and iverilog both put it (`tk(a, b, a)` with
+`inout` `a` leaves the caller's `a` holding what the task left in it). Both halves are
+ordinary `Instruction::Blocking`s, so a copy is sized and signed by its target the way
+every other assignment is, and an argument the caller passes as a constant fails as an
+`UnsupportedTarget` only if the task tries to write it back.
+
+**A task's variables are static, and are ordinary store entries under a dotted name.**
+`elaborate::declare_tasks` puts the arguments and locals of task `load` in the store as
+`load.a`, `load.b` — qualified per instance like anything else, so two instances of a
+module count separately, and shared between two enables of one task exactly as the LRM
+says a non-`automatic` task's storage is. That is also what tells a task local apart from
+a design signal of the same name: `compile_task` renames the body through the task's own
+names *only*, and `Program::rename_local` skips the ranges already spliced in from a
+nested enable — renaming a body twice would re-point a signal the inner task read at a
+variable the outer one happens to spell the same way.
+
+Those declarations are the *only* place a task's widths are recorded, and they go through
+`resolve_range` like every other declaration, so `input [WIDTH-1:0] a;` is sized from the
+parameters in scope and a parent's override reaches it. A `TaskParameter` therefore keeps
+the argument's name and direction and nothing else: an assignment to it is sized and
+signed by the store entry, and a second copy of the width here could only disagree with
+the first.
+
+Three things about an enable are named errors rather than silent no-ops: a task the module
+does not declare (`UnknownTask`), the wrong number of arguments (`TaskArity`), and a task
+that enables itself directly or around a cycle (`RecursiveTask`) — inlining does not
+terminate on one, and a static task's storage means real Verilog cannot recurse either.
+`declare_tasks` compiles in dependency order by repeating until a pass compiles nothing
+new, so a task may enable one declared further down the file.
+
+Still unsupported: `disable` (both `disable <task>` and the named-block form — cancelling a
+block that has already suspended is not something a program counter alone can express);
+a hierarchical enable (`instance.task(…)`); a task enabled from inside a `function`, which
+is rejected by the function body analysis rather than by a check of its own; and
+intra-assignment delays (`a = #5 b;` — the held right hand side does not fit in a program
+counter) and concatenation as an assignment target. A drive is also tracked per signal *name* rather than per bit, so
 `force bus[0] = 1;` blocks a write to `bus[1]` as well — corpus `pr1832097a`, `pr245`,
 `pr527` and the `_pv` pair are that one gap. `signals.rs` is built but still unwired.
 
@@ -498,11 +544,11 @@ is read regardless so that a design using one says that is why it stopped, rathe
 dying on unfamiliar syntax several lines earlier.
 | File | Role |
 | --- | --- |
-| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope) and the compiling of a `function` into a `FunctionDefinition` |
+| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope) and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, and `TaskDefinition` / `Program::splice`, which inlines one into another |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `permits_write` answers |
@@ -916,6 +962,18 @@ tripwire.
   an event is illegal Verilog, so nothing that was already legal is given a second
   meaning. The trigger is deliberately reported as **not** a change: saying otherwise
   would keep the continuous assignment fixpoint from ever settling.
+- **A task enable is the loosest statement shape there is, so it must not claim a reserved
+  word.** `my_task;` and `my_task(a);` are a bare identifier followed by `;` or by an
+  argument list — which is also exactly what `wait (a);` looks like, and what every
+  statement form the grammar has yet to learn will look like. `parse_task_enable` is tried
+  last in `procedural_statement`'s `alt` *and* rejects anything `keywords::is_reserved_word`
+  knows, so `wait (1);` is still a parse error rather than a task nothing declared. Without
+  that guard five corpus files stop being parse failures and become `UnknownTask` failures
+  instead, which is a worse answer wearing a better one's clothes.
+- **A `time` variable inside a `function` or `task` is 64 bits by being a `time`**, the way
+  an `integer` is 32 by being an `integer`. `behavior.rs::declared_type` reads the keyword
+  rather than treating it as a bare storage class, so `output time stamp;` is a 64-bit
+  unsigned argument.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

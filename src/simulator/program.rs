@@ -19,14 +19,15 @@
 //! evaluates its right hand side now but hands the write back as a
 //! [`PendingUpdate`] for [`commit_updates`](super::exec::commit_updates).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
 use crate::parsers::behavior::{
     CaseKind, CaseLabel, CaseStatement, ForStatement, IfStatement, ProceduralStatements,
-    RepeatStatement, WhileStatement,
+    RepeatStatement, TaskDirection, WhileStatement,
 };
 use crate::parsers::expr::Expression;
+use crate::parsers::identifier::Identifier;
 use crate::register::Register;
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, eval_sized};
@@ -131,9 +132,17 @@ pub enum Instruction {
 }
 
 /// A procedural block flattened into instructions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Program {
     instructions: Vec<Instruction>,
+    /// Half-open instruction ranges that came from an enabled task's body
+    /// rather than from this block's own statements.
+    ///
+    /// The names in one of those have already been resolved against the task
+    /// that owns them, so [`rename_local`](Program::rename_local) has to leave
+    /// them alone: a task local called `count` and a design signal called
+    /// `count` are different variables, and renaming twice would confuse them.
+    inlined: Vec<(usize, usize)>,
 }
 
 /// Why [`resume`] gave control back.
@@ -149,6 +158,35 @@ pub enum Resume {
     },
 }
 
+/// Rewrites every name one instruction uses through `resolve`.
+fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> String) {
+    match instruction {
+        Instruction::Blocking { target, value }
+        | Instruction::NonBlocking { target, value }
+        | Instruction::Assign { target, value }
+        | Instruction::Force { target, value } => {
+            rename_expression(target, resolve);
+            rename_expression(value, resolve);
+        }
+        Instruction::Deassign(target) | Instruction::Release(target) => {
+            rename_expression(target, resolve)
+        }
+        Instruction::JumpIfFalse { condition, .. } => rename_expression(condition, resolve),
+        Instruction::CaseSubject(subject) => rename_expression(subject, resolve),
+        Instruction::JumpIfMatch { label, .. } => rename_expression(label, resolve),
+        // A `repeat` counter is qualified like any other signal, which is what
+        // gives two instances of the same module a counter each rather than one
+        // they trample on together.
+        Instruction::RepeatInit { counter, count } => {
+            *counter = resolve(counter);
+            rename_expression(count, resolve);
+        }
+        Instruction::RepeatNext { counter, .. } => *counter = resolve(counter),
+        Instruction::Task(call) => call.rename(resolve),
+        Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
+    }
+}
+
 impl Program {
     /// Flattens a statement body into instructions.
     ///
@@ -156,13 +194,34 @@ impl Program {
     /// (`a = #5 b;`), whose right hand side has to be carried across the
     /// suspension: a resume point is only a program counter, so there is
     /// nowhere to keep it.
-    pub fn compile(statements: &[ProceduralStatements]) -> Result<Program, SimulationError> {
-        let mut program = Program {
-            instructions: Vec::new(),
-        };
-        program.compile_statements(statements)?;
+    pub fn compile(
+        statements: &[ProceduralStatements],
+        tasks: &TaskTable,
+    ) -> Result<Program, SimulationError> {
+        let mut program = Program::compile_body(statements, tasks)?;
         program.emit(Instruction::Halt);
         Ok(program)
+    }
+
+    /// The same, without the trailing [`Instruction::Halt`] — a task's body,
+    /// which is spliced into the middle of whatever enables it and so must not
+    /// end the block it lands in.
+    pub fn compile_body(
+        statements: &[ProceduralStatements],
+        tasks: &TaskTable,
+    ) -> Result<Program, SimulationError> {
+        let mut program = Program::default();
+        program.compile_statements(statements, tasks)?;
+        Ok(program)
+    }
+
+    /// Whether any enabled task's body was inlined into this program.
+    ///
+    /// The statement tree keeps no trace of what a task's body reads, so an
+    /// `@(*)` block that enables one has to take its sensitivity list from the
+    /// compiled instructions instead.
+    pub fn inlines_a_task(&self) -> bool {
+        !self.inlined.is_empty()
     }
 
     /// Whether the block does nothing at all, i.e. it compiled to a bare
@@ -186,37 +245,67 @@ impl Program {
     /// owns its expressions outright.
     pub fn rename(&mut self, resolve: &dyn Fn(&str) -> String) {
         for instruction in &mut self.instructions {
-            match instruction {
-                Instruction::Blocking { target, value }
-                | Instruction::NonBlocking { target, value }
-                | Instruction::Assign { target, value }
-                | Instruction::Force { target, value } => {
-                    rename_expression(target, resolve);
-                    rename_expression(value, resolve);
-                }
-                Instruction::Deassign(target) | Instruction::Release(target) => {
-                    rename_expression(target, resolve)
-                }
-                Instruction::JumpIfFalse { condition, .. } => rename_expression(condition, resolve),
-                Instruction::CaseSubject(subject) => rename_expression(subject, resolve),
-                Instruction::JumpIfMatch { label, .. } => rename_expression(label, resolve),
-                // A `repeat` counter is qualified like any other signal, which
-                // is what gives two instances of the same module a counter
-                // each rather than one they trample on together.
-                Instruction::RepeatInit { counter, count } => {
-                    *counter = resolve(counter);
-                    rename_expression(count, resolve);
-                }
-                Instruction::RepeatNext { counter, .. } => *counter = resolve(counter),
-                Instruction::Task(call) => call.rename(resolve),
-                Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
-            }
+            rename_instruction(instruction, resolve);
         }
+    }
+
+    /// Rewrites the names this program's *own* statements use, leaving the
+    /// instructions spliced in from a task's body untouched.
+    ///
+    /// That is what keeps a task's locals distinct from the caller's: by the
+    /// time a body is spliced in its names are already resolved, and a second
+    /// pass with the caller's map would re-point a design signal the inner task
+    /// read at a variable the outer one happens to declare under the same name.
+    pub fn rename_local(&mut self, resolve: &dyn Fn(&str) -> String) {
+        let mut skipping = self.inlined.iter().peekable();
+        let mut index = 0;
+        while index < self.instructions.len() {
+            if let Some((start, end)) = skipping.peek() {
+                if index == *start {
+                    index = *end;
+                    skipping.next();
+                    continue;
+                }
+            }
+            rename_instruction(&mut self.instructions[index], resolve);
+            index += 1;
+        }
+    }
+
+    /// Appends a task body, recording it as inlined.
+    ///
+    /// Jump targets are indices into the instruction list, so every one of them
+    /// shifts by where the body lands. So does a `repeat` counter's name, which
+    /// is derived from the index of its own `RepeatInit`: two enables of one
+    /// task are two loops, and a shared counter would let them count each other
+    /// down.
+    fn splice(&mut self, body: &Program) {
+        let offset = self.instructions.len();
+        for instruction in &body.instructions {
+            let mut instruction = instruction.clone();
+            match &mut instruction {
+                Instruction::Jump(target)
+                | Instruction::JumpIfFalse { target, .. }
+                | Instruction::JumpIfMatch { target, .. }
+                | Instruction::RepeatNext { target, .. } => *target += offset,
+                _ => {}
+            }
+            match &mut instruction {
+                Instruction::RepeatInit { counter, .. }
+                | Instruction::RepeatNext { counter, .. } => {
+                    *counter = format!("{}${}", counter, offset)
+                }
+                _ => {}
+            }
+            self.instructions.push(instruction);
+        }
+        self.inlined.push((offset, self.instructions.len()));
     }
 
     fn compile_statements(
         &mut self,
         statements: &[ProceduralStatements],
+        tasks: &TaskTable,
     ) -> Result<(), SimulationError> {
         for statement in statements {
             match statement {
@@ -229,7 +318,7 @@ impl Program {
                 // one at the top level does.
                 ProceduralStatements::Delayed { delay, statements } => {
                     self.emit(Instruction::Delay(delay.ticks()));
-                    self.compile_statements(statements)?;
+                    self.compile_statements(statements, tasks)?;
                 }
                 ProceduralStatements::Assignment(assignment) => {
                     self.compile_assignment(assignment)?
@@ -254,12 +343,22 @@ impl Program {
                 ProceduralStatements::Release(target) => {
                     self.emit(Instruction::Release(target.clone()));
                 }
-                ProceduralStatements::If(conditional) => self.compile_if(conditional)?,
-                ProceduralStatements::Case(case) => self.compile_case(case)?,
-                ProceduralStatements::For(statement) => self.compile_for(statement)?,
-                ProceduralStatements::While(statement) => self.compile_while(statement)?,
-                ProceduralStatements::Repeat(statement) => self.compile_repeat(statement)?,
-                ProceduralStatements::Forever(statements) => self.compile_forever(statements)?,
+                ProceduralStatements::If(conditional) => self.compile_if(conditional, tasks)?,
+                ProceduralStatements::Case(case) => self.compile_case(case, tasks)?,
+                ProceduralStatements::For(statement) => self.compile_for(statement, tasks)?,
+                ProceduralStatements::While(statement) => self.compile_while(statement, tasks)?,
+                ProceduralStatements::Repeat(statement) => self.compile_repeat(statement, tasks)?,
+                ProceduralStatements::Forever(statements) => {
+                    self.compile_forever(statements, tasks)?
+                }
+                // A task's body is spliced in where the enable stands, with its
+                // arguments copied in ahead of it and back out behind it. That
+                // is what makes a `#delay` inside a task suspend the block that
+                // enabled it: the resume point is already a program counter,
+                // and the body's instructions are in that same list.
+                ProceduralStatements::TaskEnable { name, arguments } => {
+                    self.compile_task_enable(name, arguments, tasks)?
+                }
                 // Which `$name`s exist is settled here rather than while the
                 // design runs, so an unrecognised one fails before it can look
                 // like a task that quietly printed nothing.
@@ -291,19 +390,23 @@ impl Program {
 
     /// `if (c) T else E` becomes
     /// `JumpIfFalse(c, else); T; Jump(end); else: E; end:`.
-    fn compile_if(&mut self, conditional: &IfStatement) -> Result<(), SimulationError> {
+    fn compile_if(
+        &mut self,
+        conditional: &IfStatement,
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
         let branch = self.emit(Instruction::JumpIfFalse {
             condition: conditional.condition.clone(),
             target: 0,
         });
-        self.compile_statements(&conditional.then_statements)?;
+        self.compile_statements(&conditional.then_statements, tasks)?;
 
         match &conditional.else_statements {
             Some(else_statements) => {
                 let skip_else = self.emit(Instruction::Jump(0));
                 let else_start = self.next();
                 self.patch(branch, else_start);
-                self.compile_statements(else_statements)?;
+                self.compile_statements(else_statements, tasks)?;
                 let end = self.next();
                 self.patch(skip_else, end);
             }
@@ -321,13 +424,17 @@ impl Program {
     /// The condition is re-evaluated at the top of every iteration, and an `x`
     /// or `z` one ends the loop — `JumpIfFalse` reads a condition the way `if`
     /// does.
-    fn compile_while(&mut self, statement: &WhileStatement) -> Result<(), SimulationError> {
+    fn compile_while(
+        &mut self,
+        statement: &WhileStatement,
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
         let top = self.next();
         let branch = self.emit(Instruction::JumpIfFalse {
             condition: statement.condition.clone(),
             target: 0,
         });
-        self.compile_statements(&statement.statements)?;
+        self.compile_statements(&statement.statements, tasks)?;
         self.emit(Instruction::Jump(top));
         let end = self.next();
         self.patch(branch, end);
@@ -337,14 +444,18 @@ impl Program {
     /// `for (i; c; s) B` is the `while` shape with the initialiser in front of
     /// it and the step in front of the back-jump, so `continue`-less Verilog
     /// runs `s` after every completed iteration and never after the test fails.
-    fn compile_for(&mut self, statement: &ForStatement) -> Result<(), SimulationError> {
+    fn compile_for(
+        &mut self,
+        statement: &ForStatement,
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
         self.compile_assignment(&statement.initializer)?;
         let top = self.next();
         let branch = self.emit(Instruction::JumpIfFalse {
             condition: statement.condition.clone(),
             target: 0,
         });
-        self.compile_statements(&statement.statements)?;
+        self.compile_statements(&statement.statements, tasks)?;
         self.compile_assignment(&statement.step)?;
         self.emit(Instruction::Jump(top));
         let end = self.next();
@@ -363,7 +474,11 @@ impl Program {
     /// program counter and the store. The counter's name is derived from the
     /// index of its own `RepeatInit`, so nested and sibling `repeat`s each get
     /// their own.
-    fn compile_repeat(&mut self, statement: &RepeatStatement) -> Result<(), SimulationError> {
+    fn compile_repeat(
+        &mut self,
+        statement: &RepeatStatement,
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
         let counter = format!("{}{}", REPEAT_COUNTER_PREFIX, self.next());
         self.emit(Instruction::RepeatInit {
             counter: counter.clone(),
@@ -372,7 +487,7 @@ impl Program {
 
         let top = self.next();
         let branch = self.emit(Instruction::RepeatNext { counter, target: 0 });
-        self.compile_statements(&statement.statements)?;
+        self.compile_statements(&statement.statements, tasks)?;
         self.emit(Instruction::Jump(top));
         let end = self.next();
         self.patch(branch, end);
@@ -384,9 +499,10 @@ impl Program {
     fn compile_forever(
         &mut self,
         statements: &[ProceduralStatements],
+        tasks: &TaskTable,
     ) -> Result<(), SimulationError> {
         let top = self.next();
-        self.compile_statements(statements)?;
+        self.compile_statements(statements, tasks)?;
         self.emit(Instruction::Jump(top));
         Ok(())
     }
@@ -396,7 +512,11 @@ impl Program {
     /// statement when there is none — then the arm bodies.
     ///
     /// Only the first `default` is reachable, so later ones are not compiled.
-    fn compile_case(&mut self, case: &CaseStatement) -> Result<(), SimulationError> {
+    fn compile_case(
+        &mut self,
+        case: &CaseStatement,
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
         self.emit(Instruction::CaseSubject(case.subject.clone()));
 
         let mut arms: Vec<&[ProceduralStatements]> = Vec::new();
@@ -432,7 +552,7 @@ impl Program {
         let mut exits = Vec::with_capacity(arms.len());
         for arm in &arms {
             starts.push(self.next());
-            self.compile_statements(arm)?;
+            self.compile_statements(arm, tasks)?;
             exits.push(self.emit(Instruction::Jump(0)));
         }
 
@@ -444,6 +564,51 @@ impl Program {
         self.patch(fall_through, default_arm.map_or(end, |arm| starts[arm]));
         for exit in exits {
             self.patch(exit, end);
+        }
+        Ok(())
+    }
+
+    /// `t(a, b);` becomes the argument copy-in, the body, and the copy-out.
+    ///
+    /// A task returns nothing, so its `output` and `inout` arguments are the
+    /// only way a result gets back to the caller: they are written to the
+    /// caller's variables *after* the body has run, which is where the LRM puts
+    /// the copy and what iverilog does.
+    fn compile_task_enable(
+        &mut self,
+        name: &Identifier,
+        arguments: &[Expression],
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
+        let definition = tasks
+            .get(&name.name)
+            .ok_or_else(|| SimulationError::UnknownTask(name.name.clone()))?;
+        if arguments.len() != definition.arguments.len() {
+            return Err(SimulationError::TaskArity {
+                name: name.name.clone(),
+                expected: definition.arguments.len(),
+                found: arguments.len(),
+            });
+        }
+
+        for (argument, connection) in definition.arguments.iter().zip(arguments) {
+            if argument.direction.copies_in() {
+                self.emit(Instruction::Blocking {
+                    target: argument.variable(),
+                    value: connection.clone(),
+                });
+            }
+        }
+
+        self.splice(&definition.program);
+
+        for (argument, connection) in definition.arguments.iter().zip(arguments) {
+            if argument.direction.copies_back() {
+                self.emit(Instruction::Blocking {
+                    target: connection.clone(),
+                    value: argument.variable(),
+                });
+            }
         }
         Ok(())
     }
@@ -468,6 +633,47 @@ impl Program {
         }
     }
 }
+
+/// A task the design declares, compiled into the shape an enable needs.
+///
+/// Unlike a function, a task is not called: its body is *inlined* wherever it
+/// is enabled. A task may consume time, and the only state a suspension keeps
+/// is a program counter and the [`StateStore`], so a body sitting in the
+/// caller's own instruction list is what makes a `#delay` inside one work at
+/// all. It also gives a task the static storage the LRM asks for — the
+/// argument and local variables live in the store, one set per task, shared by
+/// every enable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskDefinition {
+    /// The arguments, in call order, with the names the body already uses.
+    pub arguments: Vec<TaskParameter>,
+    /// The body, with no `Halt`: it is spliced into the middle of a block.
+    pub program: Program,
+}
+
+/// One task argument: the store entry the body reads and writes, plus which
+/// way it is copied at the enable.
+///
+/// Only the *name* is kept. A task's variables are declared in the store like
+/// any others, so an assignment to one is sized and signed by the declaration
+/// the way every other assignment is; carrying a second copy of the width here
+/// would be a copy that could disagree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskParameter {
+    pub name: String,
+    pub direction: TaskDirection,
+}
+
+impl TaskParameter {
+    /// The argument named as an expression, which is what a copy in or out
+    /// assigns from and to.
+    fn variable(&self) -> Expression {
+        Expression::Identifier(Identifier::new(self.name.clone()))
+    }
+}
+
+/// Every task one module declares, by the name an enable writes.
+pub type TaskTable = HashMap<String, TaskDefinition>;
 
 /// One variable in a function's frame: an argument, a body-local, or the
 /// function's own name — the variable a body assigns to return a value.
@@ -752,7 +958,7 @@ mod tests {
     fn compile(source: &str) -> Program {
         let (remaining, statements) = parse_block(source).expect("block should parse");
         assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
-        Program::compile(&statements).expect("block should compile")
+        Program::compile(&statements, &TaskTable::new()).expect("block should compile")
     }
 
     fn value(store: &StateStore, name: &str) -> String {
@@ -776,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_empty_block_compiles_to_a_bare_halt() {
-        let program = Program::compile(&[]).unwrap();
+        let program = Program::compile(&[], &TaskTable::new()).unwrap();
         assert!(program.is_empty());
         assert_eq!(program.instructions(), &[Instruction::Halt]);
 
@@ -1007,7 +1213,10 @@ mod tests {
     #[test]
     fn test_intra_assignment_delay_is_rejected_at_compile_time() {
         let (_, statements) = parse_block("begin a = #5 b; end").unwrap();
-        assert_eq!(Program::compile(&statements), Err(DELAY_UNSUPPORTED));
+        assert_eq!(
+            Program::compile(&statements, &TaskTable::new()),
+            Err(DELAY_UNSUPPORTED)
+        );
     }
 
     #[test]

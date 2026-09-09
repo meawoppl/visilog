@@ -328,6 +328,16 @@ fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTre
                 collect_statement_reads(&statement.statements, names);
             }
             ProceduralStatements::Forever(statements) => collect_statement_reads(statements, names),
+            // What the task's *body* reads is not in the statement tree at all
+            // — only its compiled instructions have it, which is where
+            // `elaborate` takes an `@(*)` block's sensitivity list from when it
+            // enables one. An argument is read whichever way it is copied: an
+            // `output` one still names a variable the enable writes to.
+            ProceduralStatements::TaskEnable { arguments, .. } => {
+                for argument in arguments {
+                    collect_expression_reads(argument, names);
+                }
+            }
             ProceduralStatements::Case(statement) => {
                 collect_expression_reads(&statement.subject, names);
                 for item in &statement.items {

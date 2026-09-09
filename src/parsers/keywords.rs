@@ -389,6 +389,146 @@ fn keyword(input: &str) -> IResult<&str, VerilogKeyword> {
     )(input)
 }
 
+/// Every reserved word of IEEE 1364-2005, in sorted order.
+///
+/// This is the *Verilog* keyword set, distinct from [`ALL_KEYWORDS`] above,
+/// which lists the words SystemVerilog added. It exists because one production
+/// has no other way to tell a keyword from a name: a task enable is a bare
+/// identifier followed by `;` or an argument list, which is also the shape of
+/// `wait (a);` and of every statement form the grammar has yet to learn.
+const RESERVED_WORDS: &[&str] = &[
+    "always",
+    "and",
+    "assign",
+    "automatic",
+    "begin",
+    "buf",
+    "bufif0",
+    "bufif1",
+    "case",
+    "casex",
+    "casez",
+    "cell",
+    "cmos",
+    "config",
+    "deassign",
+    "default",
+    "defparam",
+    "design",
+    "disable",
+    "edge",
+    "else",
+    "end",
+    "endcase",
+    "endconfig",
+    "endfunction",
+    "endgenerate",
+    "endmodule",
+    "endprimitive",
+    "endspecify",
+    "endtable",
+    "endtask",
+    "event",
+    "for",
+    "force",
+    "forever",
+    "fork",
+    "function",
+    "generate",
+    "genvar",
+    "highz0",
+    "highz1",
+    "if",
+    "ifnone",
+    "incdir",
+    "include",
+    "initial",
+    "inout",
+    "input",
+    "instance",
+    "integer",
+    "join",
+    "large",
+    "liblist",
+    "library",
+    "localparam",
+    "macromodule",
+    "medium",
+    "module",
+    "nand",
+    "negedge",
+    "nmos",
+    "nor",
+    "noshowcancelled",
+    "not",
+    "notif0",
+    "notif1",
+    "or",
+    "output",
+    "parameter",
+    "pmos",
+    "posedge",
+    "primitive",
+    "pull0",
+    "pull1",
+    "pulldown",
+    "pullup",
+    "pulsestyle_ondetect",
+    "pulsestyle_onevent",
+    "rcmos",
+    "real",
+    "realtime",
+    "reg",
+    "release",
+    "repeat",
+    "rnmos",
+    "rpmos",
+    "rtran",
+    "rtranif0",
+    "rtranif1",
+    "scalared",
+    "showcancelled",
+    "signed",
+    "small",
+    "specify",
+    "specparam",
+    "strong0",
+    "strong1",
+    "supply0",
+    "supply1",
+    "table",
+    "task",
+    "time",
+    "tran",
+    "tranif0",
+    "tranif1",
+    "tri",
+    "tri0",
+    "tri1",
+    "triand",
+    "trior",
+    "trireg",
+    "unsigned",
+    "use",
+    "uwire",
+    "vectored",
+    "wait",
+    "wand",
+    "weak0",
+    "weak1",
+    "while",
+    "wire",
+    "wor",
+    "xnor",
+    "xor",
+];
+
+/// Whether `name` is a word IEEE 1364-2005 reserves, and so cannot be an
+/// identifier.
+pub fn is_reserved_word(name: &str) -> bool {
+    RESERVED_WORDS.binary_search(&name).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +851,23 @@ mod tests {
         assert_eq!(keyword_from_string("with"), Some(VerilogKeyword::With));
         assert_eq!(keyword_from_string("within"), Some(VerilogKeyword::Within));
         assert_eq!(keyword_from_string("nonexistent"), None);
+    }
+
+    /// The 1364 list is searched by bisection, so it has to stay sorted — and
+    /// it is a different set from the SystemVerilog one above.
+    #[test]
+    fn test_reserved_words() {
+        let mut sorted = RESERVED_WORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, RESERVED_WORDS);
+
+        for word in ["wait", "disable", "end", "endtask", "fork", "join", "while"] {
+            assert!(is_reserved_word(word), "{} should be reserved", word);
+        }
+        assert!(!is_reserved_word("my_task"));
+        assert!(!is_reserved_word("waiting"));
+        // A SystemVerilog keyword is not a 1364 reserved word.
+        assert!(!is_reserved_word("always_comb"));
     }
 
     #[test]
