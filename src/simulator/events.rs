@@ -369,6 +369,10 @@ fn collect_target_reads(target: &Expression, names: &mut BTreeSet<String>) {
             collect_expression_reads(msb, names);
             collect_expression_reads(lsb, names);
         }
+        Expression::IndexedPartSelect { base, width, .. } => {
+            collect_expression_reads(base, names);
+            collect_expression_reads(width, names);
+        }
         // Nothing else is a legal target; treat it as a read rather than drop it.
         other => collect_expression_reads(other, names),
     }
@@ -416,6 +420,13 @@ fn collect_expression_reads(expression: &Expression, names: &mut BTreeSet<String
             names.insert(id.name.clone());
             collect_expression_reads(msb, names);
             collect_expression_reads(lsb, names);
+        }
+        Expression::IndexedPartSelect {
+            id, base, width, ..
+        } => {
+            names.insert(id.name.clone());
+            collect_expression_reads(base, names);
+            collect_expression_reads(width, names);
         }
     }
 }

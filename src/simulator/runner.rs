@@ -1032,6 +1032,28 @@ mod tests {
         assert_eq!(simulator.get("out").unwrap().to_binary(), "10x1");
     }
 
+    /// An indexed part select works as an assignment target, not just as a
+    /// value. `iverilog` prints `0110` for the same writes.
+    #[test]
+    fn test_indexed_part_select_target() {
+        let mut simulator = simulator_for(
+            r#"
+            module packer(input [1:0] hi, output [3:0] out);
+                assign out[1 +: 2] = hi;
+                assign out[3 -: 1] = 1'b0;
+                assign out[0] = 1'b0;
+            endmodule
+        "#,
+        );
+
+        simulator
+            .set_input("hi", Register::from_binary("11"))
+            .unwrap();
+        simulator.run().unwrap();
+
+        assert_eq!(simulator.get("out").unwrap().to_binary(), "0110");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(

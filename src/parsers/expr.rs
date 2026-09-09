@@ -9,7 +9,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
     character::complete::{alpha1, char},
-    combinator::{map, map_res, opt, recognize},
+    combinator::{map, map_res, opt, recognize, value},
     multi::{fold_many0, many1, separated_list0, separated_list1},
     sequence::{pair, preceded, tuple},
     IResult,
@@ -32,6 +32,18 @@ pub enum Expression {
     /// parameter, so it is not known until elaboration. `{16384{4'b1001}}` is
     /// also a reminder that expanding eagerly would be expensive.
     Replication(Box<Expression>, Vec<Expression>),
+    /// `a[base +: width]` and `a[base -: width]` — an indexed part select.
+    ///
+    /// Distinct from [`Expression::PartSelect`] because only the *width* has
+    /// to be constant: the base may be any expression, including one that
+    /// moves during the run, which is the whole reason the operator exists.
+    /// `upward` is `true` for `+:`, which runs from the base upwards.
+    IndexedPartSelect {
+        id: Identifier,
+        base: Box<Expression>,
+        width: Box<Expression>,
+        upward: bool,
+    },
     FunctionCall(Identifier, Vec<Expression>),
     /// `$time`, `$random`, `$signed(a)` — a call to one of the simulator's own
     /// functions, named without its `$`.
@@ -111,6 +123,18 @@ impl Expression {
                 ident.name,
                 start.to_contracted_string(),
                 end.to_contracted_string()
+            ),
+            Expression::IndexedPartSelect {
+                id,
+                base,
+                width,
+                upward,
+            } => format!(
+                "{}[{} {}: {}]",
+                id.name,
+                base.to_contracted_string(),
+                if *upward { "+" } else { "-" },
+                width.to_contracted_string()
             ),
         }
     }
@@ -206,6 +230,20 @@ impl Expression {
                 indent_str,
                 end.to_ast_string(indent + 1),
                 indent_str
+            ),
+            Expression::IndexedPartSelect {
+                id,
+                base,
+                width,
+                upward,
+            } => format!(
+                "{}IndexedPartSelect{}(\n{}{},\n{},\n{})",
+                indent_str,
+                if *upward { "Up" } else { "Down" },
+                indent_str,
+                id.name,
+                base.to_ast_string(indent + 1),
+                width.to_ast_string(indent + 1)
             ),
         }
     }
@@ -342,6 +380,7 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         system_function_call,
         fn_call,
         bit_select,
+        indexed_part_select,
         part_select,
         map(identifier, Expression::Identifier),
         map(verilog_const, Expression::Constant),
@@ -363,6 +402,35 @@ pub fn bit_select(input: &str) -> IResult<&str, Expression> {
         delimited(tag("["), ws(verilog_expression), tag("]")),
     )(input)?;
     Ok((input, Expression::BitSelect(expr, Box::new(index))))
+}
+
+/// `a[base +: width]` / `a[base -: width]` — an indexed part select.
+///
+/// Tried before [`part_select`], which would otherwise read the `:` of `+:` as
+/// its own separator and stop at a base expression it could not finish.
+pub fn indexed_part_select(input: &str) -> IResult<&str, Expression> {
+    let (input, id) = identifier(input)?;
+    let (input, (base, upward, width)) = preceded(
+        ws_and_comments,
+        delimited(
+            tag("["),
+            tuple((
+                ws(verilog_expression),
+                alt((value(true, tag("+:")), value(false, tag("-:")))),
+                ws(verilog_expression),
+            )),
+            tag("]"),
+        ),
+    )(input)?;
+    Ok((
+        input,
+        Expression::IndexedPartSelect {
+            id,
+            base: Box::new(base),
+            width: Box::new(width),
+            upward,
+        },
+    ))
 }
 
 /// `a[msb:lsb]` — a range select. Both bounds are full expressions, and the
@@ -1799,6 +1867,40 @@ mod tests {
         assert!(matches!(
             assert_parses(verilog_expression, "{2{a}}"),
             Expression::Replication(_, _)
+        ));
+    }
+
+    /// `a[base +: width]` and `a[base -: width]` — the indexed part selects.
+    /// The `:` inside `+:` must not be mistaken for a part-select separator.
+    #[test]
+    fn test_parse_indexed_part_select() {
+        for source in [
+            "a[0 +: 4]",
+            "a[0+:2]",
+            "original[16 -:8]",
+            "ref[{addr, 2'b00} +: 4]",
+            "out[j * 1 - 1 +: 4]",
+            "r[0 +: ab * ch]",
+        ] {
+            assert_parses(verilog_expression, source);
+        }
+    }
+
+    /// A plain part select still parses as one: only `+:`/`-:` picks the
+    /// indexed form.
+    #[test]
+    fn test_indexed_and_plain_part_selects_stay_distinct() {
+        assert!(matches!(
+            assert_parses(verilog_expression, "a[3:0]"),
+            Expression::PartSelect(_, _, _)
+        ));
+        assert!(matches!(
+            assert_parses(verilog_expression, "a[3 +: 2]"),
+            Expression::IndexedPartSelect { upward: true, .. }
+        ));
+        assert!(matches!(
+            assert_parses(verilog_expression, "a[3 -: 2]"),
+            Expression::IndexedPartSelect { upward: false, .. }
         ));
     }
 }
