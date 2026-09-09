@@ -266,14 +266,40 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
 #[derive(Debug, PartialEq, Clone)]
 pub enum ModuleInitArguments {
     NoArgs,
-    Positional(Vec<Expression>),
+    /// `dut u(a, b)` — connections bound in port-declaration order.
+    ///
+    /// An element is `None` when the position was written blank —
+    /// `two U7 (,)`, `two U8 (w3,)`, `two U9 (,w4)` — which leaves that port
+    /// unconnected. A blank keeps its *place* in the list rather than being
+    /// dropped: the whole meaning of a positional list is the index, so
+    /// dropping one would silently bind every later connection to the wrong
+    /// port.
+    Positional(Vec<Option<Expression>>),
     Keyword(HashMap<Identifier, Expression>),
 }
 
+/// One element of a positional argument list, absent when it was written
+/// blank. Whitespace and comments stand in for the expression, so `( , )` is
+/// two blanks rather than a parse error.
+fn positional_argument(input: &str) -> IResult<&str, Option<Expression>> {
+    alt((
+        map(verilog_expression, Some),
+        map(ws_and_comments, |_| None),
+    ))(input)
+}
+
 pub fn parse_positional_arguments(input: &str) -> IResult<&str, ModuleInitArguments> {
-    map(separated_list1(tag(","), verilog_expression), |args| {
-        ModuleInitArguments::Positional(args)
-    })(input)
+    let (rest, args) = separated_list1(tag(","), positional_argument)(input)?;
+    // A single blank element is an *empty* argument block — `()` — not a
+    // one-element list with a gap in it. Rejecting it here is what leaves
+    // `parse_arguments` reporting `NoArgs`.
+    if args.len() == 1 && args[0].is_none() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::SeparatedList,
+        )));
+    }
+    Ok((rest, ModuleInitArguments::Positional(args)))
 }
 
 fn kw_arg(input: &str) -> IResult<&str, (Identifier, Expression)> {
@@ -693,6 +719,104 @@ mod tests {
         }
     }
 
+    /// A blank element leaves that *position* unconnected, so it keeps its
+    /// place in the list rather than being dropped.
+    #[test]
+    fn test_a_blank_positional_argument_keeps_its_place() {
+        let w3 = || Expression::Identifier(Identifier::new("w3".to_string()));
+        let w4 = || Expression::Identifier(Identifier::new("w4".to_string()));
+
+        for (source, expected) in [
+            ("two U7 (,);", vec![None, None]),
+            ("two U8 (w3,);", vec![Some(w3()), None]),
+            ("two U9 (,w4);", vec![None, Some(w4())]),
+            ("three Ug (,,);", vec![None, None, None]),
+            (
+                "three Uh ( w3 , , w4 );",
+                vec![Some(w3()), None, Some(w4())],
+            ),
+            ("two Ui (w3,w4);", vec![Some(w3()), Some(w4())]),
+        ] {
+            let instantiation = assert_parses(parse_module_instantiation_statement, source);
+            assert_eq!(
+                instantiation.arguments,
+                ModuleInitArguments::Positional(expected),
+                "{}",
+                source
+            );
+        }
+
+        // An empty block is still `NoArgs` — one blank is no argument list at
+        // all, not a one-element list with a gap in it.
+        let none = assert_parses(parse_module_instantiation_statement, "two Uj ();");
+        assert_eq!(none.arguments, ModuleInitArguments::NoArgs);
+    }
+
+    /// A blank connection has to reach elaboration as an *absent* one: the
+    /// port is undriven, which is `z`, rather than bound to whatever the next
+    /// argument was.
+    #[test]
+    fn test_a_blank_positional_connection_leaves_its_port_unconnected() {
+        let child = r#"
+            module two(
+                input [3:0] first,
+                input [3:0] second
+            );
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                wire [3:0] w4 = 4'b0101;
+                two U9 (,w4);
+                two U7 (,);
+            endmodule
+        "#;
+
+        let mut modules = crate::parsers::source::parse_verilog_source(top)
+            .expect("top should parse")
+            .1;
+        modules.extend(
+            crate::parsers::source::parse_verilog_source(child)
+                .expect("child should parse")
+                .1,
+        );
+
+        let mut simulator = crate::simulator::runner::Simulator::with_modules(modules, "top");
+        simulator.setup().expect("setup should succeed");
+        simulator.run().expect("run should settle");
+
+        // The blank leaves the *first* port floating and binds `w4` to the
+        // second — not the other way round.
+        assert_eq!(
+            simulator
+                .get("U9.first")
+                .expect("U9.first exists")
+                .to_binary(),
+            "zzzz"
+        );
+        assert_eq!(
+            simulator
+                .get("U9.second")
+                .expect("U9.second exists")
+                .to_binary(),
+            "0101"
+        );
+        assert_eq!(
+            simulator
+                .get("U7.first")
+                .expect("U7.first exists")
+                .to_binary(),
+            "zzzz"
+        );
+        assert_eq!(
+            simulator
+                .get("U7.second")
+                .expect("U7.second exists")
+                .to_binary(),
+            "zzzz"
+        );
+    }
+
     #[test]
     fn test_parse_named_args() {
         let arg_list_examples = vec![
@@ -729,17 +853,17 @@ mod tests {
             (
                 "(1,2,3)",
                 ModuleInitArguments::Positional(vec![
-                    verilog_expression("1".into()).unwrap().1,
-                    verilog_expression("2".into()).unwrap().1,
-                    verilog_expression("3".into()).unwrap().1,
+                    Some(verilog_expression("1".into()).unwrap().1),
+                    Some(verilog_expression("2".into()).unwrap().1),
+                    Some(verilog_expression("3".into()).unwrap().1),
                 ]),
             ),
             (
                 "(1, 2, 3)",
                 ModuleInitArguments::Positional(vec![
-                    verilog_expression("1".into()).unwrap().1,
-                    verilog_expression("2".into()).unwrap().1,
-                    verilog_expression("3".into()).unwrap().1,
+                    Some(verilog_expression("1".into()).unwrap().1),
+                    Some(verilog_expression("2".into()).unwrap().1),
+                    Some(verilog_expression("3".into()).unwrap().1),
                 ]),
             ),
             ("(.a(1),.b(2),.c(3))", abc_123()),

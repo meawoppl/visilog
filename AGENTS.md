@@ -622,8 +622,8 @@ tripwire.
 - **A parser range is already `(i64, i64)`**, constant-folded at parse time, so a
   parameter cannot determine a width: `output [WIDTH-1:0] q` does not parse. A parameter
   override therefore changes a child's *behaviour*, never its widths, until the front end
-  grows expression ranges. `range` also rejects whitespace inside the brackets, so
-  `output [ 0:0] c;` still does not parse.
+  grows expression ranges. Every position *inside* the brackets is a token boundary
+  though, so `[ 7:0]`, `[7 : 0]` and `[7:0 ]` all parse.
 - **A declaration is a *list*, and every declaration parser returns a `Vec`.**
   `reg [4:0] a, b;`, `wire a, b, c;` and `integer i, j;` all share one width (or, for an
   `integer`, one fixed 32-bit width) across every name, so `parse_register_declaration`,
@@ -780,6 +780,28 @@ tripwire.
   is `EvalError::MemoryAsValue` rather than `UnknownIdentifier`: the name does
   exist. `MAX_MEMORY_DEPTH` in `elaborate.rs` makes a nonsense dimension a named
   error rather than an allocation nothing survives.
+- **A select may be separated from the name it selects from.** `v [0]` and `v [3:0]` are
+  `v[0]` and `v[3:0]` — `expr.rs`'s `bit_select` / `part_select` skip whitespace and
+  comments before the `[`. That widening is safe where the unary junction's is not: `[` is
+  not an operator, so nothing else can claim it. `operand_no_ws` still refuses whitespace
+  between a unary operator and its operand, which is what tells `a && b` from `a & &b`.
+- **A based literal is three tokens.** The size, the base designator and the digits are
+  separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
+  and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
+  literal — which is also what the LRM says.
+- **A null statement leaves no node behind.** A bare `;` is a legal statement that compiles
+  to nothing, so `behavior.rs::null_statement` returns `()` rather than a
+  `ProceduralStatements` variant: `statement_body` gives an empty `Vec` for `else ;`, and
+  `statement_run` — what `parse_block` and a function body use — drops it from the list.
+  Nothing downstream had to learn a node meaning "nothing". Each alternative consumes its
+  own `;`, so the `many0` cannot spin.
+- **A blank port connection keeps its position.** `two U7 (,)`, `two U8 (w3,)` and
+  `two U9 (,w4)` leave a port unconnected, so `ModuleInitArguments::Positional` holds
+  `Vec<Option<Expression>>` and `elaborate::connections` filters the `None`s out *after*
+  zipping against the ports. Dropping a blank at parse time instead would silently bind
+  every later connection to the wrong port. A single blank is `NoArgs` — `()` is an empty
+  argument list, not a one-element list with a gap. A blank *named* connection (`.a()`) and
+  a blank in a module *header* (`module m(a,);`) are still parse errors.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

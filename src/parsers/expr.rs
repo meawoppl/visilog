@@ -3,7 +3,7 @@ use super::{
     constants::{verilog_const, VerilogConstant},
     identifier::{identifier, Identifier},
     operators::{unary_operator, BinaryOperator, UnaryOperator},
-    simple::ws,
+    simple::{ws, ws_and_comments},
 };
 use nom::{
     branch::alt,
@@ -306,22 +306,33 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
 
 /// `a[i]` — a single-bit select. The index is a full expression, so
 /// `a[n]`, `a[n+1]` and `a[c ? x : y]` are all accepted.
+///
+/// The name and the `[` are separate tokens, so `v [0]` is `v[0]`. That is a
+/// widening of `operand_no_ws` and safe in a way that whitespace after a unary
+/// operator is not: `[` is not an operator, so nothing else can claim it.
 pub fn bit_select(input: &str) -> IResult<&str, Expression> {
     let (input, expr) = identifier(input)?;
-    let (input, index) = delimited(tag("["), ws(verilog_expression), tag("]"))(input)?;
+    let (input, index) = preceded(
+        ws_and_comments,
+        delimited(tag("["), ws(verilog_expression), tag("]")),
+    )(input)?;
     Ok((input, Expression::BitSelect(expr, Box::new(index))))
 }
 
-/// `a[msb:lsb]` — a range select. Both bounds are full expressions.
+/// `a[msb:lsb]` — a range select. Both bounds are full expressions, and the
+/// `[` may be separated from the name: `v [3:0]`.
 pub fn part_select(input: &str) -> IResult<&str, Expression> {
     let (input, ident) = identifier(input)?;
-    let (input, (start, end)) = delimited(
-        tag("["),
-        pair(
-            ws(verilog_expression),
-            preceded(tag(":"), ws(verilog_expression)),
+    let (input, (start, end)) = preceded(
+        ws_and_comments,
+        delimited(
+            tag("["),
+            pair(
+                ws(verilog_expression),
+                preceded(tag(":"), ws(verilog_expression)),
+            ),
+            tag("]"),
         ),
-        tag("]"),
     )(input)?;
     Ok((
         input,
@@ -722,6 +733,66 @@ mod tests {
                 unary(UnaryOperator::Negative, a()),
                 BinaryOperator::Addition,
                 b(),
+            ),
+        );
+    }
+
+    /// A name and the `[` of a select are separate tokens, so `v [0]` is
+    /// `v[0]`. Unlike the unary junction, `[` is not an operator, so nothing
+    /// else can claim it and the widening is unambiguous.
+    #[test]
+    fn test_a_select_may_be_separated_from_the_name_it_selects_from() {
+        let expected_bit = || {
+            Expression::BitSelect(
+                Identifier::new("v".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+            )
+        };
+        for spelling in ["v[0]", "v [0]", "v\n[0]", "v/* here */[0]", "v [ 0 ]"] {
+            assert_parses_to(verilog_expression, spelling, expected_bit());
+        }
+
+        let expected_part = || {
+            Expression::PartSelect(
+                Identifier::new("v".to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(3))),
+                Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+            )
+        };
+        for spelling in ["v[3:0]", "v [3:0]", "v\t[3 : 0]", "v // pick\n[3:0]"] {
+            assert_parses_to(verilog_expression, spelling, expected_part());
+        }
+    }
+
+    /// The reduction operators are the regression risk of every whitespace
+    /// widening in this file, so they are asserted as *trees* rather than as
+    /// "it parsed": `a & &b` is a bitwise and of `a` with the reduction of
+    /// `b`, and `a && b` is one logical operator.
+    #[test]
+    fn test_the_logical_and_reduction_readings_are_unchanged() {
+        let a = || Expression::Identifier(Identifier::new("a".to_string()));
+        let b = || Expression::Identifier(Identifier::new("b".to_string()));
+
+        assert_parses_to(
+            verilog_expression,
+            "a && b",
+            Expression::Binary(Box::new(a()), BinaryOperator::LogicalAnd, Box::new(b())),
+        );
+        assert_parses_to(
+            verilog_expression,
+            "a || b",
+            Expression::Binary(Box::new(a()), BinaryOperator::LogicalOr, Box::new(b())),
+        );
+        assert_parses_to(
+            verilog_expression,
+            "a & &b",
+            Expression::Binary(
+                Box::new(a()),
+                BinaryOperator::BitwiseAnd,
+                Box::new(Expression::Unary(
+                    UnaryOperator::ReductionAnd,
+                    Box::new(b()),
+                )),
             ),
         );
     }

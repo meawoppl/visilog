@@ -10,6 +10,7 @@ use nom::{
 
 use super::base::RawToken;
 use super::numbers::{based_digits, decimal};
+use super::simple::ws_and_comments;
 use nom::character::complete::char;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,11 +155,18 @@ fn integer_constant(input: &str) -> IResult<&str, VerilogConstant> {
     })(input)
 }
 
+/// The base designator of a based literal: the `'h` of `8'hFF`, with the
+/// optional `s` of `4'sd12` in front of the base letter.
+///
+/// The `'` and the letter are one token — the LRM lets whitespace separate a
+/// literal's size from its base and its base from its digits, but not the `'`
+/// from what it introduces.
+fn base_designator(input: &str) -> IResult<&str, (bool, VerilogBaseType)> {
+    preceded(char('\''), tuple((const_signedness, const_type_char)))(input)
+}
+
 fn unsized_const(input: &str) -> IResult<&str, VerilogConstant> {
-    let parsed = tuple((
-        preceded(char('\''), tuple((const_signedness, const_type_char))),
-        based_digits,
-    ));
+    let parsed = tuple((base_designator, preceded(ws_and_comments, based_digits)));
 
     map_res(parsed, |((signed, base), content)| {
         let cnst = VerilogConstant::new(None, base, content.to_string()).with_signedness(signed);
@@ -166,11 +174,16 @@ fn unsized_const(input: &str) -> IResult<&str, VerilogConstant> {
     })(input)
 }
 
+/// `8'hFF`, `4'sd12`, `5'h 0`, `5 'h0`.
+///
+/// The size, the base designator and the digits are three tokens, so
+/// whitespace and comments between them are skipped exactly as they are
+/// between a `#` and its delay.
 fn sized_const(input: &str) -> IResult<&str, VerilogConstant> {
     let parsed = tuple((
         decimal,
-        preceded(char('\''), tuple((const_signedness, const_type_char))),
-        based_digits,
+        preceded(ws_and_comments, base_designator),
+        preceded(ws_and_comments, based_digits),
     ));
 
     map_res(parsed, |(size_str, (signed, base), content)| {
@@ -518,6 +531,60 @@ mod tests {
             Ok((
                 "",
                 VerilogConstant::new(None, VerilogBaseType::Hexadecimal, "ABC".to_string())
+            ))
+        );
+    }
+
+    /// The size, the base designator and the digits are three tokens, so
+    /// whitespace and comments may separate them. The `\'` and its base letter
+    /// are one token and may not be split.
+    #[test]
+    fn test_a_based_literal_tolerates_whitespace_between_its_tokens() {
+        let expected = VerilogConstant::new(Some(5), VerilogBaseType::Hexadecimal, "0".to_string());
+        for spelling in [
+            "5'h0",
+            "5'h 0",
+            "5 'h0",
+            "5 'h 0",
+            "5\n'h\n0",
+            "5/* wide */'h/* zero */0",
+        ] {
+            assert_eq!(
+                verilog_const(spelling),
+                Ok(("", expected.clone())),
+                "{}",
+                spelling
+            );
+        }
+
+        // The signed designator rides with the base letter, not with the size.
+        assert_eq!(
+            verilog_const("4 'sd 12"),
+            Ok((
+                "",
+                VerilogConstant::new(Some(4), VerilogBaseType::Decimal, "12".to_string())
+                    .with_signedness(true)
+            ))
+        );
+
+        // An unsized literal gets the same treatment on the one boundary it has.
+        assert_eq!(
+            verilog_const("'b 1010"),
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Binary, "1010".to_string())
+            ))
+        );
+
+        // A `\'` split from its base letter is not a literal, and neither is a
+        // size on its own.
+        assert!(unsized_const("' h0").is_err());
+        assert!(sized_const("5 ' h0").is_err());
+        assert_eq!(
+            verilog_const("5 ;"),
+            Ok((
+                " ;",
+                VerilogConstant::new(None, VerilogBaseType::Decimal, "5".to_string())
             ))
         );
     }

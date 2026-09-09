@@ -103,10 +103,17 @@ pub fn signedness(input: &str) -> IResult<&str, bool> {
     )(input)
 }
 
+/// `[7:0]` — a declared width, constant-folded to its two bounds at parse
+/// time.
+///
+/// Every one of the four positions inside the brackets is a token boundary, so
+/// whitespace and comments are skipped at all of them: `[ 7:0]`, `[7 : 0]` and
+/// `[7:0 ]` are the same range. Only the brackets themselves have to touch
+/// what is next to them.
 pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
     delimited(
         char('['),
-        tuple((raw_pos_int, preceded(ws(char(':')), raw_pos_int))),
+        tuple((ws(raw_pos_int), preceded(char(':'), ws(raw_pos_int)))),
         char(']'),
     )(input)
 }
@@ -366,6 +373,26 @@ mod tests {
             "module m(); (* keep *) always @(*) a = b; always @(*) c = d; endmodule",
         );
         assert_eq!(attributed[0].statements.len(), 2);
+    }
+
+    /// Every position inside the brackets is a token boundary, so whitespace
+    /// and comments are skipped at all of them.
+    #[test]
+    fn test_range_tolerates_whitespace_inside_the_brackets() {
+        for spelling in [
+            "[ 7:0]",
+            "[7 :0]",
+            "[7: 0]",
+            "[7:0 ]",
+            "[ 7 : 0 ]",
+            "[\n 7 :\n 0\n]",
+            "[/* msb */7:/* lsb */0]",
+        ] {
+            assert_eq!(range(spelling), Ok(("", (7, 0))), "{}", spelling);
+        }
+        // The brackets themselves still have to be there.
+        assert!(range(" [7:0]").is_err());
+        assert!(range("[7:0").is_err());
     }
 
     #[test]

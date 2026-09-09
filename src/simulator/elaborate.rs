@@ -685,7 +685,13 @@ impl<'m> Elaborator<'m> {
                         found: expressions.len(),
                     });
                 }
-                pairs.extend(declared.iter().copied().zip(expressions));
+                pairs.extend(
+                    declared
+                        .iter()
+                        .copied()
+                        .zip(expressions)
+                        .filter_map(|(name, expression)| Some((name, expression.as_ref()?))),
+                );
             }
             ModuleInitArguments::Keyword(arguments) => {
                 let mut named: Vec<(&Identifier, &Expression)> = arguments.iter().collect();
@@ -718,7 +724,9 @@ impl<'m> Elaborator<'m> {
 /// Pairs each connected port with the expression the parent bound to it.
 ///
 /// Positional arguments bind in port-declaration order, named arguments by
-/// port name. A port nobody mentioned is left out and stays unconnected.
+/// port name. A port nobody mentioned is left out and stays unconnected, and
+/// so is one whose position was written blank — `dut u(, b)` connects only the
+/// second port.
 fn connections<'a>(
     child: &'a VerilogModule,
     arguments: &'a ModuleInitArguments,
@@ -734,7 +742,12 @@ fn connections<'a>(
                     found: expressions.len(),
                 });
             }
-            Ok(child.ports.iter().zip(expressions).collect())
+            Ok(child
+                .ports
+                .iter()
+                .zip(expressions)
+                .filter_map(|(port, expression)| Some((port, expression.as_ref()?)))
+                .collect())
         }
         ModuleInitArguments::Keyword(arguments) => {
             let mut named: Vec<&Identifier> = arguments.keys().collect();
