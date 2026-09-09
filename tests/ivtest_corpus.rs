@@ -449,13 +449,18 @@ fn first_difference(expected: &str, got: &str) -> Option<String> {
 }
 
 fn judge(source: &str) -> Outcome {
-    judge_with(&Preprocessor::new(), source, None)
+    judge_with(&Preprocessor::new(), source, None, &[])
 }
 
 /// [`judge`], with an include path — which only the corpus itself needs, since
 /// its files include one another by relative path — and with the contents of
 /// the entry's gold file, when it has one.
-fn judge_with(preprocessor: &Preprocessor, source: &str, gold: Option<&str>) -> Outcome {
+fn judge_with(
+    preprocessor: &Preprocessor,
+    source: &str,
+    gold: Option<&str>,
+    search_paths: &[PathBuf],
+) -> Outcome {
     let Ok(parsed) = front_end(preprocessor, source) else {
         return Outcome::ParseFailed;
     };
@@ -465,6 +470,12 @@ fn judge_with(preprocessor: &Preprocessor, source: &str, gold: Option<&str>) -> 
     };
 
     let mut simulator = Simulator::with_modules(modules, top);
+    // `$readmemh("foo.txt", mem)` names a file relative to the test directory.
+    // A `Simulator` is built from parsed modules and never learns which file
+    // they came from, so the harness — which does know — supplies the path.
+    for directory in search_paths {
+        simulator.add_search_path(directory.clone());
+    }
     if let Err(error) = simulator.setup() {
         return Outcome::SetupFailed(error_kind(&error));
     }
@@ -525,6 +536,10 @@ fn ivtest_corpus_closure_rate() {
     };
     let dir = root.join("ivtest").join("ivltests");
     let preprocessor = corpus_preprocessor(&root);
+    // `$readmemh` names its data file relative to the test directory, just as
+    // an include does. Without these a design that loads a memory from a file
+    // cannot find it and dies in `setup`.
+    let search_paths = [root.join("ivtest"), dir.clone()];
 
     let mut outcomes: Vec<(String, Outcome)> = Vec::new();
     let mut gold_entries = 0usize;
@@ -552,7 +567,7 @@ fn ivtest_corpus_closure_rate() {
         };
         outcomes.push((
             entry.name.clone(),
-            judge_with(&preprocessor, &source, gold.as_deref()),
+            judge_with(&preprocessor, &source, gold.as_deref(), &search_paths),
         ));
     }
 
@@ -780,7 +795,7 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
     "#;
     let gold = "  a = 3\n  b = 4\n";
     assert_eq!(
-        judge_with(&Preprocessor::new(), source, Some(gold)),
+        judge_with(&Preprocessor::new(), source, Some(gold), &[]),
         Outcome::GoldMatch
     );
 
@@ -788,13 +803,13 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
     // leading indent is not, because column alignment is what these tests check.
     let sloppy = "  a = 3   \n  b = 4";
     assert_eq!(
-        judge_with(&Preprocessor::new(), source, Some(sloppy)),
+        judge_with(&Preprocessor::new(), source, Some(sloppy), &[]),
         Outcome::GoldMatch
     );
 
     // A different value must be reported as a mismatch, naming where it parted.
     let wrong = "  a = 3\n  b = 5\n";
-    let outcome = judge_with(&Preprocessor::new(), source, Some(wrong));
+    let outcome = judge_with(&Preprocessor::new(), source, Some(wrong), &[]);
     match outcome {
         Outcome::GoldMismatch(difference) => {
             assert!(
@@ -815,7 +830,7 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
         endmodule
     "#;
     assert_eq!(
-        judge_with(&Preprocessor::new(), mute, Some("")),
+        judge_with(&Preprocessor::new(), mute, Some(""), &[]),
         Outcome::Silent
     );
 }
