@@ -3,7 +3,9 @@ use nom::{
     multi::separated_list0, sequence::delimited, IResult,
 };
 
-use crate::parsers::expr::{bit_select, part_select, verilog_expression, Expression};
+use crate::parsers::expr::{
+    bit_select, indexed_part_select, part_select, verilog_expression, Expression,
+};
 use crate::parsers::identifier::identifier;
 
 use super::{
@@ -126,6 +128,7 @@ pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
 pub fn assignment_lhs(input: &str) -> IResult<&str, Expression> {
     alt((
         bit_select,
+        indexed_part_select,
         part_select,
         map(identifier, Expression::Identifier),
         parse_concatenation,

@@ -29,7 +29,9 @@
 use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
 use crate::register::Register;
-use crate::simulator::eval::{eval, eval_sized, EvalError, SELF_DETERMINED};
+use crate::simulator::eval::{
+    eval, eval_sized, indexed_select_indices, indexed_select_width, EvalError, SELF_DETERMINED,
+};
 use crate::simulator::program::{resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{Drive, DriveLevel, StateStore};
@@ -200,6 +202,23 @@ pub fn resolve_target(
             } else {
                 (first..=second).collect()
             };
+            Ok(ResolvedTarget::Bits {
+                name: id.name.clone(),
+                indices,
+            })
+        }
+        Expression::IndexedPartSelect {
+            id,
+            base,
+            width,
+            upward,
+        } => {
+            let span = indexed_select_width(width, state)?;
+            // A write through an unknown base has nowhere to land. Reporting it
+            // rather than writing somewhere arbitrary keeps the rule that a
+            // wrong answer is never produced quietly.
+            let indices = indexed_select_indices(base, span, *upward, state)?
+                .ok_or_else(|| SimulationError::UnsupportedTarget(target.to_contracted_string()))?;
             Ok(ResolvedTarget::Bits {
                 name: id.name.clone(),
                 indices,

@@ -391,6 +391,25 @@ fn eval_in_context(
             let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
             Ok(widened(Register::from_bits(bits), width))
         }
+        Expression::IndexedPartSelect {
+            id,
+            base,
+            width: selected,
+            upward,
+        } => {
+            let Some(signal) = store.get_signal(&id.name) else {
+                return Err(unresolved(&id.name, store));
+            };
+            let span = indexed_select_width(selected, store)?;
+            // The base is the operand that is allowed to move, so an unknown
+            // one is not an error the way a bad bound is — it selects `x`,
+            // which is what a vector indexed by an unknown holds.
+            let Some(indices) = indexed_select_indices(base, span, *upward, store)? else {
+                return Ok(widened(Register::unknown(span), width));
+            };
+            let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
+            Ok(widened(Register::from_bits(bits), width))
+        }
         // A call is as wide as its function was declared, and a context can
         // only pad that — it cannot reach the arguments, which the function's
         // own declaration sizes.
@@ -678,7 +697,8 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
         Expression::Concatenation(_)
         | Expression::Replication(_, _)
         | Expression::BitSelect(_, _)
-        | Expression::PartSelect(_, _, _) => false,
+        | Expression::PartSelect(_, _, _)
+        | Expression::IndexedPartSelect { .. } => false,
         // A function is as signed as it was declared to be, which is a
         // property of the declaration rather than of what it returns.
         Expression::FunctionCall(id, _) => store
@@ -781,6 +801,11 @@ fn expression_width(expr: &Expression, store: &StateStore) -> usize {
             replication_count(count, store).map_or(inner, |times| inner * times)
         }
         Expression::BitSelect(_, _) => 1,
+        // The width is constant by construction, so this is exact whenever the
+        // expression is legal at all.
+        Expression::IndexedPartSelect { width, .. } => {
+            indexed_select_width(width, store).unwrap_or(1)
+        }
         Expression::PartSelect(_, first, second) => {
             match (select_bound(first, store), select_bound(second, store)) {
                 (Ok(first), Ok(second)) => (first - second).unsigned_abs() as usize + 1,
@@ -950,6 +975,47 @@ fn replication_count(expr: &Expression, store: &StateStore) -> Option<usize> {
     numeric(&eval(expr, store).ok()?)
         .ok()?
         .and_then(|value| usize::try_from(value).ok())
+}
+
+/// How many bits a `[base +: width]` names. The width — unlike the base — must
+/// be a constant, which is what makes the select a fixed size however the base
+/// moves.
+pub fn indexed_select_width(expr: &Expression, store: &StateStore) -> Result<usize, EvalError> {
+    let span = select_bound(expr, store)?;
+    let span = usize::try_from(span)
+        .map_err(|_| EvalError::NonConstantSelectBound(expr.to_contracted_string()))?;
+    if span == 0 || span > MAX_SELECT_WIDTH {
+        return Err(EvalError::WidthOverflow(span));
+    }
+    Ok(span)
+}
+
+/// The declared bit indices a `[base +: span]` or `[base -: span]` names, most
+/// significant first — the order [`Register::from_bits`] and
+/// `ResolvedTarget::Bits` both take.
+///
+/// `None` means the base did not evaluate to a number, which for this operator
+/// is a legal outcome rather than an error: the base is the operand allowed to
+/// move at run time, so an unknown one selects `x`.
+pub fn indexed_select_indices(
+    base: &Expression,
+    span: usize,
+    upward: bool,
+    store: &StateStore,
+) -> Result<Option<Vec<i64>>, EvalError> {
+    let Some(base) = numeric(&eval(base, store)?)?.and_then(|value| i64::try_from(value).ok())
+    else {
+        return Ok(None);
+    };
+    let span = span as i64;
+    // `+:` runs from the base upwards and `-:` from the base downwards; both
+    // come back most significant first.
+    let (high, low) = if upward {
+        (base + span - 1, base)
+    } else {
+        (base, base - span + 1)
+    };
+    Ok(Some((low..=high).rev().collect()))
 }
 
 fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError> {
@@ -2505,5 +2571,48 @@ mod tests {
             "expected a width overflow, got {:?}",
             error
         );
+    }
+
+    /// `a[base +: width]` and `a[base -: width]` — the indexed part selects.
+    /// Every expectation is what `iverilog` 12.0 prints for the same select on
+    /// `a = 16'b1010_1100_0011_0101`.
+    #[test]
+    fn test_indexed_part_select() {
+        let mut store = StateStore::new();
+        store.set_ranged("a", Register::from_binary("1010110000110101"), (15, 0));
+        assert_eq!(bits_in("a[0 +: 4]", &store), "0101");
+        assert_eq!(bits_in("a[4 +: 4]", &store), "0011");
+        assert_eq!(bits_in("a[15 -: 4]", &store), "1010");
+        assert_eq!(bits_in("a[7 -: 8]", &store), "00110101");
+    }
+
+    /// The base may be any expression, including one that moves at run time —
+    /// that is the whole reason the operator exists. Only the width has to be
+    /// constant.
+    #[test]
+    fn test_indexed_part_select_base_may_be_computed() {
+        let mut store = StateStore::new();
+        store.set_ranged("a", Register::from_binary("1010110000110101"), (15, 0));
+        store.set_ranged("n", Register::from_u128(1, 4), (3, 0));
+        assert_eq!(bits_in("a[n * 4 +: 4]", &store), "0011");
+    }
+
+    /// An unknown base selects `x`, the way a vector indexed by an unknown
+    /// does — it is not the error a bad *width* is.
+    #[test]
+    fn test_indexed_part_select_with_unknown_base_is_unknown() {
+        let mut store = StateStore::new();
+        store.set_ranged("a", Register::from_binary("1010110000110101"), (15, 0));
+        store.set_ranged("n", Register::from_binary("xx"), (1, 0));
+        assert_eq!(bits_in("a[n +: 4]", &store), "xxxx");
+    }
+
+    /// The width is constant by construction, so it is known without
+    /// evaluating anything.
+    #[test]
+    fn test_indexed_part_select_width() {
+        let store = StateStore::new();
+        assert_eq!(expression_width(&parse("a[0 +: 4]"), &store), 4);
+        assert_eq!(expression_width(&parse("a[15 -: 8]"), &store), 8);
     }
 }
