@@ -313,12 +313,6 @@ pub struct Drive {
     target: Expression,
     value: Expression,
     level: DriveLevel,
-    /// What a `force` displaced when it was installed. A `release` with no
-    /// procedural `assign` underneath it puts this back: writes made while the
-    /// force was in place were discarded, so this is still the signal's last
-    /// procedural value. `None` for an `assign`, which a `deassign` does not
-    /// undo.
-    displaced: Option<Register>,
 }
 
 impl Drive {
@@ -327,14 +321,12 @@ impl Drive {
         target: Expression,
         value: Expression,
         level: DriveLevel,
-        displaced: Option<Register>,
     ) -> Self {
         Drive {
             name: name.into(),
             target,
             value,
             level,
-            displaced,
         }
     }
 
@@ -352,11 +344,6 @@ impl Drive {
 
     pub fn level(&self) -> DriveLevel {
         self.level
-    }
-
-    /// The value this drive displaced, consumed by the `release` that undoes it.
-    pub fn into_displaced(self) -> Option<Register> {
-        self.displaced
     }
 }
 
@@ -537,9 +524,8 @@ impl StateStore {
 
     /// Installs a drive, replacing any of the same strength on the same signal.
     ///
-    /// Re-`force`ing an already forced signal keeps what the *first* force
-    /// displaced: that is the value a `release` has to put back, and the
-    /// intervening one never reached the signal.
+    /// Re-`force`ing an already forced signal replaces what it drives; there
+    /// is nothing to remember, because a `release` puts nothing back.
     pub fn install_drive(&mut self, drive: Drive) {
         let drives = Rc::make_mut(&mut self.drives);
         match drives
@@ -554,8 +540,7 @@ impl StateStore {
         }
     }
 
-    /// Takes the drive of `level` off `name`, handing it back so that a
-    /// `release` can read what it displaced.
+    /// Takes the drive of `level` off `name`, handing it back to the caller.
     pub fn remove_drive(&mut self, name: &str, level: DriveLevel) -> Option<Drive> {
         let position = self
             .drives

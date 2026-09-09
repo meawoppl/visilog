@@ -305,37 +305,6 @@ pub fn drive_at(
     }
 }
 
-/// Reads back exactly the bits a target names.
-///
-/// The mirror of [`drive_resolved`], and it exists for one caller: a `force`
-/// has to remember what it displaced so that a `release` can put it back.
-pub fn read_resolved(
-    state: &StateStore,
-    target: &ResolvedTarget,
-) -> Result<Register, SimulationError> {
-    match target {
-        ResolvedTarget::Whole(name) => state
-            .get(name)
-            .cloned()
-            .ok_or_else(|| SimulationError::UnknownSignal(name.clone())),
-        ResolvedTarget::Bits { name, indices } => {
-            let signal = state
-                .get_signal(name)
-                .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
-            let bits: Vec<u8> = indices.iter().map(|&index| signal.bit(index)).collect();
-            Ok(Register::from_bits(bits))
-        }
-        ResolvedTarget::Word { name, index } => state
-            .memory(name)
-            .map(|memory| memory.word(Some(*index)))
-            .ok_or_else(|| SimulationError::UnknownSignal(name.clone())),
-        // An event holds no value, so there is nothing for a `force` to
-        // displace and put back. Forcing one is illegal Verilog anyway; this
-        // reports it as the category error it is rather than inventing bits.
-        ResolvedTarget::Event(name) => Err(EvalError::EventAsValue(name.clone()).into()),
-    }
-}
-
 /// Installs a procedural continuous drive — an `assign` or a `force` — and
 /// applies it straight away.
 ///
@@ -350,10 +319,6 @@ pub fn install_drive(
     level: DriveLevel,
 ) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
-    let displaced = match level {
-        DriveLevel::Force => Some(read_resolved(state, &resolved)?),
-        _ => None,
-    };
     let evaluated = eval_sized(value, state, resolved.width(state))?;
     drive_at(state, &resolved, &evaluated, level)?;
     state.install_drive(Drive::new(
@@ -361,7 +326,6 @@ pub fn install_drive(
         target.clone(),
         value.clone(),
         level,
-        displaced,
     ));
     Ok(())
 }
@@ -386,11 +350,15 @@ pub fn apply_drive(state: &mut StateStore, drive: &Drive) -> Result<bool, Simula
 /// stored.
 pub fn release_drive(state: &mut StateStore, target: &Expression) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
-    let released = state.remove_drive(resolved.name(), DriveLevel::Force);
+    state.remove_drive(resolved.name(), DriveLevel::Force);
+    // A `release` puts nothing back. A **net** reverts anyway, because its
+    // continuous drivers reach it again on the next pass; a **variable** has no
+    // driver, so it keeps the value the force left. That asymmetry is the whole
+    // of the rule, and it is what iverilog does: releasing a forced `reg` holding
+    // `1010` leaves `1010`, while releasing a forced `wire` returns it to its
+    // assignment.
     if let Some(assign) = state.drive(resolved.name(), DriveLevel::Assign).cloned() {
         apply_drive(state, &assign)?;
-    } else if let Some(displaced) = released.and_then(Drive::into_displaced) {
-        drive_resolved(state, &resolved, &displaced)?;
     }
     Ok(())
 }
