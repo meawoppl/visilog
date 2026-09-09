@@ -157,6 +157,11 @@ pub enum SimulationError {
     /// override that quietly did not happen leaves a design running at a width
     /// it was told not to use.
     UnappliedDefparam(String),
+    /// A `disable` naming a scope the design has nowhere: no named block and
+    /// no task spells it, anywhere. Disabling a scope that exists but is not
+    /// running is a legitimate no-op — disabling one that does not exist is a
+    /// design that thinks it cancelled something.
+    UnknownScope(String),
 }
 
 impl fmt::Display for SimulationError {
@@ -240,6 +245,9 @@ impl fmt::Display for SimulationError {
             ),
             SimulationError::UnappliedDefparam(path) => {
                 write!(f, "`defparam {}` names no parameter in the design", path)
+            }
+            SimulationError::UnknownScope(scope) => {
+                write!(f, "`disable {}` names no block or task in the design", scope)
             }
             SimulationError::GateTerminals { gate, found } => write!(
                 f,
@@ -814,12 +822,100 @@ impl Simulator {
         id: usize,
         pc: usize,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
-        match program::resume(
-            &self.blocks[id].program,
-            pc,
-            &mut self.state,
-            &mut self.tasks,
-        )? {
+        let mut pc = pc;
+        let mut carried = Vec::new();
+        // A `disable` of another block does not suspend the block that wrote
+        // it: the driver cancels what it named and control comes straight back
+        // here. Looping rather than recursing keeps the store borrow inside
+        // `resume` and lets the cancellation have the simulator mutably.
+        loop {
+            let outcome = program::resume(
+                &self.blocks[id].program,
+                pc,
+                &mut self.state,
+                &mut self.tasks,
+            )?;
+            let Resume::Disabled {
+                scope,
+                pc: next,
+                pending,
+            } = outcome
+            else {
+                let (mut updates, halted) = self.settled_resume(id, outcome)?;
+                carried.append(&mut updates);
+                return Ok((carried, halted));
+            };
+            carried.extend(pending);
+            self.cancel_scope(&scope)?;
+            pc = next;
+        }
+    }
+
+    /// Cancels every suspended block currently inside `scope`, re-queueing each
+    /// one at the instruction its scope ends on.
+    ///
+    /// That is the whole of what disabling somebody else means: the LRM says
+    /// execution continues with the statement following the disabled block, and
+    /// a resume point here is a program counter, so "continue after it" is the
+    /// scope's `end`. Queueing rather than resuming inline is what puts the
+    /// cancelled block's remaining output *after* the block that disabled it,
+    /// which is where iverilog puts it.
+    ///
+    /// A scope the design has nowhere is [`SimulationError::UnknownScope`]. A
+    /// scope that exists but is not running anywhere is a no-op, which is what
+    /// the LRM asks for — `always #6 disable foo;` cancels the enable of `foo`
+    /// that happens to be in flight and says nothing about the times it is not.
+    fn cancel_scope(&mut self, scope: &str) -> Result<(), SimulationError> {
+        let known = self
+            .blocks
+            .iter()
+            .any(|block| block.program.scopes().iter().any(|it| it.name == scope));
+        if !known {
+            return Err(SimulationError::UnknownScope(scope.to_string()));
+        }
+
+        let blocks = &self.blocks;
+        let mut cancelled = Vec::new();
+        self.queue.retain(|cursor| {
+            match blocks[cursor.block]
+                .program
+                .scope_end_containing(scope, cursor.pc)
+            {
+                Some(end) => {
+                    cancelled.push(ExecutionCursor::new(cursor.block, end));
+                    true
+                }
+                None => false,
+            }
+        });
+        self.waiting.retain(|waiting| {
+            match blocks[waiting.cursor.block]
+                .program
+                .scope_end_containing(scope, waiting.cursor.pc)
+            {
+                Some(end) => {
+                    cancelled.push(ExecutionCursor::new(waiting.cursor.block, end));
+                    false
+                }
+                None => true,
+            }
+        });
+
+        for cursor in cancelled {
+            self.queue.insert(self.now, cursor);
+        }
+        Ok(())
+    }
+
+    /// What the driver does with a [`Resume`] that is not a
+    /// [`Resume::Disabled`]: queue a delay, arm a wait, or restart a
+    /// free-running block that ran off its end.
+    fn settled_resume(
+        &mut self,
+        id: usize,
+        outcome: Resume,
+    ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
+        match outcome {
             // A free-running `always` restarts the moment it finishes, which
             // is how `always begin #50 … end` keeps going forever — and how
             // `always value = @(ev) 5;` waits for the event again after the
@@ -848,6 +944,8 @@ impl Simulator {
                 });
                 Ok((pending, false))
             }
+            // `resume_block` takes this one before it gets here.
+            Resume::Disabled { scope, .. } => Err(SimulationError::UnknownScope(scope)),
         }
     }
 
@@ -5351,5 +5449,229 @@ mod tests {
             error,
             SimulationError::Unsupported("an `@(*)` event control that reads nothing")
         );
+    }
+
+    /// `disable` of the block the statement is written inside is an early exit
+    /// from it: the statements after the `disable` but still inside the block
+    /// never run, and the ones after the block do.
+    #[test]
+    fn test_disable_of_the_enclosing_block_is_an_early_exit() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    begin : body
+                        $display("in");
+                        disable body;
+                        $display("not reached");
+                    end
+                    $display("after");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "in\nafter\n");
+    }
+
+    /// The same, out of a loop several levels down: a `disable` inside a `for`
+    /// inside the named block leaves the whole block, not just the iteration.
+    #[test]
+    fn test_disable_leaves_a_loop_nested_inside_the_block_it_names() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer i;
+                initial begin
+                    begin : configloop
+                        for (i = 0; i < 4; i = i + 1) begin
+                            $display("%0d", i);
+                            if (i == 1) disable configloop;
+                        end
+                        $display("not reached");
+                    end
+                    $display("i is %0d", i);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0\n1\ni is 1\n");
+    }
+
+    /// `disable <task>` written inside the task itself is how Verilog spells an
+    /// early return, and the body is inlined where it was enabled — so the
+    /// caller carries on with the statement after the enable.
+    #[test]
+    fn test_disable_of_a_task_from_inside_it_returns_to_the_caller() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                task t;
+                    begin
+                        $display("entered");
+                        disable t;
+                        $display("not reached");
+                    end
+                endtask
+                initial begin
+                    t;
+                    $display("back");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "entered\nback\n");
+    }
+
+    /// A block suspended on a `#delay` is cancelled by a `disable` written in
+    /// another block: the statements it had left never run.
+    #[test]
+    fn test_disable_cancels_a_block_suspended_on_a_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg working;
+                initial begin : my_block
+                    working = 1;
+                    #10;
+                    working = 0;
+                end
+                initial begin
+                    #5 disable my_block;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(20).expect("time should advance");
+        assert_eq!(simulator.get("working").unwrap().to_binary(), "1");
+    }
+
+    /// The disabled block picks up at the statement following the block it
+    /// named, at the time it was disabled — and after whatever the block that
+    /// disabled it went on to print, which is where iverilog puts it.
+    #[test]
+    fn test_a_disabled_block_continues_after_the_scope_it_named() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    begin : b
+                        #10;
+                        $display("%0t inside b", $time);
+                    end
+                    $display("%0t after b", $time);
+                end
+                initial begin
+                    #5 disable b;
+                    $display("%0t disabled", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(20).expect("time should advance");
+        assert_eq!(simulator.output().text(), "5 disabled\n5 after b\n");
+    }
+
+    /// A block waiting on the design rather than on the clock is cancelled the
+    /// same way, and a *free-running* `always` then starts again — which is
+    /// what makes `disable` the way a design restarts one.
+    #[test]
+    fn test_disable_restarts_a_free_running_always_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                always begin : restartable
+                    $display("%0t runs", $time);
+                    wait (0);
+                    $display("FAILED");
+                end
+                initial begin
+                    #10 disable restartable;
+                    #10 $finish;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 runs\n10 runs\n");
+    }
+
+    /// An edge-triggered `always` block that was disabled mid-activation is
+    /// simply not running any more, and the next edge starts it afresh.
+    #[test]
+    fn test_disable_cancels_one_activation_of_an_edge_triggered_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg clk, q;
+                always @(posedge clk) begin : ff
+                    #2;
+                    q = ~q;
+                end
+                initial begin
+                    q = 0;
+                    clk = 0;
+                    #1 clk = 1;
+                    #1 disable ff;
+                    #5 clk = 0;
+                    #1 clk = 1;
+                    #5 $display("q is %b", q);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "q is 1\n");
+    }
+
+    /// Disabling a scope that exists but is not running anywhere is the LRM's
+    /// no-op — `always #6 disable t;` says nothing about the times no enable of
+    /// `t` is in flight.
+    #[test]
+    fn test_disabling_a_scope_that_is_not_running_does_nothing() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] value;
+                task t;
+                    value = #2 1;
+                endtask
+                initial begin
+                    value = 0;
+                    #5 t;
+                    #4 $display("value is %0d", value);
+                end
+                always #6 disable t;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "value is 0\n");
+    }
+
+    /// A `disable` naming nothing the design has is an error saying so. A
+    /// design that thought it cancelled something and did not is the hardest
+    /// kind of wrong answer to find.
+    #[test]
+    fn test_disabling_a_scope_the_design_does_not_have_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module main();
+                initial disable nowhere;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(error, SimulationError::UnknownScope("nowhere".to_string()));
     }
 }

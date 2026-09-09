@@ -190,8 +190,28 @@ pub enum Instruction {
     WriteHeld { slot: String, target: Expression },
     /// `$display(…)` and friends — a call to a system task.
     Task(TaskCall),
+    /// `disable blk;` — terminate the activity of the named scope.
+    ///
+    /// The scope is a range of instructions ([`Program::scopes`]), so when the
+    /// program counter is already inside it this is a jump to where that range
+    /// ends. When it is not, the scope belongs to some other block and only
+    /// the driver can reach it, which is what [`Resume::Disabled`] is for.
+    Disable(String),
     /// The end of the block.
     Halt,
+}
+
+/// A named scope — a `begin : blk` label, or a task whose body was inlined
+/// where it was enabled — and the half-open range of instructions it covers.
+///
+/// `disable` is the only thing that needs this. It names a scope rather than a
+/// statement, and "terminate that scope" is exactly "continue at `end`", so
+/// the range is the whole of what a disable has to know.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopeRange {
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 /// A procedural block flattened into instructions.
@@ -206,6 +226,10 @@ pub struct Program {
     /// them alone: a task local called `count` and a design signal called
     /// `count` are different variables, and renaming twice would confuse them.
     inlined: Vec<(usize, usize)>,
+    /// The named scopes in the program, each with the instructions it covers.
+    /// Only a `disable` reads them, so a design that never writes one carries
+    /// an empty `Vec` and pays nothing.
+    scopes: Vec<ScopeRange>,
 }
 
 /// Why [`resume`] gave control back.
@@ -224,6 +248,15 @@ pub enum Resume {
     Waiting {
         pc: usize,
         wait: WaitReason,
+        pending: Vec<PendingUpdate>,
+    },
+    /// Hit a `disable` naming a scope this block is not inside, so the block
+    /// that *is* in it can only be reached by the driver. Cancel it, then come
+    /// straight back here at `pc` — a `disable` of somebody else does not
+    /// suspend the block that wrote it.
+    Disabled {
+        scope: String,
+        pc: usize,
         pending: Vec<PendingUpdate>,
     },
 }
@@ -281,7 +314,13 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
             *slot = resolve(slot);
             rename_expression(target, resolve);
         }
-        Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
+        // A `disable` names a scope rather than a signal, so it is renamed
+        // beside the scope table it points into — see
+        // [`Program::rename_scopes`] — and never through a map of variables.
+        Instruction::Jump(_)
+        | Instruction::Delay(_)
+        | Instruction::Disable(_)
+        | Instruction::Halt => {}
     }
 }
 
@@ -318,6 +357,7 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
         | Instruction::Delay(_)
+        | Instruction::Disable(_)
         | Instruction::Halt => {}
     }
 }
@@ -382,6 +422,64 @@ impl Program {
         for instruction in &mut self.instructions {
             rename_instruction(instruction, resolve);
         }
+        self.rename_scopes(resolve);
+    }
+
+    /// Rewrites the *scope* names — the block labels and task names a
+    /// `disable` reaches for — through `resolve`.
+    ///
+    /// A label is not a signal, so it deliberately does not travel with the
+    /// rest of an instruction's names: a task's locals and a named block's
+    /// variables are renamed over a range of instructions, and a scope belongs
+    /// to the instance the block was elaborated into rather than to either of
+    /// those. Both halves move together so that `disable blk` inside instance
+    /// `dut` and the scope `dut.blk` still name the same thing.
+    fn rename_scopes(&mut self, resolve: &dyn Fn(&str) -> String) {
+        for scope in &mut self.scopes {
+            scope.name = resolve(&scope.name);
+        }
+        for instruction in &mut self.instructions {
+            if let Instruction::Disable(name) = instruction {
+                *name = resolve(name);
+            }
+        }
+    }
+
+    /// The named scopes the program holds, each with the instructions it
+    /// covers.
+    pub fn scopes(&self) -> &[ScopeRange] {
+        &self.scopes
+    }
+
+    /// Where `scope` ends, if `pc` is inside it — which is where a `disable`
+    /// of it continues.
+    ///
+    /// Two enables of one task are two ranges under one name, so the range is
+    /// chosen by the program counter rather than by the name alone.
+    pub fn scope_end_containing(&self, scope: &str, pc: usize) -> Option<usize> {
+        self.scopes
+            .iter()
+            .find(|range| range.name == scope && range.start <= pc && pc < range.end)
+            .map(|range| range.end)
+    }
+
+    /// The first `disable` in the program naming a scope that does not contain
+    /// it, or `None` when every one of them is an exit from a block it is
+    /// written inside.
+    ///
+    /// A non-local `disable` reaches out of the program it is written in, and
+    /// a caller with nothing else to reach — a function frame — has to say so
+    /// rather than quietly do nothing.
+    pub fn nonlocal_disable(&self) -> Option<&str> {
+        self.instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, instruction)| match instruction {
+                Instruction::Disable(scope) if self.scope_end_containing(scope, pc).is_none() => {
+                    Some(scope.as_str())
+                }
+                _ => None,
+            })
     }
 
     /// Rewrites every expression the program holds through `replace`.
@@ -461,6 +559,15 @@ impl Program {
                 _ => {}
             }
             self.instructions.push(instruction);
+        }
+        // A named block written inside a task is a scope of its own, and its
+        // range moves by exactly what the body moved by.
+        for scope in &body.scopes {
+            self.scopes.push(ScopeRange {
+                name: scope.name.clone(),
+                start: scope.start + offset,
+                end: scope.end + offset,
+            });
         }
         self.inlined.push((offset, self.instructions.len()));
     }
@@ -550,6 +657,15 @@ impl Program {
                 // and the body's instructions are in that same list.
                 ProceduralStatements::TaskEnable { name, arguments } => {
                     self.compile_task_enable(name, arguments, tasks)?
+                }
+                // The name is resolved against the scopes this statement is
+                // written inside, innermost first, which is what makes
+                // `disable wait_loop` inside task `t` mean `t.wait_loop`
+                // rather than a block of that name somewhere else. A name that
+                // matches none of them is left as it stands, to be found among
+                // the module's own scopes when it runs.
+                ProceduralStatements::Disable(name) => {
+                    self.emit(Instruction::Disable(enclosing_scope(scope, &name.name)));
                 }
                 // Which `$name`s exist is settled here rather than while the
                 // design runs, so an unrecognised one fails before it can look
@@ -668,6 +784,14 @@ impl Program {
         let start = self.next();
         self.compile_statements(&block.statements, tasks, &inner)?;
         let end = self.next();
+        // The label is a scope a `disable` may name, and terminating it is
+        // continuing at `end` — so the range is recorded whether or not the
+        // block declares anything.
+        self.scopes.push(ScopeRange {
+            name: inner.trim_end_matches('.').to_string(),
+            start,
+            end,
+        });
 
         if block.locals.is_empty() {
             return Ok(());
@@ -919,6 +1043,11 @@ impl Program {
             });
         }
 
+        // The scope a `disable` of this task names covers the copies as well as
+        // the body: a task that was terminated never returned, so it never
+        // wrote its `output` arguments back either.
+        let start = self.next();
+
         for (argument, connection) in definition.arguments.iter().zip(arguments) {
             if argument.direction.copies_in() {
                 self.emit(Instruction::Blocking {
@@ -938,6 +1067,13 @@ impl Program {
                 });
             }
         }
+
+        let end = self.next();
+        self.scopes.push(ScopeRange {
+            name: name.name.clone(),
+            start,
+            end,
+        });
         Ok(())
     }
 
@@ -1087,6 +1223,7 @@ impl FunctionDefinition {
             Resume::Halted { .. } => {}
             Resume::Suspended { .. } => return Err(FUNCTION_DELAY_UNSUPPORTED),
             Resume::Waiting { .. } => return Err(FUNCTION_EVENT_UNSUPPORTED),
+            Resume::Disabled { scope, .. } => return Err(SimulationError::UnknownScope(scope)),
         }
 
         frame
@@ -1270,6 +1407,21 @@ pub fn resume(
                 drive_resolved(store, &target, &value)?;
                 pc += 1;
             }
+            // Terminating a scope the block is already inside is a jump to
+            // where that scope ends — which is exactly "execution continues
+            // with the statement following the block". Terminating one it is
+            // not inside can only be done by whoever holds the other block's
+            // resume point, so it goes back to the driver.
+            Instruction::Disable(scope) => match program.scope_end_containing(scope, pc) {
+                Some(end) => pc = end,
+                None => {
+                    return Ok(Resume::Disabled {
+                        scope: scope.clone(),
+                        pc: pc + 1,
+                        pending,
+                    })
+                }
+            },
             Instruction::Halt => return Ok(Resume::Halted { pending }),
         }
     }
@@ -1283,6 +1435,28 @@ pub fn resume(
 /// variables take.
 pub fn block_scope(scope: &str, name: &str) -> String {
     format!("{}{}.", scope, name)
+}
+
+/// The scope `name` refers to when it is written inside `scope`.
+///
+/// `disable` names a block by its bare label, and the label it means is the
+/// innermost enclosing one that matches — `disable wait_loop` inside task `t`
+/// is `t.wait_loop`, and the same word written at the top of a module is
+/// `wait_loop`. A name matching none of the enclosing scopes is left as it
+/// stands: it belongs to another block, and only the driver can find it.
+fn enclosing_scope(scope: &str, name: &str) -> String {
+    let mut rest = scope.trim_end_matches('.');
+    while !rest.is_empty() {
+        let (head, last) = match rest.rfind('.') {
+            Some(at) => (&rest[..at], &rest[at + 1..]),
+            None => ("", rest),
+        };
+        if last == name {
+            return rest.to_string();
+        }
+        rest = head;
+    }
+    name.to_string()
 }
 
 /// The explicit sensitivity list an `@*` in front of `body` stands for: every
@@ -1383,7 +1557,7 @@ mod tests {
                 commit_updates(pending, store).unwrap();
                 Some((pc, delay))
             }
-            Resume::Waiting { pending, .. } => {
+            Resume::Waiting { pending, .. } | Resume::Disabled { pending, .. } => {
                 commit_updates(pending, store).unwrap();
                 None
             }

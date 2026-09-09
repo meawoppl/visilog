@@ -17,7 +17,7 @@ use super::{
     constants::VerilogConstant,
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
-    identifier::{identifier, identifier_list, Identifier},
+    identifier::{hierarchical_identifier, identifier, identifier_list, Identifier},
     keywords::is_reserved_word,
     simple::{range, signedness, ws, ws_and_comments, Range},
     string::parse_verilog_string,
@@ -275,6 +275,15 @@ pub enum ProceduralStatements {
         name: Identifier,
         arguments: Vec<Expression>,
     },
+    /// `disable blk;` / `disable my_task;` — terminate a named block or a task
+    /// enable that is currently running.
+    ///
+    /// The operand is a *scope*, not a signal: the label a `begin : blk` gave
+    /// its statements, or the name of a task whose body was inlined where it
+    /// was enabled. Both of those are already names the simulator knows, which
+    /// is what makes this a statement about the program counter rather than a
+    /// statement about a value.
+    Disable(Identifier),
 }
 
 pub enum ProceduralBlock {
@@ -305,6 +314,7 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
         // they are keyword-led, so they belong with the rest of that family.
         parse_procedural_drive,
         parse_procedural_undrive,
+        parse_disable_statement,
         map(parse_assignment, |a| ProceduralStatements::Assignment(a)),
         // `#5;` is a statement in its own right, so it is tried before the
         // prefix form, whose body would have nothing to match.
@@ -368,6 +378,19 @@ fn parse_task_enable(input: &str) -> IResult<&str, ProceduralStatements> {
             arguments: arguments.unwrap_or_default(),
         },
     ))
+}
+
+/// `disable blk;` — terminate the activity of a named block or of a task.
+///
+/// `disable` is a reserved word, so this can never be confused with the task
+/// enable it otherwise looks exactly like. The operand is a *hierarchical*
+/// identifier because a block label is a scope and a scope can be reached
+/// through the design's hierarchy.
+fn parse_disable_statement(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, _) = keyword(input, "disable")?;
+    let (input, name) = ws(hierarchical_identifier)(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    Ok((input, ProceduralStatements::Disable(name)))
 }
 
 /// `#5 <statement>` — a delay prefixing any procedural statement, including a
@@ -2525,6 +2548,40 @@ mod tests {
         assert_eq!(
             assignment.timing(),
             Some(&AssignmentTiming::Delay(Delay::new(5)))
+        );
+    }
+
+    #[test]
+    fn test_disable_parses_a_block_label_and_a_task_name_alike() {
+        for source in ["disable body;", "disable  my_task ;", "disable/*c*/b;"] {
+            let statement = assert_parses(procedural_statement, source);
+            assert!(
+                matches!(statement, ProceduralStatements::Disable(_)),
+                "expected a disable, got {:?}",
+                statement
+            );
+        }
+    }
+
+    /// A `disable` reaches a block by its hierarchical path as readily as by
+    /// its bare label.
+    #[test]
+    fn test_disable_takes_a_hierarchical_scope_name() {
+        let statement = assert_parses(procedural_statement, "disable main.dut.body;");
+        assert_eq!(
+            statement,
+            ProceduralStatements::Disable(Identifier::new("main.dut.body".to_string()))
+        );
+    }
+
+    /// `disable` is a reserved word, so the identifier-led task enable that it
+    /// otherwise looks exactly like cannot claim it.
+    #[test]
+    fn test_disable_is_not_read_as_a_task_enable() {
+        let statement = assert_parses(procedural_statement, "disable t;");
+        assert_eq!(
+            statement,
+            ProceduralStatements::Disable(Identifier::new("t".to_string()))
         );
     }
 }
