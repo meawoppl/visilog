@@ -9,6 +9,8 @@ use nom::{
 
 use nom::character::complete::{char, multispace1};
 
+use super::expr::{verilog_expression, Expression};
+
 pub fn whitespace(input: &str) -> IResult<&str, &str> {
     take_while(|c: char| c.is_whitespace())(input)
 }
@@ -103,27 +105,89 @@ pub fn signedness(input: &str) -> IResult<&str, bool> {
     )(input)
 }
 
-/// `[7:0]` — a declared width, constant-folded to its two bounds at parse
-/// time.
+/// `[7:0]`, `[WIDTH-1:0]` — a declared range, as written.
+///
+/// A width is not always a literal: `reg [WIDTH-1:0] q;` sizes itself from a
+/// parameter, and a parameter override in the parent is allowed to change it.
+/// The bounds are therefore kept as *expressions* and resolved at elaboration,
+/// where the parameters in scope are known — which is the only point at which
+/// the answer exists.
+///
+/// The literal spelling is still folded at parse time, so the overwhelmingly
+/// common `[7:0]` costs one variant and no evaluation.
+#[derive(Debug, PartialEq, Clone)]
+pub enum Range {
+    /// Both bounds were literal integers, folded where they were written.
+    Constant(i64, i64),
+    /// At least one bound is an expression, to be resolved against the
+    /// parameters in scope.
+    Expressions(Box<Expression>, Box<Expression>),
+}
+
+impl Range {
+    /// `[0:0]` — the one bit a declaration that named no range describes.
+    pub const SINGLE_BIT: Range = Range::Constant(0, 0);
+
+    /// The bounds, when the range was written as two literals. `None` means
+    /// they can only be known once the parameters in scope are.
+    pub fn constant(&self) -> Option<(i64, i64)> {
+        match self {
+            Range::Constant(msb, lsb) => Some((*msb, *lsb)),
+            Range::Expressions(_, _) => None,
+        }
+    }
+}
+
+/// A range whose two bounds are literal integers, folded as it is read.
+fn constant_range(input: &str) -> IResult<&str, Range> {
+    map(
+        delimited(
+            char('['),
+            tuple((ws(raw_pos_int), preceded(char(':'), ws(raw_pos_int)))),
+            char(']'),
+        ),
+        |(msb, lsb)| Range::Constant(msb, lsb),
+    )(input)
+}
+
+/// A range whose bounds are general expressions: `[WIDTH-1:0]`, `[0:count-1]`.
+fn expression_range(input: &str) -> IResult<&str, Range> {
+    map(
+        delimited(
+            char('['),
+            tuple((
+                ws(verilog_expression),
+                preceded(char(':'), ws(verilog_expression)),
+            )),
+            char(']'),
+        ),
+        |(msb, lsb)| Range::Expressions(Box::new(msb), Box::new(lsb)),
+    )(input)
+}
+
+/// `[7:0]` — a declared width.
 ///
 /// Every one of the four positions inside the brackets is a token boundary, so
 /// whitespace and comments are skipped at all of them: `[ 7:0]`, `[7 : 0]` and
 /// `[7:0 ]` are the same range. Only the brackets themselves have to touch
 /// what is next to them.
-pub fn range(input: &str) -> IResult<&str, (i64, i64)> {
-    delimited(
-        char('['),
-        tuple((ws(raw_pos_int), preceded(char(':'), ws(raw_pos_int)))),
-        char(']'),
-    )(input)
+///
+/// The literal form is tried first so that it folds, and it cannot mis-fire on
+/// an expression: the whole range is bracket delimited, so `[7-1:0]` fails the
+/// literal parser at the `-` and falls through with nothing consumed.
+pub fn range(input: &str) -> IResult<&str, Range> {
+    alt((constant_range, expression_range))(input)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parsers::behavior::{parse_sensitivity_list, procedural_statement, EventControl};
+    use crate::parsers::constants::VerilogConstant;
     use crate::parsers::helpers::{assert_parses, assert_parses_to};
+    use crate::parsers::identifier::Identifier;
     use crate::parsers::modules::parse_module_instantiation_statement;
+    use crate::parsers::operators::BinaryOperator;
     use crate::parsers::source::parse_verilog_source;
 
     #[test]
@@ -388,7 +452,12 @@ mod tests {
             "[\n 7 :\n 0\n]",
             "[/* msb */7:/* lsb */0]",
         ] {
-            assert_eq!(range(spelling), Ok(("", (7, 0))), "{}", spelling);
+            assert_eq!(
+                range(spelling),
+                Ok(("", Range::Constant(7, 0))),
+                "{}",
+                spelling
+            );
         }
         // The brackets themselves still have to be there.
         assert!(range(" [7:0]").is_err());
@@ -397,12 +466,61 @@ mod tests {
 
     #[test]
     fn test_range() {
-        assert_eq!(range("[1:0]abc"), Ok(("abc", (1, 0))));
-        assert_eq!(range("[10:5]abc"), Ok(("abc", (10, 5))));
-        assert_eq!(range("[0:0]abc"), Ok(("abc", (0, 0))));
-        assert_eq!(range("[123:456]abc"), Ok(("abc", (123, 456))));
+        assert_eq!(range("[1:0]abc"), Ok(("abc", Range::Constant(1, 0))));
+        assert_eq!(range("[10:5]abc"), Ok(("abc", Range::Constant(10, 5))));
+        assert_eq!(range("[0:0]abc"), Ok(("abc", Range::Constant(0, 0))));
+        assert_eq!(
+            range("[123:456]abc"),
+            Ok(("abc", Range::Constant(123, 456)))
+        );
         assert!(range("abc").is_err());
-        assert_eq!(range("[3:2]def"), Ok(("def", (3, 2))));
-        assert_eq!(range("[8:4]ghi"), Ok(("ghi", (8, 4))));
+        assert_eq!(range("[3:2]def"), Ok(("def", Range::Constant(3, 2))));
+        assert_eq!(range("[8:4]ghi"), Ok(("ghi", Range::Constant(8, 4))));
+    }
+
+    /// A bound that is not a literal is kept as an expression rather than
+    /// rejected. `[WIDTH-1:0]` is what a parameterised design writes.
+    #[test]
+    fn test_range_accepts_expression_bounds() {
+        let expected = Range::Expressions(
+            Box::new(Expression::Binary(
+                Box::new(Expression::Identifier(Identifier::new("WIDTH".to_string()))),
+                BinaryOperator::Subtraction,
+                Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+            )),
+            Box::new(Expression::Constant(VerilogConstant::from_int(0))),
+        );
+        assert_eq!(range("[WIDTH-1:0]"), Ok(("", expected)));
+    }
+
+    /// The whitespace rule is the same for an expression bound: every position
+    /// inside the brackets is a token boundary.
+    #[test]
+    fn test_expression_range_tolerates_whitespace() {
+        for spelling in [
+            "[0:count-1]",
+            "[0: count-1]",
+            "[ 0 : count - 1 ]",
+            "[0:count -1]",
+        ] {
+            let parsed = range(spelling);
+            assert!(
+                matches!(parsed, Ok(("", Range::Expressions(_, _)))),
+                "{} parsed as {:?}",
+                spelling,
+                parsed
+            );
+        }
+    }
+
+    /// A range is still bracket delimited, so an unterminated one is an error
+    /// rather than a bound that swallowed the rest of the file.
+    #[test]
+    fn test_range_still_needs_its_brackets() {
+        assert!(range("[7:0").is_err());
+        assert!(range("[a:0").is_err());
+        assert!(range("[:0]").is_err());
+        assert!(range("[7:]").is_err());
+        assert!(range("[]").is_err());
     }
 }

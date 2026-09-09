@@ -10,7 +10,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, signedness, ws},
+    simple::{range, signedness, ws, Range},
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -23,7 +23,7 @@ pub enum ParameterKind {
 pub struct ParameterDeclaration {
     pub kind: ParameterKind,
     pub name: Identifier,
-    pub range: Option<(i64, i64)>,
+    pub range: Option<Range>,
     /// Whether the declaration carried a `signed` qualifier, or a type that
     /// implies one. An unqualified parameter takes its value's signedness
     /// instead, which is why this is a plain `bool` rather than an `Option`.
@@ -67,7 +67,7 @@ pub fn parse_parameter_declaration(input: &str) -> IResult<&str, Vec<ParameterDe
         .map(|(name, value)| ParameterDeclaration {
             kind: kind.clone(),
             name,
-            range,
+            range: range.clone(),
             signed,
             value,
         })
@@ -104,7 +104,7 @@ mod tests {
             vec![ParameterDeclaration {
                 kind: ParameterKind::Parameter,
                 name: "WIDTH".into(),
-                range: Some((7, 0)),
+                range: Some(Range::Constant(7, 0)),
                 signed: false,
                 value: verilog_expression("8").unwrap().1,
             }],
@@ -148,7 +148,7 @@ mod tests {
             "parameter signed [7:0] p = -1;",
         );
         assert!(signed[0].signed);
-        assert_eq!(signed[0].range, Some((7, 0)));
+        assert_eq!(signed[0].range, Some(Range::Constant(7, 0)));
 
         let integer = assert_parses(parse_parameter_declaration, "parameter integer p = 1;");
         assert!(integer[0].signed, "`integer` is signed by definition");

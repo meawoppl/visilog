@@ -52,7 +52,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | File | Owns |
 | --- | --- |
 | `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
-| `simple.rs` | whitespace, comments, `raw_pos_int`, `range`, `signedness`, and the `ws` combinator |
+| `simple.rs` | whitespace, comments, `raw_pos_int`, `Range` and the `range` parser, `signedness`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
 | `numbers.rs` | raw binary / decimal / hex digit runs |
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
@@ -223,6 +223,28 @@ modules and never learns which *file* they came from, so it cannot resolve
 nothing is an error naming the file and every directory tried — never an empty
 memory, which would leave the design reading `x` and look exactly like one that
 simply ran.
+
+**A width is resolved at elaboration, which is the first point at which it exists.**
+A `Range` reaches `elaborate` as two expressions, and `Elaborator::resolve_range` turns
+them into the two numbers the `StateStore` declares a signal with — evaluating them against
+the store, which by then holds the parameters in scope *including any the parent
+overrode*. That is the whole point: `vector #(.WIDTH(16)) large (…)` makes `large`'s
+registers sixteen bits where `small`'s are four. A `Range::Constant` was folded where it
+was written and costs nothing here.
+
+Which is why **parameters are declared before anything else** — `walk` runs them ahead of
+the ports and the other declarations, since `output [WIDTH-1:0] q` has no width until
+`WIDTH` has a value, while keeping their order among themselves so a parameter may be
+written in terms of the one above it. Parameters and functions are circular in general (a
+parameter's value may be a call, a function's return width may be a parameter), and the
+knot is cut by evaluating the parameters first, *holding back* any that would not evaluate,
+compiling the functions, and retrying the ones held back. A second failure is the error,
+and it is the one the first attempt would have reported.
+
+A bound that is not a constant is `SimulationError::UnresolvedRange`, which names the bound
+as written: `reg [n-1:0] q;` for an `n` nothing declares stops with ``range bound `n - 1`
+is not a constant``. A width the simulator picked for itself would be wrong for the whole
+run and would look exactly like nothing having gone wrong.
 
 **Module hierarchy is flattened at elaboration, in `elaborate.rs`.** `Simulator::setup`
 walks the instantiation tree and inlines every child into the *same* flat `StateStore`,
@@ -455,9 +477,7 @@ delay does, which a function never has to; intra-assignment delays (`a = #5 b;` 
 right hand side does not fit in a program counter); and concatenation as an assignment
 target. A drive is also tracked per signal *name* rather than per bit, so
 `force bus[0] = 1;` blocks a write to `bus[1]` as well — corpus `pr1832097a`, `pr245`,
-`pr527` and the `_pv` pair are that one gap. Parameter overrides cannot change a width, because `simple.rs::range` only parses
-literal integers, so `output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built
-but still unwired.
+`pr527` and the `_pv` pair are that one gap. `signals.rs` is built but still unwired.
 
 **`time` is a variable, `event` is not, and `real` is a named refusal.** `time t;` is a 64
 bit *unsigned* register and nothing else — `elaborate` declares it at a fixed width the way
@@ -478,7 +498,7 @@ is read regardless so that a design using one says that is why it stopped, rathe
 dying on unfamiliar syntax several lines earlier.
 | File | Role |
 | --- | --- |
-| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression` and the compiling of a `function` into a `FunctionDefinition` |
+| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope) and the compiling of a `function` into a `FunctionDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
@@ -702,11 +722,13 @@ tripwire.
   The `case` tag is a prefix of both keywords, so `parse_case_keyword` tries it last.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
-- **A parser range is already `(i64, i64)`**, constant-folded at parse time, so a
-  parameter cannot determine a width: `output [WIDTH-1:0] q` does not parse. A parameter
-  override therefore changes a child's *behaviour*, never its widths, until the front end
-  grows expression ranges. Every position *inside* the brackets is a token boundary
-  though, so `[ 7:0]`, `[7 : 0]` and `[7:0 ]` all parse.
+- **A declared range holds *expressions*, and a literal one is folded where it is
+  written.** `simple.rs::Range` is `Constant(i64, i64)` when both bounds were literals and
+  `Expressions(..)` when either was not, so `reg [WIDTH-1:0] q;` and `output [0:count-1] y`
+  parse and `[7:0]` still costs nothing. The literal parser is tried first and cannot
+  mis-fire on an expression: the whole range is bracket delimited, so `[7-1:0]` fails it at
+  the `-` with nothing consumed and falls through. Every position *inside* the brackets is
+  a token boundary, so `[ 7:0]`, `[7 : 0]`, `[7:0 ]` and `[0: count-1]` all parse.
 - **A declaration is a *list*, and every declaration parser returns a `Vec`.**
   `reg [4:0] a, b;`, `wire a, b, c;` and `integer i, j;` all share one width (or, for an
   `integer`, one fixed 32-bit width) across every name, so `parse_register_declaration`,
@@ -853,7 +875,8 @@ tripwire.
   `input`, `reg`, `wire`, `integer`, `time`, `signed`, or a range — which is what lets
   `many0` stop at the first statement of the body. A body is then a `begin`…`end` block or
   a bare list of statements, the same `alt` `initial` uses. A function's range is a
-  `simple.rs::range` like any other, so `function [WIDTH-1:0] f;` still does not parse.
+  `simple.rs::range` like any other, so `function [W-1:0] f;` is sized from a parameter
+  exactly as a `reg` is.
 - **A memory and a signal cannot share a name, and nothing else tells `m[3]`
   from `a[3]`.** `StateStore` keeps two maps and `elaborate` decides which one a
   declaration lands in by whether it carried an address dimension. Anything that

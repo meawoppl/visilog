@@ -45,6 +45,7 @@ use crate::parsers::{
     expr::Expression,
     identifier::Identifier,
     modules::{ModuleInitArguments, ModuleInstantiation, Port, PortDirection, VerilogModule},
+    simple::Range,
     statements::ModuleStatement,
 };
 use crate::register::Register;
@@ -245,18 +246,34 @@ impl<'m> Elaborator<'m> {
         }
         self.stack.push(index);
 
-        // Declarations first, in two passes, so that an instantiation can
+        // Declarations first, in several passes, so that an instantiation can
         // connect to a net declared further down the file — Verilog puts no
         // ordering requirement on module items.
+        //
+        // Parameters come before everything else because a declared width may
+        // be *made of* them: `output [WIDTH-1:0] q` has no width until `WIDTH`
+        // has a value. Their own order among themselves is kept, since a
+        // parameter may be written in terms of the one above it.
+        //
+        // A parameter's value may in turn be a call to one of the module's
+        // functions, and a function's return width may be a parameter — so the
+        // two are circular in general. The knot is cut by evaluating the
+        // parameters first, holding back any that could not be evaluated,
+        // compiling the functions, and then retrying the ones held back. A
+        // parameter that still cannot be evaluated then reports the reason it
+        // could not, which is what it would have reported the first time.
+        let deferred = self.declare_parameters(module, scope)?;
+        self.declare_functions(module, scope)?;
+        for statement in deferred {
+            self.declare(statement, scope)?;
+        }
         for port in &module.ports {
             self.declare_port(port, scope)?;
         }
-        // Functions come before the declarations rather than with them: a
-        // parameter's value may be a call, and the call has to find its
-        // definition already compiled.
-        self.declare_functions(module, scope)?;
         for statement in &module.statements {
-            self.declare(statement, scope)?;
+            if !matches!(statement, ModuleStatement::ParameterDeclaration(_)) {
+                self.declare(statement, scope)?;
+            }
         }
         for statement in &module.statements {
             self.build(statement, scope)?;
@@ -264,6 +281,68 @@ impl<'m> Elaborator<'m> {
 
         self.stack.pop();
         Ok(())
+    }
+
+    /// Evaluates every `parameter` and `localparam` this module declares,
+    /// in the order they were written.
+    ///
+    /// A declaration that cannot be evaluated yet is handed back rather than
+    /// reported: the only thing it can be waiting for is a function, which is
+    /// compiled next. The caller retries it then, and a second failure is the
+    /// error.
+    fn declare_parameters(
+        &mut self,
+        module: &'m VerilogModule,
+        scope: &Scope,
+    ) -> Result<Vec<&'m ModuleStatement>, SimulationError> {
+        let mut deferred = Vec::new();
+        for statement in &module.statements {
+            if !matches!(statement, ModuleStatement::ParameterDeclaration(_)) {
+                continue;
+            }
+            if self.declare(statement, scope).is_err() {
+                deferred.push(statement);
+            }
+        }
+        Ok(deferred)
+    }
+
+    /// The two numbers a declared range describes.
+    ///
+    /// A literal range was folded where it was written and costs nothing here.
+    /// An expression range is evaluated against the store, which by this point
+    /// holds the parameters in scope — including any the parent overrode, which
+    /// is the whole point: an override is allowed to change a child's widths.
+    fn resolve_range(&self, range: &Range, scope: &Scope) -> Result<(i64, i64), SimulationError> {
+        match range {
+            Range::Constant(msb, lsb) => Ok((*msb, *lsb)),
+            Range::Expressions(msb, lsb) => Ok((
+                self.resolve_bound(msb, scope)?,
+                self.resolve_bound(lsb, scope)?,
+            )),
+        }
+    }
+
+    /// One bound of an expression range, as a number.
+    ///
+    /// Anything that is not a number — an unknown name, an `x`, a value too
+    /// wide to be a bound — is a **named** error. A width the simulator picked
+    /// for itself would be wrong for the whole run and look like nothing at
+    /// all had gone wrong.
+    fn resolve_bound(&self, bound: &Expression, scope: &Scope) -> Result<i64, SimulationError> {
+        let unresolved = |why: String| SimulationError::UnresolvedRange {
+            bound: bound.to_contracted_string(),
+            why,
+        };
+        let value = eval(&renamed(bound, scope), &self.out.state)
+            .map_err(|why| unresolved(why.to_string()))?;
+        let wide = if value.is_signed() {
+            value.to_i128()
+        } else {
+            value.to_u128().and_then(|value| i128::try_from(value).ok())
+        };
+        wide.and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| unresolved("it does not evaluate to an integer".to_string()))
     }
 
     /// Declares one port, unless it was aliased onto a signal that already
@@ -276,9 +355,10 @@ impl<'m> Elaborator<'m> {
             Some(Binding::Alias(_)) => return Ok(()),
             Some(Binding::Driven(expression)) => {
                 let name = scope.qualified(local);
+                let range = self.resolve_range(&port.range, scope)?;
                 self.out
                     .state
-                    .declare_signed(name.clone(), port.range, port.signed);
+                    .declare_signed(name.clone(), range, port.signed);
                 self.out.assignments.push(ContinuousAssignment::new(
                     Expression::Identifier(Identifier::new(name)),
                     expression.clone(),
@@ -289,9 +369,10 @@ impl<'m> Elaborator<'m> {
         }
 
         let name = scope.qualified(local);
+        let range = self.resolve_range(&port.range, scope)?;
         self.out
             .state
-            .declare_signed(name.clone(), port.range, port.signed);
+            .declare_signed(name.clone(), range, port.signed);
 
         if !matches!(port.direction, PortDirection::Input) {
             return Ok(());
@@ -300,8 +381,8 @@ impl<'m> Elaborator<'m> {
             self.out.inputs.push(name);
         } else {
             // Nothing at all is driving this input, which is what `z` means.
-            let floating = Register::high_impedance(range_width(port.range));
-            self.out.state.set_ranged(name, floating, port.range);
+            let floating = Register::high_impedance(range_width(range));
+            self.out.state.set_ranged(name, floating, range);
         }
         Ok(())
     }
@@ -350,13 +431,23 @@ impl<'m> Elaborator<'m> {
         let mut frame_names: HashMap<&str, String> = HashMap::new();
         frame_names.insert(function.name.name.as_str(), qualified.clone());
 
-        let variable = |variable: &FunctionVariable| FrameVariable {
-            name: format!("{}.{}", qualified, variable.name.name),
-            range: variable.range,
-            signed: variable.signed,
+        let variable = |variable: &FunctionVariable| {
+            Ok(FrameVariable {
+                name: format!("{}.{}", qualified, variable.name.name),
+                range: self.resolve_range(&variable.range, scope)?,
+                signed: variable.signed,
+            })
         };
-        let arguments: Vec<FrameVariable> = function.arguments.iter().map(variable).collect();
-        let locals: Vec<FrameVariable> = function.locals.iter().map(variable).collect();
+        let arguments: Vec<FrameVariable> = function
+            .arguments
+            .iter()
+            .map(variable)
+            .collect::<Result<_, SimulationError>>()?;
+        let locals: Vec<FrameVariable> = function
+            .locals
+            .iter()
+            .map(variable)
+            .collect::<Result<_, SimulationError>>()?;
         for (declared, frame) in function
             .arguments
             .iter()
@@ -378,7 +469,7 @@ impl<'m> Elaborator<'m> {
         Ok(FunctionDefinition {
             result: FrameVariable {
                 name: qualified,
-                range: function.range,
+                range: self.resolve_range(&function.range, scope)?,
                 signed: function.signed,
             },
             arguments,
@@ -398,23 +489,30 @@ impl<'m> Elaborator<'m> {
         match statement {
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
-                    self.declare_local(&net.identifier().name, net.range(), net.is_signed(), scope);
+                    let range = self.resolve_range(net.range(), scope)?;
+                    self.declare_local(&net.identifier().name, range, net.is_signed(), scope);
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
                 for register in registers {
-                    let range = register.range.unwrap_or((0, 0));
+                    let range = match &register.range {
+                        Some(range) => self.resolve_range(range, scope)?,
+                        None => (0, 0),
+                    };
                     // The address dimension is what makes the name a memory
                     // rather than a vector, and it is the only place that
                     // distinction is ever recorded.
-                    match register.dimensions {
-                        Some(addresses) => self.declare_memory(
-                            &register.name.name,
-                            addresses,
-                            range,
-                            register.signed,
-                            scope,
-                        )?,
+                    match &register.dimensions {
+                        Some(addresses) => {
+                            let addresses = self.resolve_range(addresses, scope)?;
+                            self.declare_memory(
+                                &register.name.name,
+                                addresses,
+                                range,
+                                register.signed,
+                                scope,
+                            )?
+                        }
                         None => {
                             self.declare_local(&register.name.name, range, register.signed, scope)
                         }
@@ -426,14 +524,17 @@ impl<'m> Elaborator<'m> {
                     // An `integer` is a 32 bit *signed* variable. Signedness is
                     // part of what the keyword means, so there is no qualifier
                     // to read here — it is always true.
-                    match declaration.dimensions {
-                        Some(addresses) => self.declare_memory(
-                            &declaration.name.name,
-                            addresses,
-                            (31, 0),
-                            true,
-                            scope,
-                        )?,
+                    match &declaration.dimensions {
+                        Some(addresses) => {
+                            let addresses = self.resolve_range(addresses, scope)?;
+                            self.declare_memory(
+                                &declaration.name.name,
+                                addresses,
+                                (31, 0),
+                                true,
+                                scope,
+                            )?
+                        }
                         None => self.declare_local(&declaration.name.name, (31, 0), true, scope),
                     }
                 }
@@ -443,14 +544,17 @@ impl<'m> Elaborator<'m> {
                     // A `time` is 64 bits wide and unsigned; like an `integer`
                     // the keyword is the whole of its type, so there is no
                     // range or qualifier to read.
-                    match declaration.dimensions {
-                        Some(addresses) => self.declare_memory(
-                            &declaration.name.name,
-                            addresses,
-                            TIME_RANGE,
-                            false,
-                            scope,
-                        )?,
+                    match &declaration.dimensions {
+                        Some(addresses) => {
+                            let addresses = self.resolve_range(addresses, scope)?;
+                            self.declare_memory(
+                                &declaration.name.name,
+                                addresses,
+                                TIME_RANGE,
+                                false,
+                                scope,
+                            )?
+                        }
                         None => {
                             self.declare_local(&declaration.name.name, TIME_RANGE, false, scope)
                         }
@@ -489,12 +593,16 @@ impl<'m> Elaborator<'m> {
                     // *after* or the stored parameter reads unsigned.
                     let signed = parameter.signed || value.is_signed();
                     let value = value.with_signedness(signed);
-                    let value = match parameter.range {
+                    let range = match &parameter.range {
+                        Some(range) => Some(self.resolve_range(range, scope)?),
+                        None => None,
+                    };
+                    let value = match range {
                         Some(range) => value.coerced(range_width(range)),
                         None => value,
                     }
                     .with_signedness(signed);
-                    match parameter.range {
+                    match range {
                         Some(range) => self.out.state.set_ranged(name, value, range),
                         None => self.out.state.set(name, value),
                     }
@@ -1621,6 +1729,129 @@ mod tests {
         // The default is untouched in the instance that did not override it.
         assert_eq!(simulator.get("plain.STEP").unwrap().to_u128(), Some(1));
         assert_eq!(simulator.get("quick.STEP").unwrap().to_u128(), Some(5));
+    }
+
+    /// A declared width may be an *expression* over the parameters in scope,
+    /// and it is resolved where those have values: at elaboration.
+    #[test]
+    fn test_a_declared_width_may_be_an_expression() {
+        let modules = parse_all(&[r#"
+            module sized();
+                parameter WIDTH = 8;
+                reg [WIDTH-1:0] q;
+                wire [0:WIDTH/2-1] half;
+                reg [WIDTH-1:0] mem [0:WIDTH-1];
+            endmodule
+        "#]);
+        let elaborated = elaborate(&modules, 0).expect("design should elaborate");
+
+        assert_eq!(elaborated.state.get("q").unwrap().width(), 8);
+        assert_eq!(elaborated.state.get("half").unwrap().width(), 4);
+        let memory = elaborated.state.memory("mem").expect("mem is a memory");
+        assert_eq!(memory.depth(), 8);
+        assert_eq!(memory.width(), 8);
+    }
+
+    /// The point of the whole thing: an override in the parent decides the
+    /// child's widths, so two instances of one module are different sizes.
+    #[test]
+    fn test_a_parameter_override_changes_a_childs_width() {
+        let child = r#"
+            module vector(output [WIDTH-1:0] q);
+                parameter WIDTH = 4;
+                reg [WIDTH-1:0] hold;
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                wire [3:0] narrow;
+                wire [15:0] wide;
+                vector small (.q(narrow));
+                vector #(.WIDTH(16)) large (.q(wide));
+            endmodule
+        "#;
+        let modules = parse_all(&[top, child]);
+        let elaborated = elaborate(&modules, 0).expect("design should elaborate");
+
+        assert_eq!(elaborated.state.get("small.hold").unwrap().width(), 4);
+        assert_eq!(elaborated.state.get("large.hold").unwrap().width(), 16);
+    }
+
+    /// A port width is a range like any other, and it is resolved before the
+    /// ports are declared — which is why the parameters go first.
+    #[test]
+    fn test_a_port_width_may_be_a_parameter() {
+        let modules = parse_all(&[r#"
+            module ported(input [W-1:0] a, output [W-1:0] y);
+                parameter W = 12;
+                assign y = a;
+            endmodule
+        "#]);
+        let elaborated = elaborate(&modules, 0).expect("design should elaborate");
+
+        assert_eq!(elaborated.state.get("a").unwrap().width(), 12);
+        assert_eq!(elaborated.state.get("y").unwrap().width(), 12);
+    }
+
+    /// A function's return width and its arguments are ranges too, so they are
+    /// parameterised the same way.
+    #[test]
+    fn test_a_function_width_may_be_a_parameter() {
+        let modules = parse_all(&[r#"
+            module functional(output [15:0] y);
+                parameter W = 16;
+                function [W-1:0] widen;
+                    input [W-1:0] a;
+                    widen = a + 1;
+                endfunction
+                assign y = widen(16'd41);
+            endmodule
+        "#]);
+        let mut simulator = Simulator::with_modules(modules, "functional");
+        simulator.setup().expect("design should elaborate");
+        simulator.run().expect("design should settle");
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(42));
+    }
+
+    /// A bound that is not a constant is a **named** error. A width the
+    /// simulator picked for itself would be wrong for the whole run and look
+    /// exactly like nothing having gone wrong.
+    #[test]
+    fn test_an_unresolvable_range_bound_is_named() {
+        let error = setup_error(
+            &[r#"
+                module unsized();
+                    reg [n-1:0] q;
+                endmodule
+            "#],
+            "unsized",
+        );
+        match error {
+            SimulationError::UnresolvedRange { ref bound, .. } => assert_eq!(bound, "n - 1"),
+            ref other => panic!("expected an unresolved range, got {:?}", other),
+        }
+        assert!(error.to_string().contains("n - 1"), "{}", error);
+    }
+
+    /// A parameter may be written in terms of a function the module declares,
+    /// and a function's width in terms of a parameter. Neither ordering is a
+    /// failure, which is what holding back an unevaluated parameter buys.
+    #[test]
+    fn test_a_parameter_may_still_be_a_function_call() {
+        let modules = parse_all(&[r#"
+            module called(output [7:0] y);
+                parameter N = twice(4);
+                function [7:0] twice;
+                    input [7:0] a;
+                    twice = a * 2;
+                endfunction
+                assign y = N;
+            endmodule
+        "#]);
+        let mut simulator = Simulator::with_modules(modules, "called");
+        simulator.setup().expect("design should elaborate");
+        simulator.run().expect("design should settle");
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(8));
     }
 
     /// Positional overrides bind in the order the child declares its
