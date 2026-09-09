@@ -67,7 +67,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
-| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction` |
+| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction`, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
@@ -426,11 +426,36 @@ lands after the call has ended), an assignment to a signal outside the function,
 `$display` inside a function is the one worth revisiting — it needs an output sink the
 evaluator can reach.
 
+**A signal can have more than one source, and `StateStore` says which one wins.**
+`assign v = e;` and `force v = e;` written *inside* a procedural block install a continuous
+drive that outlives the statement, `deassign` and `release` take it away again, and the
+rule is `force` beats procedural `assign` beats an ordinary write. That is `DriveLevel`,
+and `StateStore::permits_write` is where it is enforced — asked by `exec::drive_at`, which
+every assignment in the simulator goes through. A write that loses is **discarded**, not
+applied and overwritten a moment later: that is what keeps it out of the change journal,
+and so out of the edges that wake blocks. A design that forces nothing pays a
+`Vec::is_empty` for the question, the same shape `any_signed` and `any_memory` use.
+
+The drives live on the store because a running procedural block is handed nothing else,
+and they are re-evaluated by `Simulator::propagate` alongside the module's own `assign`
+statements — one fixpoint, not two, which is what makes a forced signal *follow* its
+expression when an operand moves. `propagate` holds them through `StateStore::drives`, an
+`Rc` handle, so the list is still in the store while it is being written through: an
+`assign` underneath a `force` has to be able to see the force to know its own write goes
+nowhere.
+
+`release` puts back what the `force` displaced — still the signal's last *procedural*
+value, since writes made while it was forced never landed — unless a procedural `assign`
+is still installed, in which case that one takes over. iverilog reads the LRM the other
+way for a variable and leaves the forced value in place (corpus `pr1477190`).
+
 Still unsupported: **tasks** (`task … endtask` and a call to one) — a task may consume
 time, so a call to one is a suspendable statement and interacts with `resume` the way a
 delay does, which a function never has to; intra-assignment delays (`a = #5 b;` — the held
 right hand side does not fit in a program counter); and concatenation as an assignment
-target. Parameter overrides cannot change a width, because `simple.rs::range` only parses
+target. A drive is also tracked per signal *name* rather than per bit, so
+`force bus[0] = 1;` blocks a write to `bus[1]` as well — corpus `pr1832097a`, `pr245`,
+`pr527` and the `_pv` pair are that one gap. Parameter overrides cannot change a width, because `simple.rs::range` only parses
 literal integers, so `output [WIDTH-1:0] q` does not parse at all. `signals.rs` is built
 but still unwired.
 
@@ -456,11 +481,11 @@ dying on unfamiliar syntax several lines earlier.
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression` and the compiling of a `function` into a `FunctionDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
-| `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
+| `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `permits_write` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
