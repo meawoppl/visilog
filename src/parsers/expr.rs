@@ -25,6 +25,13 @@ pub enum Expression {
     Conditional(Box<Expression>, Box<Expression>, Box<Expression>), // condition ? true_expr : false_expr
     Parenthetical(Box<Expression>),
     Concatenation(Vec<Expression>),
+    /// `{N{a, b}}` — the inner concatenation repeated `N` times.
+    ///
+    /// Held apart from [`Expression::Concatenation`] rather than expanded at
+    /// parse time because the count is a full expression and may name a
+    /// parameter, so it is not known until elaboration. `{16384{4'b1001}}` is
+    /// also a reminder that expanding eagerly would be expensive.
+    Replication(Box<Expression>, Vec<Expression>),
     FunctionCall(Identifier, Vec<Expression>),
     /// `$time`, `$random`, `$signed(a)` — a call to one of the simulator's own
     /// functions, named without its `$`.
@@ -62,6 +69,15 @@ impl Expression {
             Expression::Parenthetical(expr) => format!("({})", expr.to_contracted_string()),
             Expression::Concatenation(exprs) => format!(
                 "{{{}}}",
+                exprs
+                    .iter()
+                    .map(|e| e.to_contracted_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Expression::Replication(count, exprs) => format!(
+                "{{{}{{{}}}}}",
+                count.to_contracted_string(),
                 exprs
                     .iter()
                     .map(|e| e.to_contracted_string())
@@ -145,6 +161,16 @@ impl Expression {
                     .collect::<Vec<_>>()
                     .join(",\n")
             ),
+            Expression::Replication(count, exprs) => format!(
+                "{}Replication(\n{},\n{})",
+                indent_str,
+                count.to_ast_string(indent + 1),
+                exprs
+                    .iter()
+                    .map(|e| e.to_ast_string(indent + 1))
+                    .collect::<Vec<_>>()
+                    .join(",\n")
+            ),
             Expression::FunctionCall(id, args) => format!(
                 "{}FunctionCall({},\n{})",
                 indent_str,
@@ -209,16 +235,36 @@ fn parenthetical(input: &str) -> IResult<&str, Expression> {
     )(input)
 }
 
-// TODO(meawoppl) - support the multiplication concatentation operator roughly here
+/// `{N{a, b}}` — a concatenation repeated `N` times.
+///
+/// Tried before [`concatenation`], because the two share a prefix: `{a` is the
+/// start of both, and only the `{` after the first expression tells them
+/// apart. Committing to the plain form first would read `{2{x}}` as a
+/// concatenation of one element and then choke on the inner brace.
+fn replication(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = tag("{")(input)?;
+    let (input, count) = ws(verilog_expression)(input)?;
+    let (input, inner) = delimited(
+        tag("{"),
+        separated_list1(tag(","), ws(verilog_expression)),
+        tag("}"),
+    )(input)?;
+    let (input, _) = ws(tag("}"))(input)?;
+    Ok((input, Expression::Replication(Box::new(count), inner)))
+}
+
 fn concatenation(input: &str) -> IResult<&str, Expression> {
-    map(
-        delimited(
-            tag("{"),
-            separated_list1(tag(","), ws(verilog_expression)),
-            tag("}"),
+    alt((
+        replication,
+        map(
+            delimited(
+                tag("{"),
+                separated_list1(tag(","), ws(verilog_expression)),
+                tag("}"),
+            ),
+            Expression::Concatenation,
         ),
-        |exprs| Expression::Concatenation(exprs),
-    )(input)
+    ))(input)
 }
 
 /// `$` followed by a name, without the `$`.
@@ -1724,5 +1770,35 @@ mod tests {
             assert_parses(verilog_expression, "$signed(a) + $time").to_contracted_string(),
             "$signed(a) + $time"
         );
+    }
+
+    /// `{N{…}}` is a replication, and it is told from a plain concatenation
+    /// only by the brace that follows the first expression.
+    #[test]
+    fn test_parse_replication() {
+        for source in [
+            "{2{a}}",
+            "{2{a, b}}",
+            "{{4{1'b1}}, 4'b0000}",
+            "{{2{a[7]}}, a[3:0]}",
+            "{WIDTH{1'b0}}",
+            "{1 << WIDTH{1'b1}}",
+        ] {
+            assert_parses(verilog_expression, source);
+        }
+    }
+
+    /// A replication and a concatenation of the same opening text must not be
+    /// confused: `{a, b}` has no inner brace and stays a concatenation.
+    #[test]
+    fn test_replication_and_concatenation_stay_distinct() {
+        assert!(matches!(
+            assert_parses(verilog_expression, "{a, b}"),
+            Expression::Concatenation(_)
+        ));
+        assert!(matches!(
+            assert_parses(verilog_expression, "{2{a}}"),
+            Expression::Replication(_, _)
+        ));
     }
 }

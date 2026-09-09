@@ -1002,6 +1002,12 @@ impl BodyNames {
                     self.expression(part);
                 }
             }
+            Expression::Replication(count, parts) => {
+                self.expression(count);
+                for part in parts {
+                    self.expression(part);
+                }
+            }
             Expression::FunctionCall(id, arguments) => {
                 self.calls.insert(id.name.clone());
                 for argument in arguments {
@@ -1095,6 +1101,12 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
         // A function is qualified like a signal, and for the same reason: an
         // instance's function is its own, so a call inside a child has to
         // resolve to the definition elaborated for *that* instance.
+        Expression::Replication(count, parts) => {
+            rename_expression(count, resolve);
+            for part in parts {
+                rename_expression(part, resolve);
+            }
+        }
         Expression::FunctionCall(id, arguments) => {
             id.name = resolve(&id.name);
             for argument in arguments {
