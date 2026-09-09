@@ -16,10 +16,12 @@ fn parse_escape_sequence(input: &str) -> IResult<&str, char> {
             value('\t', char('t')),
             value('\\', char('\\')),
             value('\"', char('"')),
-            map_res(
-                preceded(char('d'), take_while_m_n(1, 3, |c: char| c.is_digit(8))),
-                |octal| u8::from_str_radix(octal, 8).map(|v| v as char),
-            ),
+            // `\ddd` is up to three *octal* digits naming a character code —
+            // the `d`s in the standard's notation stand for digits, they are
+            // not a literal `d`. `"\123"` is `S`, as iverilog agrees.
+            map_res(take_while_m_n(1, 3, |c: char| c.is_digit(8)), |octal| {
+                u8::from_str_radix(octal, 8).map(|v| v as char)
+            }),
             value('%', char('%')),
         )),
     )(input)
@@ -56,18 +58,30 @@ mod tests {
         }
     }
 
-    // NOTE(meawoppl) This is hard to support but part of the spec. Skipped for now
-    // #[test]
-    fn test_escaped_literal_in_string() {
+    /// `\\ddd` is a character code in **octal**, up to three digits — the `d`s
+    /// in the standard's notation stand for digits, not a literal `d`.
+    ///
+    /// This test replaces one that was disabled and also wrong: it asserted
+    /// `\\d123` produced `{`, which is a literal `d` followed by *decimal* 123.
+    /// `iverilog` prints `S` for `"\\123"` and `A` for `"\\101"`, which is
+    /// octal, and that is what these assert.
+    #[test]
+    fn test_octal_character_escapes() {
+        assert_parses_to(parse_verilog_string, "\"\\123\"", "S".to_string());
+        assert_parses_to(parse_verilog_string, "\"\\101\"", "A".to_string());
+        // One and two digit forms, and a digit that is not part of the escape.
+        assert_parses_to(parse_verilog_string, "\"\\0\"", "\0".to_string());
+        assert_parses_to(parse_verilog_string, "\"\\1011\"", "A1".to_string());
+    }
+
+    /// The escapes that are not character codes. iverilog prints
+    /// `a<TAB>b\c"d` for the Verilog literal `"a\tb\\c\"d"`.
+    #[test]
+    fn test_simple_escapes_match_the_reference() {
         assert_parses_to(
             parse_verilog_string,
-            "hello\\d123world\"",
-            "hello{world".to_string(),
-        );
-        assert_parses_to(
-            parse_verilog_string,
-            "\"\\n\\t\\\\\\\"\\d123%\"",
-            "\n\t\\\"{".to_string(),
+            "\"a\\tb\\\\c\\\"d\"",
+            "a\tb\\c\"d".to_string(),
         );
     }
 }
