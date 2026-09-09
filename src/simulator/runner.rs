@@ -2303,6 +2303,41 @@ mod tests {
         assert_eq!(simulator.output().text(), "y=00000110\np=2 q=1\n");
     }
 
+    /// An output port bound to a **concatenation** carries the child's value
+    /// out across the parts, most significant first. It became expressible
+    /// once a concatenation was a writable target.
+    ///
+    /// iverilog 12.0 prints `e=0 f=1 g=1 h=0` for `iB = 4'b0101` and
+    /// `assign oB = iB + 1`.
+    #[test]
+    fn test_output_bound_to_a_concatenation() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module child(input clk, input [3:0] iB, output [3:0] oB);
+                assign oB = iB + 1;
+            endmodule
+            module tb;
+                reg clk;
+                reg [3:0] i;
+                wire e, f, g, h;
+                child M1(clk, i, {e, f, g, h});
+                initial begin
+                    i = 4'b0101;
+                    #1 $display("e=%b f=%b g=%b h=%b", e, f, g, h);
+                end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(2).expect("time should advance");
+
+        assert_eq!(simulator.output().text(), "e=0 f=1 g=1 h=0\n");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(

@@ -576,6 +576,14 @@ fn ivtest_corpus_closure_rate() {
             }
             None => None,
         };
+        // Announced before judging so the `ERROR` lines that follow belong to
+        // it: `error_kind` is called from deep inside the simulator and has no
+        // idea which entry is being run, and threading a name down to it just
+        // to label a debug dump would be a worse trade than pairing the two
+        // here with an `awk`.
+        if std::env::var_os("VISILOG_DUMP_ERRORS").is_some() {
+            println!("FILE\t{}", entry.name);
+        }
         outcomes.push((
             entry.name.clone(),
             judge_with(&preprocessor, &source, gold.as_deref(), &search_paths),
