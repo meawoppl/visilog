@@ -763,7 +763,7 @@ fn sized_within(expr: &Expression) -> bool {
 /// constants, report one bit rather than an error: evaluating the same
 /// expression is about to fail and say why, and a width guessed here never
 /// reaches the answer.
-fn expression_width(expr: &Expression, store: &StateStore) -> usize {
+pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
     match expr {
         Expression::Constant(constant) => constant.size().unwrap_or(UNSIZED_CONSTANT_WIDTH),
         Expression::Identifier(id) => store

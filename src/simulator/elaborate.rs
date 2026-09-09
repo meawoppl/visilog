@@ -37,21 +37,24 @@
 //! parent's. That is the price of never having to reconcile the two, and it
 //! only differs from Verilog when a connection is deliberately mismatched.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
     behavior::{Event, EventControl, FunctionDeclaration, FunctionVariable, TaskDeclaration},
+    constants::VerilogConstant,
     expr::Expression,
+    gates::{GateInstantiation, GateKind},
     identifier::Identifier,
     modules::{ModuleInitArguments, ModuleInstantiation, Port, PortDirection, VerilogModule},
     simple::Range,
     statements::ModuleStatement,
 };
 use crate::register::Register;
-use crate::simulator::eval::eval;
+use crate::simulator::eval::{eval, expression_width};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
+use crate::simulator::gates::Gate;
 use crate::simulator::program::{
     FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition, TaskParameter,
     TaskTable, FUNCTION_DELAY_UNSUPPORTED,
@@ -146,6 +149,15 @@ impl TimedBlock {
 pub struct Elaborated {
     pub state: StateStore,
     pub assignments: Vec<ContinuousAssignment>,
+    /// The gate primitives, which are continuous drivers and settle in the
+    /// same fixpoint the assignments do.
+    pub gates: Vec<Gate>,
+    /// The names a gate drives. Those nets are *resolved* between all their
+    /// continuous drivers instead of being written by whichever one ran last,
+    /// which is the only way a three-state bus or a `pullup` can mean
+    /// anything. Empty for a design with no gates in it, which is what keeps
+    /// the question off the propagation hot path.
+    pub resolved_nets: HashSet<String>,
     pub blocks: Vec<TimedBlock>,
     /// The *top* module's input ports, the only ones a testbench may drive.
     pub inputs: Vec<String>,
@@ -161,6 +173,8 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
         out: Elaborated {
             state: StateStore::new(),
             assignments: Vec::new(),
+            gates: Vec::new(),
+            resolved_nets: HashSet::new(),
             blocks: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
@@ -737,6 +751,102 @@ impl<'m> Elaborator<'m> {
         Ok(())
     }
 
+    /// Elaborates one gate primitive instance into the flat driver list.
+    ///
+    /// An *array* of instances — `bufif1 drv [7:0] (bus, data, enable);` — is
+    /// expanded here into one gate per index, because nothing downstream has a
+    /// notion of an instance at all. A terminal one bit wide is shared by every
+    /// instance and a terminal as wide as the array is sliced a bit at a time,
+    /// which is what the LRM asks for; the two are told apart by width, and a
+    /// terminal that is neither is a named error rather than a silent
+    /// misconnection.
+    fn build_gate(
+        &mut self,
+        gate: &GateInstantiation,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        let strength = gate.drive_strength();
+        let terminals: Vec<Expression> = gate
+            .instance
+            .terminals
+            .iter()
+            .map(|terminal| renamed(terminal, scope))
+            .collect();
+        let Some(range) = &gate.instance.range else {
+            let gate = Gate::new(gate.kind, strength, terminals)?;
+            self.push_gate(gate);
+            return Ok(());
+        };
+        // An array's bounds are a `Range` like any declaration's, so
+        // `buf drv [N-1:0] (…)` is sized by the parameters in scope.
+        let count = range_width(self.resolve_range(range, scope)?);
+        for position in 0..count {
+            let sliced = terminals
+                .iter()
+                .map(|terminal| self.array_terminal(gate.kind, terminal, position, count))
+                .collect::<Result<Vec<Expression>, SimulationError>>()?;
+            let gate = Gate::new(gate.kind, strength, sliced)?;
+            self.push_gate(gate);
+        }
+        Ok(())
+    }
+
+    /// Records a gate and the nets it drives, which are the ones that have to
+    /// be resolved rather than simply written.
+    fn push_gate(&mut self, gate: Gate) {
+        for output in &gate.outputs {
+            if let Some(name) = assigned_name(output) {
+                self.out.resolved_nets.insert(name.to_string());
+            }
+        }
+        self.out.gates.push(gate);
+    }
+
+    /// One instance's view of an arrayed gate's terminal.
+    fn array_terminal(
+        &self,
+        kind: GateKind,
+        terminal: &Expression,
+        position: usize,
+        count: usize,
+    ) -> Result<Expression, SimulationError> {
+        let width = expression_width(terminal, &self.out.state);
+        // A scalar reaches every instance, which is how one enable drives a
+        // whole array of three-state buffers.
+        if width == 1 {
+            return Ok(terminal.clone());
+        }
+        let too_wide = || SimulationError::GateArrayTerminal {
+            gate: kind.keyword(),
+            expected: count,
+            found: width,
+        };
+        if width != count {
+            return Err(too_wide());
+        }
+        // Only a plain signal can be sliced: a bit of `{16'b0, data}` is not
+        // something a `BitSelect` can name, and an output has to be drivable.
+        let Expression::Identifier(id) = terminal else {
+            return Err(too_wide());
+        };
+        let Some(signal) = self.out.state.get_signal(&id.name) else {
+            return Err(SimulationError::UnknownSignal(id.name.clone()));
+        };
+        let (msb, lsb) = signal.range();
+        // `position` counts from the least significant end, and both the
+        // terminal and the instance array are walked that way — so which end
+        // the array's own range starts at cannot matter.
+        let index = if msb >= lsb {
+            lsb + position as i64
+        } else {
+            lsb - position as i64
+        };
+        Ok(Expression::BitSelect(
+            id.clone(),
+            Box::new(Expression::Constant(VerilogConstant::from_int(index))),
+        ))
+    }
+
     /// Applies a variable initialiser: `reg a = expr;` and `integer i = expr;`.
     ///
     /// This is a single write at elaboration time, *not* a continuous
@@ -805,6 +915,11 @@ impl<'m> Elaborator<'m> {
                     renamed(assignment.lhs(), scope),
                     renamed(assignment.rhs(), scope),
                 ));
+            }
+            ModuleStatement::GateInstantiation(instances) => {
+                for instance in instances {
+                    self.build_gate(instance, scope)?;
+                }
             }
             ModuleStatement::AlwaysBlock(block) => {
                 let mut program = Program::compile(&block.statements, tasks)?;

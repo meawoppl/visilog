@@ -29,19 +29,24 @@
 //! was connected to. Hand the simulator more than one module with
 //! [`Simulator::with_modules`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::parsers::{assignment::ContinuousAssignment, modules::VerilogModule};
+use crate::parsers::{
+    assignment::ContinuousAssignment,
+    gates::{DriveStrength, StrengthLevel},
+    modules::VerilogModule,
+};
 use crate::register::Register;
 use crate::simulator::elaborate::{elaborate, BlockKind, TimedBlock};
 use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events;
 use crate::simulator::exec::{
-    apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate,
+    apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
+use crate::simulator::gates::{resolve_bit, Gate};
 use crate::simulator::program::{self, Resume};
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{Output, TaskContext};
@@ -107,6 +112,17 @@ pub enum SimulationError {
     RecursiveTask(String),
     /// An `assign` whose left hand side is not something that can be driven.
     UnsupportedTarget(String),
+    /// A gate primitive instantiated with a terminal count its type cannot
+    /// take: `and (out);` has nothing to read, `bufif1 (out, in);` has no
+    /// control.
+    GateTerminals { gate: &'static str, found: usize },
+    /// A terminal of an *arrayed* gate instance that is neither one bit wide —
+    /// shared by every instance — nor one bit per instance.
+    GateArrayTerminal {
+        gate: &'static str,
+        expected: usize,
+        found: usize,
+    },
     /// [`Simulator::setup`] has not run yet.
     NotSetUp,
     /// The continuous assignments never stopped changing, which means the
@@ -180,6 +196,20 @@ impl fmt::Display for SimulationError {
                 "range bound `{}` is not a constant: {}",
                 bound, why
             ),
+            SimulationError::GateTerminals { gate, found } => write!(
+                f,
+                "gate `{}` cannot be instantiated with {} terminals",
+                gate, found
+            ),
+            SimulationError::GateArrayTerminal {
+                gate,
+                expected,
+                found,
+            } => write!(
+                f,
+                "an array of {} gates needs a terminal of 1 or {} bits, but one is {} bits wide",
+                gate, expected, found
+            ),
             SimulationError::NotSetUp => write!(f, "the simulator has not been set up"),
             SimulationError::NoConvergence { passes } => write!(
                 f,
@@ -209,6 +239,13 @@ pub struct Simulator {
     top: String,
     state: StateStore,
     assignments: Vec<ContinuousAssignment>,
+    /// The design's gate primitives, which are continuous drivers and settle
+    /// in the same fixpoint the assignments do.
+    gates: Vec<Gate>,
+    /// The nets a gate drives, which are resolved between all their continuous
+    /// drivers rather than written by whichever one ran last. Empty for a
+    /// design with no gates, which is what keeps the question off the hot path.
+    resolved_nets: HashSet<String>,
     blocks: Vec<TimedBlock>,
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
@@ -240,6 +277,8 @@ impl Simulator {
             top: top.into(),
             state: StateStore::new(),
             assignments: Vec::new(),
+            gates: Vec::new(),
+            resolved_nets: HashSet::new(),
             blocks: Vec::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
@@ -261,6 +300,8 @@ impl Simulator {
     pub fn setup(&mut self) -> Result<(), SimulationError> {
         self.state = StateStore::new();
         self.assignments.clear();
+        self.gates.clear();
+        self.resolved_nets.clear();
         self.blocks.clear();
         self.aliases.clear();
         self.queue = EventQueue::new();
@@ -279,6 +320,8 @@ impl Simulator {
         let elaborated = elaborate(&self.modules, top)?;
         self.state = elaborated.state;
         self.assignments = elaborated.assignments;
+        self.gates = elaborated.gates;
+        self.resolved_nets = elaborated.resolved_nets;
         self.blocks = elaborated.blocks;
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
@@ -626,25 +669,166 @@ impl Simulator {
         Ok(changed)
     }
 
-    /// Settles the continuous assignments alone. See [`Simulator::run`].
+    /// Settles the continuous assignments and gates alike. See
+    /// [`Simulator::run`].
     fn propagate(&mut self) -> Result<usize, SimulationError> {
-        let limit = 2 * (self.assignments.len() + self.state.drive_count()) + 4;
+        let limit = 2 * (self.assignments.len() + self.gates.len() + self.state.drive_count()) + 4;
         for pass in 1..=limit {
             let mut changed = false;
+            let mut contributions: Vec<Contribution> = Vec::new();
             for assignment in &self.assignments {
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
                 // target is resolved before the right hand side is evaluated.
                 let target = resolve_target(&self.state, assignment.lhs())?;
                 let value = eval_sized(assignment.rhs(), &self.state, target.width(&self.state))?;
-                changed |= drive_resolved(&mut self.state, &target, &value)?;
+                // A net a gate also drives is resolved rather than written:
+                // the assignment is one driver of it, not the only one. An
+                // `assign` drives at `strong` unless it says otherwise, and
+                // `assign (pull1, pull0) x = y;` saying otherwise is this one
+                // value coming off the assignment instead of the constant.
+                if self.is_resolved(target.name()) {
+                    contributions.push(Contribution {
+                        target,
+                        value,
+                        strength: DriveStrength::STRONG,
+                    });
+                } else {
+                    changed |= drive_resolved(&mut self.state, &target, &value)?;
+                }
             }
+            for gate in &self.gates {
+                let code = gate.evaluate(&self.state)?;
+                for output in &gate.outputs {
+                    let target = scalar_output(&self.state, resolve_target(&self.state, output)?);
+                    contributions.push(Contribution {
+                        target,
+                        value: Register::from_bits(vec![code]),
+                        strength: gate.strength,
+                    });
+                }
+            }
+            changed |= self.resolve_contributions(contributions)?;
             changed |= self.apply_drives()?;
             if !changed {
                 return Ok(pass);
             }
         }
         Err(SimulationError::NoConvergence { passes: limit })
+    }
+
+    /// Whether a net has to be resolved between its drivers rather than simply
+    /// written.
+    ///
+    /// A design with no gates in it answers without hashing the name, the same
+    /// shape `StateStore::any_signed` and `any_memory` use.
+    fn is_resolved(&self, name: &str) -> bool {
+        !self.resolved_nets.is_empty() && self.resolved_nets.contains(name)
+    }
+
+    /// Combines one pass's worth of driver contributions and writes the result.
+    ///
+    /// Every driver of a resolved net contributes a value and a strength, and
+    /// each *bit* is settled on its own by [`resolve_bit`]: a bit nothing
+    /// reaches keeps what it held, so a driver of `bus[0]` says nothing about
+    /// `bus[1]`. The whole net is then written once, which is what keeps a
+    /// three-state bus out of the change journal while it is not moving.
+    fn resolve_contributions(
+        &mut self,
+        contributions: Vec<Contribution>,
+    ) -> Result<bool, SimulationError> {
+        if contributions.is_empty() {
+            return Ok(false);
+        }
+        // Grouped by net, in the order the drivers were written, so a design
+        // resolves the same way twice.
+        let mut names: Vec<&str> = Vec::new();
+        for contribution in &contributions {
+            let name = contribution.target.name();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let mut settled: Vec<(String, Register)> = Vec::new();
+        for name in names {
+            let signal = self
+                .state
+                .get_signal(name)
+                .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
+            let width = signal.width();
+            // Bits run most significant first, the way a `Register` is written.
+            let mut driven: Vec<Vec<(u8, StrengthLevel)>> = vec![Vec::new(); width];
+            for contribution in &contributions {
+                if contribution.target.name() != name {
+                    continue;
+                }
+                match &contribution.target {
+                    ResolvedTarget::Whole(_) => {
+                        let value = contribution.value.coerced(width);
+                        for (offset, slot) in driven.iter_mut().enumerate() {
+                            let code = value.get_raw()[offset];
+                            slot.push((code, contribution.strength.of(code)));
+                        }
+                    }
+                    ResolvedTarget::Bits { indices, .. } => {
+                        let value = contribution.value.coerced(indices.len());
+                        for (offset, index) in indices.iter().enumerate() {
+                            let Some(position) = signal.bit_position(*index) else {
+                                continue;
+                            };
+                            let code = value.get_raw()[offset];
+                            driven[position].push((code, contribution.strength.of(code)));
+                        }
+                    }
+                    // Neither a memory word nor an event is a net, so neither
+                    // can have a second driver to be resolved against.
+                    ResolvedTarget::Word { .. } | ResolvedTarget::Event(_) => {}
+                }
+            }
+            let mut bits: Vec<u8> = signal.register().get_raw().to_vec();
+            for (position, drivers) in driven.iter().enumerate() {
+                if !drivers.is_empty() {
+                    bits[position] = resolve_bit(drivers);
+                }
+            }
+            settled.push((name.to_string(), Register::from_bits(bits)));
+        }
+        let mut changed = false;
+        for (name, value) in settled {
+            changed |= drive_resolved(&mut self.state, &ResolvedTarget::Whole(name), &value)?;
+        }
+        Ok(changed)
+    }
+}
+
+/// One continuous driver's claim on a net for one propagation pass.
+struct Contribution {
+    target: ResolvedTarget,
+    value: Register,
+    strength: DriveStrength,
+}
+
+/// A gate terminal is one bit, so an output connected to a vector drives that
+/// vector's least significant bit and leaves the rest of it alone.
+fn scalar_output(state: &StateStore, target: ResolvedTarget) -> ResolvedTarget {
+    match target {
+        ResolvedTarget::Whole(name) => match state.get_signal(&name).map(|signal| signal.range()) {
+            Some((_, least)) if state.get_signal(&name).is_some_and(|s| s.width() > 1) => {
+                ResolvedTarget::Bits {
+                    name,
+                    indices: vec![least],
+                }
+            }
+            _ => ResolvedTarget::Whole(name),
+        },
+        ResolvedTarget::Bits { name, mut indices } if indices.len() > 1 => {
+            let least = indices.pop().expect("a select names at least one bit");
+            ResolvedTarget::Bits {
+                name,
+                indices: vec![least],
+            }
+        }
+        other => other,
     }
 }
 
@@ -1433,6 +1617,15 @@ mod tests {
     }
 
     /// The unsigned value of a signal, which is what a width test is about.
+    /// A signal read as four-state bits, which is the only way to see the `z`
+    /// a three-state driver leaves behind.
+    fn level(simulator: &Simulator, name: &str) -> String {
+        simulator
+            .get(name)
+            .unwrap_or_else(|_| panic!("no signal `{}`", name))
+            .to_binary()
+    }
+
     fn number(simulator: &Simulator, name: &str) -> u128 {
         simulator
             .get(name)
@@ -3606,5 +3799,469 @@ mod tests {
         simulator.advance(5).expect("time should advance");
         assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
         assert_eq!(number(&simulator, "wakes"), 2);
+    }
+
+    /// A gate is a continuous driver, so instantiating one settles its output
+    /// the way an `assign` settles a net.
+    #[test]
+    fn test_gate_primitives_drive_their_outputs() {
+        let mut simulator = simulator_for(
+            r#"
+            module gate_logic();
+                reg a, b;
+                wire w_and, w_or, w_xor, w_nand, w_nor, w_xnor, w_buf, w_not;
+                and  (w_and, a, b);
+                or   (w_or, a, b);
+                xor  (w_xor, a, b);
+                nand (w_nand, a, b);
+                nor  (w_nor, a, b);
+                xnor (w_xnor, a, b);
+                buf  (w_buf, a);
+                not  (w_not, a);
+                initial begin
+                    a = 1'b1;
+                    b = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        assert_eq!(level(&simulator, "w_and"), "0");
+        assert_eq!(level(&simulator, "w_or"), "1");
+        assert_eq!(level(&simulator, "w_xor"), "1");
+        assert_eq!(level(&simulator, "w_nand"), "1");
+        assert_eq!(level(&simulator, "w_nor"), "0");
+        assert_eq!(level(&simulator, "w_xnor"), "0");
+        assert_eq!(level(&simulator, "w_buf"), "1");
+        assert_eq!(level(&simulator, "w_not"), "0");
+    }
+
+    /// The four-state half of a gate, which is the half a two-state simulator
+    /// gets wrong: an unknown input that cannot change the answer does not make
+    /// the answer unknown. Every value here is `iverilog`'s.
+    #[test]
+    fn test_gates_propagate_x_and_z() {
+        let mut simulator = simulator_for(
+            r#"
+            module gate_unknowns();
+                reg a, b, c;
+                wire and_0x, and_1x, or_1x, or_0z, xor_0x, buf_z, not_z;
+                and (and_0x, a, b);
+                and (and_1x, c, b);
+                or  (or_1x, c, b);
+                or  (or_0z, a, a);
+                xor (xor_0x, a, b);
+                buf (buf_z, a);
+                not (not_z, a);
+                initial begin
+                    a = 1'bz;
+                    b = 1'bx;
+                    c = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        // A `z` reaches a logic gate as an `x`, so `a` behaves as unknown.
+        assert_eq!(level(&simulator, "and_0x"), "x");
+        assert_eq!(level(&simulator, "and_1x"), "x");
+        assert_eq!(level(&simulator, "or_1x"), "1");
+        assert_eq!(level(&simulator, "or_0z"), "x");
+        assert_eq!(level(&simulator, "xor_0x"), "x");
+        assert_eq!(level(&simulator, "buf_z"), "x");
+        assert_eq!(level(&simulator, "not_z"), "x");
+    }
+
+    /// The dominance rule, which is the whole point of a four-state table:
+    /// a `0` into an `and` and a `1` into an `or` decide the answer whatever
+    /// the other input is.
+    #[test]
+    fn test_a_known_input_can_decide_a_gate() {
+        let mut simulator = simulator_for(
+            r#"
+            module gate_dominance();
+                reg unknown, floating;
+                wire and_out, or_out;
+                and (and_out, 1'b0, unknown);
+                or  (or_out, 1'b1, floating);
+                initial begin
+                    unknown = 1'bx;
+                    floating = 1'bz;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        assert_eq!(level(&simulator, "and_out"), "0");
+        assert_eq!(level(&simulator, "or_out"), "1");
+    }
+
+    /// A three-state buffer drives `z` when it is disabled, and `x` when it
+    /// cannot tell whether it is enabled.
+    #[test]
+    fn test_three_state_buffers() {
+        let mut simulator = simulator_for(
+            r#"
+            module three_state();
+                reg data, enable, unknown;
+                wire b1, b0, n1, n0, unsure;
+                bufif1 (b1, data, enable);
+                bufif0 (b0, data, enable);
+                notif1 (n1, data, enable);
+                notif0 (n0, data, enable);
+                bufif1 (unsure, data, unknown);
+                initial begin
+                    data = 1'b1;
+                    enable = 1'b0;
+                    unknown = 1'bx;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        assert_eq!(level(&simulator, "b1"), "z");
+        assert_eq!(level(&simulator, "b0"), "1");
+        assert_eq!(level(&simulator, "n1"), "z");
+        assert_eq!(level(&simulator, "n0"), "0");
+        assert_eq!(level(&simulator, "unsure"), "x");
+    }
+
+    /// Two drivers on one net, which is what a gate makes possible and an
+    /// `assign` never did. Whichever wrote last would be exactly the wrong
+    /// answer; the net is resolved between them instead.
+    #[test]
+    fn test_a_three_state_bus_resolves_between_its_drivers() {
+        let mut simulator = simulator_for(
+            r#"
+            module bus_resolution();
+                reg e0, e1;
+                wire bus;
+                bufif1 (bus, 1'b0, e0);
+                bufif1 (bus, 1'b1, e1);
+                initial begin
+                    e0 = 1'b0;
+                    e1 = 1'b0;
+                    #1 e0 = 1'b1;
+                    #1 e0 = 1'b0;
+                    #1 e1 = 1'b1;
+                    #1 e0 = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        // Both drivers off: the bus floats.
+        simulator.advance(0).unwrap();
+        assert_eq!(level(&simulator, "bus"), "z");
+        // One driver each, then both at once, which the net cannot settle.
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "bus"), "0");
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "bus"), "z");
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "bus"), "1");
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "bus"), "x");
+    }
+
+    /// A `pullup` is a *weak* driver: it holds a net nothing else is driving
+    /// and loses to anything that is.
+    #[test]
+    fn test_a_pull_source_loses_to_a_real_driver() {
+        let mut simulator = simulator_for(
+            r#"
+            module pulls();
+                reg enable;
+                wire up, down;
+                pullup (up);
+                pulldown (down);
+                bufif1 (up, 1'b0, enable);
+                bufif1 (down, 1'b1, enable);
+                initial begin
+                    enable = 1'b0;
+                    #1 enable = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(0).unwrap();
+        assert_eq!(level(&simulator, "up"), "1");
+        assert_eq!(level(&simulator, "down"), "0");
+
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "up"), "0");
+        assert_eq!(level(&simulator, "down"), "1");
+    }
+
+    /// A pull also loses to a continuous assignment, which reaches the same
+    /// resolution the gates do rather than a write of its own.
+    #[test]
+    fn test_a_pull_source_resolves_against_an_assignment() {
+        let mut simulator = simulator_for(
+            r#"
+            module pull_and_assign();
+                reg drive;
+                wire net;
+                pullup (net);
+                assign net = drive ? 1'b0 : 1'bz;
+                initial begin
+                    drive = 1'b0;
+                    #1 drive = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(0).unwrap();
+        assert_eq!(level(&simulator, "net"), "1");
+
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "net"), "0");
+    }
+
+    /// An open drain: `(highz0, strong1)` drives its `1` and floats instead of
+    /// driving its `0`, which is what leaves the pull in charge.
+    #[test]
+    fn test_a_drive_strength_can_float_one_half() {
+        let mut simulator = simulator_for(
+            r#"
+            module open_drain();
+                reg data;
+                wire net;
+                pulldown (net);
+                buf (highz0, strong1) (net, data);
+                initial begin
+                    data = 1'b1;
+                    #1 data = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(0).unwrap();
+        assert_eq!(level(&simulator, "net"), "1");
+
+        // Driving a `0` through a `highz0` half drives nothing at all, so the
+        // `pulldown` is what the net reads.
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "net"), "0");
+    }
+
+    /// A gate wakes an `always` block exactly as an `assign` does, because it
+    /// settles in the same fixpoint and its writes are journalled the same way.
+    #[test]
+    fn test_a_gate_output_wakes_a_sensitive_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module gate_edges();
+                reg a, b;
+                reg [7:0] wakes;
+                wire y;
+                and (y, a, b);
+                always @(posedge y) wakes = wakes + 1;
+                initial begin
+                    wakes = 0;
+                    a = 1'b0;
+                    b = 1'b1;
+                    #1 a = 1'b1;
+                    #1 a = 1'b0;
+                    #1 a = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(4).unwrap();
+
+        assert_eq!(number(&simulator, "wakes"), 2);
+    }
+
+    /// An array of instances is expanded at elaboration: a terminal as wide as
+    /// the array is sliced a bit per instance, and a scalar reaches all of them.
+    #[test]
+    fn test_an_array_of_gate_instances() {
+        let mut simulator = simulator_for(
+            r#"
+            module gate_array();
+                reg [3:0] data;
+                reg enable;
+                wire [3:0] bus;
+                pullup pu [3:0] (bus);
+                bufif1 drv [3:0] (bus, data, enable);
+                initial begin
+                    data = 4'b1010;
+                    enable = 1'b0;
+                    #1 enable = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        // Every bit floats, so every pullup holds its own.
+        simulator.advance(0).unwrap();
+        assert_eq!(level(&simulator, "bus"), "1111");
+
+        // Enabled, the buffers drive each bit of `data` onto its own bit.
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "bus"), "1010");
+    }
+
+    /// An array's bounds are an ordinary declared range, so a parameter sizes
+    /// the array exactly as it sizes the net the array drives.
+    #[test]
+    fn test_an_array_of_gate_instances_sized_by_a_parameter() {
+        let mut simulator = simulator_for(
+            r#"
+            module parameterised_array();
+                parameter N = 4;
+                reg [N-1:0] data;
+                reg enable;
+                wire [N-1:0] bus;
+                bufif1 drv [N-1:0] (bus, data, enable);
+                initial begin
+                    data = 4'b0110;
+                    enable = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        assert_eq!(level(&simulator, "bus"), "0110");
+    }
+
+    /// Which terminals a gate drives is decided by its kind, so `buf` with
+    /// three terminals drives two nets from one input.
+    #[test]
+    fn test_a_buffer_may_drive_several_outputs() {
+        let mut simulator = simulator_for(
+            r#"
+            module fan_out();
+                reg in;
+                wire o1, o2, o3;
+                buf (o1, o2, in);
+                not (o3, in);
+                initial in = 1'b1;
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+
+        assert_eq!(level(&simulator, "o1"), "1");
+        assert_eq!(level(&simulator, "o2"), "1");
+        assert_eq!(level(&simulator, "o3"), "0");
+    }
+
+    /// A bidirectional pass switch conducts both ways and has no output
+    /// terminal, so it stops elaboration by name rather than quietly driving
+    /// nothing.
+    #[test]
+    fn test_a_bidirectional_switch_is_reported_by_name() {
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module pass_switch();
+                wire a, b;
+                reg control;
+                tranif1 (a, b, control);
+            endmodule
+        "#,
+        )
+        .expect("a `tranif1` should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = Simulator::new(module);
+        assert_eq!(
+            simulator.setup(),
+            Err(SimulationError::Unsupported(
+                "a bidirectional pass switch (`tran` and friends)"
+            ))
+        );
+    }
+
+    /// A terminal count no gate of that kind can take is a named error too.
+    #[test]
+    fn test_a_gate_with_too_few_terminals_is_reported_by_name() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module short_gate();
+                wire out;
+                and (out);
+            endmodule
+        "#,
+        )
+        .expect("the statement should parse");
+
+        let mut simulator = Simulator::new(module);
+        assert_eq!(
+            simulator.setup(),
+            Err(SimulationError::GateTerminals {
+                gate: "and",
+                found: 1
+            })
+        );
+    }
+
+    /// An arrayed instance whose terminal is neither shared nor sliceable is
+    /// reported rather than misconnected.
+    #[test]
+    fn test_an_unsliceable_array_terminal_is_reported_by_name() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module bad_array();
+                reg [7:0] wide;
+                reg enable;
+                wire [3:0] bus;
+                bufif1 drv [3:0] (bus, wide, enable);
+            endmodule
+        "#,
+        )
+        .expect("the statement should parse");
+
+        let mut simulator = Simulator::new(module);
+        assert_eq!(
+            simulator.setup(),
+            Err(SimulationError::GateArrayTerminal {
+                gate: "bufif1",
+                expected: 4,
+                found: 8
+            })
+        );
+    }
+
+    /// A gate inside an instantiated module drives the parent's net, because
+    /// its terminals are renamed into the flat store like everything else.
+    #[test]
+    fn test_a_gate_inside_an_instance() {
+        let child = parse_module_declaration(
+            r#"
+            module inverter(input wire a, output wire y);
+                not (y, a);
+            endmodule
+        "#,
+        )
+        .unwrap()
+        .1;
+        let top = parse_module_declaration(
+            r#"
+            module top();
+                reg in;
+                wire out;
+                inverter dut (.a(in), .y(out));
+                initial in = 1'b0;
+            endmodule
+        "#,
+        )
+        .unwrap()
+        .1;
+
+        let mut simulator = Simulator::with_modules(vec![top, child], "top");
+        simulator.setup().unwrap();
+        simulator.advance(1).unwrap();
+
+        assert_eq!(level(&simulator, "out"), "1");
     }
 }

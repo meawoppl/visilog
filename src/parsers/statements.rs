@@ -6,6 +6,7 @@ use super::{
         parse_always_block, parse_function_declaration, parse_initial_block,
         parse_task_declaration, AlwaysBlock, FunctionDeclaration, InitialBlock, TaskDeclaration,
     },
+    gates::{parse_gate_instantiation, GateInstantiation},
     integer::{
         parse_event_declaration, parse_integer_declaration, parse_real_declaration,
         parse_time_declaration, EventDeclaration, IntegerDeclaration, RealDeclaration,
@@ -42,6 +43,9 @@ pub enum ModuleStatement {
     /// `task t; … endtask` — a task the module's procedural blocks may enable.
     TaskDeclaration(TaskDeclaration),
     Assignment(ContinuousAssignment),
+    /// `and g1 (out, a, b);` — one built-in primitive per instance declared,
+    /// since one statement may declare several.
+    GateInstantiation(Vec<GateInstantiation>),
     ModuleInstantiation(ModuleInstantiation),
 }
 
@@ -79,6 +83,12 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
             map(parse_always_block, |d| ModuleStatement::AlwaysBlock(d)),
             map(parse_continuous_assignment, |d| {
                 ModuleStatement::Assignment(d)
+            }),
+            // A gate primitive is keyword led — `and g1 (…)` — so it must be
+            // tried *before* the module instantiation below, which would
+            // otherwise read the keyword as a module name.
+            map(parse_gate_instantiation, |d| {
+                ModuleStatement::GateInstantiation(d)
             }),
             // NB(meawoppl) a module instantiation is just an identifier followed by
             // an argument block, so it has to come last or it will shadow the
