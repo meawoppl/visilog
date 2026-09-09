@@ -1204,7 +1204,7 @@ impl Simulator {
                 // `assign` drives at `strong` unless it says otherwise, and
                 // `assign (pull1, pull0) x = y;` saying otherwise is this one
                 // value coming off the assignment instead of the constant.
-                if self.is_resolved(target.name()) {
+                if self.target_is_resolved(&target) {
                     contributions.push(Contribution {
                         target,
                         value,
@@ -1253,6 +1253,15 @@ impl Simulator {
     /// shape `StateStore::any_signed` and `any_memory` use.
     fn is_resolved(&self, name: &str) -> bool {
         !self.resolved_nets.is_empty() && self.resolved_nets.contains(name)
+    }
+
+    /// Whether a *target* has to be resolved between its drivers.
+    ///
+    /// A concatenation never does: it names several signals, so the one name
+    /// the resolution path groups by would be a lie. It goes down the plain
+    /// write path, which splits it.
+    fn target_is_resolved(&self, target: &ResolvedTarget) -> bool {
+        !target.is_multiple() && self.is_resolved(target.name())
     }
 
     /// Combines one pass's worth of driver contributions and writes the result.
@@ -1310,8 +1319,12 @@ impl Simulator {
                         }
                     }
                     // Neither a memory word nor an event is a net, so neither
-                    // can have a second driver to be resolved against.
-                    ResolvedTarget::Word { .. } | ResolvedTarget::Event(_) => {}
+                    // can have a second driver to be resolved against, and a
+                    // concatenation never reaches here — `is_resolved` reports
+                    // it unresolved so it goes down the plain write path.
+                    ResolvedTarget::Word { .. }
+                    | ResolvedTarget::Event(_)
+                    | ResolvedTarget::Parts(_) => {}
                 }
             }
             let mut bits: Vec<u8> = signal.register().get_raw().to_vec();
@@ -1935,6 +1948,40 @@ mod tests {
 
         simulator.advance(30).expect("time should advance");
         assert_eq!(simulator.output().text(), "t=23 a=10 b=99\n");
+    }
+
+    /// `{a, b, c} = v;` splits the value across the parts, most significant
+    /// part first, each taking its own width.
+    ///
+    /// iverilog 12.0 prints `a=0101 b=10 c=1`, then `a=0111 b=00`, then
+    /// `c=1 a=0011` for these three assignments.
+    #[test]
+    fn test_concatenation_assignment_target() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [3:0] a;
+                reg [1:0] b;
+                reg c;
+                reg [7:0] src;
+                initial begin
+                    src = 8'b1010_1101;
+                    {a, b, c} = src[6:0];
+                    $display("a=%b b=%b c=%b", a, b, c);
+                    {a[1:0], b} = 4'b1100;
+                    $display("a=%b b=%b", a, b);
+                    {c, a} = 5'b10011;
+                    $display("c=%b a=%b", c, a);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "a=0101 b=10 c=1\na=0111 b=00\nc=1 a=0011\n"
+        );
     }
 
     #[test]
