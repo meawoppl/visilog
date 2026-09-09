@@ -1239,6 +1239,14 @@ mod tests {
         assert_eq!(Register::from_binary("xxxx").to_f64(), 0.0);
     }
 
+    /// The value type is moved on every operation, so its size matters: the
+    /// two bit planes align to sixteen bytes, which is what leaves room for
+    /// both of the flags that say how to read them without costing a byte.
+    #[test]
+    fn test_a_reading_flag_costs_no_space() {
+        assert_eq!(std::mem::size_of::<Register>(), 64);
+    }
+
     /// Realness says how bits are read, exactly as signedness does, so it is
     /// no more part of equality than signedness is.
     #[test]

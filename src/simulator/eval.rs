@@ -330,28 +330,23 @@ fn eval_in_context(
             // taken is never evaluated, so its type could not be read off a
             // value. `c ? 1 : 2.5` is `1.0`, and dividing it by 2 gives 0.5
             // where an integer `1` would give 0.
-            let real = either_is_real(when_true, when_false, store);
-            let width = if real { SELF_DETERMINED } else { width };
-            let taken = |arm: &Expression| -> Result<Register, EvalError> {
-                let value = eval_in_context(arm, store, arms, width)?;
-                Ok(if real && !value.is_real() {
-                    Register::from_f64(value.to_f64())
-                } else {
-                    value
-                })
-            };
+            // One real arm makes the whole conditional real, and that has to be
+            // decided *before* the condition picks one — the arm that is not
+            // taken is never evaluated, so its type could not be read off a
+            // value. It is a separate function so that the ordinary
+            // conditional, which is every one in a design with no real in it,
+            // is the code it always was plus a load and a branch.
+            if either_is_real(when_true, when_false, store) {
+                return real_conditional(condition, when_true, when_false, store, arms);
+            }
             match truth(&eval(condition, store)?) {
-                Some(true) => taken(when_true),
-                Some(false) => taken(when_false),
+                Some(true) => eval_in_context(when_true, store, arms, width),
+                Some(false) => eval_in_context(when_false, store, arms, width),
                 None => {
-                    let (when_true, when_false) = (taken(when_true)?, taken(when_false)?);
-                    // A real has no `x` to merge into, so an unknown condition
-                    // gives the value the two arms agree on and `0.0` when they
-                    // do not — which is what iverilog produces.
-                    if real {
-                        let (a, b) = (when_true.to_f64(), when_false.to_f64());
-                        return Ok(Register::from_f64(if a == b { a } else { 0.0 }));
-                    }
+                    let (when_true, when_false) = (
+                        eval_in_context(when_true, store, arms, width)?,
+                        eval_in_context(when_false, store, arms, width)?,
+                    );
                     Ok(merge(&when_true, &when_false).with_signedness(arms))
                 }
             }
@@ -568,6 +563,40 @@ fn pad(value: &Register, width: usize) -> Register {
         return value.clone();
     }
     value.coerced(width).with_signedness(value.is_signed())
+}
+
+/// `c ? a : b` where one of the arms is a real, so the whole conditional is.
+///
+/// The arms are self-determined — a real has no width for a context to reach —
+/// and the arm that is taken is converted, so `c ? 1 : 2.5` is `1.0` and
+/// dividing it by 2 gives 0.5 where an integer `1` would give 0. An unknown
+/// condition has no `x` to produce, so it gives what the two arms agree on and
+/// `0.0` when they do not, which is what iverilog produces (corpus
+/// `pr2453002`).
+#[cold]
+fn real_conditional(
+    condition: &Expression,
+    when_true: &Expression,
+    when_false: &Expression,
+    store: &StateStore,
+    arms: bool,
+) -> Result<Register, EvalError> {
+    let arm = |expr: &Expression| -> Result<Register, EvalError> {
+        let value = eval_in_context(expr, store, arms, SELF_DETERMINED)?;
+        Ok(if value.is_real() {
+            value
+        } else {
+            Register::from_f64(value.to_f64())
+        })
+    };
+    match truth(&eval(condition, store)?) {
+        Some(true) => arm(when_true),
+        Some(false) => arm(when_false),
+        None => {
+            let (a, b) = (arm(when_true)?.to_f64(), arm(when_false)?.to_f64());
+            Ok(Register::from_f64(if a == b { a } else { 0.0 }))
+        }
+    }
 }
 
 /// `value` as an unsigned one unless the context allows it to stay signed.
@@ -817,8 +846,16 @@ fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
 /// Whether either side of an operation is a real, which is what says the
 /// operation has no width to hand down. Asked only where it can change an
 /// answer, and never at all of a design that declares no real.
+#[inline(always)]
 fn either_is_real(lhs: &Expression, rhs: &Expression, store: &StateStore) -> bool {
-    store.any_real() && (expression_is_real(lhs, store) || expression_is_real(rhs, store))
+    store.any_real() && either_walked(lhs, rhs, store)
+}
+
+/// The walk itself, kept out of line: a design with no real in it never gets
+/// here, and one that has a real pays for it only where it could matter.
+#[cold]
+fn either_walked(lhs: &Expression, rhs: &Expression, store: &StateStore) -> bool {
+    expression_is_real(lhs, store) || expression_is_real(rhs, store)
 }
 
 /// The signedness and the width a comparison's two operands share.
@@ -1491,6 +1528,7 @@ fn eval_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Re
 /// bits: `& | ^ ~^`, the shifts and `===`/`!==`. iverilog rejects each of them
 /// at compile time and so does this, by name, rather than converting to an
 /// integer behind the design's back.
+#[cold]
 fn real_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
     let (a, b) = (lhs.to_f64(), rhs.to_f64());
     let real = |value: f64| Ok(Register::from_f64(value));
@@ -1521,6 +1559,7 @@ fn real_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Re
 /// A unary operation on a real. `+` and `-` are arithmetic and `!` is a truth
 /// value; `~` and the reductions read bits and are refused by name, exactly as
 /// they are in [`real_binary`].
+#[cold]
 fn real_unary(op: &UnaryOperator, operand: &Register) -> Result<Register, EvalError> {
     let value = operand.to_f64();
     match op {
@@ -1781,13 +1820,14 @@ fn logic_bit(bit: u8) -> Register {
 /// A register used as a condition: any `1` bit is true, all-zero is false, and
 /// anything else (only unknown bits and zeros) is unknown.
 fn truth(register: &Register) -> Option<bool> {
-    // A real is true when it is not zero, and `-0.0` is zero however its sign
-    // bit reads — which is the one place the bits would answer differently
-    // from the number.
-    if register.is_real() {
-        return Some(register.to_f64() != 0.0);
-    }
     if register.has_one() {
+        // Every real with a bit set is true except `-0.0`, whose sign bit is
+        // the one place the bits answer differently from the number. Asking
+        // here rather than first is what keeps the question off a value that
+        // is plainly false or unknown.
+        if register.is_real() {
+            return Some(register.to_f64() != 0.0);
+        }
         Some(true)
     } else if register.has_unknown() {
         None
