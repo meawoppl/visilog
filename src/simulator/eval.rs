@@ -289,7 +289,9 @@ fn eval_in_context(
             // An operation with a real operand has no width, so a context
             // cannot reach its operands: `w = (a + b) + 1.0;` adds `a` and `b`
             // at their own width and converts the sum, however wide `w` is.
-            if width != SELF_DETERMINED && either_is_real(lhs, rhs, store) {
+            // The two cheap questions are asked first — most operations are
+            // self-determined, and most designs have no real at all.
+            if width != SELF_DETERMINED && store.any_real() && either_is_real(lhs, rhs, store) {
                 left_width = SELF_DETERMINED;
                 right_width = SELF_DETERMINED;
             }
@@ -315,6 +317,19 @@ fn eval_in_context(
             }
         }
         Expression::Conditional(condition, when_true, when_false) => {
+            // One real arm makes the whole conditional real, and that has to be
+            // decided *before* the condition picks one — the arm that is not
+            // taken is never evaluated, so its type could not be read off a
+            // value. `c ? 1 : 2.5` is `1.0`, and dividing it by 2 gives 0.5
+            // where an integer `1` would give 0.
+            //
+            // A design with no real in it pays one load and one branch for the
+            // question, and everything the answer needs is out of line: the
+            // walk, the arms' signedness and the conversion are all inside
+            // `real_conditional`.
+            if store.any_real() && either_is_real(when_true, when_false, store) {
+                return real_conditional(condition, when_true, when_false, store, signed_context);
+            }
             // Only the taken branch is evaluated. When the condition is `x` both
             // branches are needed, and the result merges them bit by bit: bits
             // that agree survive, bits that disagree become `x`.
@@ -325,20 +340,6 @@ fn eval_in_context(
             let arms = signed_context
                 && expression_is_signed(when_true, store)
                 && expression_is_signed(when_false, store);
-            // One real arm makes the whole conditional real, and that has to be
-            // decided *before* the condition picks one — the arm that is not
-            // taken is never evaluated, so its type could not be read off a
-            // value. `c ? 1 : 2.5` is `1.0`, and dividing it by 2 gives 0.5
-            // where an integer `1` would give 0.
-            // One real arm makes the whole conditional real, and that has to be
-            // decided *before* the condition picks one — the arm that is not
-            // taken is never evaluated, so its type could not be read off a
-            // value. It is a separate function so that the ordinary
-            // conditional, which is every one in a design with no real in it,
-            // is the code it always was plus a load and a branch.
-            if either_is_real(when_true, when_false, store) {
-                return real_conditional(condition, when_true, when_false, store, arms);
-            }
             match truth(&eval(condition, store)?) {
                 Some(true) => eval_in_context(when_true, store, arms, width),
                 Some(false) => eval_in_context(when_false, store, arms, width),
@@ -579,8 +580,14 @@ fn real_conditional(
     when_true: &Expression,
     when_false: &Expression,
     store: &StateStore,
-    arms: bool,
+    signed_context: bool,
 ) -> Result<Register, EvalError> {
+    // Both arms carry the conditional's own signedness, exactly as they do
+    // when it is not real. Working it out here rather than at the call keeps
+    // the two walks off the ordinary conditional's path.
+    let arms = signed_context
+        && expression_is_signed(when_true, store)
+        && expression_is_signed(when_false, store);
     let arm = |expr: &Expression| -> Result<Register, EvalError> {
         let value = eval_in_context(expr, store, arms, SELF_DETERMINED)?;
         Ok(if value.is_real() {
@@ -844,17 +851,13 @@ fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
 }
 
 /// Whether either side of an operation is a real, which is what says the
-/// operation has no width to hand down. Asked only where it can change an
-/// answer, and never at all of a design that declares no real.
-#[inline(always)]
-fn either_is_real(lhs: &Expression, rhs: &Expression, store: &StateStore) -> bool {
-    store.any_real() && either_walked(lhs, rhs, store)
-}
-
-/// The walk itself, kept out of line: a design with no real in it never gets
-/// here, and one that has a real pays for it only where it could matter.
+/// operation has no width to hand down.
+///
+/// Kept out of line, and every caller asks [`StateStore::any_real`] *first*:
+/// a design with no real in it never walks anything, and pays a load and a
+/// branch where the question is put.
 #[cold]
-fn either_walked(lhs: &Expression, rhs: &Expression, store: &StateStore) -> bool {
+fn either_is_real(lhs: &Expression, rhs: &Expression, store: &StateStore) -> bool {
     expression_is_real(lhs, store) || expression_is_real(rhs, store)
 }
 
@@ -872,7 +875,7 @@ fn compared_operands(lhs: &Expression, rhs: &Expression, store: &StateStore) -> 
     let signed = expression_is_signed(lhs, store) && expression_is_signed(rhs, store);
     // A real has no width to share: the integer beside it is worked out at its
     // own width and converted afterwards.
-    if either_is_real(lhs, rhs, store) {
+    if store.any_real() && either_is_real(lhs, rhs, store) {
         return (signed, SELF_DETERMINED);
     }
     let width = expression_width(lhs, store).max(expression_width(rhs, store));
