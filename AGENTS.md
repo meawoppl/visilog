@@ -65,6 +65,8 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `nets.rs` | `wire`/`tri`/... declarations → `Net` |
 | `gates.rs` | the built-in primitives — `GateKind`, `DriveStrength`, `GateInstantiation` |
 | `generate.rs` | `generate … endgenerate`, `genvar` and `defparam` — the shapes, never the decisions |
+| `primitive.rs` | `primitive … endprimitive` — a user-defined primitive and its truth table |
+| `specify.rs` | `specify … endspecify` — path delays, timing checks and `specparam` |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
@@ -683,6 +685,55 @@ refusing — an `x` runs zero iterations where iverilog reports a non-constant b
 `eval` cannot tell a parameter from a net through the store to say otherwise. `generate`
 items written outside `generate`/`endgenerate`, an `inout` bound to a select, and a
 `defparam` whose path indexes something other than a generate block are all unsupported.
+**A user-defined primitive is a module with a truth table in it.** `primitive mux (q, sel,
+a, b); … table … endtable endprimitive` is instantiated exactly the way a module is, so
+`parsers/primitive.rs` parses one into a `VerilogModule` whose *single* statement is a
+`ModuleStatement::PrimitiveTable`. The header is the same production a module's is — both
+spellings, reconciled by the same `reconcile_ports` — and instantiation, the module
+library, port binding and the flattening walk then work on it unchanged. Nothing else had
+to learn what a UDP is: `elaborate::primitive_table` asking that one question is the whole
+of the difference. A `table` is deliberately *not* one of `parse_module_statement`'s
+alternatives, so there is no ordering hazard to get wrong — a table is legal only inside a
+`primitive`.
+
+A combinational UDP is then a **continuous driver** like a gate: `simulator::udp::Udp`
+joins the same `propagate` fixpoint, contributes one bit at strong strength, and marks its
+output as a `resolved_net`, so a UDP and a `bufif1` may drive one bus without either one
+knowing. **The lookup rule was measured against iverilog 12.0, not read off the LRM**: an
+input's `z` is read as an `x` before anything is matched (a table has no `z` symbol), `?`
+matches `0`, `1` and `x` alike, `b` matches only the two known levels, and where rows
+*disagree* — which the LRM leaves undefined — a `0` row beats a `1` row and both beat an
+unmatched combination, whichever order they were written in. That last rule is what makes
+a row whose output is `x` say nothing a missing row does not already say, since an
+unmatched combination is `x` anyway. There is no cleverness about an unknown input: `x 0`
+against `0 0 : 1` and `1 0 : 1` is `x` and not `1`, even though both substitutions agree.
+
+A **sequential** UDP — one whose output is a `reg`, whose rows carry a current-state field,
+and whose input columns may name an edge (`(01)`, `r`, `*`) — parses and is then
+`SimulationError::SequentialPrimitive`, naming it. Its rows ask about the *previous* value
+of an input, and a continuous driver is handed only the present ones; a driver that quietly
+answered from the levels alone would be a wrong answer wearing a working simulator's
+clothes. A UDP instance also still needs an instance *name*: `p(Q, D);` — legal, and how a
+UDP is often written — is a parse error, because a module instantiation's name is not
+optional (corpus `pr298`, `pr3587570`).
+
+**A `specify` block records and does not simulate, and that is the one place a no-op is the
+honest reading.** A module path delay (`(A => Z) = (0.1, 0.2);`) changes only *when* a value
+arrives, never what the value is, and this simulator settles every continuous driver in zero
+time — so a recorded, unsimulated path produces the same values at different edge times
+rather than a wrong answer. It is exactly the trade already taken for a gate delay. A design
+whose *checks* are about timing does then fail honestly: corpus `specify2` prints `FAILED —
+dst changed too fast`, where before it did not parse at all.
+
+Two things inside the block are not inert and are not treated as though they were. A
+`specparam` is a **real constant the whole module may name**, so `elaborate` declares it
+beside the parameters — except one whose value is a *real number*, which is kept as the text
+it was written as and declares nothing, since a four-state `Register` cannot hold one. A
+**timing check** (`$setup`, `$hold`, `$width`, …) reports a violation, which needs the same
+model the paths would; one is recorded and never run, so no violation is invented and none
+is claimed to have been checked. Every form is parsed *structurally* — there is no "skip to
+the next `;`" fallback, so anything inside a `specify` block the grammar does not recognise
+is a parse error rather than something swallowed.
 
 **`time` is a variable, `event` is not, and `real` is a named refusal.** `time t;` is a 64
 bit *unsigned* register and nothing else — `elaborate` declares it at a fixed width the way
@@ -707,6 +758,7 @@ dying on unfamiliar syntax several lines earlier.
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
+| `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, and `TaskDefinition` / `Program::splice`, which inlines one into another |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
@@ -1164,6 +1216,22 @@ tripwire.
 - **An unnamed generate block is numbered from a counter on the `Elaborator`**, and a
   loop takes its label *once*, before the iterations — numbering per iteration would give
   `genblk1[0]`, `genblk2[1]` and defeat the point.
+- **A UDP table row is written without separators, so every symbol is one character.**
+  `?? 0` is three fields, not two, which is why a level is a single character and an edge
+  has to be bracketed (`(01)`) or one of the five shorthands (`r f p n *`). The row parser
+  reads input columns until it reaches a `:`, and the shape of what follows — one field or
+  two — is what says whether the row carries a current state. `e` is not a symbol, which is
+  what lets `many0(table_row)` stop at `endtable`.
+- **A `specify` path terminal is deliberately not a general expression.** `b *> a` would
+  otherwise read as `b` multiplied by whatever follows, and what comes out is a wrong parse
+  tree rather than an error. `specify.rs::terminal` is a name with an optional bit or part
+  select and nothing else. The delay on the right of the `=` *is* an expression, which is
+  how `= (tRise, tFall)` names two `specparam`s.
+- **A real number is parsed in exactly one place.** `specify.rs::real_number` reads the
+  fixed-point spelling (`0.9`, `0.500`) for a delay and a `specparam`, and it is tried
+  *before* the expression grammar — which would otherwise read `0.9` as `0` and leave `.9`
+  behind. There is still no real number anywhere else: `real` is a named refusal at
+  elaboration and the expression grammar has no floating point operand.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

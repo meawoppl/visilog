@@ -50,6 +50,7 @@ use crate::simulator::gates::{resolve_bit, Gate};
 use crate::simulator::program::{self, Resume};
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{Output, TaskContext};
+use crate::simulator::udp::Udp;
 
 /// Ceiling on delta cycles within a single settle. A design that keeps
 /// producing edges past this is oscillating, not converging.
@@ -112,6 +113,10 @@ pub enum SimulationError {
     RecursiveTask(String),
     /// An `assign` whose left hand side is not something that can be driven.
     UnsupportedTarget(String),
+    /// An instance of a *sequential* user-defined primitive. Its rows ask
+    /// about the previous value of an input and its output is a register the
+    /// primitive owns, neither of which a continuous driver is handed.
+    SequentialPrimitive(String),
     /// A gate primitive instantiated with a terminal count its type cannot
     /// take: `and (out);` has nothing to read, `bufif1 (out, in);` has no
     /// control.
@@ -163,6 +168,11 @@ impl fmt::Display for SimulationError {
             }
             SimulationError::SystemTask(problem) => write!(f, "{}", problem),
             SimulationError::UnknownModule(name) => write!(f, "no module named `{}`", name),
+            SimulationError::SequentialPrimitive(name) => write!(
+                f,
+                "`{}` is a sequential user-defined primitive, which is not supported",
+                name
+            ),
             SimulationError::UnknownTask(name) => write!(f, "no task named `{}`", name),
             SimulationError::TaskArity {
                 name,
@@ -276,6 +286,9 @@ pub struct Simulator {
     /// The design's gate primitives, which are continuous drivers and settle
     /// in the same fixpoint the assignments do.
     gates: Vec<Gate>,
+    /// The design's user-defined primitives, continuous drivers beside the
+    /// gates and settled in the same fixpoint.
+    udps: Vec<Udp>,
     /// The nets a gate drives, which are resolved between all their continuous
     /// drivers rather than written by whichever one ran last. Empty for a
     /// design with no gates, which is what keeps the question off the hot path.
@@ -314,6 +327,7 @@ impl Simulator {
             state: StateStore::new(),
             assignments: Vec::new(),
             gates: Vec::new(),
+            udps: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
@@ -338,6 +352,7 @@ impl Simulator {
         self.state = StateStore::new();
         self.assignments.clear();
         self.gates.clear();
+        self.udps.clear();
         self.resolved_nets.clear();
         self.pulled_nets.clear();
         self.blocks.clear();
@@ -359,6 +374,7 @@ impl Simulator {
         self.state = elaborated.state;
         self.assignments = elaborated.assignments;
         self.gates = elaborated.gates;
+        self.udps = elaborated.udps;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
         self.blocks = elaborated.blocks;
@@ -711,7 +727,12 @@ impl Simulator {
     /// Settles the continuous assignments and gates alike. See
     /// [`Simulator::run`].
     fn propagate(&mut self) -> Result<usize, SimulationError> {
-        let limit = 2 * (self.assignments.len() + self.gates.len() + self.state.drive_count()) + 4;
+        let limit = 2
+            * (self.assignments.len()
+                + self.gates.len()
+                + self.udps.len()
+                + self.state.drive_count())
+            + 4;
         for pass in 1..=limit {
             let mut changed = false;
             let mut contributions: Vec<Contribution> = Vec::new();
@@ -765,6 +786,18 @@ impl Simulator {
                         strength: gate.strength,
                     });
                 }
+            }
+            // A user-defined primitive drives its output exactly the way a gate
+            // does: one bit, at strong strength, resolved against every other
+            // driver of that net.
+            for udp in &self.udps {
+                let code = udp.evaluate(&self.state)?;
+                let target = scalar_output(&self.state, resolve_target(&self.state, &udp.output)?);
+                contributions.push(Contribution {
+                    target,
+                    value: Register::from_bits(vec![code]),
+                    strength: DriveStrength::STRONG,
+                });
             }
             changed |= self.resolve_contributions(contributions)?;
             changed |= self.apply_drives()?;

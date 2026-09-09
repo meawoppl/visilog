@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use nom::{
+    branch::alt,
     combinator::all_consuming,
     multi::many0,
     sequence::{preceded, terminated},
@@ -11,19 +12,27 @@ use nom::{
 use super::{
     modules::{parse_module_declaration, VerilogModule},
     preprocessor::{PreprocessError, Preprocessed, Preprocessor, SourceMap, Timescale},
+    primitive::parse_primitive_declaration,
     simple::ws_and_comments,
 };
 
-/// Parse a whole source file: zero or more module declarations, separated (and
-/// surrounded) by any mix of whitespace and comments. The entire input has to be
-/// consumed, so a trailing fragment that is not a module is a parse error rather
-/// than a silently ignored remainder.
+/// Parse a whole source file: zero or more module or primitive declarations,
+/// separated (and surrounded) by any mix of whitespace and comments. The entire
+/// input has to be consumed, so a trailing fragment that is neither is a parse
+/// error rather than a silently ignored remainder.
+///
+/// A `primitive` yields a [`VerilogModule`] like a `module` does — it is
+/// instantiated the same way, so it lives in the same list and the same
+/// library, and what tells it apart is the table statement inside it.
 ///
 /// This is the grammar alone. A backtick directive is not part of the grammar,
 /// so a file that uses one has to go through [`parse_source`] first.
 pub fn parse_verilog_source(input: &str) -> IResult<&str, Vec<VerilogModule>> {
     all_consuming(terminated(
-        many0(preceded(ws_and_comments, parse_module_declaration)),
+        many0(preceded(
+            ws_and_comments,
+            alt((parse_module_declaration, parse_primitive_declaration)),
+        )),
         ws_and_comments,
     ))(input)
 }
@@ -466,6 +475,38 @@ mod tests {
             panic!("expected a parse failure");
         };
         assert_eq!(at, "<source>:4");
+    }
+
+    /// A `primitive` is a top-level declaration beside a `module`, and it goes
+    /// into the same list and the same library: it is instantiated the same
+    /// way, so nothing downstream should have to keep two of anything.
+    #[test]
+    fn test_a_primitive_sits_beside_a_module() {
+        let source = r#"
+            primitive BUFG (O, I);
+              output O;
+              input I;
+              table
+                0 : 0 ;
+                1 : 1 ;
+              endtable
+            endprimitive
+
+            module main;
+              wire out;
+              reg in;
+              BUFG bg (out, in);
+            endmodule
+        "#;
+        let modules = assert_parses(parse_verilog_source, source);
+        assert_eq!(modules.len(), 2);
+        assert!(matches!(
+            modules[0].statements.as_slice(),
+            [ModuleStatement::PrimitiveTable(_)]
+        ));
+
+        let library = ModuleLibrary::from_source(source).expect("library should build");
+        assert_eq!(library.names(), vec!["BUFG", "main"]);
     }
 
     #[test]
