@@ -3690,6 +3690,38 @@ mod tests {
         );
     }
 
+    /// The same guard, over the deepest frame per call the evaluator has: a
+    /// **real** function whose recursive call is an arm of a `?:`, which goes
+    /// through `real_conditional` and so adds a frame to every level. The bound
+    /// has to fire before the stack does, in a debug build, where the frames
+    /// are widest.
+    #[test]
+    fn test_runaway_recursion_through_a_real_conditional_is_a_named_error() {
+        let mut simulator = simulator_for(
+            r#"
+            module runaway(input [7:0] n, output [7:0] y);
+                function real deeper;
+                    input real value;
+                    deeper = 1 ? deeper(value + 1.0) : 0.0;
+                endfunction
+
+                assign y = deeper(n);
+            endmodule
+        "#,
+        );
+
+        simulator.set_input("n", Register::from_u128(1, 8)).unwrap();
+        let error = simulator.run().expect_err("runaway recursion should fail");
+        assert!(
+            matches!(
+                error,
+                SimulationError::Eval(EvalError::FunctionCallDepth { .. })
+            ),
+            "unexpected error: {:?}",
+            error
+        );
+    }
+
     /// A function in an instantiated module belongs to that instance: it is
     /// qualified like every other name, so two instances do not share one.
     #[test]
