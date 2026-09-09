@@ -1,7 +1,7 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while_m_n},
-    character::complete::{alpha1, char},
+    bytes::complete::{tag, take_while1, take_while_m_n},
+    character::complete::{alpha1, char, multispace1},
     combinator::map_res,
     multi::separated_list1,
     sequence::tuple,
@@ -39,7 +39,27 @@ impl From<String> for Identifier {
     }
 }
 
+/// An escaped identifier: `\\` then any run of printable, non-whitespace
+/// characters, terminated by whitespace.
+///
+/// IEEE 1364 §3.7.1: "the backslash and the terminating white space are not
+/// considered part of the identifier". So `\\a ` and `a` name the *same*
+/// object, which `iverilog` confirms — assigning through one and reading
+/// through the other sees the same value. Stripping both here is what makes
+/// that fall out, with no special case anywhere downstream.
+fn escaped_identifier(input: &str) -> IResult<&str, Identifier> {
+    let (input, _) = char('\\')(input)?;
+    let (input, name) = take_while1(|c: char| !c.is_whitespace())(input)?;
+    // The terminating whitespace belongs to the token, not to what follows.
+    let (input, _) = multispace1(input)?;
+    Ok((input, Identifier::new(name.to_string())))
+}
+
 pub fn identifier(input: &str) -> IResult<&str, Identifier> {
+    alt((escaped_identifier, simple_identifier))(input)
+}
+
+fn simple_identifier(input: &str) -> IResult<&str, Identifier> {
     map_res(
         tuple((
             alt((alpha1, tag("_"))),
@@ -71,6 +91,26 @@ mod tests {
 
     use super::*;
     use nom::Parser;
+
+    /// IEEE 1364 §3.7.1 — the backslash and the terminating whitespace are not
+    /// part of the name, so an escaped identifier and the simple identifier it
+    /// spells are the *same* object. `iverilog` agrees: assigning through `a`
+    /// and reading through `\\a ` sees the same value.
+    #[test]
+    fn test_escaped_identifiers_drop_the_backslash_and_terminator() {
+        assert_parses_to(identifier, "\\a ", "a".into());
+        assert_parses_to(identifier, "\\odd*name$ ", "odd*name$".into());
+        assert_parses_to(identifier, "\\in[0] ", "in[0]".into());
+        // Characters a simple identifier could never carry.
+        assert_parses_to(identifier, "\\1st.wire! ", "1st.wire!".into());
+    }
+
+    /// The terminator is required — without it there is no way to know where
+    /// the name stops, since an escaped identifier may contain almost anything.
+    #[test]
+    fn test_an_escaped_identifier_needs_its_terminating_whitespace() {
+        assert!(identifier("\\a").is_err());
+    }
 
     #[test]
     fn test_identifiers_valid_first_characters() {
