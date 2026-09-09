@@ -30,9 +30,12 @@ use crate::parsers::expr::Expression;
 use crate::register::Register;
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, eval_sized};
-use crate::simulator::exec::{drive_resolved, resolve_target, PendingUpdate, ResolvedTarget};
+use crate::simulator::exec::{
+    deassign_drive, drive_resolved, install_drive, release_drive, resolve_target, PendingUpdate,
+    ResolvedTarget,
+};
 use crate::simulator::runner::SimulationError;
-use crate::simulator::state_store::StateStore;
+use crate::simulator::state_store::{DriveLevel, StateStore};
 use crate::simulator::tasks::{TaskCall, TaskContext};
 
 /// What a delay nobody can run reports — either because it cannot be compiled,
@@ -80,6 +83,22 @@ pub enum Instruction {
         target: Expression,
         value: Expression,
     },
+    /// `assign a = b;` — install a continuous drive on `a` that outlives the
+    /// statement and overrides ordinary writes to it.
+    Assign {
+        target: Expression,
+        value: Expression,
+    },
+    /// `force a = b;` — the same, at the strength that overrides an `assign`
+    /// as well.
+    Force {
+        target: Expression,
+        value: Expression,
+    },
+    /// `deassign a;` — take the `assign` off.
+    Deassign(Expression),
+    /// `release a;` — take the `force` off.
+    Release(Expression),
     /// Jump when `condition` is not a known non-zero value, so that `x` and `z`
     /// conditions take the branch.
     JumpIfFalse {
@@ -169,9 +188,14 @@ impl Program {
         for instruction in &mut self.instructions {
             match instruction {
                 Instruction::Blocking { target, value }
-                | Instruction::NonBlocking { target, value } => {
+                | Instruction::NonBlocking { target, value }
+                | Instruction::Assign { target, value }
+                | Instruction::Force { target, value } => {
                     rename_expression(target, resolve);
                     rename_expression(value, resolve);
+                }
+                Instruction::Deassign(target) | Instruction::Release(target) => {
+                    rename_expression(target, resolve)
                 }
                 Instruction::JumpIfFalse { condition, .. } => rename_expression(condition, resolve),
                 Instruction::CaseSubject(subject) => rename_expression(subject, resolve),
@@ -209,6 +233,26 @@ impl Program {
                 }
                 ProceduralStatements::Assignment(assignment) => {
                     self.compile_assignment(assignment)?
+                }
+                // The four drive statements are one instruction each: what they
+                // install outlives the block, so there is nothing to flatten.
+                ProceduralStatements::Assign { target, value } => {
+                    self.emit(Instruction::Assign {
+                        target: target.clone(),
+                        value: value.clone(),
+                    });
+                }
+                ProceduralStatements::Force { target, value } => {
+                    self.emit(Instruction::Force {
+                        target: target.clone(),
+                        value: value.clone(),
+                    });
+                }
+                ProceduralStatements::Deassign(target) => {
+                    self.emit(Instruction::Deassign(target.clone()));
+                }
+                ProceduralStatements::Release(target) => {
+                    self.emit(Instruction::Release(target.clone()));
                 }
                 ProceduralStatements::If(conditional) => self.compile_if(conditional)?,
                 ProceduralStatements::Case(case) => self.compile_case(case)?,
@@ -566,6 +610,22 @@ pub fn resume(
                 let target = resolve_target(store, target)?;
                 let value = eval_sized(value, store, target.width(store))?;
                 pending.push(PendingUpdate::new(target, value));
+                pc += 1;
+            }
+            Instruction::Assign { target, value } => {
+                install_drive(store, target, value, DriveLevel::Assign)?;
+                pc += 1;
+            }
+            Instruction::Force { target, value } => {
+                install_drive(store, target, value, DriveLevel::Force)?;
+                pc += 1;
+            }
+            Instruction::Deassign(target) => {
+                deassign_drive(store, target)?;
+                pc += 1;
+            }
+            Instruction::Release(target) => {
+                release_drive(store, target)?;
                 pc += 1;
             }
             Instruction::JumpIfFalse { condition, target } => {

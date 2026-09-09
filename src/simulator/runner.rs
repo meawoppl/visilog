@@ -39,7 +39,9 @@ use crate::simulator::elaborate::{elaborate, BlockKind, TimedBlock};
 use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events;
-use crate::simulator::exec::{commit_updates, drive_resolved, resolve_target, PendingUpdate};
+use crate::simulator::exec::{
+    apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate,
+};
 use crate::simulator::program::{self, Resume};
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{Output, TaskContext};
@@ -565,9 +567,33 @@ impl Simulator {
         }
     }
 
+    /// Re-evaluates every `force` and procedural `assign` the design has
+    /// installed, reporting whether any of them moved a signal.
+    ///
+    /// They are continuous drives, so this is one round of the same fixpoint
+    /// the module's own `assign` statements settle in — which is what makes a
+    /// forced signal follow its expression when an operand moves, rather than
+    /// freeze at the value it had when the `force` ran.
+    ///
+    /// The drives are held through a handle rather than borrowed out of the
+    /// store, because writing them needs the store mutably and the precedence
+    /// rule needs the list to still be *in* it: an `assign` underneath a
+    /// `force` has to see the force to know its own write goes nowhere.
+    fn apply_drives(&mut self) -> Result<bool, SimulationError> {
+        if !self.state.has_drives() {
+            return Ok(false);
+        }
+        let drives = self.state.drives();
+        let mut changed = false;
+        for drive in drives.iter() {
+            changed |= apply_drive(&mut self.state, drive)?;
+        }
+        Ok(changed)
+    }
+
     /// Settles the continuous assignments alone. See [`Simulator::run`].
     fn propagate(&mut self) -> Result<usize, SimulationError> {
-        let limit = 2 * self.assignments.len() + 4;
+        let limit = 2 * (self.assignments.len() + self.state.drive_count()) + 4;
         for pass in 1..=limit {
             let mut changed = false;
             for assignment in &self.assignments {
@@ -578,6 +604,7 @@ impl Simulator {
                 let value = eval_sized(assignment.rhs(), &self.state, target.width(&self.state))?;
                 changed |= drive_resolved(&mut self.state, &target, &value)?;
             }
+            changed |= self.apply_drives()?;
             if !changed {
                 return Ok(pass);
             }
@@ -3001,5 +3028,164 @@ mod tests {
                 source
             );
         }
+    }
+    /// A procedural `assign` gives a variable a second source, and it is the
+    /// one that wins: an ordinary write while it is installed goes nowhere.
+    /// `deassign` takes it away and hands the variable back.
+    #[test]
+    fn test_a_procedural_assign_overrides_writes_until_it_is_deassigned() {
+        let mut simulator = simulator_for(
+            r#"
+            module driven();
+                reg v, source;
+                initial begin
+                    source = 1'b1;
+                    v = 1'b0;
+                    assign v = source;
+                    #5 v = 1'b0;
+                    #5 deassign v;
+                    #5 v = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+
+        // The drive lands the moment the statement runs.
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+    }
+
+    /// `force` is stronger than a procedural `assign`, and `release` hands the
+    /// variable back to it rather than to whatever the force left behind.
+    #[test]
+    fn test_force_overrides_a_procedural_assign_and_release_falls_back_to_it() {
+        let mut simulator = simulator_for(
+            r#"
+            module forced();
+                reg v, a, b;
+                initial begin
+                    a = 1'b0;
+                    b = 1'b1;
+                    assign v = a;
+                    #5 force v = b;
+                    #5 release v;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+    }
+
+    /// With nothing underneath it, a `release` puts back the value the force
+    /// displaced — which is still the variable's last *procedural* value,
+    /// because the write at time 10 was discarded rather than stored.
+    #[test]
+    fn test_release_with_nothing_underneath_restores_the_last_written_value() {
+        let mut simulator = simulator_for(
+            r#"
+            module released();
+                reg v, b;
+                initial begin
+                    v = 1'b0;
+                    b = 1'b1;
+                    #5 force v = b;
+                    #5 v = 1'b1;
+                    #5 release v;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+    }
+
+    /// A force is a *continuous* drive: it is re-evaluated whenever an operand
+    /// of its right hand side moves, not once when the statement ran.
+    #[test]
+    fn test_a_forced_signal_follows_its_expression() {
+        let mut simulator = simulator_for(
+            r#"
+            module following();
+                reg v, a;
+                initial begin
+                    a = 1'b0;
+                    force v = ~a;
+                    #5 a = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+    }
+
+    /// A write to a forced signal is discarded rather than applied and then
+    /// overwritten — so it never reaches the store's journal and never wakes a
+    /// block. The same write after the `release` does wake one, which is what
+    /// says the counter was capable of moving all along.
+    #[test]
+    fn test_a_write_to_a_forced_signal_wakes_nothing() {
+        let mut simulator = simulator_for(
+            r#"
+            module quiet();
+                reg v, other;
+                reg [7:0] wakes;
+                initial begin
+                    wakes = 8'd0;
+                    v = 1'b0;
+                    other = 1'b0;
+                    force v = 1'b0;
+                    #5 other = 1'b1;
+                    #5 release v;
+                    #5 other = 1'b0;
+                end
+                always @(other) v = 1'b1;
+                always @(v) wakes = wakes + 8'd1;
+            endmodule
+        "#,
+        );
+
+        // Declaring `v` and writing it `0` is itself an edge, so the counter
+        // starts at one.
+        assert_eq!(number(&simulator, "wakes"), 1);
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+        assert_eq!(number(&simulator, "wakes"), 1);
+
+        // The release puts back the same `0`, so it is not an edge either.
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(number(&simulator, "wakes"), 1);
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+        assert_eq!(number(&simulator, "wakes"), 2);
     }
 }

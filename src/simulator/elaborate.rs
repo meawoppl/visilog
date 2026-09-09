@@ -75,6 +75,12 @@ const FUNCTION_NONBLOCKING_UNSUPPORTED: SimulationError =
 const FUNCTION_SIDE_EFFECT_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a function assigning a signal outside itself");
 
+/// A `force` or a procedural `assign` installs a drive that outlives the
+/// statement, and a call's frame does not outlive the call — so a drive
+/// installed inside one would be discarded before it could ever be re-evaluated.
+const FUNCTION_DRIVE_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a `force` or procedural `assign` inside a function");
+
 /// The `$random` stream lives on the store a frame is *copied* from, so a draw
 /// made inside a call would be lost with the frame and the next call would draw
 /// the same number again.
@@ -876,6 +882,12 @@ fn analyse_function_body(
                 }
             },
             Instruction::NonBlocking { .. } => return Err(FUNCTION_NONBLOCKING_UNSUPPORTED),
+            // A drive outlives the call that installed it, and the frame it
+            // would be installed on is thrown away when the call returns.
+            Instruction::Assign { .. }
+            | Instruction::Force { .. }
+            | Instruction::Deassign(_)
+            | Instruction::Release(_) => return Err(FUNCTION_DRIVE_UNSUPPORTED),
             Instruction::Task(_) => return Err(FUNCTION_TASK_UNSUPPORTED),
             Instruction::Delay(_) => return Err(FUNCTION_DELAY_UNSUPPORTED),
             _ => {}
@@ -933,10 +945,13 @@ impl BodyNames {
     fn instruction(&mut self, instruction: &Instruction) {
         match instruction {
             Instruction::Blocking { target, value }
-            | Instruction::NonBlocking { target, value } => {
+            | Instruction::NonBlocking { target, value }
+            | Instruction::Assign { target, value }
+            | Instruction::Force { target, value } => {
                 self.target(target);
                 self.expression(value);
             }
+            Instruction::Deassign(target) | Instruction::Release(target) => self.target(target),
             Instruction::JumpIfFalse { condition, .. } => self.expression(condition),
             Instruction::CaseSubject(subject) => self.expression(subject),
             Instruction::JumpIfMatch { label, .. } => self.expression(label),
