@@ -500,6 +500,14 @@ fn judge_with(
 /// specific signal or module a message happens to mention.
 fn error_kind(error: &impl std::fmt::Debug) -> String {
     let text = format!("{:?}", error);
+    // The ranked table groups by variant, which answers "what kind of thing
+    // went wrong" but not "which one". Setting `VISILOG_DUMP_ERRORS` emits the
+    // whole message so a one-off `sort | uniq -c` can rank the *names* — which
+    // `$task` is missing, which construct is unsupported — the same affordance
+    // `VISILOG_DUMP_SITES` gives the parse failures.
+    if std::env::var_os("VISILOG_DUMP_ERRORS").is_some() {
+        println!("ERROR\t{}", text);
+    }
     text.split(['(', ' ', '{'])
         .next()
         .unwrap_or("Unknown")
