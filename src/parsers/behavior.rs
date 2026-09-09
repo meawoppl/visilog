@@ -11,7 +11,9 @@ use nom::{
 use crate::parsers::assignment::parse_assignment;
 
 use super::{
-    assignment::{assignment_lhs, ProceduralAssignment, ProceduralAssignmentType},
+    assignment::{
+        assignment_lhs, AssignmentTiming, ProceduralAssignment, ProceduralAssignmentType,
+    },
     constants::VerilogConstant,
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
@@ -27,7 +29,7 @@ pub enum EventTriggers {
     EitherEdge,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Event {
     pub trigger: EventTriggers,
     pub expression: Expression,
@@ -54,7 +56,7 @@ impl InitialBlock {
 
 /// How an `always` block is triggered. The three forms are distinct constructs
 /// and simulate differently.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum EventControl {
     /// `always begin … end` — no event control, the body runs continuously.
     None,
@@ -147,6 +149,35 @@ pub struct RepeatStatement {
     pub statements: Vec<ProceduralStatements>,
 }
 
+/// `begin : name … end` or `fork : name … join` — a block of statements,
+/// optionally named.
+///
+/// A name is what makes the block a scope of its own: only a named block may
+/// declare variables, and [`locals`](BlockStatement::locals) is always empty
+/// for an unnamed one. The name also spells those variables in the flat store,
+/// `block_id.tmp` the way a task's are `load.data`.
+#[derive(Debug, PartialEq)]
+pub struct BlockStatement {
+    /// `None` for a plain `begin`…`end` nested inside another block.
+    pub name: Option<Identifier>,
+    /// The variables the block declares, which only a named block may have.
+    pub locals: Vec<FunctionVariable>,
+    /// The statements: run in order for a `begin`, one branch each for a
+    /// `fork`.
+    pub statements: Vec<ProceduralStatements>,
+}
+
+/// `wait (expr) statement` — the statement runs once the expression is true.
+///
+/// It suspends the block the way a `#delay` does, but is resumed by a *value*
+/// rather than by time: a `wait` whose condition is already true does not
+/// suspend at all.
+#[derive(Debug, PartialEq)]
+pub struct WaitStatement {
+    pub condition: Expression,
+    pub statements: Vec<ProceduralStatements>,
+}
+
 /// One argument of a system task call.
 ///
 /// A format string is a plain string literal rather than an [`Expression`] —
@@ -215,6 +246,19 @@ pub enum ProceduralStatements {
     /// ends it, so only a `#delay` in it lets time move.
     Forever(Vec<ProceduralStatements>),
     SystemTask(SystemTaskCall),
+    /// `begin … end`, with or without a name of its own.
+    Block(BlockStatement),
+    /// `fork … join` — the statements are branches that run concurrently and
+    /// the block continues once every one of them has finished.
+    Fork(BlockStatement),
+    /// `wait (expr) statement` — suspend until the expression is true.
+    Wait(WaitStatement),
+    /// `@(posedge clk) statement` — an event control written in front of a
+    /// statement rather than in front of a whole `always` block.
+    EventControlled {
+        control: EventControl,
+        statements: Vec<ProceduralStatements>,
+    },
     /// `my_task(a, b);` or a bare `my_task;` — a task enable.
     ///
     /// A task returns nothing, so this is a statement rather than an
@@ -240,8 +284,14 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
         map(parse_for_statement, |f| ProceduralStatements::For(f)),
         map(parse_while_statement, |w| ProceduralStatements::While(w)),
         map(parse_repeat_statement, |r| ProceduralStatements::Repeat(r)),
+        map(parse_wait_statement, |w| ProceduralStatements::Wait(w)),
+        // A block nested inside another one is a statement like any other, and
+        // a named one is a scope with variables of its own.
+        map(sequential_block, ProceduralStatements::Block),
+        map(parallel_block, ProceduralStatements::Fork),
         map(parse_system_task, |t| ProceduralStatements::SystemTask(t)),
         parse_event_trigger,
+        parse_event_controlled_statement,
         // The four keyword-led drive statements. They cannot be confused with
         // an ordinary assignment — `assign v = 2;` reads as the identifier
         // `assign` followed by `v`, which is not an assignment at all — but
@@ -608,6 +658,22 @@ fn parse_forever_statement(input: &str) -> IResult<&str, ProceduralStatements> {
     Ok((input, ProceduralStatements::Forever(statements)))
 }
 
+/// An identifier that is not a keyword.
+///
+/// A bare `@ev` event control ends at whatever follows the name, so without
+/// this an `@` in front of a keyword-led statement would read the keyword as
+/// the event it waits on.
+fn unreserved_identifier(input: &str) -> IResult<&str, Identifier> {
+    let (rest, name) = identifier(input)?;
+    if is_reserved_word(&name.name) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    Ok((rest, name))
+}
+
 fn parse_edge(input: &str) -> IResult<&str, EventTriggers> {
     terminated(
         alt((
@@ -636,21 +702,36 @@ fn event_separator(input: &str) -> IResult<&str, &str> {
 }
 
 /// Parse an event control expression: `@(posedge clk or negedge rst)`,
-/// `@(a, b)` or `@(*)`. The wildcard form yields `EventControl::Implicit`,
-/// which is distinct from a block that carries no event control at all.
+/// `@(a, b)`, `@(*)`, `@*` or a bare `@ev`. The wildcard forms yield
+/// `EventControl::Implicit`, which is distinct from a block that carries no
+/// event control at all.
+///
+/// The parenthesised list is tried first, so `@(*)` is the wildcard rather
+/// than `@` followed by a parenthesised something. The bare identifier form is
+/// last: it is the loosest, and only an identifier — `@ posedge clk` without
+/// parentheses is not Verilog.
 pub fn parse_sensitivity_list(input: &str) -> IResult<&str, EventControl> {
     let (input, _) = ws(char('@'))(input)?;
-    delimited(
-        ws(char('(')),
-        alt((
-            map(ws(char('*')), |_| EventControl::Implicit),
-            map(
-                separated_list1(event_separator, parse_event),
-                EventControl::Events,
-            ),
-        )),
-        ws(char(')')),
-    )(input)
+    alt((
+        delimited(
+            ws(char('(')),
+            alt((
+                map(ws(char('*')), |_| EventControl::Implicit),
+                map(
+                    separated_list1(event_separator, parse_event),
+                    EventControl::Events,
+                ),
+            )),
+            ws(char(')')),
+        ),
+        map(ws(char('*')), |_| EventControl::Implicit),
+        map(ws(unreserved_identifier), |name| {
+            EventControl::Events(vec![Event::new(
+                EventTriggers::EitherEdge,
+                Expression::Identifier(name),
+            )])
+        }),
+    ))(input)
 }
 
 pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
@@ -681,19 +762,144 @@ pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
     Ok((input, block))
 }
 
+/// A `begin`…`end` block as a statement list.
+///
+/// An unnamed block is *flattened* into the statements it holds: it is a
+/// grouping and nothing else, so nothing downstream has to know it was
+/// written. A named one keeps its node, because its name is the scope its
+/// variables live in.
 pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
-    let (input, _) = ws(tag("begin"))(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, assignments) = statement_run(input)?;
-    // `begin` has been consumed, so nothing else can match this text: a
-    // missing `end` is a hard failure, and the position it carries points at
-    // the first statement in the block the grammar could not read rather than
-    // at the `begin` itself.
-    let (input, _) = ws(tag("end"))(input).map_err(|error: nom::Err<_>| match error {
+    let (input, block) = sequential_block(input)?;
+    Ok((
+        input,
+        match block.name {
+            None => block.statements,
+            Some(_) => vec![ProceduralStatements::Block(block)],
+        },
+    ))
+}
+
+/// `begin [: name] [declarations] statements end`.
+fn sequential_block(input: &str) -> IResult<&str, BlockStatement> {
+    block_between(input, "begin", "end")
+}
+
+/// `fork [: name] [declarations] statements join`.
+fn parallel_block(input: &str) -> IResult<&str, BlockStatement> {
+    block_between(input, "fork", "join")
+}
+
+/// The shared shape of the two block forms, which differ only in their
+/// keywords.
+///
+/// The opening keyword has been consumed by the time the body is read, so
+/// nothing else can match this text: a missing closing keyword is a hard
+/// failure, and the position it carries points at the first statement the
+/// grammar could not read rather than at the `begin` itself.
+fn block_between<'a>(
+    input: &'a str,
+    open: &'static str,
+    close: &'static str,
+) -> IResult<&'a str, BlockStatement> {
+    let (input, _) = keyword(input, open)?;
+    let (input, name) = opt(preceded(ws(char(':')), ws(identifier)))(input)?;
+    // Only a named block is a scope, and only a scope may declare variables.
+    let (input, locals) = match &name {
+        Some(_) => map(many0(block_item), |items| {
+            items.into_iter().flatten().collect()
+        })(input)?,
+        None => (input, Vec::new()),
+    };
+    let (input, statements) = statement_run(input)?;
+    let (input, _) = ws(tag(close))(input).map_err(|error: nom::Err<_>| match error {
         nom::Err::Error(inner) => nom::Err::Failure(inner),
         other => other,
     })?;
-    Ok((input, assignments))
+
+    Ok((
+        input,
+        BlockStatement {
+            name,
+            locals,
+            statements,
+        },
+    ))
+}
+
+/// One variable declaration inside a named block: `reg [7:0] tmp;`,
+/// `integer i, j;`.
+///
+/// Like [`function_item`] it gives up unless it saw a type, which is what lets
+/// `many0` stop at the first statement of the block.
+fn block_item(input: &str) -> IResult<&str, Vec<FunctionVariable>> {
+    let (input, declared) = declared_type(input)?;
+    if !declared.explicit {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let (input, names) = identifier_list(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        names
+            .into_iter()
+            .map(|name| FunctionVariable {
+                name,
+                range: declared.range.clone(),
+                signed: declared.signed,
+            })
+            .collect(),
+    ))
+}
+
+/// `wait (expr) statement`, including `wait (expr);` with no statement at all.
+fn parse_wait_statement(input: &str) -> IResult<&str, WaitStatement> {
+    let (input, _) = keyword(input, "wait")?;
+    let (input, condition) = parenthesized_expression(input)?;
+    let (input, statements) = statement_body(input)?;
+
+    Ok((
+        input,
+        WaitStatement {
+            condition,
+            statements,
+        },
+    ))
+}
+
+/// `@(posedge clk) statement`, `@ev;` — an event control in front of a
+/// statement rather than in front of a whole `always` block.
+fn parse_event_controlled_statement(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, control) = parse_sensitivity_list(input)?;
+    let (input, statements) = statement_body(input)?;
+    Ok((
+        input,
+        ProceduralStatements::EventControlled {
+            control,
+            statements,
+        },
+    ))
+}
+
+/// The timing control written between an assignment's `=` and its right hand
+/// side: `a = #5 b;`, `a = @(posedge clk) b;`, `a = repeat (3) @(clk) b;`.
+///
+/// The grammar for it lives here because the event forms are this module's,
+/// while the value it produces belongs to the assignment that carries it.
+pub(crate) fn assignment_timing(input: &str) -> IResult<&str, AssignmentTiming> {
+    alt((map(parse_delay, AssignmentTiming::Delay), event_timing))(input)
+}
+
+/// `@(posedge clk)`, or `repeat (3) @(ev)` — the event half of an
+/// intra-assignment timing control. The count says how many times the event
+/// has to happen before the write lands.
+fn event_timing(input: &str) -> IResult<&str, AssignmentTiming> {
+    let (input, repeat) = opt(preceded(|i| keyword(i, "repeat"), parenthesized_expression))(input)?;
+    let (input, control) = parse_sensitivity_list(input)?;
+    Ok((input, AssignmentTiming::Event { repeat, control }))
 }
 
 /// One variable a `function` or a `task` declares: an argument or a
@@ -2113,5 +2319,191 @@ mod tests {
                 statement
             );
         }
+    }
+
+    #[test]
+    fn test_named_block_declares_its_own_variables() {
+        let statements = assert_parses(
+            parse_block,
+            "begin : block_id reg [7:0] tmp; integer i, j; tmp = 1; end",
+        );
+
+        let [ProceduralStatements::Block(block)] = statements.as_slice() else {
+            panic!("expected one named block, got {:?}", statements);
+        };
+        assert_eq!(block.name, Some("block_id".into()));
+        assert_eq!(
+            block
+                .locals
+                .iter()
+                .map(|local| local.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tmp", "i", "j"]
+        );
+        assert_eq!(block.locals[0].range, Range::Constant(7, 0));
+        // An `integer` is 32 bits and signed by being an `integer`.
+        assert_eq!(block.locals[1].range, Range::Constant(31, 0));
+        assert!(block.locals[1].signed);
+        assert_eq!(block.statements.len(), 1);
+    }
+
+    /// An unnamed block is grouping and nothing else, so it leaves no node
+    /// behind — but a nested one is still a statement in its own right.
+    #[test]
+    fn test_a_nested_block_is_a_statement() {
+        let statements = assert_parses(parse_block, "begin a = 1; begin b = 2; c = 3; end end");
+
+        let [ProceduralStatements::Assignment(_), ProceduralStatements::Block(inner)] =
+            statements.as_slice()
+        else {
+            panic!("expected an assignment and a block, got {:?}", statements);
+        };
+        assert_eq!(inner.name, None);
+        assert!(inner.locals.is_empty());
+        assert_eq!(inner.statements.len(), 2);
+    }
+
+    #[test]
+    fn test_fork_join_parses_its_branches() {
+        let statement = assert_parses(procedural_statement, "fork a = 1; b = 2; join");
+
+        let ProceduralStatements::Fork(block) = statement else {
+            panic!("expected a fork, got {:?}", statement);
+        };
+        assert_eq!(block.name, None);
+        assert_eq!(block.statements.len(), 2);
+
+        let statement = assert_parses(procedural_statement, "fork : f reg t; t = 1; a = t; join");
+        let ProceduralStatements::Fork(block) = statement else {
+            panic!("expected a named fork, got {:?}", statement);
+        };
+        assert_eq!(block.name, Some("f".into()));
+        assert_eq!(block.locals.len(), 1);
+        assert_eq!(block.statements.len(), 2);
+    }
+
+    #[test]
+    fn test_wait_statement_parses_with_and_without_a_body() {
+        let statement = assert_parses(procedural_statement, "wait (foo) a = 1;");
+        let ProceduralStatements::Wait(wait) = statement else {
+            panic!("expected a wait, got {:?}", statement);
+        };
+        assert_eq!(wait.condition, identifier_expression("foo"));
+        assert_eq!(wait.statements.len(), 1);
+
+        // `wait (foo) ;` waits and then does nothing, which is a null
+        // statement and so leaves no node behind.
+        let statement = assert_parses(procedural_statement, "wait (foo) ;");
+        let ProceduralStatements::Wait(wait) = statement else {
+            panic!("expected a wait, got {:?}", statement);
+        };
+        assert!(wait.statements.is_empty());
+    }
+
+    #[test]
+    fn test_statement_level_event_control_parses() {
+        let statement = assert_parses(procedural_statement, "@(posedge clk) a = 1;");
+        let ProceduralStatements::EventControlled {
+            control,
+            statements,
+        } = statement
+        else {
+            panic!("expected an event control, got {:?}", statement);
+        };
+        assert_eq!(
+            control,
+            EventControl::Events(vec![Event::new(
+                EventTriggers::PosEdge,
+                identifier_expression("clk")
+            )])
+        );
+        assert_eq!(statements.len(), 1);
+
+        // `@ev;` waits and does nothing, and the bare name is an event
+        // control just as a parenthesised one is.
+        let statement = assert_parses(procedural_statement, "@ev;");
+        let ProceduralStatements::EventControlled {
+            control,
+            statements,
+        } = statement
+        else {
+            panic!("expected an event control, got {:?}", statement);
+        };
+        assert_eq!(
+            control,
+            EventControl::Events(vec![Event::new(
+                EventTriggers::EitherEdge,
+                identifier_expression("ev")
+            )])
+        );
+        assert!(statements.is_empty());
+    }
+
+    /// `@*`, `@(*)` and a bare `@ev` are all event controls, and the two
+    /// wildcard spellings mean the same thing.
+    #[test]
+    fn test_the_three_sensitivity_list_spellings() {
+        assert_parses_to(parse_sensitivity_list, "@(*)", EventControl::Implicit);
+        assert_parses_to(parse_sensitivity_list, "@*", EventControl::Implicit);
+        assert_parses_to(
+            parse_sensitivity_list,
+            "@ ev",
+            EventControl::Events(vec![Event::new(
+                EventTriggers::EitherEdge,
+                identifier_expression("ev"),
+            )]),
+        );
+    }
+
+    /// A bare `@` event control takes an identifier, and a keyword is not one:
+    /// without that guard `always @* begin … end` would read `begin` as the
+    /// event it waits on.
+    #[test]
+    fn test_a_bare_event_control_does_not_take_a_keyword() {
+        let block = assert_parses(parse_always_block, "always @* begin a = b; end");
+        assert_eq!(block.event_control, EventControl::Implicit);
+    }
+
+    #[test]
+    fn test_intra_assignment_event_control_parses() {
+        let statement = assert_parses(procedural_statement, "value1 = @ ev 4'h5;");
+        let ProceduralStatements::Assignment(assignment) = statement else {
+            panic!("expected an assignment, got {:?}", statement);
+        };
+        let Some(AssignmentTiming::Event { repeat, control }) = assignment.timing() else {
+            panic!("expected an event timing, got {:?}", assignment.timing());
+        };
+        assert_eq!(*repeat, None);
+        assert_eq!(
+            *control,
+            EventControl::Events(vec![Event::new(
+                EventTriggers::EitherEdge,
+                identifier_expression("ev")
+            )])
+        );
+
+        let statement = assert_parses(procedural_statement, "value1 = repeat ( 5 ) @ ev 4'h5;");
+        let ProceduralStatements::Assignment(assignment) = statement else {
+            panic!("expected an assignment, got {:?}", statement);
+        };
+        let Some(AssignmentTiming::Event { repeat, .. }) = assignment.timing() else {
+            panic!("expected an event timing, got {:?}", assignment.timing());
+        };
+        assert_eq!(
+            *repeat,
+            Some(Expression::Constant(VerilogConstant::from_int(5)))
+        );
+    }
+
+    #[test]
+    fn test_intra_assignment_delay_is_kept_on_the_assignment() {
+        let statement = assert_parses(procedural_statement, "a = #5 b;");
+        let ProceduralStatements::Assignment(assignment) = statement else {
+            panic!("expected an assignment, got {:?}", statement);
+        };
+        assert_eq!(
+            assignment.timing(),
+            Some(&AssignmentTiming::Delay(Delay::new(5)))
+        );
     }
 }

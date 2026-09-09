@@ -431,6 +431,15 @@ pub struct StateStore {
     /// installing one goes through [`Rc::make_mut`], the same way the function
     /// table does.
     drives: Rc<Vec<Drive>>,
+    /// The right hand sides an intra-assignment timing control is holding on
+    /// to, keyed by the hidden slot the instruction that evaluated them named.
+    ///
+    /// `a = @(posedge clk) b;` evaluates `b` when the statement runs and
+    /// writes it when the edge arrives, and the block suspends in between — so
+    /// the value has to outlive the return from `resume`, exactly as a
+    /// `repeat` count does. It is deliberately not a signal: nothing in the
+    /// design can name it, so journalling it would only manufacture edges.
+    holds: HashMap<String, Register>,
 }
 
 impl StateStore {
@@ -470,6 +479,7 @@ impl StateStore {
             // A frame holds only the call's own variables, and a function body
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
+            holds: HashMap::new(),
         }
     }
 
@@ -653,6 +663,18 @@ impl StateStore {
             self.triggers.push(name.to_string());
         }
         true
+    }
+
+    /// Holds an already-evaluated right hand side until the timing control in
+    /// front of it expires.
+    pub fn hold(&mut self, slot: String, value: Register) {
+        self.holds.insert(slot, value);
+    }
+
+    /// Takes back what [`hold`](StateStore::hold) put there. A slot is written
+    /// once and read once, so it is removed rather than left behind.
+    pub fn take_hold(&mut self, slot: &str) -> Option<Register> {
+        self.holds.remove(slot)
     }
 
     /// Every event triggered since the last call, clearing the journal so the

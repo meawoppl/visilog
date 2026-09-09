@@ -131,7 +131,6 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
     note(body.contains("task"), "task");
     note(body.contains("real "), "real declaration");
     note(body.contains("generate"), "generate block");
-    note(body.contains("fork"), "fork / join");
     found
 }
 
@@ -554,6 +553,17 @@ fn ivtest_corpus_closure_rate() {
             entry.name.clone(),
             judge_with(&preprocessor, &source, gold.as_deref(), &search_paths),
         ));
+    }
+
+    // The report below counts outcomes and names the interesting ones. A
+    // change that moves the metric needs the whole map instead — "did anything
+    // that used to pass stop passing?" is a question about names, not counts —
+    // so setting `VISILOG_DUMP_OUTCOMES` emits every file's outcome as TSV to
+    // diff against another run, the same way `VISILOG_DUMP_SITES` does.
+    if std::env::var_os("VISILOG_DUMP_OUTCOMES").is_some() {
+        for (name, outcome) in &outcomes {
+            println!("OUTCOME\t{}\t{:?}", name, outcome);
+        }
     }
 
     let total = outcomes.len();

@@ -29,12 +29,13 @@
 //! was connected to. Hand the simulator more than one module with
 //! [`Simulator::with_modules`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
+    behavior::EventControl,
     gates::{DriveStrength, StrengthLevel},
     modules::VerilogModule,
 };
@@ -42,12 +43,12 @@ use crate::register::Register;
 use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
 use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
-use crate::simulator::events;
+use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
 use crate::simulator::gates::{resolve_bit, Gate};
-use crate::simulator::program::{self, Resume};
+use crate::simulator::program::{self, Resume, WaitReason};
 use crate::simulator::state_store::StateStore;
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
@@ -273,6 +274,61 @@ impl From<EvalError> for SimulationError {
     }
 }
 
+/// A block suspended on something the clock does not decide.
+struct Waiting {
+    cursor: ExecutionCursor,
+    /// What it is waiting for. `None` is a `wait (c)`, whose condition is a
+    /// value the block reads for itself when it is re-entered.
+    watch: Option<EventWatch>,
+}
+
+/// An event control a block is suspended on, with what the signals it names
+/// held when the block started waiting.
+///
+/// The snapshot is what gives the moment of arming any meaning. A settle round
+/// sees everything the timestep moved, including what the block itself wrote
+/// before it reached the wait — so `clk = 0; @(negedge clk) …` would be woken
+/// by its own write. Measuring against what was there when the wait was armed
+/// asks the question the design asked: has it moved *since*?
+struct EventWatch {
+    control: EventControl,
+    /// One entry per signal the control names, holding what it had at the last
+    /// look. `None` is a name the store has no value for, which is what a
+    /// named event is — an event has no value, and is matched by its trigger
+    /// instead.
+    snapshot: Vec<(String, Option<Register>)>,
+}
+
+impl EventWatch {
+    fn arm(control: EventControl, state: &StateStore) -> EventWatch {
+        let snapshot = events::control_signals(&control)
+            .into_iter()
+            .map(|name| {
+                let value = state.get(&name).cloned();
+                (name, value)
+            })
+            .collect();
+        EventWatch { control, snapshot }
+    }
+
+    /// The edges the watched signals have taken since the last look, which is
+    /// also where the next look is measured from.
+    fn edges_since(&mut self, state: &StateStore) -> Vec<SignalEdge> {
+        let mut edges = Vec::new();
+        for (name, before) in &mut self.snapshot {
+            let current = state.get(name).cloned();
+            if current == *before {
+                continue;
+            }
+            if let (Some(was), Some(is)) = (before.as_ref(), current.as_ref()) {
+                edges.push(SignalEdge::new(name.clone(), was.clone(), is.clone()));
+            }
+            *before = current;
+        }
+        edges
+    }
+}
+
 /// A parsed design, elaborated into signals and runnable blocks.
 pub struct Simulator {
     /// Every module the design may draw on. Only the top one is walked
@@ -296,6 +352,14 @@ pub struct Simulator {
     /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
     pulled_nets: Vec<PulledNet>,
     blocks: Vec<TimedBlock>,
+    /// The blocks suspended on something other than the clock: a `wait` on a
+    /// value, or an event control waiting for an edge.
+    ///
+    /// They are not on the [`EventQueue`], because nothing schedules them —
+    /// what wakes them is the design moving, which is exactly what a settle
+    /// round measures. Empty for a design that waits on nothing, which is what
+    /// keeps the question off that round's hot path.
+    waiting: Vec<Waiting>,
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
     aliases: HashMap<String, String>,
@@ -331,6 +395,7 @@ impl Simulator {
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
+            waiting: Vec::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
             now: 0,
@@ -356,6 +421,7 @@ impl Simulator {
         self.resolved_nets.clear();
         self.pulled_nets.clear();
         self.blocks.clear();
+        self.waiting.clear();
         self.aliases.clear();
         self.queue = EventQueue::new();
         self.now = 0;
@@ -516,10 +582,15 @@ impl Simulator {
             // A named event has no value, so it cannot appear in either
             // journal above: a trigger is recorded as the bare fact that it
             // happened, and taking it here is what makes it wake a block
-            // exactly once.
-            if self.state.any_event() {
-                edges.extend(events::trigger_edges(self.state.take_triggers()));
-            }
+            // exactly once. They are kept apart from the rest because a
+            // suspended block measures a *signal* against what it held when it
+            // started waiting, and a trigger has nothing to measure.
+            let triggers = if self.state.any_event() {
+                events::trigger_edges(self.state.take_triggers())
+            } else {
+                Vec::new()
+            };
+            edges.extend(triggers.iter().cloned());
             if edges.is_empty() {
                 return Ok(delta - 1);
             }
@@ -532,6 +603,17 @@ impl Simulator {
                 if self.blocks[id].kind != BlockKind::Always || self.blocks[id].free_running {
                     continue;
                 }
+                // A block part way through a `wait` has not finished the run it
+                // is on, and an `always` block does not start again until it
+                // does. Starting a second copy of it here would give the design
+                // two writers of everything the block assigns.
+                if self
+                    .waiting
+                    .iter()
+                    .any(|waiting| waiting.cursor.block == id)
+                {
+                    continue;
+                }
                 if self.blocks[id].fires(&edges) {
                     let (updates, _) = self.resume_block(id, 0)?;
                     pending.extend(updates);
@@ -541,6 +623,8 @@ impl Simulator {
                 }
             }
 
+            pending.extend(self.wake_waiting(&triggers)?);
+
             commit_updates(pending, &mut self.state)?;
             self.propagate()?;
         }
@@ -548,6 +632,58 @@ impl Simulator {
         Err(SimulationError::NoConvergence {
             passes: MAX_DELTA_CYCLES,
         })
+    }
+
+    /// Resumes every waiting block whose wait is now satisfied.
+    ///
+    /// The two reasons a block waits are answered differently on purpose. A
+    /// condition is a value that is still there, so the block is simply
+    /// re-entered and its own `wait` instruction decides. An edge is not: it
+    /// is measured against what the watched signals held when the block
+    /// started waiting, which is what keeps a block from being woken by a
+    /// write it made itself before it reached the wait. `triggers` are the
+    /// named events fired this round, which have no value to measure and so
+    /// are offered to every waiter as they are.
+    ///
+    /// A block that is still not satisfied goes back on the list, and writes
+    /// nothing, so it cannot keep the settle loop from converging.
+    fn wake_waiting(
+        &mut self,
+        triggers: &[SignalEdge],
+    ) -> Result<Vec<PendingUpdate>, SimulationError> {
+        let mut pending = Vec::new();
+        if self.waiting.is_empty() {
+            return Ok(pending);
+        }
+
+        let implicit = BTreeSet::new();
+        let mut still_waiting = Vec::new();
+        let mut woken = Vec::new();
+        for mut waiting in std::mem::take(&mut self.waiting) {
+            let wake = match &mut waiting.watch {
+                None => true,
+                Some(watch) => {
+                    let mut edges = watch.edges_since(&self.state);
+                    edges.extend(triggers.iter().cloned());
+                    events::control_fires(&watch.control, &edges, &implicit)
+                }
+            };
+            if wake {
+                woken.push(waiting.cursor);
+            } else {
+                still_waiting.push(waiting);
+            }
+        }
+        self.waiting = still_waiting;
+
+        for cursor in woken {
+            let (updates, _) = self.resume_block(cursor.block, cursor.pc)?;
+            pending.extend(updates);
+            if self.finished() {
+                break;
+            }
+        }
+        Ok(pending)
     }
 
     /// Runs whatever the timestep just finished deferred to its end.
@@ -648,15 +784,8 @@ impl Simulator {
                 }
 
                 let (_, cursor) = self.queue.pop().expect("peeked time must pop");
-                let (updates, halted) = self.resume_block(cursor.block, cursor.pc)?;
+                let (updates, _) = self.resume_block(cursor.block, cursor.pc)?;
                 pending.extend(updates);
-
-                // A free-running `always` restarts the moment it finishes,
-                // which is how `always begin #50 … end` keeps going forever.
-                if halted && self.blocks[cursor.block].free_running {
-                    self.queue
-                        .insert(self.now, ExecutionCursor::new(cursor.block, 0));
-                }
 
                 if self.finished() {
                     break;
@@ -691,10 +820,32 @@ impl Simulator {
             &mut self.state,
             &mut self.tasks,
         )? {
-            Resume::Halted { pending } => Ok((pending, true)),
+            // A free-running `always` restarts the moment it finishes, which
+            // is how `always begin #50 … end` keeps going forever — and how
+            // `always value = @(ev) 5;` waits for the event again after the
+            // one it was woken by.
+            Resume::Halted { pending } => {
+                if self.blocks[id].free_running {
+                    self.queue.insert(self.now, ExecutionCursor::new(id, 0));
+                }
+                Ok((pending, true))
+            }
             Resume::Suspended { pc, delay, pending } => {
                 self.queue
                     .insert(self.now + delay, ExecutionCursor::new(id, pc));
+                Ok((pending, false))
+            }
+            // Nothing schedules this one: it goes on the waiting list and
+            // `settle` offers it every round of edges until one satisfies it.
+            Resume::Waiting { pc, wait, pending } => {
+                let watch = match wait {
+                    WaitReason::Condition => None,
+                    WaitReason::Event(control) => Some(EventWatch::arm(control, &self.state)),
+                };
+                self.waiting.push(Waiting {
+                    cursor: ExecutionCursor::new(id, pc),
+                    watch,
+                });
                 Ok((pending, false))
             }
         }
@@ -4599,5 +4750,363 @@ mod tests {
         simulator.advance(1).unwrap();
 
         assert_eq!(level(&simulator, "out"), "1");
+    }
+
+    /// A named block is a scope: the variable it declares is its own, and the
+    /// design signal of the same name outside it is untouched.
+    #[test]
+    fn test_a_named_block_local_shadows_an_outer_signal() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [7:0] value;
+                initial begin
+                    value = 1;
+                    begin : blk
+                        reg [7:0] value;
+                        value = 9;
+                        $display("inner=%0d", value);
+                    end
+                    $display("outer=%0d", value);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "inner=9\nouter=1\n");
+        // The two live side by side in the flat store, the block's under the
+        // dotted name its scope gives it.
+        assert_eq!(simulator.get("value").expect("declared").to_u128(), Some(1));
+        assert_eq!(
+            simulator.get("blk.value").expect("declared").to_u128(),
+            Some(9)
+        );
+    }
+
+    /// Two blocks that name a variable the same way are two variables, and a
+    /// block inside a block takes both names.
+    #[test]
+    fn test_named_blocks_do_not_share_a_variable() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    begin : first
+                        integer i;
+                        i = 1;
+                        begin : inner
+                            integer i;
+                            i = 3;
+                        end
+                    end
+                    begin : second
+                        integer i;
+                        i = 2;
+                    end
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.get("first.i").expect("declared").to_u128(),
+            Some(1)
+        );
+        assert_eq!(
+            simulator.get("second.i").expect("declared").to_u128(),
+            Some(2)
+        );
+        assert_eq!(
+            simulator.get("first.inner.i").expect("declared").to_u128(),
+            Some(3)
+        );
+    }
+
+    /// A block inside an instance is qualified like everything else in it, so
+    /// two instances of one module have a variable each.
+    #[test]
+    fn test_a_named_block_inside_an_instance_is_qualified() {
+        let child = parse_module_declaration(
+            r#"
+            module counter();
+                initial begin : body
+                    integer count;
+                    count = 7;
+                end
+            endmodule
+        "#,
+        )
+        .unwrap()
+        .1;
+        let top = parse_module_declaration(
+            r#"
+            module top();
+                counter one ();
+                counter two ();
+            endmodule
+        "#,
+        )
+        .unwrap()
+        .1;
+
+        let mut simulator = Simulator::with_modules(vec![top, child], "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("time should advance");
+
+        assert_eq!(
+            simulator.get("one.body.count").expect("declared").to_u128(),
+            Some(7)
+        );
+        assert_eq!(
+            simulator.get("two.body.count").expect("declared").to_u128(),
+            Some(7)
+        );
+    }
+
+    /// A `wait` on something already true falls straight through; one on
+    /// something that is not suspends until whatever it names moves.
+    #[test]
+    fn test_wait_suspends_until_its_condition_becomes_true() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg flag;
+                reg [7:0] seen;
+                initial begin
+                    flag = 0;
+                    #10 flag = 1;
+                end
+                initial begin
+                    seen = 0;
+                    wait (flag) seen = 1;
+                    $display("seen=%0d at %0t", seen, $time);
+                    wait (seen == 1) $display("through at %0t", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("seen").expect("declared").to_u128(), Some(0));
+
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(simulator.get("seen").expect("declared").to_u128(), Some(1));
+        assert_eq!(simulator.output().text(), "seen=1 at 10\nthrough at 10\n");
+    }
+
+    /// `fork`/`join` branches that consume no time run one after another,
+    /// which is what running them at once would come to.
+    #[test]
+    fn test_fork_join_runs_every_branch() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [7:0] a, b, c;
+                initial begin
+                    fork
+                        a = 1;
+                        b = 2;
+                    join
+                    c = a + b;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.get("c").expect("declared").to_u128(), Some(3));
+    }
+
+    /// A branch that consumes time gives the others a turn while it waits, and
+    /// running those in sequence would put their writes in an order the design
+    /// never asked for. That is refused by name rather than approximated.
+    #[test]
+    fn test_a_fork_whose_branches_consume_time_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module main();
+                reg [7:0] a, b;
+                initial begin
+                    fork
+                        #5 a = 1;
+                        b = 2;
+                    join
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            error,
+            SimulationError::Unsupported("a `fork`/`join` branch that consumes time")
+        );
+    }
+
+    /// An event control written in front of a statement suspends the block it
+    /// is in until the edge arrives, and only counts edges taken *after* it
+    /// was reached — the write the block made itself on its way there is not
+    /// one.
+    #[test]
+    fn test_statement_level_event_control_waits_for_a_later_edge() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg clk;
+                reg [3:0] q;
+                initial begin
+                    clk = 0;
+                    #1 clk = 1;
+                    #1 clk = 0;
+                end
+                initial begin
+                    clk = 0;
+                    @(negedge clk) q = 4'ha;
+                    $display("q=%h at %0t", q, $time);
+                end
+            endmodule
+        "#,
+        );
+
+        // The block wrote `clk = 0` itself before arming the wait, so the
+        // x -> 0 transition that write made must not wake it.
+        simulator.advance(1).expect("time should advance");
+        assert!(simulator.output().text().is_empty());
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.output().text(), "q=a at 2\n");
+    }
+
+    /// `value = @(ev) 4'h5;` reads the right hand side now and writes it when
+    /// the event arrives, and the free-running block it is in arms again the
+    /// moment the write lands.
+    #[test]
+    fn test_intra_assignment_event_control_writes_when_the_event_arrives() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] value;
+                reg trigger;
+                initial begin
+                    value = 0;
+                    #5 trigger = 0;
+                    #5 trigger = 1;
+                end
+                always value = @(trigger) 4'h5;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(4).expect("time should advance");
+        assert_eq!(simulator.get("value").expect("declared").to_u128(), Some(0));
+
+        // x -> 0 is a change of `trigger`, so the held 5 lands at time 5.
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.get("value").expect("declared").to_u128(), Some(5));
+    }
+
+    /// A `repeat` in front of an intra-assignment event control counts the
+    /// events, so the write lands on the last of them.
+    #[test]
+    fn test_intra_assignment_event_control_counts_its_repeats() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] value;
+                reg trigger;
+                initial begin
+                    value = 0;
+                    trigger = 0;
+                    #5 trigger = 1;
+                    #5 trigger = 0;
+                    #5 trigger = 1;
+                end
+                initial value = repeat (3) @(trigger) 4'h5;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(12).expect("time should advance");
+        assert_eq!(simulator.get("value").expect("declared").to_u128(), Some(0));
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("value").expect("declared").to_u128(), Some(5));
+    }
+
+    /// A function is evaluated at one instant, so a wait inside one is a named
+    /// error rather than a call that quietly returns whatever it found.
+    #[test]
+    fn test_a_wait_inside_a_function_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module main();
+                reg flag;
+                function f;
+                    input a;
+                    begin
+                        wait (flag) f = a;
+                    end
+                endfunction
+                initial flag = f(1);
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            error,
+            SimulationError::Unsupported("a wait or event control inside a function")
+        );
+    }
+
+    /// `@*` in front of a *statement* is sensitive to what that statement
+    /// reads, where the same token in front of a block is sensitive to what
+    /// the block reads. Here the outer one waits on `b` and `c`, the inner one
+    /// on `c` alone.
+    #[test]
+    fn test_statement_level_implicit_event_control_reads_its_own_statement() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg a, b, c;
+                always @* begin
+                    a = b;
+                    $display("one at %0t", $time);
+                    @* a = c;
+                    $display("two at %0t", $time);
+                end
+                initial begin
+                    #10 b = 0;
+                    #10 c = 0;
+                    #10 b = 1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(40).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "one at 10\ntwo at 20\none at 30\n"
+        );
+    }
+
+    /// An `@*` with no statement after it to read has nothing to wait on, so
+    /// it is an error naming it rather than a wait that never ends.
+    #[test]
+    fn test_an_implicit_event_control_with_nothing_to_read_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module main();
+                reg [3:0] a, b;
+                initial a = @* b;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            error,
+            SimulationError::Unsupported("an `@(*)` event control that reads nothing")
+        );
     }
 }
