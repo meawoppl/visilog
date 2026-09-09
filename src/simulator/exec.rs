@@ -60,17 +60,34 @@ pub enum ResolvedTarget {
     /// A named event, as in `-> done;`. It holds no value, so the write that
     /// lands on it is a trigger and whatever was evaluated for it is dropped.
     Event(String),
+    /// `{a, b, c} = v;` — several targets sharing one value, most significant
+    /// part first.
+    ///
+    /// The only target that names more than one signal, which is why the
+    /// paths that assume a single one check for it rather than trusting
+    /// [`ResolvedTarget::name`].
+    Parts(Vec<ResolvedTarget>),
 }
 
 impl ResolvedTarget {
     /// The signal this target writes into.
+    ///
+    /// A [`ResolvedTarget::Parts`] names several, so this reports the first —
+    /// which is only ever asked of it by a caller that has already established
+    /// the target is a single signal. `is_multiple` is how those callers ask.
     pub fn name(&self) -> &str {
         match self {
             ResolvedTarget::Whole(name) => name,
             ResolvedTarget::Bits { name, .. } => name,
             ResolvedTarget::Word { name, .. } => name,
             ResolvedTarget::Event(name) => name,
+            ResolvedTarget::Parts(parts) => parts.first().map_or("", |part| part.name()),
         }
+    }
+
+    /// Whether this target names more than one signal.
+    pub fn is_multiple(&self) -> bool {
+        matches!(self, ResolvedTarget::Parts(_))
     }
 
     /// How many bits the target holds, which is the width context the right
@@ -94,6 +111,9 @@ impl ResolvedTarget {
             // Nothing is written into an event, so the value a trigger carries
             // is sized by itself and then thrown away.
             ResolvedTarget::Event(_) => SELF_DETERMINED,
+            // A concatenation is as wide as its parts add up to, which is what
+            // sizes the right hand side that fills it.
+            ResolvedTarget::Parts(parts) => parts.iter().map(|part| part.width(state)).sum(),
         }
     }
 }
@@ -277,6 +297,16 @@ pub fn resolve_target(
                 indices,
             })
         }
+        // `{a, b, c} = v;` — each part resolved on its own, in source order,
+        // which is most significant first.
+        Expression::Concatenation(parts) => {
+            let mut resolved = Vec::with_capacity(parts.len());
+            for part in parts {
+                resolved.push(resolve_target(state, part)?);
+            }
+            Ok(ResolvedTarget::Parts(resolved))
+        }
+        Expression::Parenthetical(inner) => resolve_target(state, inner),
         other => Err(SimulationError::UnsupportedTarget(
             other.to_contracted_string(),
         )),
@@ -357,6 +387,23 @@ pub fn drive_at(
     value: &Register,
     level: DriveLevel,
 ) -> Result<bool, SimulationError> {
+    // A concatenation is split before anything else looks at it: each part is
+    // a target in its own right, with its own precedence and its own slice of
+    // the value, most significant part first.
+    if let ResolvedTarget::Parts(parts) = target {
+        let total: usize = parts.iter().map(|part| part.width(state)).sum();
+        let value = value.coerced(total);
+        let codes = value.get_raw().to_vec();
+        let mut offset = 0;
+        let mut changed = false;
+        for part in parts {
+            let width = part.width(state);
+            let slice = Register::from_bits(codes[offset..offset + width].to_vec());
+            changed |= drive_at(state, part, &slice, level)?;
+            offset += width;
+        }
+        return Ok(changed);
+    }
     let held = held_bits(state, target.name(), level)?;
     if matches!(held, Held::Everything) {
         return Ok(false);
@@ -420,6 +467,8 @@ pub fn drive_at(
             // it causes comes from the trigger journal, not from this flag.
             Ok(false)
         }
+        // Split above, before precedence was asked about.
+        ResolvedTarget::Parts(_) => unreachable!("a concatenation is split first"),
     }
 }
 
@@ -437,6 +486,14 @@ pub fn install_drive(
     level: DriveLevel,
 ) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
+    // A drive is recorded against one signal name, so a concatenation has no
+    // place to live. Reporting it is better than installing it on the first
+    // part and quietly losing the rest.
+    if resolved.is_multiple() {
+        return Err(SimulationError::UnsupportedTarget(
+            target.to_contracted_string(),
+        ));
+    }
     let evaluated = eval_sized(value, state, resolved.width(state))?;
     drive_at(state, &resolved, &evaluated, level)?;
     state.install_drive(Drive::new(
