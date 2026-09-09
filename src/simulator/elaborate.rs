@@ -41,7 +41,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
-    behavior::{Event, EventControl, FunctionDeclaration, FunctionVariable, TaskDeclaration},
+    behavior::{
+        Event, EventControl, FunctionDeclaration, FunctionVariable, ProceduralStatements,
+        TaskDeclaration,
+    },
     constants::VerilogConstant,
     expr::Expression,
     gates::{GateInstantiation, GateKind, StrengthLevel},
@@ -63,8 +66,8 @@ use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
 use crate::simulator::gates::Gate;
 use crate::simulator::program::{
-    FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition, TaskParameter,
-    TaskTable, FUNCTION_DELAY_UNSUPPORTED,
+    block_scope, FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition,
+    TaskParameter, TaskTable, FUNCTION_DELAY_UNSUPPORTED, FUNCTION_EVENT_UNSUPPORTED,
 };
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
@@ -891,6 +894,10 @@ impl<'m> Elaborator<'m> {
         }
 
         for task in &declarations {
+            // A named block inside a task body is scoped under the task, the
+            // same way the body's instructions spell it.
+            let inside = block_scope("", &task.name.name);
+            self.declare_block_locals(&task.statements, scope, &inside)?;
             for variable in task
                 .arguments
                 .iter()
@@ -910,6 +917,68 @@ impl<'m> Elaborator<'m> {
         }
 
         Ok(tasks)
+    }
+
+    /// Declares the variables every named block inside a procedural body
+    /// holds.
+    ///
+    /// A block's name is a scope, and its variables are ordinary store entries
+    /// under a dotted name — `block_id.tmp`, qualified per instance like
+    /// everything else — which is exactly what a task's are. `scope` walks down
+    /// with the blocks, so a block inside a block is `outer.inner.tmp` and two
+    /// blocks that name a variable the same way are two variables.
+    fn declare_block_locals(
+        &mut self,
+        statements: &[ProceduralStatements],
+        scope: &Scope,
+        block: &str,
+    ) -> Result<(), SimulationError> {
+        for statement in statements {
+            match statement {
+                ProceduralStatements::Block(inner) | ProceduralStatements::Fork(inner) => {
+                    let nested = match &inner.name {
+                        Some(name) => block_scope(block, &name.name),
+                        None => block.to_string(),
+                    };
+                    for local in &inner.locals {
+                        let range = self.resolve_range(&local.range, scope)?;
+                        let name = scope.qualified(&format!("{}{}", nested, local.name.name));
+                        self.out.state.declare_signed(name, range, local.signed);
+                    }
+                    self.declare_block_locals(&inner.statements, scope, &nested)?;
+                }
+                ProceduralStatements::If(conditional) => {
+                    self.declare_block_locals(&conditional.then_statements, scope, block)?;
+                    if let Some(otherwise) = &conditional.else_statements {
+                        self.declare_block_locals(otherwise, scope, block)?;
+                    }
+                }
+                ProceduralStatements::Case(case) => {
+                    for item in &case.items {
+                        self.declare_block_locals(&item.statements, scope, block)?;
+                    }
+                }
+                ProceduralStatements::For(loop_) => {
+                    self.declare_block_locals(&loop_.statements, scope, block)?
+                }
+                ProceduralStatements::While(loop_) => {
+                    self.declare_block_locals(&loop_.statements, scope, block)?
+                }
+                ProceduralStatements::Repeat(loop_) => {
+                    self.declare_block_locals(&loop_.statements, scope, block)?
+                }
+                ProceduralStatements::Wait(statement) => {
+                    self.declare_block_locals(&statement.statements, scope, block)?
+                }
+                ProceduralStatements::Forever(statements)
+                | ProceduralStatements::Delayed { statements, .. }
+                | ProceduralStatements::EventControlled { statements, .. } => {
+                    self.declare_block_locals(statements, scope, block)?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Compiles every function this module declares and puts it in the store
@@ -1488,6 +1557,7 @@ impl<'m> Elaborator<'m> {
                 }
             }
             ModuleStatement::AlwaysBlock(block) => {
+                self.declare_block_locals(&block.statements, scope, "")?;
                 let mut program = Program::compile(&block.statements, tasks)?;
                 if !scope.genvars.is_empty() {
                     program
@@ -1543,6 +1613,7 @@ impl<'m> Elaborator<'m> {
                 });
             }
             ModuleStatement::InitialBlock(block) => {
+                self.declare_block_locals(&block.statements, scope, "")?;
                 let mut program = Program::compile(&block.statements, tasks)?;
                 if !scope.genvars.is_empty() {
                     program
@@ -1831,6 +1902,13 @@ fn analyse_function_body(
             | Instruction::Release(_) => return Err(FUNCTION_DRIVE_UNSUPPORTED),
             Instruction::Task(_) => return Err(FUNCTION_TASK_UNSUPPORTED),
             Instruction::Delay(_) => return Err(FUNCTION_DELAY_UNSUPPORTED),
+            // A `wait` and an event control are both suspensions, and a call
+            // happens at one instant: there is no later for the body to come
+            // back at. `Hold` and `WriteHeld` are the halves of one, so they
+            // cannot appear without it.
+            Instruction::Wait(_) | Instruction::EventWait(_) => {
+                return Err(FUNCTION_EVENT_UNSUPPORTED)
+            }
             _ => {}
         }
     }
@@ -1922,6 +2000,20 @@ impl BodyNames {
             Instruction::CaseSubject(subject) => self.expression(subject),
             Instruction::JumpIfMatch { label, .. } => self.expression(label),
             Instruction::RepeatInit { count, .. } => self.expression(count),
+            Instruction::Wait(condition) => self.expression(condition),
+            // A block waiting on an edge reads the signal that edge is of.
+            Instruction::EventWait(control) => {
+                if let EventControl::Events(events) = control {
+                    for event in events {
+                        self.expression(&event.expression);
+                    }
+                }
+            }
+            Instruction::Hold { target, value, .. } => {
+                self.target(target);
+                self.expression(value);
+            }
+            Instruction::WriteHeld { target, .. } => self.target(target),
             Instruction::Jump(_)
             | Instruction::RepeatNext { .. }
             | Instruction::Task(_)
@@ -2043,7 +2135,8 @@ fn compile_task(
         })
         .collect();
 
-    let mut program = Program::compile_body(&task.statements, tasks)?;
+    let mut program =
+        Program::compile_body(&task.statements, tasks, &block_scope("", &task.name.name))?;
     program.rename_local(&|name| match names.get(name) {
         Some(qualified) => qualified.clone(),
         None => name.to_string(),
@@ -2159,6 +2252,19 @@ fn substitute_genvars(expression: &mut Expression, genvars: &HashMap<String, i64
         Expression::IndexedPartSelect { base, width, .. } => {
             substitute_genvars(base, genvars);
             substitute_genvars(width, genvars);
+        }
+    }
+}
+
+/// Rewrites every name an event control waits on through `resolve`.
+///
+/// A control reaches the flat name space two ways — as a whole block's
+/// trigger, and as an [`Instruction::EventWait`] inside one — and both spell
+/// the signals they wait on the way the module wrote them.
+pub fn rename_event_control(control: &mut EventControl, resolve: &dyn Fn(&str) -> String) {
+    if let EventControl::Events(events) = control {
+        for event in events {
+            rename_expression(&mut event.expression, resolve);
         }
     }
 }

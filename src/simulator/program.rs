@@ -21,16 +21,20 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
+use crate::parsers::assignment::{
+    AssignmentTiming, ProceduralAssignment, ProceduralAssignmentType,
+};
 use crate::parsers::behavior::{
-    CaseKind, CaseLabel, CaseStatement, ForStatement, IfStatement, ProceduralStatements,
-    RepeatStatement, TaskDirection, WhileStatement,
+    BlockStatement, CaseKind, CaseLabel, CaseStatement, Event, EventControl, EventTriggers,
+    ForStatement, IfStatement, ProceduralStatements, RepeatStatement, TaskDirection, WaitStatement,
+    WhileStatement,
 };
 use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::register::Register;
-use crate::simulator::elaborate::rename_expression;
+use crate::simulator::elaborate::{rename_event_control, rename_expression};
 use crate::simulator::eval::{eval, eval_sized};
+use crate::simulator::events::signals_read;
 use crate::simulator::exec::{
     deassign_drive, drive_resolved, install_drive, release_drive, resolve_target, PendingUpdate,
     ResolvedTarget,
@@ -39,16 +43,52 @@ use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{DriveLevel, StateStore};
 use crate::simulator::tasks::{TaskCall, TaskContext};
 
-/// What a delay nobody can run reports — either because it cannot be compiled,
-/// or because the caller cannot hold the resume point a suspension hands back.
+/// What a delay reports when the caller cannot hold the resume point a
+/// suspension hands back.
 pub(crate) const DELAY_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a delay inside a procedural block");
+
+/// The same for the two things that wait on the design rather than on the
+/// clock: a `wait` and an event control.
+pub(crate) const WAIT_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a wait inside a procedural block");
+
+/// What an intra-assignment timing control on a non-blocking assignment
+/// reports. `a <= #5 b;` schedules its write and lets the block carry straight
+/// on, where everything here suspends the block that hit it — so running one
+/// would hold up statements that are supposed to have already run.
+pub(crate) const NONBLOCKING_TIMING_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("an intra-assignment timing control on a non-blocking assignment");
+
+/// What an `@(*)` that heads nothing reports. An implicit sensitivity list is
+/// the set of signals the statement it heads reads, so `a = @* b;` — where the
+/// right hand side has already been read and there is no statement left to
+/// take a list from — asks to wait on nothing at all.
+pub(crate) const EMPTY_IMPLICIT_EVENT_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("an `@(*)` event control that reads nothing");
+
+/// What a `fork`…`join` whose branches consume time reports.
+///
+/// Branches that never suspend finish in the order they are run whichever way
+/// a simulator schedules them, so running them one after another is exactly
+/// concurrent execution. A branch that waits gives the others a turn while it
+/// is waiting, and running those in sequence would put their writes in an
+/// order the design did not ask for — a wrong answer that looks like a right
+/// one, which is worth less than stopping.
+pub(crate) const FORK_TIMING_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a `fork`/`join` branch that consumes time");
 
 /// What a function body that could consume time reports. A function returns a
 /// value into the expression that called it, and an expression is evaluated at
 /// one instant, so there is no later for it to resume at.
 pub(crate) const FUNCTION_DELAY_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a delay inside a function");
+
+/// What a function body that waits on the design reports. A call is made from
+/// inside an expression, so there is no later for it to come back at — the
+/// same reason a delay in one cannot work.
+pub(crate) const FUNCTION_EVENT_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a wait or event control inside a function");
 
 /// Ceiling on the instructions one [`resume`] may execute before it is called
 /// a non-terminating loop.
@@ -67,6 +107,11 @@ const REPEAT_COUNTER_PREFIX: &str = "$repeat$";
 /// The width of that counter. A `repeat` asking for more iterations than this
 /// holds would exhaust [`MAX_INSTRUCTIONS`] long before it ran out of count.
 const REPEAT_COUNTER_WIDTH: usize = 64;
+
+/// The prefix of the hidden slot an intra-assignment timing control holds its
+/// already-evaluated right hand side in, on the same terms as
+/// [`REPEAT_COUNTER_PREFIX`].
+const HOLD_SLOT_PREFIX: &str = "$hold$";
 
 /// One step of a compiled procedural block.
 ///
@@ -125,6 +170,24 @@ pub enum Instruction {
     RepeatNext { counter: String, target: usize },
     /// `#n` — suspend, and resume at the next instruction `n` time units later.
     Delay(i64),
+    /// `wait (c)` — suspend until `c` is true. A condition that is already
+    /// true does not suspend at all, so this re-evaluates `c` every time it is
+    /// reached.
+    Wait(Expression),
+    /// `@(posedge clk)` — suspend until an edge the control names is seen. It
+    /// is *always* a suspension: an edge is a thing that happens, not a value
+    /// that can already be the case.
+    EventWait(EventControl),
+    /// The first half of an intra-assignment timing control: resolve `target`
+    /// and evaluate `value` **now**, holding the result in `slot` until the
+    /// control expires.
+    Hold {
+        slot: String,
+        target: Expression,
+        value: Expression,
+    },
+    /// The second half: write what `slot` has been holding to `target`.
+    WriteHeld { slot: String, target: Expression },
     /// `$display(…)` and friends — a call to a system task.
     Task(TaskCall),
     /// The end of the block.
@@ -156,6 +219,26 @@ pub enum Resume {
         delay: i64,
         pending: Vec<PendingUpdate>,
     },
+    /// Hit something that waits on the design rather than on the clock. Resume
+    /// at `pc` once `wait` is satisfied.
+    Waiting {
+        pc: usize,
+        wait: WaitReason,
+        pending: Vec<PendingUpdate>,
+    },
+}
+
+/// What a suspended block is waiting for, which is what decides how the driver
+/// finds out that it can go on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WaitReason {
+    /// `wait (c)` — a value, so the driver re-enters the block and lets the
+    /// instruction re-evaluate the condition. `pc` is the `Wait` itself.
+    Condition,
+    /// `@(posedge clk)` — an edge, which is gone by the time the block could
+    /// look for it, so the driver matches the control against the edges of the
+    /// round instead. `pc` is the instruction *after* the wait.
+    Event(EventControl),
 }
 
 /// Rewrites every name one instruction uses through `resolve`.
@@ -183,6 +266,21 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
         }
         Instruction::RepeatNext { counter, .. } => *counter = resolve(counter),
         Instruction::Task(call) => call.rename(resolve),
+        Instruction::Wait(condition) => rename_expression(condition, resolve),
+        Instruction::EventWait(control) => rename_event_control(control, resolve),
+        Instruction::Hold {
+            slot,
+            target,
+            value,
+        } => {
+            *slot = resolve(slot);
+            rename_expression(target, resolve);
+            rename_expression(value, resolve);
+        }
+        Instruction::WriteHeld { slot, target } => {
+            *slot = resolve(slot);
+            rename_expression(target, resolve);
+        }
         Instruction::Jump(_) | Instruction::Delay(_) | Instruction::Halt => {}
     }
 }
@@ -202,6 +300,21 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
         Instruction::JumpIfMatch { label, .. } => replace(label),
         Instruction::RepeatInit { count, .. } => replace(count),
         Instruction::Task(call) => call.substitute(replace),
+        Instruction::Wait(condition) => replace(condition),
+        // A genvar may index a signal a control waits on:
+        // `@(posedge clk[i])` inside a generate loop.
+        Instruction::EventWait(control) => {
+            if let EventControl::Events(events) = control {
+                for event in events {
+                    replace(&mut event.expression);
+                }
+            }
+        }
+        Instruction::Hold { target, value, .. } => {
+            replace(target);
+            replace(value);
+        }
+        Instruction::WriteHeld { target, .. } => replace(target),
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
         | Instruction::Delay(_)
@@ -211,16 +324,11 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
 
 impl Program {
     /// Flattens a statement body into instructions.
-    ///
-    /// Fails with [`SimulationError::Unsupported`] on an intra-assignment delay
-    /// (`a = #5 b;`), whose right hand side has to be carried across the
-    /// suspension: a resume point is only a program counter, so there is
-    /// nowhere to keep it.
     pub fn compile(
         statements: &[ProceduralStatements],
         tasks: &TaskTable,
     ) -> Result<Program, SimulationError> {
-        let mut program = Program::compile_body(statements, tasks)?;
+        let mut program = Program::compile_body(statements, tasks, "")?;
         program.emit(Instruction::Halt);
         Ok(program)
     }
@@ -228,12 +336,17 @@ impl Program {
     /// The same, without the trailing [`Instruction::Halt`] — a task's body,
     /// which is spliced into the middle of whatever enables it and so must not
     /// end the block it lands in.
+    ///
+    /// `scope` is what a named block inside the body spells its variables
+    /// under, so a task's blocks are `load.loop.i` rather than sharing
+    /// `loop.i` with every other task that names a block the same way.
     pub fn compile_body(
         statements: &[ProceduralStatements],
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<Program, SimulationError> {
         let mut program = Program::default();
-        program.compile_statements(statements, tasks)?;
+        program.compile_statements(statements, tasks, scope)?;
         Ok(program)
     }
 
@@ -292,10 +405,22 @@ impl Program {
     /// pass with the caller's map would re-point a design signal the inner task
     /// read at a variable the outer one happens to declare under the same name.
     pub fn rename_local(&mut self, resolve: &dyn Fn(&str) -> String) {
-        let mut skipping = self.inlined.iter().peekable();
-        let mut index = 0;
-        while index < self.instructions.len() {
+        self.rename_range(0, self.instructions.len(), resolve);
+    }
+
+    /// [`rename_local`](Program::rename_local) over one half-open range of
+    /// instructions, which is what a named block's own variables are renamed
+    /// through: the block is a scope, and only what it compiled to is in it.
+    fn rename_range(&mut self, from: usize, to: usize, resolve: &dyn Fn(&str) -> String) {
+        let skip: Vec<(usize, usize)> = self.inlined.clone();
+        let mut skipping = skip.iter().peekable();
+        let mut index = from;
+        while index < to {
             if let Some((start, end)) = skipping.peek() {
+                if index >= *end {
+                    skipping.next();
+                    continue;
+                }
                 if index == *start {
                     index = *end;
                     skipping.next();
@@ -330,6 +455,9 @@ impl Program {
                 | Instruction::RepeatNext { counter, .. } => {
                     *counter = format!("{}${}", counter, offset)
                 }
+                Instruction::Hold { slot, .. } | Instruction::WriteHeld { slot, .. } => {
+                    *slot = format!("{}${}", slot, offset)
+                }
                 _ => {}
             }
             self.instructions.push(instruction);
@@ -341,6 +469,7 @@ impl Program {
         &mut self,
         statements: &[ProceduralStatements],
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         for statement in statements {
             match statement {
@@ -353,7 +482,7 @@ impl Program {
                 // one at the top level does.
                 ProceduralStatements::Delayed { delay, statements } => {
                     self.emit(Instruction::Delay(delay.ticks()));
-                    self.compile_statements(statements, tasks)?;
+                    self.compile_statements(statements, tasks, scope)?;
                 }
                 ProceduralStatements::Assignment(assignment) => {
                     self.compile_assignment(assignment)?
@@ -378,13 +507,41 @@ impl Program {
                 ProceduralStatements::Release(target) => {
                     self.emit(Instruction::Release(target.clone()));
                 }
-                ProceduralStatements::If(conditional) => self.compile_if(conditional, tasks)?,
-                ProceduralStatements::Case(case) => self.compile_case(case, tasks)?,
-                ProceduralStatements::For(statement) => self.compile_for(statement, tasks)?,
-                ProceduralStatements::While(statement) => self.compile_while(statement, tasks)?,
-                ProceduralStatements::Repeat(statement) => self.compile_repeat(statement, tasks)?,
+                ProceduralStatements::If(conditional) => {
+                    self.compile_if(conditional, tasks, scope)?
+                }
+                ProceduralStatements::Case(case) => self.compile_case(case, tasks, scope)?,
+                ProceduralStatements::For(statement) => {
+                    self.compile_for(statement, tasks, scope)?
+                }
+                ProceduralStatements::While(statement) => {
+                    self.compile_while(statement, tasks, scope)?
+                }
+                ProceduralStatements::Repeat(statement) => {
+                    self.compile_repeat(statement, tasks, scope)?
+                }
                 ProceduralStatements::Forever(statements) => {
-                    self.compile_forever(statements, tasks)?
+                    self.compile_forever(statements, tasks, scope)?
+                }
+                ProceduralStatements::Block(block) => self.compile_block(block, tasks, scope)?,
+                ProceduralStatements::Fork(block) => self.compile_fork(block, tasks, scope)?,
+                // `wait (c) S` is the condition followed by the statement it
+                // guards: the instruction falls through the moment `c` is
+                // true, so a `wait` on something already true costs a single
+                // evaluation and no suspension.
+                ProceduralStatements::Wait(WaitStatement {
+                    condition,
+                    statements,
+                }) => {
+                    self.emit(Instruction::Wait(condition.clone()));
+                    self.compile_statements(statements, tasks, scope)?;
+                }
+                ProceduralStatements::EventControlled {
+                    control,
+                    statements,
+                } => {
+                    self.emit_event_wait(control, statements)?;
+                    self.compile_statements(statements, tasks, scope)?;
                 }
                 // A task's body is spliced in where the enable stands, with its
                 // arguments copied in ahead of it and back out behind it. That
@@ -410,16 +567,146 @@ impl Program {
         &mut self,
         assignment: &ProceduralAssignment,
     ) -> Result<(), SimulationError> {
-        if assignment.assignment_delay().is_some() {
-            return Err(DELAY_UNSUPPORTED);
-        }
-
         let target = assignment.lhs().clone();
         let value = assignment.rhs().clone();
-        self.emit(match assignment.assignment_type() {
-            ProceduralAssignmentType::Blocking => Instruction::Blocking { target, value },
-            ProceduralAssignmentType::NonBlocking => Instruction::NonBlocking { target, value },
+        let Some(timing) = assignment.timing() else {
+            self.emit(match assignment.assignment_type() {
+                ProceduralAssignmentType::Blocking => Instruction::Blocking { target, value },
+                ProceduralAssignmentType::NonBlocking => Instruction::NonBlocking { target, value },
+            });
+            return Ok(());
+        };
+        if matches!(
+            assignment.assignment_type(),
+            ProceduralAssignmentType::NonBlocking
+        ) {
+            return Err(NONBLOCKING_TIMING_UNSUPPORTED);
+        }
+
+        // The right hand side is read *now* and written when the control
+        // expires, which is the whole of what makes the control an
+        // intra-assignment one. The value has to survive the suspension in
+        // between, so it goes in a hidden slot named after the instruction
+        // that filled it — two of these in one block are two slots.
+        let slot = format!("{}{}", HOLD_SLOT_PREFIX, self.next());
+        self.emit(Instruction::Hold {
+            slot: slot.clone(),
+            target: target.clone(),
+            value,
         });
+        match timing {
+            AssignmentTiming::Delay(delay) => {
+                self.emit(Instruction::Delay(delay.ticks()));
+            }
+            AssignmentTiming::Event {
+                repeat: None,
+                control,
+            } => self.emit_event_wait(control, &[])?,
+            // `repeat (n) @(ev)` waits for the event `n` times, so it is the
+            // `repeat` loop with the wait as its whole body. A count of zero
+            // therefore writes immediately, which is what the LRM says.
+            AssignmentTiming::Event {
+                repeat: Some(count),
+                control,
+            } => {
+                let counter = format!("{}{}", REPEAT_COUNTER_PREFIX, self.next());
+                self.emit(Instruction::RepeatInit {
+                    counter: counter.clone(),
+                    count: count.clone(),
+                });
+                let top = self.next();
+                let branch = self.emit(Instruction::RepeatNext { counter, target: 0 });
+                self.emit_event_wait(control, &[])?;
+                self.emit(Instruction::Jump(top));
+                let end = self.next();
+                self.patch(branch, end);
+            }
+        }
+        self.emit(Instruction::WriteHeld { slot, target });
+        Ok(())
+    }
+
+    /// Emits the wait an event control asks for.
+    ///
+    /// `@*` in front of a statement is sensitive to what *that statement*
+    /// reads, where the same token in front of a block is sensitive to what
+    /// the block reads — so it is resolved into the explicit list it stands
+    /// for here, while the statement it heads is in hand. Everything past this
+    /// point then sees one kind of event control instead of two.
+    fn emit_event_wait(
+        &mut self,
+        control: &EventControl,
+        body: &[ProceduralStatements],
+    ) -> Result<(), SimulationError> {
+        let control = match control {
+            EventControl::Implicit => implicit_control(body)?,
+            other => other.clone(),
+        };
+        self.emit(Instruction::EventWait(control));
+        Ok(())
+    }
+
+    /// `begin : name … end` — the statements, with the block's own variables
+    /// renamed into the scope its name opens.
+    ///
+    /// An unnamed block is nothing but grouping and compiles to its contents.
+    /// A named one is renamed *after* its body is compiled, over exactly the
+    /// instructions the body produced: a nested block has already resolved its
+    /// own variables by then, and they are spelled with a `.` this map cannot
+    /// match, so the inner scope wins where the two declare the same name.
+    fn compile_block(
+        &mut self,
+        block: &BlockStatement,
+        tasks: &TaskTable,
+        scope: &str,
+    ) -> Result<(), SimulationError> {
+        let Some(name) = &block.name else {
+            return self.compile_statements(&block.statements, tasks, scope);
+        };
+
+        let inner = block_scope(scope, &name.name);
+        let start = self.next();
+        self.compile_statements(&block.statements, tasks, &inner)?;
+        let end = self.next();
+
+        if block.locals.is_empty() {
+            return Ok(());
+        }
+        let locals: HashMap<&str, String> = block
+            .locals
+            .iter()
+            .map(|local| {
+                (
+                    local.name.name.as_str(),
+                    format!("{}{}", inner, local.name.name),
+                )
+            })
+            .collect();
+        self.rename_range(start, end, &|name| match locals.get(name) {
+            Some(qualified) => qualified.clone(),
+            None => name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// `fork … join` — the branches, run one after another.
+    ///
+    /// Branches that consume no time cannot tell that apart from running at
+    /// once: each runs to completion without giving another a turn either way.
+    /// One that *does* consume time can, so it is refused by name rather than
+    /// approximated.
+    fn compile_fork(
+        &mut self,
+        block: &BlockStatement,
+        tasks: &TaskTable,
+        scope: &str,
+    ) -> Result<(), SimulationError> {
+        let start = self.next();
+        self.compile_block(block, tasks, scope)?;
+        if block.statements.len() > 1 && self.instructions[start..].iter().any(instruction_suspends)
+        {
+            return Err(FORK_TIMING_UNSUPPORTED);
+        }
         Ok(())
     }
 
@@ -429,19 +716,20 @@ impl Program {
         &mut self,
         conditional: &IfStatement,
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         let branch = self.emit(Instruction::JumpIfFalse {
             condition: conditional.condition.clone(),
             target: 0,
         });
-        self.compile_statements(&conditional.then_statements, tasks)?;
+        self.compile_statements(&conditional.then_statements, tasks, scope)?;
 
         match &conditional.else_statements {
             Some(else_statements) => {
                 let skip_else = self.emit(Instruction::Jump(0));
                 let else_start = self.next();
                 self.patch(branch, else_start);
-                self.compile_statements(else_statements, tasks)?;
+                self.compile_statements(else_statements, tasks, scope)?;
                 let end = self.next();
                 self.patch(skip_else, end);
             }
@@ -463,13 +751,14 @@ impl Program {
         &mut self,
         statement: &WhileStatement,
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         let top = self.next();
         let branch = self.emit(Instruction::JumpIfFalse {
             condition: statement.condition.clone(),
             target: 0,
         });
-        self.compile_statements(&statement.statements, tasks)?;
+        self.compile_statements(&statement.statements, tasks, scope)?;
         self.emit(Instruction::Jump(top));
         let end = self.next();
         self.patch(branch, end);
@@ -483,6 +772,7 @@ impl Program {
         &mut self,
         statement: &ForStatement,
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         self.compile_assignment(&statement.initializer)?;
         let top = self.next();
@@ -490,7 +780,7 @@ impl Program {
             condition: statement.condition.clone(),
             target: 0,
         });
-        self.compile_statements(&statement.statements, tasks)?;
+        self.compile_statements(&statement.statements, tasks, scope)?;
         self.compile_assignment(&statement.step)?;
         self.emit(Instruction::Jump(top));
         let end = self.next();
@@ -513,6 +803,7 @@ impl Program {
         &mut self,
         statement: &RepeatStatement,
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         let counter = format!("{}{}", REPEAT_COUNTER_PREFIX, self.next());
         self.emit(Instruction::RepeatInit {
@@ -522,7 +813,7 @@ impl Program {
 
         let top = self.next();
         let branch = self.emit(Instruction::RepeatNext { counter, target: 0 });
-        self.compile_statements(&statement.statements, tasks)?;
+        self.compile_statements(&statement.statements, tasks, scope)?;
         self.emit(Instruction::Jump(top));
         let end = self.next();
         self.patch(branch, end);
@@ -535,9 +826,10 @@ impl Program {
         &mut self,
         statements: &[ProceduralStatements],
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         let top = self.next();
-        self.compile_statements(statements, tasks)?;
+        self.compile_statements(statements, tasks, scope)?;
         self.emit(Instruction::Jump(top));
         Ok(())
     }
@@ -551,6 +843,7 @@ impl Program {
         &mut self,
         case: &CaseStatement,
         tasks: &TaskTable,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         self.emit(Instruction::CaseSubject(case.subject.clone()));
 
@@ -587,7 +880,7 @@ impl Program {
         let mut exits = Vec::with_capacity(arms.len());
         for arm in &arms {
             starts.push(self.next());
-            self.compile_statements(arm, tasks)?;
+            self.compile_statements(arm, tasks, scope)?;
             exits.push(self.emit(Instruction::Jump(0)));
         }
 
@@ -793,6 +1086,7 @@ impl FunctionDefinition {
         match resume(&self.program, 0, &mut frame, &mut tasks)? {
             Resume::Halted { .. } => {}
             Resume::Suspended { .. } => return Err(FUNCTION_DELAY_UNSUPPORTED),
+            Resume::Waiting { .. } => return Err(FUNCTION_EVENT_UNSUPPORTED),
         }
 
         frame
@@ -936,9 +1230,86 @@ pub fn resume(
                     pending,
                 })
             }
+            // A true condition is not a wait at all, which is why the resume
+            // point is this instruction rather than the next one: coming back
+            // here re-evaluates it, and that is the whole of the retry.
+            Instruction::Wait(condition) => {
+                let condition = eval(condition, store)?;
+                if is_true(&condition) {
+                    pc += 1;
+                    continue;
+                }
+                return Ok(Resume::Waiting {
+                    pc,
+                    wait: WaitReason::Condition,
+                    pending,
+                });
+            }
+            Instruction::EventWait(control) => {
+                return Ok(Resume::Waiting {
+                    pc: pc + 1,
+                    wait: WaitReason::Event(control.clone()),
+                    pending,
+                })
+            }
+            Instruction::Hold {
+                slot,
+                target,
+                value,
+            } => {
+                let target = resolve_target(store, target)?;
+                let value = eval_sized(value, store, target.width(store))?;
+                store.hold(slot.clone(), value);
+                pc += 1;
+            }
+            Instruction::WriteHeld { slot, target } => {
+                let value = store
+                    .take_hold(slot)
+                    .ok_or_else(|| SimulationError::UnknownSignal(slot.clone()))?;
+                let target = resolve_target(store, target)?;
+                drive_resolved(store, &target, &value)?;
+                pc += 1;
+            }
             Instruction::Halt => return Ok(Resume::Halted { pending }),
         }
     }
+}
+
+/// The scope a named block opens, which is what its variables are spelled
+/// under: `block_id.` inside nothing, `load.loop.` for a block inside a task.
+///
+/// A Verilog identifier cannot contain a `.`, so one of these can never
+/// collide with a signal the design declares — the same shape a task's
+/// variables take.
+pub fn block_scope(scope: &str, name: &str) -> String {
+    format!("{}{}.", scope, name)
+}
+
+/// The explicit sensitivity list an `@*` in front of `body` stands for: every
+/// signal the statement reads, each of them level sensitive.
+fn implicit_control(body: &[ProceduralStatements]) -> Result<EventControl, SimulationError> {
+    let events: Vec<Event> = signals_read(body)
+        .into_iter()
+        .map(|name| {
+            Event::new(
+                EventTriggers::EitherEdge,
+                Expression::Identifier(Identifier::new(name)),
+            )
+        })
+        .collect();
+    if events.is_empty() {
+        return Err(EMPTY_IMPLICIT_EVENT_UNSUPPORTED);
+    }
+    Ok(EventControl::Events(events))
+}
+
+/// Whether an instruction can hand control back before the block is done,
+/// which is what a `fork` branch may not do.
+fn instruction_suspends(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Delay(_) | Instruction::Wait(_) | Instruction::EventWait(_)
+    )
 }
 
 /// Whether a `case` item matches the subject.
@@ -1011,6 +1382,10 @@ mod tests {
             Resume::Suspended { pc, delay, pending } => {
                 commit_updates(pending, store).unwrap();
                 Some((pc, delay))
+            }
+            Resume::Waiting { pending, .. } => {
+                commit_updates(pending, store).unwrap();
+                None
             }
         }
     }
@@ -1246,11 +1621,28 @@ mod tests {
     }
 
     #[test]
-    fn test_intra_assignment_delay_is_rejected_at_compile_time() {
-        let (_, statements) = parse_block("begin a = #5 b; end").unwrap();
+    fn test_intra_assignment_delay_holds_the_value_it_read() {
+        let program = compile("begin a = #5 b; end");
+        let mut store = store_with(&[("a", "0000"), ("b", "1111")]);
+
+        let (pc, delay) = step(&program, 0, &mut store).expect("should suspend");
+        assert_eq!(delay, 5);
+        assert_eq!(value(&store, "a"), "0000");
+
+        // What lands is what `b` held when the statement ran, not what it
+        // holds when the delay expires — that is the whole of what makes the
+        // control an intra-assignment one.
+        store.set("b", Register::from_binary("0000"));
+        assert!(step(&program, pc, &mut store).is_none());
+        assert_eq!(value(&store, "a"), "1111");
+    }
+
+    #[test]
+    fn test_intra_assignment_timing_on_a_non_blocking_assignment_is_rejected() {
+        let (_, statements) = parse_block("begin a <= #5 b; end").unwrap();
         assert_eq!(
             Program::compile(&statements, &TaskTable::new()),
-            Err(DELAY_UNSUPPORTED)
+            Err(NONBLOCKING_TIMING_UNSUPPORTED)
         );
     }
 
@@ -1630,5 +2022,48 @@ mod tests {
 
         simulator.advance(10).unwrap();
         assert_eq!(simulator.get("ticks").unwrap().to_u128(), Some(12));
+    }
+
+    /// A named block's variables are renamed into the scope its name opens, so
+    /// the design signal spelled the same way is a different variable.
+    #[test]
+    fn test_a_named_block_local_is_renamed_into_its_scope() {
+        let program = compile("begin : blk reg [3:0] tmp; tmp = a; b = tmp; end");
+
+        assert_eq!(
+            program.instructions(),
+            &[
+                Instruction::Blocking {
+                    target: Expression::Identifier(Identifier::new("blk.tmp".to_string())),
+                    value: Expression::Identifier(Identifier::new("a".to_string())),
+                },
+                Instruction::Blocking {
+                    target: Expression::Identifier(Identifier::new("b".to_string())),
+                    value: Expression::Identifier(Identifier::new("blk.tmp".to_string())),
+                },
+                Instruction::Halt,
+            ]
+        );
+    }
+
+    /// A `wait` hands control back when its condition is false and falls
+    /// straight through when it is true, which is what makes it resumable by a
+    /// value rather than by the clock.
+    #[test]
+    fn test_wait_gives_control_back_until_its_condition_is_true() {
+        let program = compile("begin wait (flag) a = 4'b0001; end");
+        let mut store = store_with(&[("flag", "0"), ("a", "0000")]);
+
+        let Resume::Waiting { pc, wait, .. } =
+            resume(&program, 0, &mut store, &mut TaskContext::new()).expect("should wait")
+        else {
+            panic!("a false condition should not run the block to the end");
+        };
+        assert_eq!(wait, WaitReason::Condition);
+        assert_eq!(value(&store, "a"), "0000");
+
+        store.set("flag", Register::from_binary("1"));
+        assert!(step(&program, pc, &mut store).is_none());
+        assert_eq!(value(&store, "a"), "0001");
     }
 }

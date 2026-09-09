@@ -246,6 +246,21 @@ fn event_fires(event: &Event, edges: &[SignalEdge]) -> bool {
         .any(|edge| names.contains(&edge.name) && edge.matches(&event.trigger))
 }
 
+/// Every signal name an event control is sensitive to.
+///
+/// A block suspended on one has to watch exactly these, so that "has it moved
+/// since I started waiting?" is a question about the same signals
+/// [`control_fires`] would answer with.
+pub fn control_signals(control: &EventControl) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if let EventControl::Events(events) = control {
+        for event in events {
+            names.extend(event_signals(&event.expression));
+        }
+    }
+    names
+}
+
 /// The signal names a sensitivity-list entry is sensitive to.
 fn event_signals(expression: &Expression) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -328,6 +343,32 @@ fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTre
                 collect_statement_reads(&statement.statements, names);
             }
             ProceduralStatements::Forever(statements) => collect_statement_reads(statements, names),
+            // A block is its statements; a `fork`'s branches are statements
+            // too. What a block *declares* is not a design signal, so a name a
+            // block shadows still shows up here — an `@(*)` list that names
+            // one signal too many wakes too often, never too seldom.
+            ProceduralStatements::Block(block) | ProceduralStatements::Fork(block) => {
+                collect_statement_reads(&block.statements, names)
+            }
+            // A `wait` re-reads its condition every time the design moves, so
+            // the signals in it are read as surely as a loop's are.
+            ProceduralStatements::Wait(statement) => {
+                collect_expression_reads(&statement.condition, names);
+                collect_statement_reads(&statement.statements, names);
+            }
+            // A statement-level event control names the signals it waits on,
+            // which the block it is written in is therefore sensitive to.
+            ProceduralStatements::EventControlled {
+                control,
+                statements,
+            } => {
+                if let EventControl::Events(events) = control {
+                    for event in events {
+                        collect_expression_reads(&event.expression, names);
+                    }
+                }
+                collect_statement_reads(statements, names);
+            }
             // What the task's *body* reads is not in the statement tree at all
             // — only its compiled instructions have it, which is where
             // `elaborate` takes an `@(*)` block's sensitivity list from when it

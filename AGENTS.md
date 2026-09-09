@@ -71,7 +71,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
-| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
+| `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end` and `fork…join` — named or not — `if`/`else`, `case`, `wait`, a statement-level event control, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
 | `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
@@ -524,10 +524,74 @@ Still unsupported: `disable` (both `disable <task>` and the named-block form —
 block that has already suspended is not something a program counter alone can express);
 a hierarchical enable (`instance.task(…)`); a task enabled from inside a `function`, which
 is rejected by the function body analysis rather than by a check of its own; and
-intra-assignment delays (`a = #5 b;` — the held right hand side does not fit in a program
-counter) and concatenation as an assignment target. A drive is also tracked per signal *name* rather than per bit, so
+concatenation as an assignment target. A drive is also tracked per signal *name* rather than per bit, so
 `force bus[0] = 1;` blocks a write to `bus[1]` as well — corpus `pr1832097a`, `pr245`,
 `pr527` and the `_pv` pair are that one gap. `signals.rs` is built but still unwired.
+
+**A block can suspend on the design as well as on the clock, and `Resume::Waiting` is
+how.** `wait (c) S` and `@(posedge clk) S` are both suspensions that no timestamp brings
+back, so they are not on the `EventQueue` at all: `Simulator::waiting` holds them, and
+every settle round offers each one what just moved. The two are resumed differently on
+purpose. A **condition** is a value that is still there, so the block is simply re-entered
+and its own `Instruction::Wait` re-evaluates it — which is also why a `wait` on something
+already true costs one evaluation and no suspension at all. An **edge** is not: it is gone
+by the time anything could look for it, so `EventWatch` snapshots the signals the control
+names *at the moment the wait is armed* and asks on each round whether they have moved
+since.
+
+That snapshot is the whole reason the arming moment means anything. A settle round sees
+everything the timestep moved, including what the waiting block itself wrote on its way to
+the wait — `clk = 0; @(negedge clk) …` would otherwise be woken by its own write (corpus
+`dff1`). A named event has no value to snapshot, so a trigger is matched the other way, out
+of the round's own trigger journal, which is why `settle` keeps `trigger_edges` separate
+from the rest of its edges rather than folding them in.
+
+Two consequences worth keeping straight. An `always` block part way through a wait is
+**not** started again by `settle`: it has not finished the run it is on, and a second copy
+of it would give the design two writers of everything it assigns. And a *free-running*
+block that halts restarts immediately — that rule lives in `Simulator::resume_block` rather
+than in `advance`, because `always value = @(ev) 5;` finishes inside a settle round and has
+to arm itself again there (corpus `always3.1.1I`, `br991a`).
+
+**A named block is a scope, and its variables are dotted names like a task's.**
+`begin : blk reg [7:0] tmp; … end` declares `blk.tmp` in the flat store — `dut.blk.tmp`
+inside an instance, `first.inner.i` for a block inside a block — so a local that shadows a
+design signal is a second entry rather than a write to the first. `elaborate` declares them
+by walking the statement tree (`declare_block_locals`) and `Program::compile_block` renames
+exactly the instructions the body compiled to (`Program::rename_range`), which is the same
+division of labour `declare_tasks` and `compile_task` already had. An **unnamed** block is
+grouping and nothing else, so `parse_block` flattens it into the statements it holds and
+nothing downstream learns it was written.
+
+**`fork`/`join` runs its branches in sequence, and refuses to when that could differ.**
+Branches that consume no time cannot tell sequential from concurrent — each runs to
+completion without giving another a turn either way — so a `fork` of plain assignments is
+compiled exactly as a `begin`…`end` is, sharing `compile_block` for its name and its
+variables. A branch that *can* suspend can tell, so a `fork` of more than one branch
+containing a `Delay`, a `Wait` or an `EventWait` is `Unsupported("a `fork`/`join` branch
+that consumes time")` — corpus `fork3.19A` is exactly that design, and running it in
+sequence would put its writes in an order the design never asked for.
+
+**An intra-assignment timing control holds its right hand side in the store.**
+`a = #5 b;`, `a = @(posedge clk) b;` and `a = repeat (3) @(ev) b;` all evaluate `b` *now*
+and write it when the control expires, which is what tells them from `#5 a = b;`. The held
+value cannot live in the resume point — that is only a program counter — so
+`Instruction::Hold` puts it in `StateStore::holds` under a hidden `$hold$<index>` slot and
+`Instruction::WriteHeld` takes it back out. It is deliberately not a signal: nothing in the
+design can name one, so journalling it would only manufacture edges. The `repeat` form is
+the ordinary `repeat` loop with the wait as its whole body, so a count of zero writes
+immediately.
+
+A **non-blocking** assignment with one of these is a named error, not an approximation:
+`a <= #5 b;` schedules its write and lets the block carry straight on, where everything
+here suspends the block — running it would hold up statements that have already run.
+
+**`@*` in front of a statement is not the same list as `@*` in front of a block.** It is
+sensitive to what *that statement* reads, so `@* a = c;` is `@(c)` even inside an
+`always @*` that is sensitive to `b` and `c` (corpus `nested_impl_event1`).
+`Program::emit_event_wait` therefore resolves it into the explicit list it stands for while
+the statement is still in hand, and everything past that point sees one kind of event
+control instead of two. An `@*` with no statement to read — `a = @* b;` — is a named error.
 
 **A gate primitive is a continuous driver, and it is what made net resolution
 necessary.** `and g1 (out, a, b);` elaborates to a `simulator::gates::Gate` on the same
@@ -760,8 +824,8 @@ dying on unfamiliar syntax several lines earlier.
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, and `TaskDefinition` / `Program::splice`, which inlines one into another |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, and `Program::compile_block` / `rename_range`, which give a named block's variables their scope |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, and `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `permits_write` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
@@ -1045,8 +1109,9 @@ tripwire.
   would have nothing to match. `program.rs` compiles `Delayed` to an
   `Instruction::Delay` followed by the body inline, so a delay nested in an
   `if` or `case` arm suspends and resumes by program counter like any other.
-  Intra-assignment delay (`a = #5 b;`) is still a field on
-  `ProceduralAssignment` and still rejected at compile time.
+  An intra-assignment timing control (`a = #5 b;`, `a = @(ev) b;`) is a
+  different thing and stays a field on `ProceduralAssignment`: it reads its
+  right hand side *before* it waits.
 - **`#` and its value are separate tokens.** `parse_delay` skips whitespace and
   comments between them, so `# 3;` and `#/* wait */5` parse. This is worth
   roughly +24 corpus files on its own.
@@ -1232,6 +1297,24 @@ tripwire.
   *before* the expression grammar — which would otherwise read `0.9` as `0` and leave `.9`
   behind. There is still no real number anywhere else: `real` is a named refusal at
   elaboration and the expression grammar has no floating point operand.
+- **An event control has five spellings and one of them is a bare identifier.**
+  `@(posedge clk)`, `@(a or b)`, `@(*)`, `@*` and `@ev` all parse to an
+  `EventControl`, and the bare form is tried last because it is the loosest. It
+  takes an *identifier*, and `keywords::is_reserved_word` is what stops it: without
+  that guard `always @* begin … end` reads `begin` as the event it waits on. This is
+  the mirror image of the task-enable trap — the same helper, the other way round.
+- **A named block keeps its node; an unnamed one does not.** `parse_block` returns a
+  `Vec<ProceduralStatements>` either way, so `always`/`initial`/`if` bodies are
+  unchanged, but a `begin : name` comes back as a single
+  `ProceduralStatements::Block` because its name is a scope the simulator has to
+  know about. Only a named block may declare variables, which is why `block_item`
+  is only tried after a `: name` was read.
+- **`Program::rename_range` must skip an inlined task body, and a named block's
+  rename goes through it.** A block local called `count` and a design signal called
+  `count` are different variables, and a task body spliced inside the block has
+  already resolved its own names — renaming it again would re-point what it read.
+  That is the same rule `rename_local` follows, over a range instead of the whole
+  program.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

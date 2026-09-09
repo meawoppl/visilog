@@ -15,7 +15,8 @@ use crate::parsers::gates::{drive_strength, DriveStrength};
 use crate::parsers::identifier::identifier;
 
 use super::{
-    delay::{parse_delay_opt, Delay},
+    behavior::{assignment_timing, EventControl},
+    delay::Delay,
     simple::ws,
 };
 
@@ -97,11 +98,29 @@ pub enum ProceduralAssignmentType {
     NonBlocking,
 }
 
+/// The timing control written between an assignment's `=` and its right hand
+/// side.
+///
+/// It is *intra-assignment*: the right hand side is evaluated when the
+/// statement runs, and only the write waits. That is what tells `a = #5 b;`
+/// from `#5 a = b;`, which reads `b` five time units later.
+#[derive(Debug, PartialEq, Clone)]
+pub enum AssignmentTiming {
+    /// `a = #5 b;`
+    Delay(Delay),
+    /// `a = @(posedge clk) b;`, and with a `repeat` count the event has to
+    /// happen that many times before the write lands.
+    Event {
+        repeat: Option<Expression>,
+        control: EventControl,
+    },
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct ProceduralAssignment {
     lhs: Expression,
     assignment_type: ProceduralAssignmentType,
-    assignment_delay: Option<Delay>,
+    timing: Option<AssignmentTiming>,
     rhs: Expression,
 }
 
@@ -109,13 +128,13 @@ impl ProceduralAssignment {
     pub fn new(
         lhs: Expression,
         assignment_type: ProceduralAssignmentType,
-        assignment_delay: Option<Delay>,
+        timing: Option<AssignmentTiming>,
         rhs: Expression,
     ) -> Self {
         ProceduralAssignment {
             lhs,
             assignment_type,
-            assignment_delay,
+            timing,
             rhs,
         }
     }
@@ -136,10 +155,11 @@ impl ProceduralAssignment {
         &self.assignment_type
     }
 
-    /// The delay between evaluating the right side and updating the target,
-    /// e.g. the `#50` of `x = #50 y;`.
-    pub fn assignment_delay(&self) -> Option<&Delay> {
-        self.assignment_delay.as_ref()
+    /// What comes between evaluating the right side and updating the target,
+    /// e.g. the `#50` of `x = #50 y;` or the `@(posedge clk)` of
+    /// `x = @(posedge clk) y;`.
+    pub fn timing(&self) -> Option<&AssignmentTiming> {
+        self.timing.as_ref()
     }
 }
 
@@ -148,7 +168,7 @@ impl ProceduralAssignment {
 pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
     let (input, lhs) = ws(assignment_lhs)(input)?;
     let (input, assign_op) = ws(alt((tag("="), tag("<="))))(input)?;
-    let (input, assignment_delay) = parse_delay_opt(input)?;
+    let (input, timing) = opt(assignment_timing)(input)?;
     let (input, rhs) = verilog_expression(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
@@ -160,7 +180,7 @@ pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
 
     Ok((
         input,
-        ProceduralAssignment::new(lhs, assignment_type, assignment_delay, rhs),
+        ProceduralAssignment::new(lhs, assignment_type, timing, rhs),
     ))
 }
 

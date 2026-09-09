@@ -33,7 +33,9 @@ use crate::simulator::eval::{
     eval, eval_sized, indexed_select_indices, indexed_select_width, EvalError, MAX_SELECT_WIDTH,
     SELF_DETERMINED,
 };
-use crate::simulator::program::{resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED};
+use crate::simulator::program::{
+    resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED, WAIT_UNSUPPORTED,
+};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{Drive, DriveLevel, StateStore};
 use crate::simulator::tasks::TaskContext;
@@ -140,6 +142,7 @@ pub fn execute_statements(
     match resume(&program, 0, store, tasks)? {
         Resume::Halted { pending } => Ok(pending),
         Resume::Suspended { .. } => Err(DELAY_UNSUPPORTED),
+        Resume::Waiting { .. } => Err(WAIT_UNSUPPORTED),
     }
 }
 
