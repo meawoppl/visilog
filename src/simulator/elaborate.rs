@@ -791,6 +791,25 @@ impl<'m> Elaborator<'m> {
         Ok(())
     }
 
+    /// Records a continuous assignment, and the net it drives when it declared
+    /// a strength.
+    ///
+    /// An `assign` that named no strength drives at `strong` and is the only
+    /// kind of driver the simulator has ever had, so it keeps being written
+    /// straight into the store. One that *did* name a strength has to go
+    /// through resolution even when it is the net's only driver, because
+    /// `highz` is a half that does not drive at all:
+    /// `assign (strong1, highz0) x = 4'b1010;` is `1z1z`, and only
+    /// [`resolve_bit`](crate::simulator::gates::resolve_bit) knows that.
+    fn push_assignment(&mut self, assignment: ContinuousAssignment) {
+        if assignment.strength().is_some() {
+            if let Some(name) = assigned_name(assignment.lhs()) {
+                self.out.resolved_nets.insert(name.to_string());
+            }
+        }
+        self.out.assignments.push(assignment);
+    }
+
     /// Records a gate and the nets it drives, which are the ones that have to
     /// be resolved rather than simply written.
     fn push_gate(&mut self, gate: Gate) {
@@ -910,11 +929,14 @@ impl<'m> Elaborator<'m> {
                     }
                 }
             }
-            ModuleStatement::Assignment(assignment) => {
-                self.out.assignments.push(ContinuousAssignment::new(
-                    renamed(assignment.lhs(), scope),
-                    renamed(assignment.rhs(), scope),
-                ));
+            ModuleStatement::Assignment(assignments) => {
+                for assignment in assignments {
+                    self.push_assignment(ContinuousAssignment::with_strength(
+                        renamed(assignment.lhs(), scope),
+                        renamed(assignment.rhs(), scope),
+                        assignment.strength(),
+                    ));
+                }
             }
             ModuleStatement::GateInstantiation(instances) => {
                 for instance in instances {

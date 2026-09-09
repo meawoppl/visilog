@@ -691,7 +691,7 @@ impl Simulator {
                     contributions.push(Contribution {
                         target,
                         value,
-                        strength: DriveStrength::STRONG,
+                        strength: assignment.strength().unwrap_or(DriveStrength::STRONG),
                     });
                 } else {
                     changed |= drive_resolved(&mut self.state, &target, &value)?;
@@ -1219,6 +1219,112 @@ mod tests {
             Some(11),
             "sum > 4'b1000, so data should be driven with sum"
         );
+    }
+
+    #[test]
+    /// A strength-bearing `assign` is resolved even when it is the net's only
+    /// driver and the design has no gate in it at all.
+    ///
+    /// This is the seam `push_assignment` opens: `highz` is a half that does
+    /// not drive, so `(strong1, highz0)` floats every `0` bit, and only
+    /// `resolve_bit` knows that. Writing the net directly — which is what a
+    /// plain `assign` still does — would put the `0`s straight through.
+    /// `iverilog 12.0` prints `1z1z` and `z0z0` for these two.
+    #[test]
+    fn test_assign_strength_is_resolved_without_any_gate() {
+        let mut simulator = simulator_for(
+            r#"
+            module strengths(input [3:0] v, output [3:0] a, output [3:0] b, output [3:0] c);
+                assign (strong1, highz0) a = v;
+                assign (highz1, strong0) b = v;
+                assign (supply1, supply0) c = v;
+            endmodule
+        "#,
+        );
+
+        simulator.poke("v", Register::from_binary("1010")).unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "1z1z");
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "z0z0");
+        assert_eq!(
+            simulator.get("c").unwrap().to_binary(),
+            "1010",
+            "every level but highz drives the plain logic value"
+        );
+
+        // Neither polarity claims an `x` or a `z`, so neither moves.
+        simulator.poke("v", Register::from_binary("01xz")).unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "z1xz");
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "0zxz");
+    }
+
+    /// A `0` the target's width introduced floats exactly as one the
+    /// expression produced does, because resolution runs per bit over the
+    /// whole net rather than over the right hand side.
+    #[test]
+    fn test_assign_strength_floats_the_padding_too() {
+        let mut simulator = simulator_for(
+            r#"
+            module padded(input clk, output [3:0] a);
+                assign (strong1, highz0) a = 1'b1;
+            endmodule
+        "#,
+        );
+
+        simulator.poke("clk", zero()).unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "zzz1");
+    }
+
+    /// Two continuous assignments driving one net resolve by strength rather
+    /// than by whichever ran last: `pull` loses to `strong`. Contention is not
+    /// an error — `iverilog` prints `1010` here.
+    #[test]
+    fn test_contending_assign_strengths_resolve_by_level() {
+        let mut simulator = simulator_for(
+            r#"
+            module contend(input clk, output [3:0] c);
+                assign (pull1, pull0)     c = 4'b1111;
+                assign (strong1, strong0) c = 4'b1010;
+            endmodule
+        "#,
+        );
+
+        simulator.poke("clk", zero()).unwrap();
+        assert_eq!(simulator.get("c").unwrap().to_binary(), "1010");
+    }
+
+    /// Drivers tied at the strongest level agree on a bit or that bit is `x`,
+    /// and the bits they agree on are untouched — `iverilog` prints `1xx0`.
+    #[test]
+    fn test_equal_strength_drivers_disagree_to_x_per_bit() {
+        let mut simulator = simulator_for(
+            r#"
+            module tie(input clk, output [3:0] d);
+                assign (strong1, strong0) d = 4'b1100;
+                assign (strong1, strong0) d = 4'b1010;
+            endmodule
+        "#,
+        );
+
+        simulator.poke("clk", zero()).unwrap();
+        assert_eq!(simulator.get("d").unwrap().to_binary(), "1xx0");
+    }
+
+    /// One `assign` may name several targets, and they share its strength.
+    #[test]
+    fn test_continuous_assignment_list_drives_every_target() {
+        let mut simulator = simulator_for(
+            r#"
+            module several(input clk, output [3:0] a, output [3:0] b, output [3:0] c);
+                assign a = 4'd5, b = 4'd8;
+                assign (strong1, highz0) c = 4'b1010;
+            endmodule
+        "#,
+        );
+
+        simulator.poke("clk", zero()).unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(5));
+        assert_eq!(simulator.get("b").unwrap().to_u128(), Some(8));
+        assert_eq!(simulator.get("c").unwrap().to_binary(), "1z1z");
     }
 
     #[test]

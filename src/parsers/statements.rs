@@ -42,7 +42,8 @@ pub enum ModuleStatement {
     FunctionDeclaration(FunctionDeclaration),
     /// `task t; … endtask` — a task the module's procedural blocks may enable.
     TaskDeclaration(TaskDeclaration),
-    Assignment(ContinuousAssignment),
+    /// One `assign`, which may name several targets sharing a strength pair.
+    Assignment(Vec<ContinuousAssignment>),
     /// `and g1 (out, a, b);` — one built-in primitive per instance declared,
     /// since one statement may declare several.
     GateInstantiation(Vec<GateInstantiation>),
