@@ -28,7 +28,21 @@ pub struct ParameterDeclaration {
     /// implies one. An unqualified parameter takes its value's signedness
     /// instead, which is why this is a plain `bool` rather than an `Option`.
     pub signed: bool,
+    /// Whether the declaration named the type `real`, which makes the value a
+    /// double however it was written: `parameter real HALF = 1;` is `1.0`.
+    pub real: bool,
     pub value: Expression,
+}
+
+/// The type keyword a parameter may carry in place of `signed`: `parameter
+/// integer p = 1;`, `parameter real pi = 3.14;`. Each one implies a
+/// signedness, and `real` implies a value type as well.
+fn parameter_type(input: &str) -> IResult<&str, bool> {
+    alt((
+        value(true, tag("realtime")),
+        value(true, tag("real")),
+        value(false, tag("integer")),
+    ))(input)
 }
 
 fn parameter_kind(input: &str) -> IResult<&str, ParameterKind> {
@@ -52,12 +66,13 @@ fn parameter_assignment(input: &str) -> IResult<&str, (Identifier, Expression)> 
 /// `parameter [7:0] WIDTH = 8, DEPTH = 16;`
 pub fn parse_parameter_declaration(input: &str) -> IResult<&str, Vec<ParameterDeclaration>> {
     let (input, kind) = ws(parameter_kind)(input)?;
-    // `parameter integer p = 1;` — a type name stands where `signed` would,
-    // and `integer` is signed by definition. `real` is not accepted here; it
-    // is a different value type entirely (issue #93).
-    let (input, typed) = opt(ws(tag("integer")))(input)?;
+    // `parameter integer p = 1;` — a type name stands where `signed` would.
+    // Both types it may name are signed, and `real` says the value is a double
+    // as well.
+    let (input, typed) = opt(ws(parameter_type))(input)?;
     let (input, signed) = ws(signedness)(input)?;
     let (input, range) = opt(ws(range))(input)?;
+    let real = typed == Some(true);
     let signed = signed || typed.is_some();
     let (input, assignments) = separated_list1(ws(char(',')), parameter_assignment)(input)?;
     let (input, _) = ws(char(';'))(input)?;
@@ -69,6 +84,7 @@ pub fn parse_parameter_declaration(input: &str) -> IResult<&str, Vec<ParameterDe
             name,
             range: range.clone(),
             signed,
+            real,
             value,
         })
         .collect();
@@ -80,6 +96,7 @@ pub fn parse_parameter_declaration(input: &str) -> IResult<&str, Vec<ParameterDe
 struct ParameterQualifiers {
     kind: ParameterKind,
     signed: bool,
+    real: bool,
     range: Option<Range>,
 }
 
@@ -88,6 +105,7 @@ impl Default for ParameterQualifiers {
         ParameterQualifiers {
             kind: ParameterKind::Parameter,
             signed: false,
+            real: false,
             range: None,
         }
     }
@@ -99,7 +117,7 @@ fn parameter_port_item(
     input: &str,
 ) -> IResult<&str, (Option<ParameterQualifiers>, Identifier, Expression)> {
     let (input, kind) = opt(ws(parameter_kind))(input)?;
-    let (input, typed) = opt(ws(tag("integer")))(input)?;
+    let (input, typed) = opt(ws(parameter_type))(input)?;
     let (input, signed) = ws(signedness)(input)?;
     let (input, declared) = opt(ws(range))(input)?;
     // Only an item that actually said something re-qualifies the ones that
@@ -107,6 +125,7 @@ fn parameter_port_item(
     let qualifiers = kind.map(|kind| ParameterQualifiers {
         kind,
         signed: signed || typed.is_some(),
+        real: typed == Some(true),
         range: declared,
     });
     let (input, (name, value)) = parameter_assignment(input)?;
@@ -142,6 +161,7 @@ pub fn parse_parameter_port_list(input: &str) -> IResult<&str, Vec<ParameterDecl
             name,
             range: carried.range.clone(),
             signed: carried.signed,
+            real: carried.real,
             value,
         });
     }
@@ -163,6 +183,7 @@ mod tests {
                 name: "IDLE".into(),
                 range: None,
                 signed: false,
+                real: false,
                 value: verilog_expression("2'b00").unwrap().1,
             }],
         );
@@ -178,6 +199,7 @@ mod tests {
                 name: "WIDTH".into(),
                 range: Some(Range::Constant(7, 0)),
                 signed: false,
+                real: false,
                 value: verilog_expression("8").unwrap().1,
             }],
         );

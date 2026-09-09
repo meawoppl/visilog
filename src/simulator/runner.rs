@@ -4828,24 +4828,198 @@ mod tests {
         );
     }
 
-    /// A `real` is IEEE-754 floating point, which this simulator does not
-    /// model. The declaration parses so that the design stops with a message
-    /// saying so, rather than on a parse error somewhere inside it.
+    /// A `real` starts at `0.0` rather than at `x`, which is a property of the
+    /// type: a double has no unknown to hold. iverilog prints `0.000000` for
+    /// an untouched one.
     #[test]
-    fn test_real_is_rejected_by_name() {
-        for source in [
-            "module floating(); real r; endmodule",
-            "module floating(); real array3[2:1]; endmodule",
-            "module floating(); realtime t; endmodule",
+    fn test_an_untouched_real_reads_zero() {
+        let mut simulator = simulator_for(
+            r#"
+            module floating();
+                real r;
+                realtime t;
+                real samples [0:1];
+                initial $display("%f %f %f", r, t, samples[1]);
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("design should run");
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["0.000000 0.000000 0.000000"]
+        );
+    }
+
+    /// A real round-trips through the store, through an array of reals, and
+    /// through the conversions in both directions. Every value here was
+    /// measured from iverilog 12.0.
+    #[test]
+    fn test_reals_round_trip_and_convert() {
+        let mut simulator = simulator_for(
+            r#"
+            module floating();
+                real r;
+                integer i;
+                reg [7:0] a;
+                real samples [0:3];
+                initial begin
+                    r = 1.5 + 0.5;
+                    $display("%f", r);
+                    i = 2.5;
+                    $display("%0d", i);
+                    i = -1.5;
+                    $display("%0d", i);
+                    a = 8'hFF;
+                    r = a;
+                    $display("%f", r);
+                    r = 7 / 2;
+                    $display("%f", r);
+                    r = 7 / 2.0;
+                    $display("%f", r);
+                    samples[2] = 0.25;
+                    $display("%g %g", samples[2], samples[3]);
+                    $display("%0d %f", $rtoi(2.7), $itor(5));
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("design should run");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "2.000000",
+                "3",
+                "-2",
+                "255.000000",
+                "3.000000",
+                "3.500000",
+                "0.25 0",
+                "2 5.000000",
+            ]
+        );
+    }
+    /// `%f`, `%e` and `%g` are C's, and an argument with no specifier at all
+    /// is C's `%#g` — six significant digits with the trailing zeros kept,
+    /// which is why `1.5` prints as `1.50000`. Every line here was measured
+    /// from iverilog 12.0.
+    #[test]
+    fn test_real_format_specifiers() {
+        let mut simulator = simulator_for(
+            r#"
+            module printing();
+                initial begin
+                    $display("%f", 1.5 + 0.5);
+                    $display("%g", 1.5 * 0.5);
+                    $display("%e", 1.5 / 0.5);
+                    $display("%f", 1e3);
+                    $display("%g", 1.5e-3);
+                    $display("[%0f]", 2.5);
+                    $display("[%5.2f]", 2.5);
+                    $display("%f", 3);
+                    $display("%0d", 2.6);
+                    $display("%h %b %o", 2.6, 2.6, 2.6);
+                    $display(1.5, " ", 400.0, " ", 1e10, " ", 0.0015);
+                    $display("%f", 1.0 / 0.0);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("design should run");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "2.000000",
+                "0.75",
+                "3.000000e+00",
+                "1000.000000",
+                "0.0015",
+                "[2.500000]",
+                "[ 2.50]",
+                "3.000000",
+                "3",
+                "3 11 3",
+                "1.50000 400.000 1.00000e+10 0.00150000",
+                "inf",
+            ]
+        );
+    }
+
+    /// A `real` reaches every place a value can be declared: a parameter, a
+    /// function's result and its argument, and a `specparam`.
+    #[test]
+    fn test_reals_are_declared_everywhere_a_value_is() {
+        let mut simulator = simulator_for(
+            r#"
+            module scopes();
+                parameter real PI = 3.14;
+                parameter real WHOLE = 3;
+                real r;
+                function real half;
+                    input real x;
+                    half = x / 2.0;
+                endfunction
+                initial begin
+                    r = half(5.0);
+                    $display("%f %f %f", PI, WHOLE, r);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("design should run");
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["3.140000 3.000000 2.500000"]
+        );
+    }
+
+    /// An operator that reads a *pattern of bits* has no meaning for a real,
+    /// and iverilog rejects each of these at compile time. There is no
+    /// compile-time diagnostic channel here, so they are named errors from the
+    /// evaluator instead — never a silent conversion to an integer.
+    #[test]
+    fn test_bitwise_operators_refuse_a_real() {
+        for (source, operator) in [
+            ("r & 3", "&"),
+            ("r | 3", "|"),
+            ("r ^ 3", "^"),
+            ("r >> 1", ">>"),
+            ("r << 1", "<<"),
+            ("r === 1.5", "==="),
+            ("~r", "~"),
+            ("&r", "&"),
         ] {
+            let source = format!(
+                r#"
+                module refusing();
+                    real r;
+                    reg [7:0] q;
+                    initial begin
+                        r = 5.5;
+                        q = {};
+                    end
+                endmodule
+            "#,
+                source
+            );
+            let (remaining, module) =
+                parse_module_declaration(&source).expect("design should parse");
+            assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+            let mut simulator = Simulator::new(module);
+            let error = match simulator.setup() {
+                Err(error) => error,
+                Ok(_) => simulator
+                    .advance(1)
+                    .expect_err("the operator has no meaning for a real"),
+            };
             assert_eq!(
-                setup_error(source).to_string(),
-                "a `real` variable is not supported by the simulator",
+                error.to_string(),
+                format!("operator `{}` cannot take a real operand", operator),
                 "{}",
                 source
             );
         }
     }
+
     /// A procedural `assign` gives a variable a second source, and it is the
     /// one that wins: an ordinary write while it is installed goes nowhere.
     /// `deassign` takes it away and hands the variable back.

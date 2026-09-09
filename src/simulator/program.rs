@@ -1401,6 +1401,9 @@ pub struct FrameVariable {
     pub name: String,
     pub range: (i64, i64),
     pub signed: bool,
+    /// Whether it was declared `real`, which is what makes the frame declare
+    /// it as a double rather than as sixty-four bits of integer.
+    pub real: bool,
 }
 
 /// A function the design declares, compiled into the shape a call needs.
@@ -1455,13 +1458,18 @@ impl FunctionDefinition {
             }
         }
 
-        frame.declare_signed(
-            self.result.name.clone(),
-            self.result.range,
-            self.result.signed,
-        );
-        for variable in self.arguments.iter().chain(&self.locals) {
-            frame.declare_signed(variable.name.clone(), variable.range, variable.signed);
+        for variable in std::iter::once(&self.result)
+            .chain(&self.arguments)
+            .chain(&self.locals)
+        {
+            // A `real` frame variable starts at `0.0` like any other real; the
+            // rest start unknown. It is the same split `declare` makes in the
+            // design's own store.
+            if variable.real {
+                frame.declare_real(variable.name.clone());
+            } else {
+                frame.declare_signed(variable.name.clone(), variable.range, variable.signed);
+            }
         }
         for (variable, value) in self.arguments.iter().zip(arguments) {
             let target = ResolvedTarget::Whole(variable.name.clone());

@@ -4,8 +4,8 @@
 //! All four share one shape — a keyword, then a comma separated list of names,
 //! each with an optional array dimension and an optional initialiser — and
 //! differ only in what the keyword means to the simulator. `integer` is a
-//! signed 32-bit variable, `time` an unsigned 64-bit one, `real` a value this
-//! simulator does not model, and `event` a name with no value at all.
+//! signed 32-bit variable, `time` an unsigned 64-bit one, `real` a 64-bit
+//! IEEE-754 double, and `event` a name with no value at all.
 
 use nom::{
     branch::alt, bytes::complete::tag, character::complete::char, multi::separated_list1, IResult,
@@ -46,12 +46,9 @@ pub struct TimeDeclaration {
 
 /// One name from a `real r, samples[2:1];` declaration.
 ///
-/// A `real` is IEEE-754 floating point, which is not what a
-/// [`Register`](crate::register::Register) holds: there is no `x` in a float
-/// and none of the arithmetic is the same. The front end reads the declaration
-/// anyway so that the simulator can reject it *by name* — a file that uses a
-/// `real` should say that is why it stopped, rather than dying on unfamiliar
-/// syntax several lines earlier.
+/// A `real` is a 64-bit IEEE-754 double, so like an `integer` it carries no
+/// width of its own — the type is the whole of it. `realtime` is the same
+/// declaration under a longer keyword.
 #[derive(Debug, PartialEq)]
 pub struct RealDeclaration {
     pub name: Identifier,

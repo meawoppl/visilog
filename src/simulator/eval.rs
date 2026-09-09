@@ -50,11 +50,12 @@
 
 use std::fmt;
 
+use crate::parsers::base::RawToken;
 use crate::parsers::constants::{VerilogBaseType, VerilogConstant};
 use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
-use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, X, Z, ZERO};
+use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::exec::range_width;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{StateStore, MAX_CALL_DEPTH};
@@ -117,6 +118,11 @@ pub enum EvalError {
     NonConstantReplicationCount(String),
     /// A value too wide to evaluate; see [`MAX_ARITHMETIC_WIDTH`].
     WidthOverflow(usize),
+    /// An operator applied to a real value that has no meaning for one: the
+    /// bitwise operators, the shifts and the case comparisons all read a
+    /// pattern of bits, and the bits of a real are an IEEE-754 encoding rather
+    /// than a number. iverilog rejects every one of these at compile time.
+    RealOperand(String),
     /// A `$name` used as a function that this simulator does not implement.
     UnknownSystemFunction(String),
     /// A system function called with a number of arguments it does not take.
@@ -173,6 +179,9 @@ impl fmt::Display for EvalError {
             }
             EvalError::WidthOverflow(width) => {
                 write!(f, "{} bit value is too wide to evaluate", width)
+            }
+            EvalError::RealOperand(operator) => {
+                write!(f, "operator `{}` cannot take a real operand", operator)
             }
             EvalError::UnknownSystemFunction(name) => {
                 write!(f, "unknown system function `${}`", name)
@@ -248,6 +257,10 @@ fn eval_in_context(
         Expression::Constant(constant) => {
             widened_result(eval_constant(constant, signed_context), width)
         }
+        // A real is neither widened nor demoted: it is sixty-four bits that
+        // are not a number of bits at all, and no context can make it wider or
+        // make it read unsigned.
+        Expression::RealLiteral(value) => Ok(Register::from_f64(*value)),
         Expression::Identifier(id) => {
             let value = match store.get(&id.name) {
                 Some(value) => value.clone(),
@@ -273,6 +286,13 @@ fn eval_in_context(
             let rule = operand_rule(op);
             let (mut left, mut right) = operand_contexts(rule, lhs, rhs, store, signed_context);
             let (mut left_width, mut right_width) = operand_widths(rule, width);
+            // An operation with a real operand has no width, so a context
+            // cannot reach its operands: `w = (a + b) + 1.0;` adds `a` and `b`
+            // at their own width and converts the sum, however wide `w` is.
+            if width != SELF_DETERMINED && either_is_real(lhs, rhs, store) {
+                left_width = SELF_DETERMINED;
+                right_width = SELF_DETERMINED;
+            }
             if matches!(rule, OperandRule::Compared) && (sized_within(lhs) || sized_within(rhs)) {
                 let (signed, common) = compared_operands(lhs, rhs, store);
                 left = signed;
@@ -305,14 +325,33 @@ fn eval_in_context(
             let arms = signed_context
                 && expression_is_signed(when_true, store)
                 && expression_is_signed(when_false, store);
+            // One real arm makes the whole conditional real, and that has to be
+            // decided *before* the condition picks one — the arm that is not
+            // taken is never evaluated, so its type could not be read off a
+            // value. `c ? 1 : 2.5` is `1.0`, and dividing it by 2 gives 0.5
+            // where an integer `1` would give 0.
+            let real = either_is_real(when_true, when_false, store);
+            let width = if real { SELF_DETERMINED } else { width };
+            let taken = |arm: &Expression| -> Result<Register, EvalError> {
+                let value = eval_in_context(arm, store, arms, width)?;
+                Ok(if real && !value.is_real() {
+                    Register::from_f64(value.to_f64())
+                } else {
+                    value
+                })
+            };
             match truth(&eval(condition, store)?) {
-                Some(true) => eval_in_context(when_true, store, arms, width),
-                Some(false) => eval_in_context(when_false, store, arms, width),
+                Some(true) => taken(when_true),
+                Some(false) => taken(when_false),
                 None => {
-                    let (when_true, when_false) = (
-                        eval_in_context(when_true, store, arms, width)?,
-                        eval_in_context(when_false, store, arms, width)?,
-                    );
+                    let (when_true, when_false) = (taken(when_true)?, taken(when_false)?);
+                    // A real has no `x` to merge into, so an unknown condition
+                    // gives the value the two arms agree on and `0.0` when they
+                    // do not — which is what iverilog produces.
+                    if real {
+                        let (a, b) = (when_true.to_f64(), when_false.to_f64());
+                        return Ok(Register::from_f64(if a == b { a } else { 0.0 }));
+                    }
                     Ok(merge(&when_true, &when_false).with_signedness(arms))
                 }
             }
@@ -522,6 +561,12 @@ fn widened_result(value: Result<Register, EvalError>, width: usize) -> Result<Re
 
 #[cold]
 fn pad(value: &Register, width: usize) -> Register {
+    // A real is not a number of bits, so a context asking for more of them has
+    // nothing to say to it: padding one would turn the IEEE-754 encoding into
+    // an integer that happens to hold the same bits (corpus `pr2913404`).
+    if value.is_real() {
+        return value.clone();
+    }
     value.coerced(width).with_signedness(value.is_signed())
 }
 
@@ -671,6 +716,10 @@ fn unary_keeps_signedness(op: &UnaryOperator) -> bool {
 fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
     match expr {
         Expression::Constant(constant) => constant.is_signed(),
+        // A real has a sign, and saying otherwise would make the *integer*
+        // beside it unsigned: `2.5 > -1` has to read that `-1` as -1 rather
+        // than as four billion before converting it.
+        Expression::RealLiteral(_) => true,
         // The store's hint first: looking a name up costs a hash of it, and in
         // a design that declares nothing signed the answer is already known.
         Expression::Identifier(id) => {
@@ -710,6 +759,68 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
     }
 }
 
+/// Whether `expr` produces a *real*.
+///
+/// This is [`expression_is_signed`]'s counterpart, and it exists for the one
+/// thing realness has to be known *before* an operand is evaluated: an
+/// operation with a real operand has no width, so nothing may widen the
+/// integer beside it. `(a + b) != 254.0` for two eight bit `255`s is true,
+/// because the addition is carried out in eight bits and wraps before it is
+/// converted — widening it to the real's sixty-four first gives 510 and a
+/// wrong answer (corpus `pr2918095`).
+///
+/// Realness otherwise travels *up* from the values, which is the whole
+/// difference between it and signedness: an operand is evaluated the same way
+/// whether or not the operator turns out to be real, so `7/2 + 0.5` is 3.5 —
+/// an integer division and then a real addition.
+///
+/// Every caller asks [`StateStore::any_real`] first, so a design with no real
+/// in it never walks anything.
+fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
+    match expr {
+        Expression::RealLiteral(_) => true,
+        Expression::Identifier(id) => store
+            .get_signal(&id.name)
+            .is_some_and(|signal| signal.is_real()),
+        // A word of an array of reals is one, and the array is the only place
+        // the declaration is recorded.
+        Expression::BitSelect(id, _) => store
+            .memory(&id.name)
+            .is_some_and(|memory| memory.is_real()),
+        Expression::Parenthetical(inner) => expression_is_real(inner, store),
+        // `~` and the reductions are refused for a real rather than made real,
+        // so every unary operator that survives one hands it on.
+        Expression::Unary(_, operand) => expression_is_real(operand, store),
+        // One real operand makes the operation real, which is not the rule
+        // signedness follows — there it takes *both*.
+        Expression::Binary(lhs, _, rhs) => {
+            expression_is_real(lhs, store) || expression_is_real(rhs, store)
+        }
+        Expression::Conditional(_, when_true, when_false) => {
+            expression_is_real(when_true, store) || expression_is_real(when_false, store)
+        }
+        Expression::FunctionCall(id, _) => store
+            .function(&id.name)
+            .is_some_and(|definition| definition.result.real),
+        Expression::SystemFunctionCall(name, _) => {
+            matches!(name.as_str(), "realtime" | "itor" | "bitstoreal")
+        }
+        Expression::Constant(_)
+        | Expression::StringLiteral(_)
+        | Expression::Concatenation(_)
+        | Expression::Replication(_, _)
+        | Expression::PartSelect(_, _, _)
+        | Expression::IndexedPartSelect { .. } => false,
+    }
+}
+
+/// Whether either side of an operation is a real, which is what says the
+/// operation has no width to hand down. Asked only where it can change an
+/// answer, and never at all of a design that declares no real.
+fn either_is_real(lhs: &Expression, rhs: &Expression, store: &StateStore) -> bool {
+    store.any_real() && (expression_is_real(lhs, store) || expression_is_real(rhs, store))
+}
+
 /// The signedness and the width a comparison's two operands share.
 ///
 /// A comparison is self-determined as far as the expression *around* it is
@@ -722,6 +833,11 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
 /// extended.
 fn compared_operands(lhs: &Expression, rhs: &Expression, store: &StateStore) -> (bool, usize) {
     let signed = expression_is_signed(lhs, store) && expression_is_signed(rhs, store);
+    // A real has no width to share: the integer beside it is worked out at its
+    // own width and converted afterwards.
+    if either_is_real(lhs, rhs, store) {
+        return (signed, SELF_DETERMINED);
+    }
     let width = expression_width(lhs, store).max(expression_width(rhs, store));
     (signed, width)
 }
@@ -768,6 +884,7 @@ fn sized_within(expr: &Expression) -> bool {
 pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
     match expr {
         Expression::Constant(constant) => constant.size().unwrap_or(UNSIZED_CONSTANT_WIDTH),
+        Expression::RealLiteral(_) => REAL_WIDTH,
         Expression::Identifier(id) => store
             .get_signal(&id.name)
             .map_or(1, |signal| signal.width()),
@@ -820,6 +937,7 @@ pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
             .map_or(1, |definition| range_width(definition.result.range)),
         Expression::SystemFunctionCall(name, arguments) => match name.as_str() {
             "time" => TIME_WIDTH,
+            "realtime" | "itor" | "bitstoreal" | "realtobits" => REAL_WIDTH,
             // A cast changes no bit and no width.
             "signed" | "unsigned" => arguments.first().map_or(SYSTEM_FUNCTION_WIDTH, |argument| {
                 expression_width(argument, store)
@@ -836,7 +954,9 @@ pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
 /// exception: `time` is a 64 bit *unsigned* type.
 fn system_function_is_signed(name: &str) -> bool {
     match name {
-        "unsigned" | "time" => false,
+        // `$realtobits` hands back a bit pattern rather than a number, so
+        // there is no sign in it to read.
+        "unsigned" | "time" | "realtobits" => false,
         _ => true,
     }
 }
@@ -859,8 +979,19 @@ const TIME_WIDTH: usize = 64;
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 7] = [
-    "time", "stime", "signed", "unsigned", "random", "bits", "clog2",
+pub const SYSTEM_FUNCTIONS: [&str; 12] = [
+    "time",
+    "stime",
+    "realtime",
+    "signed",
+    "unsigned",
+    "random",
+    "bits",
+    "clog2",
+    "rtoi",
+    "itor",
+    "realtobits",
+    "bitstoreal",
 ];
 
 /// Evaluates `$name(...)`, the simulator's own functions.
@@ -911,6 +1042,53 @@ fn eval_system_function_bits(
                 store.time().unsigned_abs() as u128,
                 width,
             ))
+        }
+        // The same clock `$time` reads, as a real. Nothing rescales it — see
+        // `TimeFormat` — so this is the tick count with a decimal point.
+        "realtime" => {
+            arity("no arguments", &[0])?;
+            Ok(Register::from_f64(store.time() as f64))
+        }
+        // The two conversions, and the difference between them is the whole
+        // point: `$rtoi` **truncates** toward zero where an assignment to an
+        // `integer` rounds, so `$rtoi(2.7)` is 2 and `i = 2.7;` is 3.
+        "rtoi" => {
+            arity("exactly one argument", &[1])?;
+            let value = eval(&arguments[0], store)?;
+            Ok(Register::integer_from_f64(
+                value.to_f64().trunc(),
+                SYSTEM_FUNCTION_WIDTH,
+            ))
+        }
+        "itor" => {
+            arity("exactly one argument", &[1])?;
+            // `$itor` takes an *integer*, so a real argument is converted to
+            // one before it is converted back: `$itor(10.5)` is `11.0` and
+            // `$itor(1.0/0.0)` is `0.0`, since an infinity is no integer at
+            // all (corpus `itor_rtoi`).
+            let value = eval(&arguments[0], store)?.to_f64();
+            Ok(Register::from_f64(if value.is_finite() {
+                value.round()
+            } else {
+                0.0
+            }))
+        }
+        // The IEEE-754 encoding, and back. They are a pair of casts over the
+        // same sixty-four bits: `$realtobits(1.5)` is `64'h3ff8000000000000`
+        // and `$bitstoreal` of that is `1.5` again.
+        "realtobits" => {
+            arity("exactly one argument", &[1])?;
+            let value = eval(&arguments[0], store)?.to_f64();
+            Ok(Register::from_f64(value).with_realness(false))
+        }
+        "bitstoreal" => {
+            arity("exactly one argument", &[1])?;
+            let bits = eval(&arguments[0], store)?.coerced(REAL_WIDTH);
+            // An unknown bit has no place in a double, so it reads as `0` the
+            // same way it does anywhere else a four-state value becomes one.
+            Ok(Register::from_f64(f64::from_bits(
+                bits.chunk(0).ones() as u64
+            )))
         }
         // A cast that changes no bit and no width: it says only how the bits
         // that are already there are to be read. Everything it changes happens
@@ -1171,6 +1349,9 @@ fn decimal_bits(digits: &str) -> Result<Register, EvalError> {
 // ---------------------------------------------------------------------------
 
 fn eval_unary(op: &UnaryOperator, operand: &Register) -> Result<Register, EvalError> {
+    if operand.is_real() {
+        return real_unary(op, operand);
+    }
     match op {
         // `+a` is a no-op on the bits, and leaves the operand's signedness
         // alone with them.
@@ -1254,6 +1435,15 @@ fn reduce_xor(operand: &Register) -> u8 {
 // ---------------------------------------------------------------------------
 
 fn eval_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
+    // One operand being real makes the whole operation real: `7/2.0` is 3.5
+    // where `7/2` is 3. It is read off the operands *after* they are evaluated
+    // rather than decided before, because — unlike signedness — realness
+    // changes nothing about how an operand is evaluated, only what is done
+    // with it. `7/2 + 0.5` is 3.5 for exactly that reason: the division is an
+    // integer one and only the addition is real.
+    if lhs.is_real() || rhs.is_real() {
+        return real_binary(op, lhs, rhs);
+    }
     match op {
         BinaryOperator::Addition
         | BinaryOperator::Subtraction
@@ -1286,6 +1476,58 @@ fn eval_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Re
         }
 
         BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => Ok(logical(op, lhs, rhs)),
+    }
+}
+
+/// A binary operation with a real operand, carried out in `f64`.
+///
+/// The other operand is *converted*, whatever it was: an integer beside a real
+/// is read as the number its own signedness says it is and then turned into a
+/// double, so `7/2.0` divides 7.0 by 2.0. There is no unknown to propagate —
+/// a double has no `x` — and a division by zero is an infinity rather than the
+/// `x` an integer division by zero gives, which is what iverilog prints.
+///
+/// The operators that are **not** here are the ones that read a pattern of
+/// bits: `& | ^ ~^`, the shifts and `===`/`!==`. iverilog rejects each of them
+/// at compile time and so does this, by name, rather than converting to an
+/// integer behind the design's back.
+fn real_binary(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Register, EvalError> {
+    let (a, b) = (lhs.to_f64(), rhs.to_f64());
+    let real = |value: f64| Ok(Register::from_f64(value));
+    let boolean = |value: bool| Ok(logic_bit(if value { ONE } else { ZERO }));
+    match op {
+        BinaryOperator::Addition => real(a + b),
+        BinaryOperator::Subtraction => real(a - b),
+        BinaryOperator::Multiplication => real(a * b),
+        BinaryOperator::Division => real(a / b),
+        // `%` on a real is `fmod`, not a remainder of the rounded values:
+        // `1 % 2.0` is 1.0 and `2.5 % 2` is 0.5. IEEE 1364-2005 leaves it
+        // illegal; iverilog computes it, and corpus `mixed_type_div_mod`
+        // asserts the answers above.
+        BinaryOperator::Modulus => real(a % b),
+        BinaryOperator::Power => real(a.powf(b)),
+        BinaryOperator::LessThan => boolean(a < b),
+        BinaryOperator::LessThanOrEqual => boolean(a <= b),
+        BinaryOperator::GreaterThan => boolean(a > b),
+        BinaryOperator::GreaterThanOrEqual => boolean(a >= b),
+        BinaryOperator::LogicalEquality => boolean(a == b),
+        BinaryOperator::LogicalInequality => boolean(a != b),
+        BinaryOperator::LogicalAnd => boolean(a != 0.0 && b != 0.0),
+        BinaryOperator::LogicalOr => boolean(a != 0.0 || b != 0.0),
+        other => Err(EvalError::RealOperand(other.raw_token())),
+    }
+}
+
+/// A unary operation on a real. `+` and `-` are arithmetic and `!` is a truth
+/// value; `~` and the reductions read bits and are refused by name, exactly as
+/// they are in [`real_binary`].
+fn real_unary(op: &UnaryOperator, operand: &Register) -> Result<Register, EvalError> {
+    let value = operand.to_f64();
+    match op {
+        UnaryOperator::Positive => Ok(Register::from_f64(value)),
+        UnaryOperator::Negative => Ok(Register::from_f64(-value)),
+        UnaryOperator::LogicalNegation => Ok(logic_bit(if value == 0.0 { ONE } else { ZERO })),
+        other => Err(EvalError::RealOperand(other.raw_token())),
     }
 }
 
@@ -1539,6 +1781,12 @@ fn logic_bit(bit: u8) -> Register {
 /// A register used as a condition: any `1` bit is true, all-zero is false, and
 /// anything else (only unknown bits and zeros) is unknown.
 fn truth(register: &Register) -> Option<bool> {
+    // A real is true when it is not zero, and `-0.0` is zero however its sign
+    // bit reads — which is the one place the bits would answer differently
+    // from the number.
+    if register.is_real() {
+        return Some(register.to_f64() != 0.0);
+    }
     if register.has_one() {
         Some(true)
     } else if register.has_unknown() {
@@ -1676,6 +1924,87 @@ mod tests {
         store.set_ranged("a", Register::from_binary("10100110"), (7, 0));
         store.set_ranged("b", Register::from_binary("0011"), (3, 0));
         store
+    }
+
+    // -- reals -------------------------------------------------------------
+
+    /// Evaluates against a store and returns the result as a double.
+    fn real_in(source: &str, store: &StateStore) -> f64 {
+        eval(&parse(source), store)
+            .unwrap_or_else(|e| panic!("{} failed to evaluate: {}", source, e))
+            .to_f64()
+    }
+
+    fn real(source: &str) -> f64 {
+        real_in(source, &StateStore::new())
+    }
+
+    /// One real operand makes the whole operation real — and, unlike
+    /// signedness, that is decided from the operands rather than pushed down
+    /// into them: `7/2 + 0.5` divides in integers first. Every value here was
+    /// measured from iverilog 12.0.
+    #[test]
+    fn test_one_real_operand_makes_the_operation_real() {
+        assert_eq!(real("7 / 2.0"), 3.5);
+        assert_eq!(real("7 / 2"), 3.0);
+        assert_eq!(real("7 / 2 + 0.5"), 3.5);
+        assert_eq!(real("2.0 ** 3"), 8.0);
+        // `%` on a real is `fmod`; IEEE 1364 leaves it illegal and iverilog
+        // computes it (corpus `mixed_type_div_mod`).
+        assert_eq!(real("1 % 2.0"), 1.0);
+        assert_eq!(real("1.0 / 0.0"), f64::INFINITY);
+    }
+
+    /// A real is signed, and that is what keeps the *integer* beside it signed:
+    /// `-1 / 1.0e-6` is negative only if the `-1` is read as one (corpus
+    /// `pr2818823`).
+    #[test]
+    fn test_a_real_keeps_the_integer_beside_it_signed() {
+        assert_eq!(real("-1 / 1.0e-6"), -1000000.0);
+        assert_eq!(real("-1 * (1.0 / 0.0)"), f64::NEG_INFINITY);
+    }
+
+    /// A comparison sizes its operands against each other — but a real has no
+    /// width to share, so the integer beside it is worked out at its own width
+    /// and converted afterwards. Two eight bit `255`s add to 254, and widening
+    /// them to the real's sixty-four first would give 510 (corpus `pr2918095`).
+    #[test]
+    fn test_a_real_gives_a_comparison_no_width_to_share() {
+        let mut store = StateStore::new();
+        store.declare_real("r");
+        store.set_ranged("a", Register::from_binary("11111111"), (7, 0));
+        store.set_ranged("b", Register::from_binary("11111111"), (7, 0));
+        assert_eq!(value_in("(a + b) == 254.0", &store), 1);
+        assert_eq!(value_in("(a * b) == 1.0", &store), 1);
+    }
+
+    /// One real arm makes a conditional real, and that has to be decided before
+    /// the condition picks an arm. An unknown condition has no `x` to produce,
+    /// so it gives what the arms agree on and `0.0` when they disagree —
+    /// iverilog's answer, and what corpus `pr2453002` checks.
+    #[test]
+    fn test_a_conditional_is_real_when_either_arm_is() {
+        let mut store = StateStore::new();
+        store.declare_real("r");
+        assert_eq!(real_in("1 ? 1 : 2.5", &store), 1.0);
+        assert_eq!(real_in("(1 ? 1 : 2.5) / 2", &store), 0.5);
+        assert_eq!(real_in("1'bx ? 6 : 6.0", &store), 6.0);
+        assert_eq!(real_in("1'bx ? 6.0 : 7.0", &store), 0.0);
+    }
+
+    /// The conversions, and the difference between them: an assignment rounds
+    /// half away from zero, `$rtoi` truncates toward zero, and `$itor` rounds
+    /// because its argument is an integer (corpus `itor_rtoi`).
+    #[test]
+    fn test_the_real_conversion_functions() {
+        assert_eq!(value("$rtoi(2.7)"), 2);
+        assert_eq!(real("$itor(10.5)"), 11.0);
+        assert_eq!(real("$itor(1.0 / 0.0)"), 0.0);
+        assert_eq!(real("$bitstoreal(64'h3ff8000000000000)"), 1.5);
+        assert_eq!(
+            bits("$realtobits(1.5)"),
+            Register::from_hex("3ff8000000000000").to_binary()
+        );
     }
 
     // -- constants ---------------------------------------------------------
@@ -2346,7 +2675,7 @@ mod tests {
         let store = sample_store();
         for name in SYSTEM_FUNCTIONS {
             let source = match name {
-                "time" | "stime" | "random" => format!("${}", name),
+                "time" | "stime" | "realtime" | "random" => format!("${}", name),
                 other => format!("${}(a)", other),
             };
             eval(&parse(&source), &store)

@@ -28,7 +28,7 @@
 
 use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
-use crate::register::Register;
+use crate::register::{Register, REAL_WIDTH};
 use crate::simulator::eval::{
     eval, eval_sized, indexed_select_indices, indexed_select_width, EvalError, MAX_SELECT_WIDTH,
     SELF_DETERMINED,
@@ -99,6 +99,13 @@ impl ResolvedTarget {
     /// [`SimulationError::UnknownSignal`] anyway, and a made up width would
     /// change the value it failed with.
     pub fn width(&self, state: &StateStore) -> usize {
+        // A `real` target imposes no width at all: it is not a number of bits,
+        // so the right hand side sizes itself. `real r; reg [7:0] a, b;
+        // r = a * b;` multiplies in eight bits — 200 * 2 is 144 — where a
+        // sixty-four bit context would make it 400. iverilog agrees.
+        if self.is_real(state) {
+            return SELF_DETERMINED;
+        }
         match self {
             ResolvedTarget::Whole(name) => state
                 .get_signal(name)
@@ -115,6 +122,32 @@ impl ResolvedTarget {
             // A concatenation is as wide as its parts add up to, which is what
             // sizes the right hand side that fills it.
             ResolvedTarget::Parts(parts) => parts.iter().map(|part| part.width(state)).sum(),
+        }
+    }
+
+    /// Whether the target holds a `real`, which is what says a value written
+    /// into it has to be *converted* rather than resized.
+    ///
+    /// A design with no real in it answers without hashing a name, the same
+    /// shape `any_signed` and `any_memory` use. A bit or part select is never
+    /// real: a `real` has no bits to select from. Neither is a concatenation,
+    /// which is a run of bits however they were declared — so a real written
+    /// into one is converted to an integer first and then split, rather than
+    /// having its IEEE-754 encoding sliced up.
+    pub fn is_real(&self, state: &StateStore) -> bool {
+        if !state.any_real() {
+            return false;
+        }
+        match self {
+            ResolvedTarget::Whole(name) => state
+                .get_signal(name)
+                .is_some_and(|signal| signal.is_real()),
+            ResolvedTarget::Word { name, .. } => {
+                state.memory(name).is_some_and(|memory| memory.is_real())
+            }
+            ResolvedTarget::Bits { .. }
+            | ResolvedTarget::Event(_)
+            | ResolvedTarget::Parts(_) => false,
         }
     }
 }
@@ -346,6 +379,31 @@ pub fn drive_resolved(
     drive_at(state, target, value, DriveLevel::Procedural)
 }
 
+/// `value` as the type of `target` reads it.
+///
+/// An integer written into a `real` is converted to a double; a real written
+/// into anything else is **rounded**, half away from zero — `i = 1.5;` is 2 and
+/// `i = -1.5;` is -2, which is where an assignment differs from `$rtoi`, whose
+/// truncation would give 1. Anything else is handed back untouched.
+fn matched_to_target(state: &StateStore, target: &ResolvedTarget, value: &Register) -> Register {
+    match (target.is_real(state), value.is_real()) {
+        (true, false) => Register::from_f64(value.to_f64()),
+        (false, true) => {
+            // The *target's* width, not the real's sixty-four: a `reg [64:0]`
+            // holds `2**64`, and converting into sixty-four bits first would
+            // lose the bit that makes it that number (corpus `pr2913404`). A
+            // target the store does not know is converted at the width a real
+            // has, and the write then fails by name as it would have anyway.
+            let width = match target.width(state) {
+                SELF_DETERMINED => REAL_WIDTH,
+                width => width,
+            };
+            Register::integer_from_f64(value.to_f64().round(), width)
+        }
+        _ => value.clone(),
+    }
+}
+
 /// Which bits of `name` a drive stronger than `level` is holding.
 ///
 /// Precedence is per *bit*, not per signal: `force bus[0] = 1;` holds one bit
@@ -391,9 +449,24 @@ pub fn drive_at(
     value: &Register,
     level: DriveLevel,
 ) -> Result<bool, SimulationError> {
-    // A concatenation is split before anything else looks at it: each part is
-    // a target in its own right, with its own precedence and its own slice of
-    // the value, most significant part first.
+    // A real and an integer are converted into each other here, before the
+    // value is resized, because resizing is what would destroy it: an integer
+    // widened to sixty-four bits and then read as a double is a number nothing
+    // wrote, and a double truncated to eight bits is not the value it denotes.
+    // It has to happen while the value still carries its own signedness too —
+    // `-1` in eight bits is -1.0 and not 255.0. It also has to happen *before*
+    // a concatenation is split, so that `{a, b} = 2.5;` splits the integer 3
+    // rather than the bits of a double.
+    let converted;
+    let value = if state.any_real() || value.is_real() {
+        converted = matched_to_target(state, target, value);
+        &converted
+    } else {
+        value
+    };
+    // A concatenation is then split before anything else looks at it: each part
+    // is a target in its own right, with its own precedence and its own slice
+    // of the value, most significant part first.
     if let ResolvedTarget::Parts(parts) = target {
         let total: usize = parts.iter().map(|part| part.width(state)).sum();
         let value = value.coerced(total);

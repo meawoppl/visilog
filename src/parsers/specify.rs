@@ -24,11 +24,11 @@
 //! Two things inside a `specify` block are **not** inert, and neither is
 //! treated as though it were:
 //!
-//! - A `specparam` declares a real constant that expressions elsewhere may
-//!   name, so it becomes an actual parameter at elaboration rather than being
-//!   discarded. The exception is one whose value is a *real* number — the one
-//!   thing a four-state `Register` cannot hold — which is kept as the text it
-//!   was written as and declares nothing.
+//! - A `specparam` declares a constant that expressions elsewhere may name, so
+//!   it becomes an actual parameter at elaboration rather than being
+//!   discarded. One whose value is a *real* number is kept here as the text it
+//!   was written as — a path delay has no evaluator behind it to turn digits
+//!   into a value — and `elaborate` converts it when it declares it.
 //! - A **timing check** reports a violation, which needs the timing model the
 //!   paths would need. One is recorded and never run, so no violation is
 //!   invented and none is claimed to have been checked.
@@ -41,8 +41,8 @@
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    character::complete::{char, digit1, satisfy},
-    combinator::{map, not, opt, peek, recognize, value},
+    character::complete::{char, satisfy},
+    combinator::{map, not, opt, peek, value},
     multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, terminated, tuple},
     IResult,
@@ -52,6 +52,7 @@ use super::{
     behavior::EventTriggers,
     expr::{bit_select, indexed_part_select, part_select, verilog_expression, Expression},
     identifier::{identifier, Identifier},
+    numbers::real_number,
     simple::{range, ws, ws_and_comments, Range},
 };
 
@@ -83,9 +84,9 @@ pub struct SpecParam {
 #[derive(Debug, PartialEq, Clone)]
 pub enum SpecParamValue {
     Expression(Expression),
-    /// `0.9` — kept as the text it was written as. A real number is not
-    /// something a four-state `Register` can hold, and the only thing that
-    /// could use one is the path delay that is not simulated anyway.
+    /// `0.9` — kept as the text it was written as, because the other place a
+    /// real number appears here is a path *delay*, which nothing evaluates.
+    /// `elaborate` reads the digits when it declares the constant.
     Real(String),
 }
 
@@ -183,24 +184,11 @@ fn keyword(word: &'static str) -> impl Fn(&str) -> IResult<&str, &str> {
     move |input: &str| terminated(tag(word), peek(not(satisfy(identifier_char))))(input)
 }
 
-/// `0.9`, `1.0`, `0.500` — a real number, which the expression grammar has no
-/// operand for.
-///
-/// Only the fixed-point spelling is accepted, because that is the whole of
-/// what a delay is ever written as; an exponent would need a value to be
-/// computed with, and there is none here.
-fn real_number(input: &str) -> IResult<&str, String> {
-    map(
-        recognize(tuple((digit1, char('.'), digit1))),
-        str::to_string,
-    )(input)
-}
-
 /// One number of a delay: real, or anything the expression grammar reads —
 /// which is how `tRise` names a `specparam`.
 fn delay_term(input: &str) -> IResult<&str, DelayTerm> {
     alt((
-        map(real_number, DelayTerm::Real),
+        map(real_number, |text: &str| DelayTerm::Real(text.to_string())),
         map(verilog_expression, DelayTerm::Expression),
     ))(input)
 }
@@ -329,7 +317,9 @@ fn specparam_declaration(input: &str) -> IResult<&str, Vec<SpecParam>> {
             preceded(
                 ws(char('=')),
                 alt((
-                    map(real_number, SpecParamValue::Real),
+                    map(real_number, |text: &str| {
+                        SpecParamValue::Real(text.to_string())
+                    }),
                     map(verilog_expression, SpecParamValue::Expression),
                 )),
             ),

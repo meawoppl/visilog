@@ -422,7 +422,7 @@ fn collect_target_reads(target: &Expression, names: &mut BTreeSet<String>) {
 
 fn collect_expression_reads(expression: &Expression, names: &mut BTreeSet<String>) {
     match expression {
-        Expression::Constant(_) | Expression::StringLiteral(_) => {}
+        Expression::Constant(_) | Expression::RealLiteral(_) | Expression::StringLiteral(_) => {}
         Expression::Identifier(id) => {
             names.insert(id.name.clone());
         }

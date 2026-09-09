@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
-use crate::register::{Register, ONE, X, Z, ZERO};
+use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, SYSTEM_FUNCTIONS};
 use crate::simulator::runner::SimulationError;
@@ -102,7 +102,29 @@ impl Radix {
 
     /// A value in this base, together with the width it pads to when the caller
     /// did not ask for one: as wide as the widest value of that many bits.
+    ///
+    /// A **real** is rounded to a whole number first — half away from zero, so
+    /// `2.5` is `3` — and printed as narrowly as it goes, with no width to pad
+    /// to, because the bits the digits came from are not the bits the value is
+    /// stored in.
+    ///
+    /// Decimal renders the *number* and every other base renders the sixty-four
+    /// bit two's complement integer it converts to. Corpus `br1029a` is where
+    /// the difference shows: `%0d` of `-0.4` is `-0` — the sign survives a
+    /// value that rounds to zero — while `%0x` of it is `0`, and `%0x` of
+    /// `-0.5` is `ffffffffffffffff`.
     fn render(self, value: &Register) -> (String, usize) {
+        if value.is_real() {
+            let rounded = value.to_f64().round();
+            if self == Radix::Decimal {
+                // Rounded already, so this only writes the digits: C rounds a
+                // `.5` to even here, where Verilog rounds away from zero.
+                return (format!("{:.0}", rounded), 0);
+            }
+            let whole = Register::integer_from_f64(rounded, REAL_WIDTH);
+            let (text, _) = self.render(&whole);
+            return (without_leading_zeros(text), 0);
+        }
         match self {
             Radix::Decimal => (
                 decimal(value),
@@ -373,6 +395,16 @@ impl TimeFormat {
         if value.has_unknown() {
             return unknown(value);
         }
+        // `%t` counts ticks, so a real time — `$realtime` — is rounded to one
+        // before it is rendered. Nothing rescales either form; see the type's
+        // own documentation.
+        let rounded;
+        let value = if value.is_real() {
+            rounded = Register::integer_from_f64(value.to_f64().round(), REAL_WIDTH);
+            &rounded
+        } else {
+            value
+        };
         let mut text = decimal(value);
         if self.precision > 0 {
             text.push('.');
@@ -680,6 +712,15 @@ impl TaskContext {
                 }
                 argument => {
                     let value = self.value_of(argument, store)?;
+                    // An argument with no specifier at all prints as a real
+                    // whatever base the task's name asked for: there is no
+                    // number of bits to show, and iverilog renders one to six
+                    // significant digits — `$display(1.5)` is `1.50000`.
+                    if value.is_real() {
+                        text.push_str(&real_text(value.to_f64(), RealFormat::Bare, None));
+                        index += 1;
+                        continue;
+                    }
                     let (rendered, width) = radix.render(&value);
                     text.push_str(&pad(rendered, width, ' '));
                     index += 1;
@@ -734,6 +775,19 @@ impl TaskContext {
                 })?),
             };
 
+            // `.2` of `%5.2f` — how many digits follow the point. It belongs to
+            // the real conversions and to nothing else, which is why it is read
+            // here and consulted only by them.
+            let mut precision: Option<usize> = None;
+            if characters.peek() == Some(&'.') {
+                characters.next();
+                let mut digits = String::new();
+                while characters.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    digits.push(characters.next().expect("peeked digit must exist"));
+                }
+                precision = Some(digits.parse().unwrap_or(0));
+            }
+
             let specifier = characters
                 .next()
                 .ok_or_else(|| bad_format("a trailing `%` with no specifier"))?;
@@ -746,6 +800,26 @@ impl TaskContext {
             })?;
             *index += 1;
 
+            // `%f`, `%e` and `%g` are the real conversions, and they read any
+            // argument: an integer is converted, so `$display("%f", 3)` is
+            // `3.000000`. A width of zero pads nothing and does *not* drop the
+            // decimals — `%0f` of 2.5 is `2.500000` — which is the one place
+            // the "narrowest rendering" reading of `%0` does not apply.
+            if let Some(format) = real_format(specifier) {
+                let value = self.value_of(argument, store)?;
+                let rendered = real_text(value.to_f64(), format, precision);
+                // `%E` and `%G` are `%e` and `%g` in capitals, and that reaches
+                // the whole rendering: C prints `INF` for `%E` of an infinity
+                // (corpus `pr1699519`).
+                let rendered = if specifier.is_ascii_uppercase() {
+                    rendered.to_uppercase()
+                } else {
+                    rendered
+                };
+                text.push_str(&pad(rendered, width.unwrap_or(0), fill));
+                continue;
+            }
+
             // `%s` on a vector pads to the characters the vector *has* rather
             // than to the characters it spells, so a 32 bit register holding
             // `"A"` prints as `"   A"`; `%0s` is the same text with the padding
@@ -755,6 +829,13 @@ impl TaskContext {
                     TaskArgument::Text(literal) => (literal.clone(), 0),
                     other => {
                         let value = self.value_of(other, store)?;
+                        // The bits of a real are an IEEE-754 encoding, not
+                        // characters, so there is no text in one to print.
+                        // iverilog warns and prints `<%s>`; there is no warning
+                        // channel here, so it is an error that says so.
+                        if value.is_real() {
+                            return Err(bad_format("`%s` has no meaning for a real value"));
+                        }
                         (ascii(&value), value.width().div_ceil(8))
                     }
                 };
@@ -1317,6 +1398,128 @@ fn pad(text: String, width: usize, fill: char) -> String {
     }
     padded.push_str(body);
     padded
+}
+
+/// The real conversion a `%` specifier asks for, or `None` if it is not one.
+fn real_format(specifier: char) -> Option<RealFormat> {
+    match specifier {
+        'f' | 'F' => Some(RealFormat::Fixed),
+        'e' | 'E' => Some(RealFormat::Scientific),
+        'g' | 'G' => Some(RealFormat::Shortest),
+        _ => None,
+    }
+}
+
+/// How a real prints: the three C conversions Verilog inherits, plus the one
+/// an argument with no specifier at all takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealFormat {
+    /// `%f` — a fixed point number, six decimals unless a precision says
+    /// otherwise.
+    Fixed,
+    /// `%e` — a mantissa and a two digit exponent: `3.000000e+00`.
+    Scientific,
+    /// `%g` — whichever of the two is shorter, with the trailing zeros dropped.
+    Shortest,
+    /// An argument printed with no specifier. It is `%g` with C's `#` flag —
+    /// six *significant* digits with the trailing zeros **kept** — which is why
+    /// iverilog prints `1.5` as `1.50000` and `400.0` as `400.000`.
+    Bare,
+}
+
+/// The number of significant digits `%g` keeps when nothing asks for another.
+const DEFAULT_SIGNIFICANT_DIGITS: usize = 6;
+
+/// The number of decimals `%f` and `%e` print when nothing asks for another.
+const DEFAULT_DECIMALS: usize = 6;
+
+/// One real as `format` renders it.
+///
+/// A value with no digits to print — an infinity or a NaN — renders as the word
+/// for it, which is what C does and what iverilog prints for `1.0/0.0`.
+fn real_text(value: f64, format: RealFormat, precision: Option<usize>) -> String {
+    if !value.is_finite() {
+        return match (value.is_nan(), value.is_sign_negative()) {
+            (true, _) => "nan".to_string(),
+            (false, true) => "-inf".to_string(),
+            (false, false) => "inf".to_string(),
+        };
+    }
+    match format {
+        RealFormat::Fixed => format!("{:.*}", precision.unwrap_or(DEFAULT_DECIMALS), value),
+        RealFormat::Scientific => scientific(value, precision.unwrap_or(DEFAULT_DECIMALS)),
+        RealFormat::Shortest | RealFormat::Bare => {
+            // C's `%g`: `digits` significant figures, printed as `%e` when the
+            // exponent is outside the range a fixed point rendering reads well
+            // in, and as `%f` when it is not. Only `%g` proper drops the
+            // trailing zeros afterwards.
+            let digits = precision.unwrap_or(DEFAULT_SIGNIFICANT_DIGITS).max(1);
+            let exponent = decimal_exponent(value, digits);
+            let text = if exponent < -4 || exponent >= digits as i32 {
+                scientific(value, digits - 1)
+            } else {
+                // The exponent is at least -4 here, so the count of decimals
+                // this asks for is never negative.
+                format!("{:.*}", (digits as i32 - 1 - exponent) as usize, value)
+            };
+            match format {
+                RealFormat::Shortest => without_trailing_zeros(text),
+                _ => text,
+            }
+        }
+    }
+}
+
+/// `value` in C's `%e` form: one digit, `precision` decimals, then an exponent
+/// of at least two digits with its sign.
+///
+/// Rust writes `3e0` where C writes `3.000000e+00`, so the two halves are
+/// assembled here.
+fn scientific(value: f64, precision: usize) -> String {
+    let mantissa = format!("{:.*e}", precision, value);
+    match mantissa.split_once('e') {
+        Some((digits, exponent)) => {
+            let exponent: i32 = exponent.parse().unwrap_or(0);
+            format!(
+                "{}e{}{:02}",
+                digits,
+                if exponent < 0 { '-' } else { '+' },
+                exponent.abs()
+            )
+        }
+        None => mantissa,
+    }
+}
+
+/// The exponent `%g` decides on: the power of ten of `value` *after* it has
+/// been rounded to `digits` significant figures, so that `999999.9` at six
+/// figures is `1.00000e+06` rather than a seven digit fixed point number.
+fn decimal_exponent(value: f64, digits: usize) -> i32 {
+    if value == 0.0 {
+        return 0;
+    }
+    format!("{:.*e}", digits.saturating_sub(1), value)
+        .split_once('e')
+        .and_then(|(_, exponent)| exponent.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A rendering with its trailing zeros dropped, and the decimal point with them
+/// when nothing is left after it. `%g` does this and the bare form deliberately
+/// does not.
+fn without_trailing_zeros(text: String) -> String {
+    let (digits, exponent) = match text.split_once('e') {
+        Some((digits, exponent)) => (digits, Some(exponent)),
+        None => (text.as_str(), None),
+    };
+    if !digits.contains('.') {
+        return text;
+    }
+    let trimmed = digits.trim_end_matches('0').trim_end_matches('.');
+    match exponent {
+        Some(exponent) => format!("{}e{}", trimmed, exponent),
+        None => trimmed.to_string(),
+    }
 }
 
 /// The same digits with the leading zeros dropped, which is what a width of

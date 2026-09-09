@@ -122,14 +122,13 @@ fn blockers_in(source: &str) -> Vec<&'static str> {
 
     note(
         unsupported_system_names(source),
-        "unsupported system function ($monitor, $fdisplay, $realtime, ...)",
+        "unsupported system function ($fdisplay, $sscanf, $fopen, ...)",
     );
     // Only features the front end still lacks get a row. `function`, the loop
-    // statements, `casez`/`casex`, `integer` and `signed` have all shipped, and
-    // so have `specify` and the combinational user-defined primitive; counting
-    // them would keep reporting them as blockers for ever.
+    // statements, `casez`/`casex`, `integer`, `signed` and `real` have all
+    // shipped, and so have `specify` and the combinational user-defined
+    // primitive; counting them would keep reporting them as blockers for ever.
     note(body.contains("task"), "task");
-    note(body.contains("real "), "real declaration");
     note(body.contains("generate"), "generate block");
     found
 }

@@ -108,13 +108,6 @@ const FUNCTION_RANDOM_UNSUPPORTED: SimulationError =
 /// 32.
 const TIME_RANGE: (i64, i64) = (63, 0);
 
-/// A `real` is IEEE-754 floating point, which is not a four-state bit vector:
-/// there is no `x` in a float, none of the arithmetic is the same, and the
-/// expression grammar has no floating point literal to feed one with. The
-/// front end reads the declaration so that a design using one stops here, by
-/// name, rather than on a parse error somewhere in the middle of it.
-const REAL_UNSUPPORTED: SimulationError = SimulationError::Unsupported("a `real` variable");
-
 /// The most words a memory may declare.
 ///
 /// A memory is `n` real registers, so a nonsense dimension is an allocation the
@@ -908,11 +901,14 @@ impl<'m> Elaborator<'m> {
                 // [WIDTH-1:0] a;` — exactly as any other declaration is, and
                 // this is the one place a task's widths are ever recorded.
                 let range = self.resolve_range(&variable.range, scope)?;
-                self.out.state.declare_signed(
-                    scope.qualified(&task_variable(&task.name.name, &variable.name.name)),
-                    range,
-                    variable.signed,
-                );
+                let name = scope.qualified(&task_variable(&task.name.name, &variable.name.name));
+                // A `real` argument is declared as one, so a value copied into
+                // it is converted rather than reinterpreted.
+                if variable.real {
+                    self.out.state.declare_real(name);
+                } else {
+                    self.out.state.declare_signed(name, range, variable.signed);
+                }
             }
         }
 
@@ -1032,6 +1028,7 @@ impl<'m> Elaborator<'m> {
                 name: format!("{}.{}", qualified, variable.name.name),
                 range: self.resolve_range(&variable.range, scope)?,
                 signed: variable.signed,
+                real: variable.real,
             })
         };
         let arguments: Vec<FrameVariable> = function
@@ -1067,6 +1064,7 @@ impl<'m> Elaborator<'m> {
                 name: qualified,
                 range: self.resolve_range(&function.range, scope)?,
                 signed: function.signed,
+                real: function.real,
             },
             arguments,
             locals,
@@ -1178,7 +1176,23 @@ impl<'m> Elaborator<'m> {
                     }
                 }
             }
-            ModuleStatement::RealDeclaration(_) => return Err(REAL_UNSUPPORTED),
+            ModuleStatement::RealDeclaration(reals) => {
+                for declaration in reals {
+                    // A `real` has no declarable width — the type is the whole
+                    // of it, the way an `integer`'s 32 bits are — so there is
+                    // no range to resolve, only the optional array dimension.
+                    match &declaration.dimensions {
+                        Some(addresses) => {
+                            let addresses = self.resolve_range(addresses, scope)?;
+                            self.declare_real_memory(&declaration.name.name, addresses, scope)?
+                        }
+                        None => self
+                            .out
+                            .state
+                            .declare_real(scope.qualified(&declaration.name.name)),
+                    }
+                }
+            }
             ModuleStatement::EventDeclaration(events) => {
                 for declaration in events {
                     // An event is neither a signal nor a memory: it holds no
@@ -1209,19 +1223,34 @@ impl<'m> Elaborator<'m> {
                     // register does not carry it, so it has to be restated
                     // *after* or the stored parameter reads unsigned.
                     let signed = parameter.signed || value.is_signed();
+                    // A `real` parameter holds a double whatever its value was
+                    // written as, so `parameter real HALF = 1;` is `1.0` and
+                    // not one bit. It is the declaration that says so, exactly
+                    // as it does for a `real` variable.
+                    let value = if parameter.real && !value.is_real() {
+                        Register::from_f64(value.to_f64())
+                    } else {
+                        value
+                    };
                     let value = value.with_signedness(signed);
                     let range = match &parameter.range {
                         Some(range) => Some(self.resolve_range(range, scope)?),
                         None => None,
                     };
+                    // A real has no width to be coerced to; a range beside
+                    // one would be a declaration of something else.
                     let value = match range {
-                        Some(range) => value.coerced(range_width(range)),
-                        None => value,
+                        Some(range) if !value.is_real() => value.coerced(range_width(range)),
+                        _ => value,
                     }
                     .with_signedness(signed);
                     match range {
-                        Some(range) => self.out.state.set_ranged(name, value, range),
-                        None => self.out.state.set(name, value),
+                        // A real carries its own sixty-four bits, so a range
+                        // written beside one says nothing about it.
+                        Some(range) if !value.is_real() => {
+                            self.out.state.set_ranged(name, value, range)
+                        }
+                        _ => self.out.state.set(name, value),
                     }
                 }
             }
@@ -1242,18 +1271,26 @@ impl<'m> Elaborator<'m> {
 
     /// Declares one `specparam` as the constant it is.
     ///
-    /// A real-valued one declares *nothing*: there is no four-state value to
-    /// declare it with, and the only thing that could read one is the path
-    /// delay that is not simulated anyway. A design that names it in an
-    /// ordinary expression reports the name as unknown, which is the same
-    /// answer it gets for a `real` variable it tries to use.
+    /// A real-valued one is a real constant: `specparam tRise = 0.9;` declares
+    /// a `real` holding `0.9`, so a module that names it in an expression gets
+    /// the number it was written with. The parser keeps the *text* of one —
+    /// see `parsers/specify.rs` — because a path delay has no evaluator behind
+    /// it, so the conversion happens here.
     fn declare_specparam(
         &mut self,
         parameter: &SpecParam,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
-        let SpecParamValue::Expression(expression) = &parameter.value else {
-            return Ok(());
+        let expression = match &parameter.value {
+            SpecParamValue::Expression(expression) => expression,
+            SpecParamValue::Real(text) => {
+                let name = scope.qualified(&parameter.name.name);
+                let value = text.replace('_', "").parse::<f64>().map_err(|_| {
+                    SimulationError::Unsupported("a `specparam` real value that is not a number")
+                })?;
+                self.out.state.set(name, Register::from_f64(value));
+                return Ok(());
+            }
         };
         let value = eval(&renamed(expression, scope), &self.out.state)?;
         let name = scope.qualified(&parameter.name.name);
@@ -1311,6 +1348,23 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .declare_memory(scope.qualified(local), addresses, range, signed);
+        Ok(())
+    }
+
+    /// [`declare_memory`](Elaborator::declare_memory) for an array of `real`s,
+    /// whose words start at `0.0` because a double has no `x`.
+    fn declare_real_memory(
+        &mut self,
+        local: &str,
+        addresses: (i64, i64),
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        if range_width(addresses) > MAX_MEMORY_DEPTH {
+            return Err(MEMORY_TOO_LARGE);
+        }
+        self.out
+            .state
+            .declare_real_memory(scope.qualified(local), addresses);
         Ok(())
     }
 
@@ -1575,6 +1629,13 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::TimeDeclaration(times) => {
                 for declaration in times {
+                    if let Some(init) = &declaration.init {
+                        self.initialise(&declaration.name.name, init, scope)?;
+                    }
+                }
+            }
+            ModuleStatement::RealDeclaration(reals) => {
+                for declaration in reals {
                     if let Some(init) = &declaration.init {
                         self.initialise(&declaration.name.name, init, scope)?;
                     }
@@ -2121,7 +2182,8 @@ impl BodyNames {
 
     fn expression(&mut self, expression: &Expression) {
         match expression {
-            Expression::Constant(_) | Expression::StringLiteral(_) => {}
+            Expression::Constant(_) | Expression::RealLiteral(_) | Expression::StringLiteral(_) => {
+            }
             Expression::Identifier(id) => {
                 self.reads.insert(id.name.clone());
             }
@@ -2288,7 +2350,7 @@ fn renamed(expression: &Expression, scope: &Scope) -> Expression {
 /// select arms walk their subexpressions and leave the name alone.
 fn substitute_genvars(expression: &mut Expression, genvars: &HashMap<String, i64>) {
     match expression {
-        Expression::Constant(_) | Expression::StringLiteral(_) => {}
+        Expression::Constant(_) | Expression::RealLiteral(_) | Expression::StringLiteral(_) => {}
         Expression::Identifier(id) => {
             if let Some(value) = genvars.get(&id.name) {
                 *expression = Expression::Constant(VerilogConstant::from_int(*value));
@@ -2423,7 +2485,7 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
 /// a signal is: a function belongs to the instance that declares it.
 pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> String) {
     match expression {
-        Expression::Constant(_) | Expression::StringLiteral(_) => {}
+        Expression::Constant(_) | Expression::RealLiteral(_) | Expression::StringLiteral(_) => {}
         Expression::Identifier(id) => id.name = resolve(&id.name),
         Expression::Unary(_, inner) | Expression::Parenthetical(inner) => {
             rename_expression(inner, resolve)
@@ -4033,6 +4095,8 @@ mod tests {
     /// declared like a parameter — the one thing inside a `specify` block that
     /// is not inert. The paths beside it change only *when* a value arrives,
     /// which this simulator has no model for, so they record and do nothing.
+    /// A `specparam` is not one of those: it is a constant the module may name,
+    /// real-valued or not.
     #[test]
     fn test_a_specparam_is_declared_as_a_constant() {
         let modules = parse_all(&[r#"
@@ -4049,9 +4113,9 @@ mod tests {
 
         assert_eq!(elaborated.state.get("tRise").unwrap().to_u128(), Some(6));
         assert_eq!(elaborated.state.get("tFall").unwrap().to_u128(), Some(7));
-        // A real value is not something a four-state register can hold, so it
-        // declares nothing at all rather than a rounded stand-in.
-        assert!(elaborated.state.get("holdoff").is_none());
+        // A real value is a real constant: the module may name it and read
+        // the number it was written with.
+        assert_eq!(elaborated.state.get("holdoff").unwrap().to_f64(), 0.9);
     }
 
     /// A dimension nothing could allocate is a named error rather than an
