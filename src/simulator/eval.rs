@@ -72,7 +72,7 @@ const MAX_ARITHMETIC_WIDTH: usize = 128;
 
 /// Upper bound on the width a part select may produce, so that a nonsense
 /// range such as `a[1000000:0]` reports an error instead of allocating.
-const MAX_SELECT_WIDTH: usize = 1 << 16;
+pub const MAX_SELECT_WIDTH: usize = 1 << 16;
 
 /// The width context of an expression nothing around it can size: a lower
 /// bound of zero, which every register already meets.
