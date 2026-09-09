@@ -1815,18 +1815,17 @@ impl<'m> Elaborator<'m> {
                 None if matches!(port.direction, PortDirection::Input) => {
                     Binding::Driven(renamed(&connection, scope))
                 }
-                // An output the parent bound to a *select* — `.y(bus[i])`,
-                // which is how a generate loop wires an instance per bit — is
-                // the alias run backwards: the port keeps a signal of its own
-                // and a continuous assignment carries it out to the bit. An
-                // output bound to anything that cannot be written at all, like
-                // a concatenation or `a + 1`, is still a named error, because
-                // there is nowhere for the child's value to go — and so is an
-                // `inout`, which is read as well as written and would need the
+                // An output the parent bound to something *writable* —
+                // `.y(bus[i])`, which is how a generate loop wires an instance
+                // per bit, or `.oB({e, f, g, h})` — is the alias run
+                // backwards: the port keeps a signal of its own and a
+                // continuous assignment carries it out to the target. An
+                // output bound to something that cannot be written at all,
+                // like `a + 1`, is still a named error, because there is
+                // nowhere for the child's value to go — and so is an `inout`,
+                // which is read as well as written and would need the
                 // assignment to run both ways.
-                None if port.direction == PortDirection::Output
-                    && assigned_name(&connection).is_some() =>
-                {
+                None if port.direction == PortDirection::Output && is_drivable(&connection) => {
                     Binding::Driving(renamed(&connection, scope))
                 }
                 None => {
@@ -2059,6 +2058,26 @@ fn analyse_function_body(
     // What the function declares itself is not something a call has to copy in.
     names.reads.retain(|name| !own.contains(name));
     Ok(names)
+}
+
+/// Whether an expression is something a continuous assignment can *write*,
+/// which is what an output port bound to it needs.
+///
+/// It is the set `exec::resolve_target` accepts, and it has to stay that: a
+/// port bound to something this admits and that refuses would elaborate and
+/// then fail at the first propagation. A concatenation qualifies because #212
+/// made one a writable target — every part is resolved on its own and the
+/// value is split across them.
+fn is_drivable(expression: &Expression) -> bool {
+    match expression {
+        Expression::Identifier(_)
+        | Expression::BitSelect(_, _)
+        | Expression::PartSelect(_, _, _)
+        | Expression::IndexedPartSelect { .. } => true,
+        Expression::Parenthetical(inner) => is_drivable(inner),
+        Expression::Concatenation(parts) => parts.iter().all(is_drivable),
+        _ => false,
+    }
 }
 
 /// Whether a port names a variable rather than a net.
