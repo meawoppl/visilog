@@ -5,8 +5,8 @@ use nom::{
     bytes::complete::tag,
     character::complete::{char, satisfy},
     combinator::{map, not, opt},
-    multi::{many0, separated_list0, separated_list1},
-    sequence::{delimited, terminated},
+    multi::{many0, separated_list1},
+    sequence::{delimited, preceded, terminated},
     IResult,
 };
 
@@ -98,12 +98,77 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
     ))
 }
 
+/// What a port declaration says before the name, kept so the ports after it
+/// can inherit it.
+#[derive(Clone)]
+struct PortQualifiers {
+    direction: PortDirection,
+    net_type: Option<NetType>,
+    range: Range,
+    signed: bool,
+}
+
+/// One entry of an ANSI header after the first: either a fresh declaration, or
+/// a bare name that inherits the one before it.
+fn parse_port_item(input: &str) -> IResult<&str, (Option<PortQualifiers>, Identifier)> {
+    if let Ok((rest, port)) = parse_port(input) {
+        let qualifiers = PortQualifiers {
+            direction: port.direction,
+            net_type: port.net_type,
+            range: port.range,
+            signed: port.signed,
+        };
+        return Ok((rest, (Some(qualifiers), port.identifier)));
+    }
+    let (input, name) = ws(identifier)(input)?;
+    Ok((input, (None, name)))
+}
+
+/// An ANSI header. The **first** entry must carry a direction — that is what
+/// tells this header from the Verilog-1995 spelling, which is bare names — and
+/// every entry after it may either re-declare or inherit.
+///
+/// `module m(input clk, reset, input [7:0] d, output reg [7:0] q);` declares
+/// `reset` as a one-bit input, because it inherits what `clk` said, and `d`
+/// re-qualifies. That is the same carry-forward rule an ordinary declaration
+/// list follows.
 fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
-    delimited(
-        ws(char('(')),
-        separated_list0(ws(char(',')), parse_port),
-        ws(char(')')),
-    )(input)
+    let (input, _) = ws(char('('))(input)?;
+    // `module m();` — an empty ANSI list, with nothing to inherit from.
+    if let Ok((rest, _)) = ws(char(')'))(input) {
+        return Ok((rest, Vec::new()));
+    }
+    let (input, first) = parse_port(input)?;
+    let (input, rest) = many0(preceded(ws(char(',')), parse_port_item))(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+
+    let mut carried = PortQualifiers {
+        direction: first.direction,
+        net_type: first.net_type,
+        range: first.range.clone(),
+        signed: first.signed,
+    };
+    let mut ports = Vec::with_capacity(rest.len() + 1);
+    ports.push(Port {
+        direction: carried.direction,
+        net_type: carried.net_type,
+        range: carried.range.clone(),
+        identifier: first.identifier,
+        signed: carried.signed,
+    });
+    for (qualifiers, identifier) in rest {
+        if let Some(qualifiers) = qualifiers {
+            carried = qualifiers;
+        }
+        ports.push(Port {
+            direction: carried.direction,
+            net_type: carried.net_type,
+            range: carried.range.clone(),
+            identifier,
+            signed: carried.signed,
+        });
+    }
+    Ok((input, ports))
 }
 
 /// A Verilog-1995 header: bare port names, whose directions and widths are
