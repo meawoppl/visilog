@@ -1582,10 +1582,21 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::Assignment(assignments) => {
                 for assignment in assignments {
-                    self.push_assignment(ContinuousAssignment::with_strength(
+                    // `assign #(PERIOD) a = b;` names a parameter, which
+                    // belongs to the instance that declared it like every
+                    // other name the assignment holds.
+                    let delay = assignment.delay().map(|delay| {
+                        let mut delay = delay.clone();
+                        for expression in delay.expressions_mut() {
+                            *expression = renamed(expression, scope);
+                        }
+                        delay
+                    });
+                    self.push_assignment(ContinuousAssignment::with_timing(
                         renamed(assignment.lhs(), scope),
                         renamed(assignment.rhs(), scope),
                         assignment.strength(),
+                        delay,
                     ));
                 }
             }

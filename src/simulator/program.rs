@@ -29,6 +29,7 @@ use crate::parsers::behavior::{
     ForStatement, IfStatement, ProceduralStatements, RepeatStatement, TaskDirection, WaitStatement,
     WhileStatement,
 };
+use crate::parsers::delay::Delay;
 use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::register::Register;
@@ -168,8 +169,14 @@ pub enum Instruction {
     /// Jump to `target` when `counter` has run out; otherwise take one off it
     /// and fall through into the body.
     RepeatNext { counter: String, target: usize },
-    /// `#n` — suspend, and resume at the next instruction `n` time units later.
-    Delay(i64),
+    /// `#n` — suspend, and resume at the next instruction `n` time units
+    /// later.
+    ///
+    /// The whole [`Delay`] rides here rather than the number it works out to,
+    /// because its value is an expression: `#(period / 2)` is not known until
+    /// the design has elaborated, and `#n` for a variable `n` is not known
+    /// until the block reaches it.
+    Delay(Delay),
     /// `wait (c)` — suspend until `c` is true. A condition that is already
     /// true does not suspend at all, so this re-evaluates `c` every time it is
     /// reached.
@@ -314,13 +321,17 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
             *slot = resolve(slot);
             rename_expression(target, resolve);
         }
+        // `#(period / 2)` names a parameter, and a parameter belongs to the
+        // instance that declared it like anything else.
+        Instruction::Delay(delay) => {
+            for expression in delay.expressions_mut() {
+                rename_expression(expression, resolve);
+            }
+        }
         // A `disable` names a scope rather than a signal, so it is renamed
         // beside the scope table it points into — see
         // [`Program::rename_scopes`] — and never through a map of variables.
-        Instruction::Jump(_)
-        | Instruction::Delay(_)
-        | Instruction::Disable(_)
-        | Instruction::Halt => {}
+        Instruction::Jump(_) | Instruction::Disable(_) | Instruction::Halt => {}
     }
 }
 
@@ -354,9 +365,14 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
             replace(value);
         }
         Instruction::WriteHeld { target, .. } => replace(target),
+        // A generate loop may write its own index into a delay: `#(i * 10)`.
+        Instruction::Delay(delay) => {
+            for expression in delay.expressions_mut() {
+                replace(expression);
+            }
+        }
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
-        | Instruction::Delay(_)
         | Instruction::Disable(_)
         | Instruction::Halt => {}
     }
@@ -581,14 +597,14 @@ impl Program {
         for statement in statements {
             match statement {
                 ProceduralStatements::Delay(delay) => {
-                    self.emit(Instruction::Delay(delay.ticks()));
+                    self.emit(Instruction::Delay(delay.clone()));
                 }
                 // `#5 <statement>` waits, then runs the statement — exactly
                 // what a bare `#5;` written in front of it would do. The body
                 // is compiled inline, so a delay nested in it suspends just as
                 // one at the top level does.
                 ProceduralStatements::Delayed { delay, statements } => {
-                    self.emit(Instruction::Delay(delay.ticks()));
+                    self.emit(Instruction::Delay(delay.clone()));
                     self.compile_statements(statements, tasks, scope)?;
                 }
                 ProceduralStatements::Assignment(assignment) => {
@@ -712,7 +728,7 @@ impl Program {
         });
         match timing {
             AssignmentTiming::Delay(delay) => {
-                self.emit(Instruction::Delay(delay.ticks()));
+                self.emit(Instruction::Delay(delay.clone()));
             }
             AssignmentTiming::Event {
                 repeat: None,
@@ -1360,10 +1376,13 @@ pub fn resume(
                 }
                 pc += 1;
             }
+            // The delay is worked out here rather than where the block was
+            // compiled, which is what lets `#n` name a variable the design
+            // moves as it runs.
             Instruction::Delay(delay) => {
                 return Ok(Resume::Suspended {
                     pc: pc + 1,
-                    delay: *delay,
+                    delay: delay.ticks(store)?,
                     pending,
                 })
             }
@@ -1717,7 +1736,10 @@ mod tests {
     #[test]
     fn test_pre_delay_compiles_to_a_delay_before_the_assignment() {
         let program = compile("begin #50 clk = 1'b1; end");
-        assert_eq!(program.instructions()[0], Instruction::Delay(50));
+        assert_eq!(
+            program.instructions()[0],
+            Instruction::Delay(Delay::new(50))
+        );
         assert!(matches!(
             program.instructions()[1],
             Instruction::Blocking { .. }
@@ -1730,7 +1752,10 @@ mod tests {
     #[test]
     fn test_a_delayed_block_compiles_to_one_delay_then_its_body() {
         let program = compile("begin #50 begin a = 1'b1; b = 1'b0; end end");
-        assert_eq!(program.instructions()[0], Instruction::Delay(50));
+        assert_eq!(
+            program.instructions()[0],
+            Instruction::Delay(Delay::new(50))
+        );
         assert!(matches!(
             program.instructions()[1],
             Instruction::Blocking { .. }

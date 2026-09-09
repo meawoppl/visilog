@@ -61,7 +61,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `keywords.rs` | the `VerilogKeyword` enum and lookup for what SystemVerilog added, and `is_reserved_word` for the IEEE 1364-2005 set |
 | `operators.rs` | `UnaryOperator` / `BinaryOperator` and their token parsers |
 | `expr.rs` | the expression grammar — the biggest and trickiest file |
-| `delay.rs` | `#<n>` delay terms, and `parse_gate_delay` for a gate's rise/fall list |
+| `delay.rs` | `#<n>` delay terms, whose values are `Expression`s evaluated against the store, and `parse_gate_delay` for the `delay3` a gate or an `assign` writes |
 | `nets.rs` | `wire`/`tri`/... declarations → `Net` |
 | `gates.rs` | the built-in primitives — `GateKind`, `DriveStrength`, `GateInstantiation` |
 | `generate.rs` | `generate … endgenerate`, `genvar` and `defparam` — the shapes, never the decisions |
@@ -69,7 +69,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `specify.rs` | `specify … endspecify` — path delays, timing checks and `specparam` |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
-| `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
+| `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength and its optional `#delay`, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
 | `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end` and `fork…join` — named or not — `if`/`else`, `case`, `wait`, a statement-level event control, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
@@ -550,11 +550,46 @@ terminate on one, and a static task's storage means real Verilog cannot recurse 
 `declare_tasks` compiles in dependency order by repeating until a pass compiles nothing
 new, so a task may enable one declared further down the file.
 
-Still unsupported: `disable` (both `disable <task>` and the named-block form — cancelling a
-block that has already suspended is not something a program counter alone can express);
-a hierarchical enable (`instance.task(…)`); a task enabled from inside a `function`, which
-is rejected by the function body analysis rather than by a check of its own; and
-concatenation as an assignment target. `signals.rs` is built but still unwired.
+Still unsupported: a hierarchical enable (`instance.task(…)`); a task enabled from inside a
+`function`, which is rejected by the function body analysis rather than by a check of its
+own; and concatenation as an assignment target. `signals.rs` is built but still unwired.
+
+**A `disable` is a jump when it can be, and a cancellation when it cannot.** A named block
+and an inlined task body each occupy a *range* of the compiled instruction list, and
+`Program::scopes` records it — which is all "terminate that scope" needs, because the LRM
+says execution continues with the statement following the block and a resume point here is
+a program counter. So `disable body;` written *inside* `body` is `pc = end`: the early
+return from a task, and the common case in the corpus. Nothing else about it is special —
+a `disable` inside a `for` inside the block leaves the whole block, because the jump is out
+of the range rather than out of a loop.
+
+The name is resolved against the enclosing scopes at **compile** time, innermost first
+(`enclosing_scope`), so `disable wait_loop` written in task `t` means `t.wait_loop` and the
+same word at the top of a module means `wait_loop`. A name matching no enclosing scope is
+left bare and looked for among every block's scopes when it runs. Both the scope table and
+the `Instruction::Disable` go through `Program::rename_scopes` — beside the instruction
+rename, not inside it, because a block label is not a signal and must not travel through a
+map of a task's locals.
+
+A `disable` of a scope the block is **not** inside cannot be a jump, because the block that
+is inside it is suspended somewhere only the driver can reach. That is `Resume::Disabled`,
+and `Simulator::cancel_scope` answers it: every cursor in the `EventQueue` and every entry
+in `waiting` whose program counter falls in that scope's range is taken out and re-queued
+at the scope's `end`, *at the current time*. Re-queueing rather than resuming inline is
+what puts the cancelled block's remaining output after the output of the block that
+disabled it, which is where iverilog puts it. A free-running `always` whose whole body was
+the disabled block then reaches its `Halt` and restarts — which is exactly how a design
+writes a restartable thread (corpus `pr987`), and it falls out of the rule
+`resume_block` already had rather than needing one of its own.
+
+Two things about it are deliberate. Disabling a scope that **exists but is not running**
+anywhere is a no-op, because that is what the LRM asks for: `always #6 disable foo;` cancels
+whichever enable of `foo` happens to be in flight and says nothing about the times none is.
+Disabling a scope the design has **nowhere** is `SimulationError::UnknownScope` — a design
+that thought it cancelled something and did not is the hardest kind of wrong answer to
+find. Inside a `function` the second rule is checked at elaboration instead
+(`Program::nonlocal_disable`), since a frame has no driver behind it to cancel anything
+with.
 
 **A block can suspend on the design as well as on the clock, and `Resume::Waiting` is
 how.** `wait (c) S` and `@(posedge clk) S` are both suspensions that no timestamp brings
@@ -667,6 +702,36 @@ where writing the net directly would put the `0`s straight through. `None` on a
 write at `strong` exactly as it always was, so a design that declares no strength anywhere
 still pays the `HashSet::is_empty`.
 
+**`assign #10 a = b;` is a real delay, and the trick is that it changes *which* value the
+driver asserts, not whether it asserts one.** A delayed assignment is still a continuous
+driver on the same `propagate` fixpoint as every other one — it just contributes the value
+its right hand side had `#n` ago rather than the value it has now. That is
+`runner::DelayedDrive`: `applied`, what the assignment is driving at this instant, and
+`pending`, the value in flight with the time it lands. `propagate` evaluates the right hand
+side as it always did, puts it in flight if it differs from where the driver is *headed*
+(`destination` — the pending value if there is one, otherwise the applied one), and then
+contributes `applied` exactly as an undelayed assignment contributes its expression. So
+nothing about strength resolution, three-state buses or the change journal had to learn
+about delay at all.
+
+The delay is **inertial**, not transport, which is the one rule that had to be measured
+rather than assumed (iverilog 12.0): a new value *replaces* what is in flight instead of
+queueing behind it, so a pulse shorter than the delay never reaches the net. `assign #10`
+against a five-unit pulse produces no transition whatsoever.
+
+Two seams make it work. `Simulator::next_time` is the time wheel: it is the earlier of the
+`EventQueue`'s next cursor and the earliest pending transaction, so a timestamp at which
+*only* a net changes still gets a turn. `Simulator::land_due_drives` runs at the top of
+that timestamp, before any block resumes, so a block scheduled for the same instant reads
+the net as it is at that instant. Both cost nothing for a design with no delayed
+assignment: `delays` is an empty `Vec` and neither loop has anything to iterate.
+
+**A delayed net reads `x` before its first transaction, not `z`.** Something *is* driving
+it — it simply has not said what yet — which is why `setup` runs one `propagate` pass ahead
+of time zero when the design has any delayed assignment, and why `applied: None` renders as
+`Register::unknown` rather than contributing nothing. Getting this wrong shows up
+immediately: `$display` at time zero prints `z` where iverilog prints `x`.
+
 **The truth tables were measured against iverilog 12.0, not read off the LRM.** `and(0, x)`
 is `0` rather than `x` — an unknown input that cannot change the answer does not make the
 answer unknown — and `or(1, z)` is `1`. A `z` reaching a *logic* gate is read as an `x`,
@@ -689,7 +754,12 @@ so which way round either range was declared cannot matter.
 
 Not modelled, each by name where it can be: **a gate delay is parsed and ignored** — the
 gate settles in zero time along with every other continuous driver, and `#(rise, fall)`
-keeps only the first value. The **bidirectional** switches (`tran`, `tranif0`, `rtranif1`, …)
+keeps only the first value. That is now the *only* continuous driver whose delay is
+ignored: `assign #10 a = b;` is simulated (see below), so the machinery a gate needs is
+already there and the gap is that nothing hands `Gate` a delay to schedule. It is what
+corpus `rise_fall_delay1`, `rise_fall_delay2`, `rise_fall_decay1` and `rise_fall_decay2`
+fail on, and they fail *honestly* — they run and print `FAILED` rather than looking like
+missing syntax. The **bidirectional** switches (`tran`, `tranif0`, `rtranif1`, …)
 conduct both ways and have no output terminal, so `Gate::new` refuses them by name. The
 `r`-prefixed switches pass the same values as their non-resistive counterparts because the
 strength *reduction* is not modelled, and neither is strength *propagation* through a switch
@@ -852,11 +922,11 @@ dying on unfamiliar syntax several lines earlier.
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, and `Program::compile_block` / `rename_range`, which give a named block's variables their scope |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, and `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, and `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, and `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
-| `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
+| `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
 
@@ -1027,13 +1097,24 @@ tripwire.
 - **Attribute bodies are discarded.** They are synthesis metadata with no simulation
   meaning, so `ws_and_comments` skips them exactly as it skips comments. Anything that
   later wants to *read* an attribute has to stop throwing them away first.
-- **A delay may be a `min:typ:max` triple.** `#(2:10:17)` parses and `Delay` keeps all
-  three values; `Delay::ticks()` returns the *typical* one and is the single place the
-  selection happens, so a `+mindelays`/`+maxdelays` mode is a one-function change. Delay
-  values are still literal decimals — `#tPD` and `#(a:b:c)` with identifiers do not parse.
-  A **gate** writes up to three delays rather than one — `#(rise, fall, turn_off)` — which
-  is what `parse_gate_delay` is for; it keeps the first and drops the rest, since nothing
-  downstream schedules a gate delay at all.
+- **A delay value is an *expression*, and it is evaluated where it is waited on.**
+  `#tPD`, `#(period / 2)` and `#n` for an ordinary `integer` are all Verilog, and none of
+  them has a value at parse time — so `Delay` holds three `Expression`s and
+  `Instruction::Delay` carries the whole `Delay` rather than a number. `resume` works it
+  out against the store when the block reaches it, which is what makes `n = 3; #n …; n = 7;
+  #n …;` wait 3 and then 7. A delay that evaluates to `x` is zero, which is what iverilog
+  does with one. `Delay::ticks(&store)` is still the single place a delay *mode* is chosen,
+  so `+mindelays`/`+maxdelays` is still a one-function change; it just takes a store now.
+- **The unparenthesised form is a number or a name, and nothing more.** A delay prefixes a
+  statement with only whitespace between, so a full expression parser would read `#5 a = 1;`
+  as `5 a` and `#2 -> ev;` as `2 - >`. `delay_operand` is therefore a constant or a
+  hierarchical identifier, and an expression is legal only inside parentheses — which is
+  exactly what the LRM says. `#(2:10:17)` is the `min:typ:max` triple, tried first inside
+  those parentheses because the single-value branch would match `2` and choke on the `:`.
+- **A `#delay` on an `assign` is simulated; a `#delay` on a gate is not.** A **gate** writes
+  up to three delays rather than one — `#(rise, fall, turn_off)` — which is what
+  `parse_gate_delay` is for; it keeps the first and drops the rest. The same production is
+  what an `assign` uses, and there the first value is *scheduled*: see below.
 - **System task names are decomposed, not enumerated.** `split_task_name` peels an optional
   `f` prefix (takes a descriptor) and an optional `b`/`h`/`o` suffix (the default radix), so
   `$display`, `$writeh`, `$fdisplayb`, `$strobeh`, `$fmonitor` and `$readmemb` all come from
@@ -1221,8 +1302,10 @@ tripwire.
   design's.
 - **What a function body may not do is checked once, at elaboration.** `analyse_function_body`
   walks the compiled instructions and rejects a `#delay`, a system task, a non-blocking
-  assignment, a write to anything the function does not declare, and `$random` — each with
-  a name. Every one of them is something a frame would silently swallow, and a call that
+  assignment, a write to anything the function does not declare, `$random`, and a `disable`
+  naming a scope outside the body — each with a name. A `disable` of a block the function
+  *is* inside is fine, because that one is a jump and needs no driver; corpus `disblock2` is
+  exactly that. Every one of them is something a frame would silently swallow, and a call that
   quietly did nothing is the hardest kind of wrong answer to find. The same walk is what
   produces the read set a call copies into its frame, so adding a new `Instruction` means
   teaching `BodyNames` about it or a function will stop seeing what it reads.
@@ -1267,9 +1350,9 @@ tripwire.
   differently shaped rule for the same question.
 - **An `assign` is a declaration list too.** `assign a = 4'd5, b = 4'd8;` is two targets
   under one keyword, so `parse_continuous_assignment` returns a `Vec` like every
-  declaration parser and `ModuleStatement::Assignment` wraps one. The strength belongs to
-  the `assign` rather than to a target, so every target in the list shares it, the same way
-  every name in a `reg [4:0] a, b;` shares one width.
+  declaration parser and `ModuleStatement::Assignment` wraps one. The strength *and the
+  delay* belong to the `assign` rather than to a target, so every target in the list shares
+  them, the same way every name in a `reg [4:0] a, b;` shares one width.
 - **A blank port connection keeps its position.** `two U7 (,)`, `two U8 (w3,)` and
   `two U9 (,w4)` leave a port unconnected, so `ModuleInitArguments::Positional` holds
   `Vec<Option<Expression>>` and `elaborate::connections` filters the `None`s out *after*

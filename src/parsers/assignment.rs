@@ -16,7 +16,7 @@ use crate::parsers::identifier::identifier;
 
 use super::{
     behavior::{assignment_timing, EventControl},
-    delay::Delay,
+    delay::{parse_gate_delay, Delay},
     simple::ws,
 };
 
@@ -25,6 +25,11 @@ pub struct ContinuousAssignment {
     lhs: Expression,
     rhs: Expression,
     strength: Option<DriveStrength>,
+    /// The `#10` of `assign #10 a = b;` — how long after the driving
+    /// expression moves the net follows it. `None` is an assignment that named
+    /// none, which settles in the same instant like every other continuous
+    /// driver.
+    delay: Option<Delay>,
 }
 
 impl ContinuousAssignment {
@@ -33,6 +38,7 @@ impl ContinuousAssignment {
             lhs,
             rhs,
             strength: None,
+            delay: None,
         }
     }
 
@@ -41,7 +47,28 @@ impl ContinuousAssignment {
         rhs: Expression,
         strength: Option<DriveStrength>,
     ) -> Self {
-        ContinuousAssignment { lhs, rhs, strength }
+        ContinuousAssignment {
+            lhs,
+            rhs,
+            strength,
+            delay: None,
+        }
+    }
+
+    /// The full form: a strength pair and a delay, both optional and both
+    /// belonging to the `assign` rather than to any one target it names.
+    pub fn with_timing(
+        lhs: Expression,
+        rhs: Expression,
+        strength: Option<DriveStrength>,
+        delay: Option<Delay>,
+    ) -> Self {
+        ContinuousAssignment {
+            lhs,
+            rhs,
+            strength,
+            delay,
+        }
     }
 
     /// The driven target, e.g. the `x` of `assign x = y;`.
@@ -60,26 +87,46 @@ impl ContinuousAssignment {
     pub fn strength(&self) -> Option<DriveStrength> {
         self.strength
     }
+
+    /// The delay between the driving expression moving and the net following
+    /// it, e.g. the `#10` of `assign #10 a = b;`.
+    pub fn delay(&self) -> Option<&Delay> {
+        self.delay.as_ref()
+    }
+
+    /// The three expressions of the delay, for a pass that rewrites the names
+    /// in them.
+    pub fn delay_mut(&mut self) -> Option<&mut Delay> {
+        self.delay.as_mut()
+    }
 }
 
 /// `assign x = y;`, optionally carrying a drive strength pair and any number of
 /// comma-separated targets: `assign (weak1, weak0) a = 1, b = 2;`.
 ///
-/// One `assign` is one strength pair shared by every target it names, the same
-/// way one declaration is one width shared by every name in its list. The pair
-/// is [`drive_strength`], the very production a gate primitive uses — an
-/// `assign` and a `bufif1` declare the same thing and resolve through the same
-/// [`resolve_bit`](crate::simulator::gates::resolve_bit).
+/// One `assign` is one strength pair and one delay shared by every target it
+/// names, the same way one declaration is one width shared by every name in
+/// its list. The pair is [`drive_strength`], the very production a gate
+/// primitive uses — an `assign` and a `bufif1` declare the same thing and
+/// resolve through the same
+/// [`resolve_bit`](crate::simulator::gates::resolve_bit) — and the delay is
+/// [`parse_gate_delay`], the same `delay3` a gate writes.
 pub fn parse_continuous_assignment(input: &str) -> IResult<&str, Vec<ContinuousAssignment>> {
     let (input, _) = ws(tag("assign"))(input)?;
-    let (mut input, strength) = opt(drive_strength)(input)?;
+    let (input, strength) = opt(drive_strength)(input)?;
+    let (mut input, delay) = opt(parse_gate_delay)(input)?;
 
     let mut assignments = Vec::new();
     loop {
         let (rest, lhs) = ws(assignment_lhs)(input)?;
         let (rest, _) = ws(char('='))(rest)?;
         let (rest, rhs) = verilog_expression(rest)?;
-        assignments.push(ContinuousAssignment::with_strength(lhs, rhs, strength));
+        assignments.push(ContinuousAssignment::with_timing(
+            lhs,
+            rhs,
+            strength,
+            delay.clone(),
+        ));
 
         match ws(char(','))(rest) {
             Ok((next, _)) => input = next,
@@ -636,6 +683,36 @@ mod tests {
         });
         assert_eq!(assignments[0].strength(), expected);
         assert_eq!(assignments[1].strength(), expected);
+    }
+
+    /// `assign #10 a = b;` — the delay sits between the keyword (and its
+    /// strength, if it named one) and the first target.
+    #[test]
+    fn test_continuous_assignment_carries_a_delay() {
+        assert_eq!(only("assign #10 a = b;").delay(), Some(&Delay::new(10)));
+        assert_eq!(
+            only("assign (pull1, pull0) #(2) a = b;").delay(),
+            Some(&Delay::new(2))
+        );
+        assert_eq!(
+            only("assign #(1, 2, 3) a = b;").delay(),
+            Some(&Delay::new(1))
+        );
+        assert_eq!(only("assign a = b;").delay(), None);
+    }
+
+    /// One `assign` is one delay shared by every target it names, the same way
+    /// it is one strength.
+    #[test]
+    fn test_continuous_assignment_list_shares_one_delay() {
+        let (remaining, assignments) =
+            parse_continuous_assignment("assign #(LAG) a = 1, b = 0;").unwrap();
+        assert!(remaining.is_empty());
+        let expected = Some(Delay::from_expression(Expression::Identifier(
+            Identifier::new("LAG".to_string()),
+        )));
+        assert_eq!(assignments[0].delay(), expected.as_ref());
+        assert_eq!(assignments[1].delay(), expected.as_ref());
     }
 
     #[test]

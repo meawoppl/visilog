@@ -337,6 +337,35 @@ impl EventWatch {
     }
 }
 
+/// What one continuous assignment carrying a `#delay` is driving, and what it
+/// is about to drive.
+///
+/// A delayed `assign` is still a continuous driver — it re-asserts its value on
+/// every propagation pass exactly as an undelayed one does. The only difference
+/// is *which* value: not the one its right hand side has now, but the one it
+/// had `#n` ago.
+#[derive(Clone, Debug, Default)]
+struct DelayedDrive {
+    /// What the assignment is driving at this instant. `None` until the first
+    /// transaction lands, which is what makes the net read `x` rather than the
+    /// `z` of a net nothing drives — something *is* driving it, it simply has
+    /// not said what yet.
+    applied: Option<Register>,
+    /// The value in flight and the time it lands.
+    pending: Option<(i64, Register)>,
+}
+
+impl DelayedDrive {
+    /// What the assignment will be driving once everything in flight has
+    /// landed, which is what a new value is compared against.
+    fn destination(&self) -> Option<&Register> {
+        self.pending
+            .as_ref()
+            .map(|(_, value)| value)
+            .or(self.applied.as_ref())
+    }
+}
+
 /// A parsed design, elaborated into signals and runnable blocks.
 pub struct Simulator {
     /// Every module the design may draw on. Only the top one is walked
@@ -347,6 +376,10 @@ pub struct Simulator {
     top: String,
     state: StateStore,
     assignments: Vec<ContinuousAssignment>,
+    /// One slot per entry in `assignments`, `None` for an assignment that named
+    /// no delay. Empty for a design that names none anywhere, which is what
+    /// keeps the question off the propagation hot path.
+    delays: Vec<Option<DelayedDrive>>,
     /// The design's gate primitives, which are continuous drivers and settle
     /// in the same fixpoint the assignments do.
     gates: Vec<Gate>,
@@ -398,6 +431,7 @@ impl Simulator {
             top: top.into(),
             state: StateStore::new(),
             assignments: Vec::new(),
+            delays: Vec::new(),
             gates: Vec::new(),
             udps: Vec::new(),
             resolved_nets: HashSet::new(),
@@ -424,6 +458,7 @@ impl Simulator {
     pub fn setup(&mut self) -> Result<(), SimulationError> {
         self.state = StateStore::new();
         self.assignments.clear();
+        self.delays.clear();
         self.gates.clear();
         self.udps.clear();
         self.resolved_nets.clear();
@@ -447,6 +482,16 @@ impl Simulator {
         let elaborated = elaborate(&self.modules, top)?;
         self.state = elaborated.state;
         self.assignments = elaborated.assignments;
+        // A design that names no delay on any `assign` keeps an empty vector,
+        // so the propagation loop asks nothing per pass.
+        self.delays = if self.assignments.iter().any(|a| a.delay().is_some()) {
+            self.assignments
+                .iter()
+                .map(|a| a.delay().map(|_| DelayedDrive::default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.gates = elaborated.gates;
         self.udps = elaborated.udps;
         self.resolved_nets = elaborated.resolved_nets;
@@ -467,10 +512,19 @@ impl Simulator {
             }
         }
 
+        // A delayed `assign` is driving from the first instant, and what it is
+        // driving before its first transaction lands is `x` — not the `z` of a
+        // net nothing drives. One pass puts that on the net and puts the first
+        // transaction in flight, both of which a block running at time zero can
+        // already see. It is deliberately conditional: settling unconditionally
+        // here would make a module that never converges fail at setup rather
+        // than when someone actually asks it to run.
+        if !self.delays.is_empty() {
+            self.propagate()?;
+        }
+
         // Drain time zero. This is a no-op for a module with no procedural
-        // blocks, which matters: settling unconditionally here would make a
-        // module that never converges fail at setup rather than when someone
-        // actually asks it to run.
+        // blocks, for the same reason.
         self.advance(0)?;
 
         Ok(())
@@ -765,7 +819,7 @@ impl Simulator {
         }
 
         let target = self.now + duration;
-        while let Some(time) = self.queue.peek_time() {
+        while let Some(time) = self.next_time() {
             if time > target {
                 break;
             }
@@ -778,6 +832,10 @@ impl Simulator {
             // Everything the resumptions below move is an edge for the settle
             // that follows them.
             self.state.clear_changes();
+            // A delayed `assign` whose transaction is due now starts driving
+            // its new value before anything runs, so a block scheduled for
+            // this instant reads the net as it is at this instant.
+            self.land_due_drives(time);
             let mut pending = Vec::new();
             let mut resumptions = 0;
 
@@ -813,6 +871,44 @@ impl Simulator {
         self.now = target;
         self.state.set_time(target);
         Ok(())
+    }
+
+    /// The next instant the design has something to do at: a queued block
+    /// resumption, or a delayed `assign` whose new value is due to land.
+    ///
+    /// A design that names no delay on an `assign` answers out of the queue
+    /// alone — `delays` is empty and the iterator ends immediately.
+    fn next_time(&self) -> Option<i64> {
+        let due = self
+            .delays
+            .iter()
+            .flatten()
+            .filter_map(|drive| drive.pending.as_ref().map(|(time, _)| *time))
+            .min();
+        match (self.queue.peek_time(), due) {
+            (Some(queued), Some(due)) => Some(queued.min(due)),
+            (queued, None) => queued,
+            (None, due) => due,
+        }
+    }
+
+    /// Moves every delayed `assign` transaction due at or before `time` onto
+    /// the value it drives.
+    ///
+    /// Nothing is written here: the assignment is a continuous driver, so the
+    /// value reaches the net through the very same
+    /// [`propagate`](Simulator::propagate) pass an undelayed one goes through.
+    fn land_due_drives(&mut self, time: i64) {
+        for drive in self.delays.iter_mut().flatten() {
+            let Some((at, _)) = &drive.pending else {
+                continue;
+            };
+            if *at > time {
+                continue;
+            }
+            let (_, value) = drive.pending.take().expect("the slot was just matched");
+            drive.applied = Some(value);
+        }
     }
 
     /// Resumes one block, queueing its continuation if it hits a delay. Returns
@@ -1004,12 +1100,45 @@ impl Simulator {
                     },
                 });
             }
-            for assignment in &self.assignments {
+            for (index, assignment) in self.assignments.iter().enumerate() {
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
                 // target is resolved before the right hand side is evaluated.
                 let target = resolve_target(&self.state, assignment.lhs())?;
-                let value = eval_sized(assignment.rhs(), &self.state, target.width(&self.state))?;
+                let width = target.width(&self.state);
+                let value = eval_sized(assignment.rhs(), &self.state, width)?;
+                // A delay does not stop the assignment being a continuous
+                // driver — it only changes which value it drives. The fresh
+                // one goes into flight; what comes out here is the one that
+                // has already landed.
+                let value = match self.delays.get_mut(index).and_then(Option::as_mut) {
+                    None => value,
+                    Some(_) => {
+                        let ticks = assignment
+                            .delay()
+                            .expect("a delay slot belongs to a delayed assignment")
+                            .ticks(&self.state)?;
+                        let drive = self.delays[index]
+                            .as_mut()
+                            .expect("the slot was just matched");
+                        // Inertial, not transport: a new value replaces
+                        // whatever was in flight rather than queueing behind
+                        // it, so a pulse shorter than the delay never reaches
+                        // the net at all.
+                        if drive.destination() != Some(&value) {
+                            if ticks == 0 {
+                                drive.applied = Some(value);
+                                drive.pending = None;
+                            } else {
+                                drive.pending = Some((self.now + ticks, value));
+                            }
+                        }
+                        match &drive.applied {
+                            Some(applied) => applied.clone(),
+                            None => Register::unknown(width),
+                        }
+                    }
+                };
                 // A net a gate also drives is resolved rather than written:
                 // the assignment is one driver of it, not the only one. An
                 // `assign` drives at `strong` unless it says otherwise, and
@@ -5673,5 +5802,131 @@ mod tests {
         );
 
         assert_eq!(error, SimulationError::UnknownScope("nowhere".to_string()));
+    }
+
+    /// A delay is an expression, so a clock generator may be written in terms
+    /// of the parameter that gives its period — which is how nearly every
+    /// design writes one.
+    #[test]
+    fn test_a_delay_expression_reads_the_parameter_it_names() {
+        let mut simulator = simulator_for(
+            r#"
+            module oscillator(output reg clk);
+                parameter PERIOD = 20;
+                initial clk = 1'b0;
+                always #(PERIOD / 2) clk = ~clk;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "0");
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "1");
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "0");
+    }
+
+    /// `#n` for a variable `n` is read when the block reaches it, not when the
+    /// block was compiled — so a design that changes `n` waits differently the
+    /// next time round.
+    #[test]
+    fn test_a_delay_naming_a_variable_is_read_when_it_is_waited_on() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer n;
+                initial begin
+                    n = 3;
+                    #n $display("%0t first", $time);
+                    n = 7;
+                    #n $display("%0t second", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).unwrap();
+        assert_eq!(simulator.output().text(), "3 first\n10 second\n");
+    }
+
+    /// `assign #10 a = b;` — the net follows its expression ten time units
+    /// later, and reads `x` until the first value lands. Measured against
+    /// iverilog 12.0.
+    #[test]
+    fn test_a_delayed_continuous_assignment_lands_after_its_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg b;
+                wire a;
+                assign #10 a = b;
+                initial begin
+                    $display("%0t a=%b", $time, a);
+                    b = 1;
+                    #5 $display("%0t a=%b", $time, a);
+                    #10 $display("%0t a=%b", $time, a);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(50).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 a=x\n5 a=x\n15 a=1\n");
+    }
+
+    /// The delay is **inertial**, not transport: a pulse shorter than the
+    /// delay never reaches the net, because the value in flight is replaced
+    /// rather than queued behind. Measured against iverilog 12.0.
+    #[test]
+    fn test_a_delayed_assignment_swallows_a_pulse_shorter_than_its_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg b;
+                wire a;
+                assign #10 a = b;
+                initial $monitor("%0t a=%b b=%b", $time, a, b);
+                initial begin
+                    b = 0;
+                    #20 b = 1;
+                    #5  b = 0;
+                    #40 b = 1;
+                    #20 b = 0;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(125).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "0 a=x b=0\n10 a=0 b=0\n20 a=0 b=1\n25 a=0 b=0\n\
+             65 a=0 b=1\n75 a=1 b=1\n85 a=1 b=0\n95 a=0 b=0\n"
+        );
+    }
+
+    /// A delay on an `assign` may be an expression naming a parameter, and a
+    /// comma-separated list shares it exactly as it shares a strength.
+    #[test]
+    fn test_a_delayed_assignment_list_shares_one_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                parameter LAG = 4;
+                reg d;
+                wire x, y;
+                assign #(LAG) x = d, y = ~d;
+                initial d = 1;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.get("x").unwrap().to_binary(), "x");
+        assert_eq!(simulator.get("y").unwrap().to_binary(), "x");
+
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.get("x").unwrap().to_binary(), "1");
+        assert_eq!(simulator.get("y").unwrap().to_binary(), "0");
     }
 }
