@@ -452,15 +452,42 @@ lands after the call has ended), an assignment to a signal outside the function,
 `$display` inside a function is the one worth revisiting — it needs an output sink the
 evaluator can reach.
 
+**An undriven net reads `z`; an untouched variable reads `x`.** The difference is not
+cosmetic — a variable with no assignment is unknown because nothing has *said* what it
+is, while a net with no driver is high-impedance because nothing is *driving* it, and a
+three-state bus depends on the distinction. `StateStore::declare_net` fills with `z` and
+`declare_signed` with `x`; `Port::net_type` is what picks between them, so `output reg q`
+is a variable while a plain `output` is a net. A `reg` in the *body* naming a port says
+the same thing and its declaration runs after the port's, overwriting the fill, so both
+spellings land on `x` with no special case. An array of nets gets the same treatment
+through `Memory::of_nets`.
+
+**`supply0`/`supply1` and `tri0`/`tri1` drive themselves.** They are held as
+`Elaborated::pulled_nets` and seeded as one more `Contribution` on every propagation pass
+— a `supply` at `supply` strength, a `tri0`/`tri1` at `pull` — rather than as a value
+written into the store, because a permanent driver is exactly what they are. The strength
+machinery then decides between them and everything else with no second rule: `tri0 c;
+assign c = d;` reads `0` while `d` is `z` and `1` once `d` is `1`, purely because `strong`
+outranks `pull`. A pulled net that is also a *port bound to a parent signal* has no entry
+of its own, so the pull is recorded against the entry it aliases — getting that wrong
+costs the design its elaboration rather than just its answer.
+
 **A signal can have more than one source, and `StateStore` says which one wins.**
 `assign v = e;` and `force v = e;` written *inside* a procedural block install a continuous
 drive that outlives the statement, `deassign` and `release` take it away again, and the
 rule is `force` beats procedural `assign` beats an ordinary write. That is `DriveLevel`,
-and `StateStore::permits_write` is where it is enforced — asked by `exec::drive_at`, which
+and `exec::held_bits` is where it is enforced — asked by `exec::drive_at`, which
 every assignment in the simulator goes through. A write that loses is **discarded**, not
 applied and overwritten a moment later: that is what keeps it out of the change journal,
 and so out of the edges that wake blocks. A design that forces nothing pays a
 `Vec::is_empty` for the question, the same shape `any_signed` and `any_memory` use.
+
+**Precedence is per *bit*, not per signal name.** `force r[1] = 1;` holds one bit and
+leaves the rest writable, so a whole-signal write over a partly forced signal is
+**masked** rather than refused: `r = 4'b1100` on a `reg [3:0]` forced at bit 1 leaves
+`1110`, and a bit select write drops only the held indices from the write rather than
+losing all of it. `held_bits` resolves a drive's target to bits — which is why it needs
+the store — and only does so when a drive is actually installed.
 
 The drives live on the store because a running procedural block is handed nothing else,
 and they are re-evaluated by `Simulator::propagate` alongside the module's own `assign`
@@ -470,10 +497,13 @@ expression when an operand moves. `propagate` holds them through `StateStore::dr
 `assign` underneath a `force` has to be able to see the force to know its own write goes
 nowhere.
 
-`release` puts back what the `force` displaced — still the signal's last *procedural*
-value, since writes made while it was forced never landed — unless a procedural `assign`
-is still installed, in which case that one takes over. iverilog reads the LRM the other
-way for a variable and leaves the forced value in place (corpus `pr1477190`).
+**A `release` puts nothing back**, and the asymmetry that follows is the whole rule: a
+**net** reverts because its continuous drivers reach it again on the next pass, while a
+**variable** has no driver and so keeps the value the force left it holding. A releasing
+`reg` forced to `1010` stays `1010`; a releasing `wire` returns to its assignment. That
+is what iverilog does, and it is why there is no "displaced value" recorded anywhere — a
+`release` simply removes the drive, unless a procedural `assign` is still installed
+underneath, in which case that one takes over.
 
 **A task is inlined where it is enabled, which is what makes a `#delay` inside one
 work.** `task load; input [7:0] a; output [7:0] b; b = a + 1; endtask` parses in the same
@@ -524,9 +554,7 @@ Still unsupported: `disable` (both `disable <task>` and the named-block form —
 block that has already suspended is not something a program counter alone can express);
 a hierarchical enable (`instance.task(…)`); a task enabled from inside a `function`, which
 is rejected by the function body analysis rather than by a check of its own; and
-concatenation as an assignment target. A drive is also tracked per signal *name* rather than per bit, so
-`force bus[0] = 1;` blocks a write to `bus[1]` as well — corpus `pr1832097a`, `pr245`,
-`pr527` and the `_pv` pair are that one gap. `signals.rs` is built but still unwired.
+concatenation as an assignment target. `signals.rs` is built but still unwired.
 
 **A block can suspend on the design as well as on the clock, and `Resume::Waiting` is
 how.** `wait (c) S` and `@(posedge clk) S` are both suspensions that no timestamp brings
@@ -827,7 +855,7 @@ dying on unfamiliar syntax several lines earlier.
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, and `Program::compile_block` / `rename_range`, which give a named block's variables their scope |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, and `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `permits_write` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -1315,6 +1343,29 @@ tripwire.
   already resolved its own names — renaming it again would re-point what it read.
   That is the same rule `rename_local` follows, over a range instead of the whole
   program.
+- **A replication is held, not expanded.** `{N{a, b}}` is `Expression::Replication`
+  rather than an eagerly repeated `Concatenation`, because the count is a full expression
+  and may name a parameter — and because `{16384{4'b1001}}` appears in the corpus.
+  `replication` is tried before the plain concatenation, since `{a` starts both and only
+  the brace after the first expression tells them apart. A count of zero contributes no
+  bits, which is legal only inside a wider concatenation and is exactly where it lands; a
+  non-constant count is a **named** error, and an absurd one is refused by the same
+  `MAX_SELECT_WIDTH` guard a nonsense part select uses.
+- **An indexed part select is its own node because only its *width* is constant.**
+  `a[base +: width]` and `a[base -: width]` are `Expression::IndexedPartSelect`, not a
+  desugared `PartSelect`: the base may be any expression, including one that moves during
+  the run, which is the whole reason the operator exists. `indexed_select_width` and
+  `indexed_select_indices` are shared by the evaluator and by `resolve_target`, so reading
+  and writing a select can never disagree about which bits it names. An unknown *base*
+  selects `x` when read — that is what a vector indexed by an unknown holds — but is a
+  named error as an assignment *target*, since a write would have nowhere to land.
+  `indexed_part_select` is tried before `part_select`, which would otherwise read the `:`
+  of `+:` as its own separator.
+- **`resolve_target` guards its part-select width, and must keep doing so.** A range like
+  `a[1000000:0]` names more bits than any register has; the evaluator always refused it,
+  and the *write* path did not, so once enough designs elaborated to reach it one asked
+  for a 34 GB allocation and aborted the whole test harness. Both halves now check
+  `MAX_SELECT_WIDTH` before collecting indices.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow
