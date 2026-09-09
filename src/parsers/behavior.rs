@@ -191,6 +191,13 @@ pub enum SystemTaskArgument {
     SystemFunction(String),
     /// An ordinary expression.
     Expression(Expression),
+    /// A slot with nothing in it: the gap in `$display("a",, b)`.
+    ///
+    /// Not a no-op — it renders as exactly one space, which is how a design
+    /// separates two values without a format string. It has to be a variant
+    /// rather than an absence, because dropping it would silently close the
+    /// gap it exists to make.
+    Empty,
 }
 
 /// `$display("count = %0d", count);` — a system task call, named without its
@@ -470,11 +477,17 @@ fn bare_system_function(input: &str) -> IResult<&str, String> {
     terminated(system_name, peek(not(char('('))))(input)
 }
 
+/// One argument, or the empty slot between two commas.
+///
+/// The empty alternative is last and matches without consuming anything, so it
+/// only wins where nothing else could — which is exactly the `,,` gap and the
+/// `$display(,)` edge case.
 fn system_task_argument(input: &str) -> IResult<&str, SystemTaskArgument> {
     alt((
         map(parse_verilog_string, SystemTaskArgument::String),
         map(bare_system_function, SystemTaskArgument::SystemFunction),
         map(verilog_expression, SystemTaskArgument::Expression),
+        |rest| Ok((rest, SystemTaskArgument::Empty)),
     ))(input)
 }
 
@@ -482,10 +495,18 @@ fn system_task_argument(input: &str) -> IResult<&str, SystemTaskArgument> {
 /// The argument list is optional, and may be empty.
 pub fn parse_system_task(input: &str) -> IResult<&str, SystemTaskCall> {
     let (input, name) = ws(system_name)(input)?;
-    let (input, arguments) = opt(delimited(
+    // An empty *list* — `$finish()` — is told from an empty *argument* by the
+    // `)` arriving first. Without that, `system_task_argument`'s always-matching
+    // empty alternative would read `()` as one blank argument and print a space.
+    let (input, arguments) = opt(preceded(
         ws(char('(')),
-        separated_list0(char(','), ws(system_task_argument)),
-        ws(char(')')),
+        alt((
+            map(ws(char(')')), |_| Vec::new()),
+            terminated(
+                separated_list1(char(','), ws(system_task_argument)),
+                ws(char(')')),
+            ),
+        )),
     ))(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
