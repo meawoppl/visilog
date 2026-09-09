@@ -151,14 +151,17 @@ impl Gate {
 
 /// The bit a terminal connection carries: the least significant one, or `x`
 /// for the empty register a zero-width expression produces.
-fn least_significant_bit(value: &Register) -> u8 {
+///
+/// A user-defined primitive reads its terminals the same way, which is why
+/// this and [`as_level`] are shared rather than written twice.
+pub(crate) fn least_significant_bit(value: &Register) -> u8 {
     value.bit_from_lsb(0).unwrap_or(X)
 }
 
 /// `z` read as a *level*. A gate's input is a voltage, and a floating one is
 /// not something it can tell from an unknown — which is why `buf` turns a `z`
 /// into an `x` where a switch passes it straight through.
-fn as_level(code: u8) -> u8 {
+pub(crate) fn as_level(code: u8) -> u8 {
     if code == Z {
         X
     } else {

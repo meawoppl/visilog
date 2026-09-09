@@ -52,7 +52,9 @@ use crate::parsers::{
     },
     nets::NetType as WireKind,
     operators::BinaryOperator,
+    primitive::UdpTable,
     simple::Range,
+    specify::{SpecParam, SpecParamValue},
     statements::ModuleStatement,
 };
 use crate::register::{Register, ONE, ZERO};
@@ -66,6 +68,7 @@ use crate::simulator::program::{
 };
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+use crate::simulator::udp::Udp;
 
 /// A function body prints into a [`TaskContext`](crate::simulator::tasks::TaskContext)
 /// nobody reads — a call happens inside an expression, and an expression has no
@@ -171,6 +174,9 @@ pub struct Elaborated {
     /// The gate primitives, which are continuous drivers and settle in the
     /// same fixpoint the assignments do.
     pub gates: Vec<Gate>,
+    /// The user-defined primitives, which are continuous drivers beside the
+    /// gates and settle in the same fixpoint.
+    pub udps: Vec<Udp>,
     /// The names a gate drives. Those nets are *resolved* between all their
     /// continuous drivers instead of being written by whichever one ran last,
     /// which is the only way a three-state bus or a `pullup` can mean
@@ -211,6 +217,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             state: StateStore::new(),
             assignments: Vec::new(),
             gates: Vec::new(),
+            udps: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
@@ -380,6 +387,18 @@ impl<'m> Elaborator<'m> {
             ));
         }
         self.stack.push(index);
+
+        // A user-defined primitive is a module as far as instantiation and port
+        // binding go, and nothing else: its whole body is the table, so none of
+        // the passes below have anything to walk.
+        if let Some(table) = primitive_table(module) {
+            for port in &module.ports {
+                self.declare_port(port, scope)?;
+            }
+            self.build_udp(module, table, scope)?;
+            self.stack.pop();
+            return Ok(());
+        }
 
         // Declarations first, in several passes, so that an instantiation can
         // connect to a net declared further down the file — Verilog puts no
@@ -1118,7 +1137,45 @@ impl<'m> Elaborator<'m> {
                     }
                 }
             }
+            ModuleStatement::SpecifyBlock(block) => {
+                // A `specparam` is a constant like a `parameter`, and the module
+                // around the block may name it — so it is declared rather than
+                // discarded. The paths and the timing checks beside it are
+                // recorded by the parser and never reach the simulation; see
+                // `parsers/specify.rs` for why.
+                for parameter in &block.specparams {
+                    self.declare_specparam(parameter, scope)?;
+                }
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Declares one `specparam` as the constant it is.
+    ///
+    /// A real-valued one declares *nothing*: there is no four-state value to
+    /// declare it with, and the only thing that could read one is the path
+    /// delay that is not simulated anyway. A design that names it in an
+    /// ordinary expression reports the name as unknown, which is the same
+    /// answer it gets for a `real` variable it tries to use.
+    fn declare_specparam(
+        &mut self,
+        parameter: &SpecParam,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        let SpecParamValue::Expression(expression) = &parameter.value else {
+            return Ok(());
+        };
+        let value = eval(&renamed(expression, scope), &self.out.state)?;
+        let name = scope.qualified(&parameter.name.name);
+        match &parameter.range {
+            Some(range) => {
+                let range = self.resolve_range(range, scope)?;
+                let value = value.coerced(range_width(range));
+                self.out.state.set_ranged(name, value, range);
+            }
+            None => self.out.state.set(name, value),
         }
         Ok(())
     }
@@ -1255,6 +1312,46 @@ impl<'m> Elaborator<'m> {
             code,
             strength,
         });
+    }
+
+    /// Elaborates one user-defined primitive instance into the flat driver
+    /// list.
+    ///
+    /// A UDP's terminals are its ports, so they are already bound: the output
+    /// is the first one and the inputs are the rest, each resolved through the
+    /// scope the way any other name in this instance is.
+    fn build_udp(
+        &mut self,
+        module: &VerilogModule,
+        table: &UdpTable,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        // A sequential UDP asks about the previous value of an input and keeps
+        // a register of its own. A continuous driver is handed neither, so it
+        // stops here by name rather than driving something plausible.
+        if table.sequential {
+            return Err(SimulationError::SequentialPrimitive(
+                module.identifier.name.clone(),
+            ));
+        }
+        let mut terminals = module.ports.iter().map(|port| {
+            Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)))
+        });
+        // The parser guarantees an output followed by at least one input.
+        let output = terminals.next().expect("a primitive declares an output");
+        let inputs: Vec<Expression> = terminals.collect();
+        // A UDP drives its net the way a gate does, so that net is resolved
+        // between all of its drivers rather than written by the last one.
+        if let Some(name) = assigned_name(&output) {
+            self.out.resolved_nets.insert(name.to_string());
+        }
+        self.out.udps.push(Udp {
+            name: module.identifier.name.clone(),
+            output,
+            inputs,
+            table: table.clone(),
+        });
+        Ok(())
     }
 
     /// Records a gate and the nets it drives, which are the ones that have to
@@ -1754,6 +1851,21 @@ fn analyse_function_body(
 /// `z` because nothing is driving it.
 fn port_is_variable(port: &Port) -> bool {
     matches!(port.net_type, Some(NetType::Reg))
+}
+
+/// The table of a user-defined primitive, or `None` for an ordinary module.
+///
+/// A UDP is parsed into a [`VerilogModule`] so that instantiation and port
+/// binding need no notion of one; the single table statement is the only thing
+/// that tells them apart, and this is where that question is asked.
+fn primitive_table(module: &VerilogModule) -> Option<&UdpTable> {
+    module
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            ModuleStatement::PrimitiveTable(table) => Some(table),
+            _ => None,
+        })
 }
 
 /// The signal an assignment target writes, or `None` when the target is not
@@ -3731,6 +3843,31 @@ mod tests {
         assert_eq!(elaborated.state.memory("a.mem").unwrap().depth(), 8);
         assert_eq!(elaborated.state.memory("b.mem").unwrap().depth(), 8);
         assert!(elaborated.state.memory("mem").is_none());
+    }
+
+    /// A `specparam` is a constant the whole module may name, so it is
+    /// declared like a parameter — the one thing inside a `specify` block that
+    /// is not inert. The paths beside it change only *when* a value arrives,
+    /// which this simulator has no model for, so they record and do nothing.
+    #[test]
+    fn test_a_specparam_is_declared_as_a_constant() {
+        let modules = parse_all(&[r#"
+            module gate(input a, output [7:0] z);
+                specify
+                    specparam tRise = 6, tFall = 7;
+                    specparam holdoff = 0.9;
+                    (a => z) = (tRise, tFall);
+                endspecify
+                assign z = tRise + tFall;
+            endmodule
+        "#]);
+        let elaborated = elaborate(&modules, 0).expect("design should elaborate");
+
+        assert_eq!(elaborated.state.get("tRise").unwrap().to_u128(), Some(6));
+        assert_eq!(elaborated.state.get("tFall").unwrap().to_u128(), Some(7));
+        // A real value is not something a four-state register can hold, so it
+        // declares nothing at all rather than a rounded stand-in.
+        assert!(elaborated.state.get("holdoff").is_none());
     }
 
     /// A dimension nothing could allocate is a named error rather than an

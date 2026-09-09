@@ -115,14 +115,14 @@ fn parse_port_names(input: &str) -> IResult<&str, Vec<Identifier>> {
 /// `Vec<Port>` by [`reconcile_ports`] before the module is handed on, so
 /// nothing downstream has to know which one was written.
 #[derive(Debug, PartialEq)]
-enum PortHeader {
+pub(crate) enum PortHeader {
     /// `module m(input wire [3:0] a);` — direction and width in the header.
     Ansi(Vec<Port>),
     /// `module m(a, b);` — names only.
     NonAnsi(Vec<Identifier>),
 }
 
-fn parse_port_header(input: &str) -> IResult<&str, PortHeader> {
+pub(crate) fn parse_port_header(input: &str) -> IResult<&str, PortHeader> {
     alt((
         map(parse_ports, PortHeader::Ansi),
         map(parse_port_names, PortHeader::NonAnsi),
@@ -186,7 +186,7 @@ fn check_unique(names: &[Identifier]) -> Result<(), PortReconciliationError> {
 /// A `reg` declaration that names a port is *not* one of `declared` — it is an
 /// ordinary body statement, and an output backed by a register is exactly what
 /// it means — so it is neither a conflict nor a second port here.
-fn reconcile_ports(
+pub(crate) fn reconcile_ports(
     header: PortHeader,
     declared: Vec<Port>,
 ) -> Result<Vec<Port>, PortReconciliationError> {

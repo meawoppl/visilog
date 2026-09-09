@@ -22,7 +22,9 @@ use super::{
     },
     nets::{net_declaration, Net},
     parameter::{parse_parameter_declaration, ParameterDeclaration},
+    primitive::UdpTable,
     register::{parse_register_declaration, RegisterDeclaration},
+    specify::{parse_specify_block, SpecifyBlock},
 };
 
 #[derive(Debug, PartialEq)]
@@ -64,6 +66,14 @@ pub enum ModuleStatement {
     /// since one statement may declare several.
     GateInstantiation(Vec<GateInstantiation>),
     ModuleInstantiation(ModuleInstantiation),
+    /// `specify … endspecify` — module path delays, timing checks and the
+    /// `specparam`s written with them. Only the specparams reach the
+    /// simulation; see `specify.rs` for why the rest cannot.
+    SpecifyBlock(SpecifyBlock),
+    /// The `table … endtable` of a `primitive`. It is deliberately *not* one of
+    /// the alternatives below: a table is legal only inside a UDP, and a UDP is
+    /// parsed by `primitive.rs` into a module whose one statement is this.
+    PrimitiveTable(UdpTable),
 }
 
 pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
@@ -108,6 +118,7 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
             map(parse_continuous_assignment, |d| {
                 ModuleStatement::Assignment(d)
             }),
+            map(parse_specify_block, |d| ModuleStatement::SpecifyBlock(d)),
             // A gate primitive is keyword led — `and g1 (…)` — so it must be
             // tried *before* the module instantiation below, which would
             // otherwise read the keyword as a module name.
