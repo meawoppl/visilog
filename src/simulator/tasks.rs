@@ -197,6 +197,10 @@ impl TaskCall {
             .iter()
             .map(|argument| match argument {
                 SystemTaskArgument::String(text) => Ok(TaskArgument::Text(text.clone())),
+                // An empty slot renders as exactly one space — that is the
+                // whole of what `$display("a",, b)` uses it for — so it is a
+                // one-character literal and nothing downstream has to know.
+                SystemTaskArgument::Empty => Ok(TaskArgument::Text(" ".to_string())),
                 SystemTaskArgument::Expression(expression) => {
                     Ok(TaskArgument::Value(expression.clone()))
                 }

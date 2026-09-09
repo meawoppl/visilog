@@ -1399,6 +1399,54 @@ mod tests {
         );
     }
 
+    /// An empty argument slot renders as exactly one space, which is how a
+    /// design separates two values without a format string. Arguments are
+    /// otherwise concatenated with no separator at all.
+    ///
+    /// iverilog 12.0 prints, for the same five calls:
+    /// `x y`, ` 3  5`, `A  B`, two spaces, and `end:  3`.
+    #[test]
+    fn test_empty_task_arguments_are_one_space() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [3:0] a, b;
+                initial begin
+                    a = 4'd3;
+                    b = 4'd5;
+                    $display("x",,"y");
+                    $display(a,,b);
+                    $display("A",,,"B");
+                    $display(,);
+                    $display("end:",, a);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "x y\n 3  5\nA  B\n  \nend:  3\n");
+    }
+
+    /// An empty argument *list* is not one empty argument: `$finish()` takes
+    /// none, and printing a space for it would be a lie about what was written.
+    #[test]
+    fn test_an_empty_argument_list_prints_nothing() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                initial begin
+                    $display();
+                    $display("after");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "\nafter\n");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
