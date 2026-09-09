@@ -1000,7 +1000,10 @@ in eight bits is `-1.0` and not `255.0`. An assignment **rounds half away from z
 and `$itor` rounds because its argument is an integer (`$itor(10.5)` is 11.0). The
 conversion is made at the *target's* width, so a `reg [64:0]` holds `2**64` (corpus
 `pr2913404`), and an infinity or a NaN converts to `x` — the only four-state answer for a
-value with no whole number in it. `$realtime`, `$realtobits` and `$bitstoreal` round out the
+value with no whole number in it. It also happens *before* a `ResolvedTarget::Parts` is
+split, because a concatenation is a run of bits however its parts were declared:
+`{a, b} = 2.5;` splits the integer 3, where slicing the IEEE-754 encoding would put a piece
+of an exponent in each part. `$realtime`, `$realtobits` and `$bitstoreal` round out the
 set; `$bits` of a real reports **64**, where iverilog reports 1, because sixty-four is what
 `$realtobits` hands back.
 

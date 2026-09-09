@@ -145,9 +145,9 @@ impl ResolvedTarget {
             ResolvedTarget::Word { name, .. } => {
                 state.memory(name).is_some_and(|memory| memory.is_real())
             }
-            ResolvedTarget::Bits { .. }
-            | ResolvedTarget::Event(_)
-            | ResolvedTarget::Parts(_) => false,
+            ResolvedTarget::Bits { .. } | ResolvedTarget::Event(_) | ResolvedTarget::Parts(_) => {
+                false
+            }
         }
     }
 }

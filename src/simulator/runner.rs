@@ -2153,6 +2153,34 @@ mod tests {
         assert_eq!(simulator.output().text(), "t0: y=0011 a=0\n");
     }
 
+    /// A concatenation is a run of bits however its parts were declared, so a
+    /// real written into one is **converted to an integer first and then
+    /// split** — slicing the IEEE-754 encoding would put a piece of an exponent
+    /// in each part. It is converted at the concatenation's own width, so
+    /// `258.6` wraps in eight bits exactly as `259` would. iverilog 12.0 prints
+    /// `a=0 b=3` for both.
+    #[test]
+    fn test_a_real_written_into_a_concatenation_is_converted_first() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [3:0] a, b;
+                real r;
+                initial begin
+                    r = 2.5;
+                    {a, b} = r;
+                    $display("a=%0d b=%0d", a, b);
+                    {a, b} = 258.6;
+                    $display("a=%0d b=%0d", a, b);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "a=0 b=3\na=0 b=3\n");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
