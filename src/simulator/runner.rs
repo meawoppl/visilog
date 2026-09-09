@@ -1476,6 +1476,40 @@ mod tests {
         );
     }
 
+    /// An ANSI parameter port list declares ordinary parameters, so an
+    /// override reaches them and a port width made of one resolves.
+    ///
+    /// iverilog 12.0 prints `a=1 b=2 c=-3 w=2` then `a=3 b=9 c=-3 w=4`.
+    #[test]
+    fn test_ansi_parameter_ports() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module dut #(parameter a = 1, b = 2, parameter signed [7:0] c = -3)
+                        (output [a:0] q);
+                assign q = 0;
+                initial $display("a=%0d b=%0d c=%0d w=%0d", a, b, c, $bits(q));
+            endmodule
+            module tb;
+                wire [1:0] q1;
+                wire [3:0] q2;
+                dut d1 (q1);
+                dut #(.a(3), .b(9)) d2 (q2);
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(1).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().text(),
+            "a=1 b=2 c=-3 w=2\na=3 b=9 c=-3 w=4\n"
+        );
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
