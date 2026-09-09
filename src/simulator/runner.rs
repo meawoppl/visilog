@@ -1447,6 +1447,35 @@ mod tests {
         assert_eq!(simulator.output().text(), "\nafter\n");
     }
 
+    /// A string is legal wherever a value is: as a parameter's value, as a
+    /// comparison operand, and inside a concatenation.
+    ///
+    /// iverilog 12.0 prints `s=464f4f s=FOO NAME=test` and then `eq works`.
+    #[test]
+    fn test_string_literals_simulate() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                parameter NAME = "test";
+                reg [39:0] y;
+                reg [23:0] s;
+                initial begin
+                    s = "FOO";
+                    y = "hello";
+                    $display("s=%h s=%s NAME=%s", s, s, NAME);
+                    if (y === "hello") $display("eq works");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "s=464f4f s=FOO NAME=test\neq works\n"
+        );
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
