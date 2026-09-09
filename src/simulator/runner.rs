@@ -904,8 +904,9 @@ mod tests {
     fn test_simple_module_example() {
         let mut simulator = simulator_for_example("simple_module.v");
 
-        // Every signal starts out unknown, at its declared width.
-        assert_eq!(simulator.get("sum").unwrap().to_binary(), "xxxx");
+        // `sum` is a net with nothing driving it yet, so it starts `z` at its
+        // declared width. A variable would start `x` instead.
+        assert_eq!(simulator.get("sum").unwrap().to_binary(), "zzzz");
 
         simulator.set_input("a", Register::from_u128(3, 4)).unwrap();
         simulator.set_input("b", Register::from_u128(5, 4)).unwrap();
@@ -1028,8 +1029,10 @@ mod tests {
             .unwrap();
         simulator.run().unwrap();
 
-        // Bit 1 is never driven and stays unknown.
-        assert_eq!(simulator.get("out").unwrap().to_binary(), "10x1");
+        // Bit 1 has no driver, so it reads `z` — `out` is a net, and an
+        // undriven net is high-impedance rather than unknown. iverilog prints
+        // `10z1` for this module.
+        assert_eq!(simulator.get("out").unwrap().to_binary(), "10z1");
     }
 
     /// An indexed part select works as an assignment target, not just as a
@@ -1052,6 +1055,38 @@ mod tests {
         simulator.run().unwrap();
 
         assert_eq!(simulator.get("out").unwrap().to_binary(), "0110");
+    }
+
+    /// An undriven **net** reads `z` while an untouched **variable** reads
+    /// `x`. The difference is not cosmetic: a variable with no assignment is
+    /// unknown because nothing has said what it is, while a net with no driver
+    /// is high-impedance because nothing is driving it.
+    ///
+    /// iverilog 12.0 prints `out=10z1 standalone=z avariable=x` for the
+    /// equivalent design.
+    #[test]
+    fn test_undriven_nets_read_z_and_variables_read_x() {
+        let mut simulator = simulator_for(
+            r#"
+            module m(input [1:0] hi, output [3:0] out, output reg q);
+                wire standalone;
+                reg  avariable;
+                assign out[3:2] = hi;
+                assign out[0] = 1'b1;
+            endmodule
+        "#,
+        );
+
+        simulator
+            .set_input("hi", Register::from_binary("10"))
+            .unwrap();
+        simulator.run().unwrap();
+
+        assert_eq!(simulator.get("out").unwrap().to_binary(), "10z1");
+        assert_eq!(simulator.get("standalone").unwrap().to_binary(), "z");
+        assert_eq!(simulator.get("avariable").unwrap().to_binary(), "x");
+        // `output reg q` is a variable however it is spelled.
+        assert_eq!(simulator.get("q").unwrap().to_binary(), "x");
     }
 
     #[test]
