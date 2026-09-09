@@ -1020,6 +1020,30 @@ whole number and printed as narrowly as it goes, and decimal renders the *number
 every other base renders the sixty-four bit two's complement integer — `%0d` of `-0.4` is
 `-0` and `%0x` of it is `0` (corpus `br1029a`). `%s` of a real is an error: there are no
 characters in an IEEE-754 encoding.
+
+**`%c`, `%v` and `%m` are the three specifiers that are not about a number.** `%c` is the
+low eight bits as a character. `%m` is the *hierarchical name of the scope the call sits
+in* — `top`, `top.dut`, `top.dut.blk`, `top.dut.load` inside a task — and it takes no
+argument at all, so it is answered before one is fetched. It is settled when the design is
+elaborated and is a constant from then on, which is why it arrives in two halves: `Program`
+stamps the *block* path it is already carrying as it compiles, and `elaborate` puts the
+instance path in front through `Program::qualify_scopes` once it knows which instance the
+block belongs to. A spliced task body is skipped there for the reason `rename_local` skips
+it — it was qualified when the task was compiled, and doing it twice would prefix it twice.
+
+**`%v` is a strength, and only two of them can be told from a value.** A `z` bit is driven
+by nothing, which is `HiZ`; every other bit reports `St`, because an ordinary continuous
+assignment and a gate both drive at `strong`. A `pullup`, a `tri0`/`tri1` or an
+`assign (pull1, strong0)` really is weaker and this prints `St1` where iverilog prints
+`Pu1` — `StateStore` keeps a *value* per signal and not a strength, so there is nothing to
+read the difference from. Corpus `multi_bit_strength` is exactly that gap, and closing it
+means carrying a strength per bit through `resolve_contributions`.
+
+**A string is a value wherever a number is wanted.** `$display("%d", "A")` is 65:
+`TaskArgument::Text` reaches a numeric format as its own bytes, eight bits a character.
+A string argument is held as text rather than as an expression because a task has to try
+the *format string* reading of one first, and that is the only reason the two ever needed
+telling apart.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
@@ -1030,7 +1054,7 @@ characters in an IEEE-754 encoding.
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
-| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |

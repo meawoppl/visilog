@@ -297,6 +297,14 @@ impl Scope {
         }
     }
 
+    /// The hierarchical name of `block` written inside this scope, which is
+    /// what `%m` prints: the top module's own name, then the instance path,
+    /// then the named blocks. `""` is the module scope itself.
+    fn hierarchy(&self, block: &str) -> String {
+        let path = format!("{}{}{}", self.root_name, self.prefix, block);
+        path.trim_end_matches('.').to_string()
+    }
+
     fn is_root(&self) -> bool {
         self.prefix.is_empty() && self.locals.is_empty()
     }
@@ -866,7 +874,13 @@ impl<'m> Elaborator<'m> {
             let mut deferred = Vec::new();
             for task in pending {
                 match compile_task(task, &tasks) {
-                    Ok(definition) => {
+                    Ok(mut definition) => {
+                        // A task's body is spliced into every enable of it, so
+                        // its `%m` is qualified here — once, where the instance
+                        // is known — rather than at each of them.
+                        definition
+                            .program
+                            .qualify_scopes(&|block| scope.hierarchy(block));
                         tasks.insert(task.name.name.clone(), definition);
                     }
                     // The task it enables may be one this pass has not reached
@@ -1669,6 +1683,7 @@ impl<'m> Elaborator<'m> {
             ModuleStatement::AlwaysBlock(block) => {
                 self.declare_block_locals(&block.statements, scope, "")?;
                 let mut program = Program::compile(&block.statements, tasks)?;
+                program.qualify_scopes(&|block| scope.hierarchy(block));
                 if !scope.genvars.is_empty() {
                     program
                         .substitute(&|expression| substitute_genvars(expression, &scope.genvars));
@@ -1725,6 +1740,7 @@ impl<'m> Elaborator<'m> {
             ModuleStatement::InitialBlock(block) => {
                 self.declare_block_locals(&block.statements, scope, "")?;
                 let mut program = Program::compile(&block.statements, tasks)?;
+                program.qualify_scopes(&|block| scope.hierarchy(block));
                 if !scope.genvars.is_empty() {
                     program
                         .substitute(&|expression| substitute_genvars(expression, &scope.genvars));

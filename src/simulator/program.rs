@@ -618,6 +618,37 @@ impl Program {
         }
     }
 
+    /// Puts the instance path in front of the block path every `%m` in this
+    /// program carries, which is the half of a scope name only `elaborate`
+    /// knows.
+    ///
+    /// It leaves a spliced task body alone for the reason
+    /// [`rename_local`](Program::rename_local) does: that body was qualified
+    /// when the task was compiled, and doing it twice would put the instance
+    /// path on twice.
+    pub fn qualify_scopes(&mut self, hierarchy: &dyn Fn(&str) -> String) {
+        let skip: Vec<(usize, usize)> = self.inlined.clone();
+        let mut skipping = skip.iter().peekable();
+        let mut index = 0;
+        while index < self.instructions.len() {
+            if let Some((start, end)) = skipping.peek() {
+                if index >= *end {
+                    skipping.next();
+                    continue;
+                }
+                if index == *start {
+                    index = *end;
+                    skipping.next();
+                    continue;
+                }
+            }
+            if let Instruction::Task(call) = &mut self.instructions[index] {
+                call.qualify_scope(hierarchy);
+            }
+            index += 1;
+        }
+    }
+
     /// Rewrites the names this program's *own* statements use, leaving the
     /// instructions spliced in from a task's body untouched.
     ///
@@ -802,7 +833,11 @@ impl Program {
                 // design runs, so an unrecognised one fails before it can look
                 // like a task that quietly printed nothing.
                 ProceduralStatements::SystemTask(call) => {
-                    let call = TaskCall::compile(call)?;
+                    let mut call = TaskCall::compile(call)?;
+                    // The block path this statement sits in is what `%m`
+                    // prints, and this is the only place it is known: the
+                    // scope walks down with the named blocks as they compile.
+                    call.set_scope(scope);
                     self.emit(Instruction::Task(call));
                 }
             }

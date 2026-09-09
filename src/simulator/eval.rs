@@ -1247,7 +1247,7 @@ fn string_width(text: &str) -> usize {
 
 /// A string literal as bits. Unsigned: it is a vector of bytes, not a number
 /// anyone declared a sign for.
-fn string_bits(text: &str) -> Register {
+pub(crate) fn string_bits(text: &str) -> Register {
     let mut bits = Vec::with_capacity(string_width(text));
     if text.is_empty() {
         return Register::from_u128(0, 8);

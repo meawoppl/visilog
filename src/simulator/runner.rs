@@ -5020,6 +5020,51 @@ mod tests {
         }
     }
 
+    /// `%m` is the hierarchical name of the scope the call sits in: the top
+    /// module, then the instance path, then the named blocks and the task. It
+    /// takes no argument — the scope is settled when the design is elaborated
+    /// and is a constant from then on. Every line here was measured from
+    /// iverilog 12.0.
+    #[test]
+    fn test_the_scope_format_names_the_hierarchy() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module sub;
+                initial begin
+                    $display("in sub: %m");
+                    t;
+                end
+                task t;
+                    $display("in task: %m");
+                endtask
+            endmodule
+            module top;
+                sub s();
+                initial begin
+                    $display("top: %m");
+                    begin : blk
+                        $display("block: %m");
+                    end
+                end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("design should run");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "in sub: top.s",
+                "in task: top.s.t",
+                "top: top",
+                "block: top.blk"
+            ]
+        );
+    }
+
     /// A procedural `assign` gives a variable a second source, and it is the
     /// one that wins: an ordinary write while it is installed goes nowhere.
     /// `deassign` takes it away and hands the variable back.

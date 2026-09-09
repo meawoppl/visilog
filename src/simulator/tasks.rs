@@ -26,7 +26,7 @@ use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
 use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
-use crate::simulator::eval::{eval, SYSTEM_FUNCTIONS};
+use crate::simulator::eval::{eval, string_bits, SYSTEM_FUNCTIONS};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 
@@ -203,6 +203,16 @@ pub enum TaskArgument {
 pub struct TaskCall {
     task: SystemTask,
     arguments: Vec<TaskArgument>,
+    /// The hierarchical name of the scope the call was written in, which is
+    /// what `%m` prints: `top`, `top.dut`, `top.dut.blk`, `top.dut.load` for
+    /// one inside task `load`.
+    ///
+    /// It is filled in twice, because the two halves are known in two places:
+    /// `Program::compile` stamps the *block* path it is already carrying, and
+    /// `elaborate` puts the instance path in front of it once it knows which
+    /// instance the block belongs to. A call that never reaches elaboration —
+    /// which is only ever a test — keeps the block path alone.
+    scope: String,
 }
 
 impl TaskCall {
@@ -242,7 +252,23 @@ impl TaskCall {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(TaskCall { task, arguments })
+        Ok(TaskCall {
+            task,
+            arguments,
+            scope: String::new(),
+        })
+    }
+
+    /// Records the block path this call sits in — what `%m` prints, before the
+    /// instance in front of it is known.
+    pub fn set_scope(&mut self, scope: &str) {
+        self.scope = scope.trim_end_matches('.').to_string();
+    }
+
+    /// Puts the instance path in front of the block path, which is the other
+    /// half of `%m` and the half only `elaborate` knows.
+    pub fn qualify_scope(&mut self, hierarchy: &dyn Fn(&str) -> String) {
+        self.scope = hierarchy(&self.scope);
     }
 
     /// Rewrites every signal the call reads through `resolve`, so a call inside
@@ -522,7 +548,7 @@ impl TaskContext {
             let SystemTask::Strobe(print) = call.task else {
                 unreachable!("only a `$strobe` is ever queued as one");
             };
-            self.print_call(print, &call.arguments, store)?;
+            self.print_call(print, &call.arguments, store, &call.scope)?;
         }
 
         // Taking the monitor out keeps `self` free to print with; nothing
@@ -537,7 +563,12 @@ impl TaskContext {
             // gets printed even though nothing moved.
             if monitor.snapshot.as_ref() != Some(&values) {
                 monitor.snapshot = Some(values);
-                self.print_call(monitor.print(), &monitor.call.arguments, store)?;
+                self.print_call(
+                    monitor.print(),
+                    &monitor.call.arguments,
+                    store,
+                    &monitor.call.scope,
+                )?;
             }
         }
         self.monitor = Some(monitor);
@@ -550,7 +581,9 @@ impl TaskContext {
     /// a system task is not only an output. Everything else here reads it.
     pub fn run(&mut self, call: &TaskCall, store: &mut StateStore) -> Result<(), SimulationError> {
         match call.task {
-            SystemTask::Print(print) => self.print_call(print, &call.arguments, store)?,
+            SystemTask::Print(print) => {
+                self.print_call(print, &call.arguments, store, &call.scope)?
+            }
             // A `$strobe` is kept rather than run: what it prints is whatever
             // its arguments hold once the timestep has finished moving.
             SystemTask::Strobe(_) => self.strobes.push(call.clone()),
@@ -588,7 +621,12 @@ impl TaskContext {
         let was_enabled = monitor.enabled;
         monitor.enabled = enabled;
         if enabled && !was_enabled {
-            self.print_call(monitor.print(), &monitor.call.arguments, store)?;
+            self.print_call(
+                monitor.print(),
+                &monitor.call.arguments,
+                store,
+                &monitor.call.scope,
+            )?;
             monitor.snapshot = Some(self.snapshot(&monitor.call, store)?);
         }
         self.monitor = Some(monitor);
@@ -629,6 +667,7 @@ impl TaskContext {
         print: Print,
         arguments: &[TaskArgument],
         store: &StateStore,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         let arguments = if print.descriptor {
             let (descriptor, rest) = arguments.split_first().ok_or_else(|| {
@@ -641,7 +680,7 @@ impl TaskContext {
         } else {
             arguments
         };
-        let text = self.render(arguments, store, print.radix)?;
+        let text = self.render(arguments, store, print.radix, scope)?;
         if print.newline {
             self.output.push_line(&text);
         } else {
@@ -701,6 +740,7 @@ impl TaskContext {
         arguments: &[TaskArgument],
         store: &StateStore,
         radix: Radix,
+        scope: &str,
     ) -> Result<String, SimulationError> {
         let mut text = String::new();
         let mut index = 0;
@@ -708,7 +748,7 @@ impl TaskContext {
             match &arguments[index] {
                 TaskArgument::Text(format) => {
                     index += 1;
-                    self.render_format(format, arguments, &mut index, store, &mut text)?;
+                    self.render_format(format, arguments, &mut index, store, &mut text, scope)?;
                 }
                 argument => {
                     let value = self.value_of(argument, store)?;
@@ -739,6 +779,7 @@ impl TaskContext {
         index: &mut usize,
         store: &StateStore,
         text: &mut String,
+        scope: &str,
     ) -> Result<(), SimulationError> {
         let mut characters = format.chars().peekable();
         while let Some(character) = characters.next() {
@@ -792,6 +833,14 @@ impl TaskContext {
                 .next()
                 .ok_or_else(|| bad_format("a trailing `%` with no specifier"))?;
 
+            // `%m` is the scope the call sits in, and it takes no argument at
+            // all — so it is answered before one is fetched, and a `$display`
+            // whose format string is nothing but `%m` needs none.
+            if specifier.eq_ignore_ascii_case(&'m') {
+                text.push_str(&pad(scope.to_string(), width.unwrap_or(0), fill));
+                continue;
+            }
+
             let argument = arguments.get(*index).ok_or_else(|| {
                 bad_format(&format!(
                     "`%{}` has no argument left to format",
@@ -840,6 +889,26 @@ impl TaskContext {
                     }
                 };
                 text.push_str(&pad(rendered, width.unwrap_or(default_width), fill));
+                continue;
+            }
+
+            // `%c` is one character: the low eight bits, whatever the value
+            // is wider than that. An unknown byte has no character, so it
+            // prints as a NUL would — nothing at all.
+            if specifier.eq_ignore_ascii_case(&'c') {
+                let value = self.value_of(argument, store)?;
+                let rendered = match value.resize(8).to_u128() {
+                    Some(code) => char::from(code as u8).to_string(),
+                    None => String::new(),
+                };
+                text.push_str(&pad(rendered, width.unwrap_or(0), fill));
+                continue;
+            }
+
+            // `%v` is the *strength* of each bit, `_` between them.
+            if specifier.eq_ignore_ascii_case(&'v') {
+                let value = self.value_of(argument, store)?;
+                text.push_str(&pad(strengths(&value), width.unwrap_or(0), fill));
                 continue;
             }
 
@@ -1164,10 +1233,12 @@ impl TaskContext {
     ) -> Result<Register, SimulationError> {
         match argument {
             TaskArgument::Value(expression) => Ok(eval(expression, store)?),
-            TaskArgument::Text(text) => Err(bad_format(&format!(
-                "the string \"{}\" is not a value a numeric format can take",
-                text
-            ))),
+            // A string *is* a value — eight bits a character, most significant
+            // character first — and `$display("%d", "A")` is 65. It reaches
+            // here as text rather than as an expression because a task tries
+            // the format-string reading of a string argument first, which is
+            // what it has to do for the one that is a format string.
+            TaskArgument::Text(text) => Ok(string_bits(text)),
         }
     }
 }
@@ -1398,6 +1469,31 @@ fn pad(text: String, width: usize, fill: char) -> String {
     }
     padded.push_str(body);
     padded
+}
+
+/// The strength of every bit of `value`, most significant first, `_` between
+/// them: `St0_Pu1_Pu1_St0`.
+///
+/// **Only the two strengths a value alone can tell are reported.** A bit that
+/// is `z` is driven by nothing, which is `HiZ`; every other bit is reported as
+/// `St`, because an ordinary continuous assignment and a gate both drive at
+/// `strong` and that is what almost every design has. A `pullup`, a
+/// `tri0`/`tri1` or an `assign (pull1, strong0)` really is weaker, and this
+/// prints `St1` where iverilog prints `Pu1` — the store keeps a *value* per
+/// signal and not a strength, so there is nothing here to read the difference
+/// from. Corpus `multi_bit_strength` is that gap.
+fn strengths(value: &Register) -> String {
+    let bit = |code: u8| match code {
+        ZERO => "St0",
+        ONE => "St1",
+        X => "StX",
+        _ => "HiZ",
+    };
+    (0..value.width())
+        .rev()
+        .map(|index| bit(value.bit_from_lsb(index).unwrap_or(X)))
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// The real conversion a `%` specifier asks for, or `None` if it is not one.
@@ -2341,8 +2437,37 @@ mod tests {
 
     #[test]
     fn test_a_format_the_simulator_does_not_understand_is_an_error() {
-        let message = error(r#"$display("%v", 1);"#);
-        assert!(message.contains("`%v`"), "unexpected message: {}", message);
+        let message = error(r#"$display("%q", 1);"#);
+        assert!(message.contains("`%q`"), "unexpected message: {}", message);
+    }
+
+    /// `%c` is the low eight bits as a character and `%v` is the strength of
+    /// every bit, `_` between them — both measured from iverilog 12.0. The
+    /// strength of a value nothing weaker drives is `St`; see [`strengths`].
+    #[test]
+    fn test_character_and_strength_formats() {
+        let store = store_with(&[("a", "0110"), ("byte", "01000001")]);
+        assert_eq!(printed(r#"$display("[%c]", byte);"#, &store), "[A]\n");
+        assert_eq!(printed(r#"$display("[%c]", 8'h42);"#, &store), "[B]\n");
+        assert_eq!(
+            printed(r#"$display("[%v]", a);"#, &store),
+            "[St0_St1_St1_St0]\n"
+        );
+        assert_eq!(
+            printed(r#"$display("[%v]", 4'b01xz);"#, &store),
+            "[St0_St1_StX_HiZ]\n"
+        );
+    }
+
+    /// A string is a value — eight bits a character — so a numeric format
+    /// takes one: `$display("%d", "A")` is 65, right-aligned in the three
+    /// columns eight bits ask for (iverilog 12.0).
+    #[test]
+    fn test_a_string_reaches_a_numeric_format_as_its_bytes() {
+        let store = store_with(&[]);
+        assert_eq!(printed(r#"$display("[%d]", "A");"#, &store), "[ 65]\n");
+        assert_eq!(printed(r#"$display("[%0d]", "AB");"#, &store), "[16706]\n");
+        assert_eq!(printed(r#"$display("[%h]", "A");"#, &store), "[41]\n");
     }
 
     #[test]
