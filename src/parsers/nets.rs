@@ -10,7 +10,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, signedness, ws},
+    simple::{range, signedness, ws, Range},
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -30,7 +30,7 @@ pub enum NetType {
 #[derive(Debug, PartialEq, Clone)]
 pub struct Net {
     identifier: Identifier,
-    range: (i64, i64),
+    range: Range,
     net_type: NetType,
     delay: u32,
     /// Whether the declaration carried a `signed` qualifier.
@@ -45,7 +45,7 @@ pub struct Net {
 }
 
 impl Net {
-    pub fn new(identifier: Identifier, range: (i64, i64), net_type: NetType, delay: u32) -> Self {
+    pub fn new(identifier: Identifier, range: Range, net_type: NetType, delay: u32) -> Self {
         Net {
             identifier,
             range,
@@ -77,8 +77,8 @@ impl Net {
         &self.identifier
     }
 
-    pub fn range(&self) -> (i64, i64) {
-        self.range
+    pub fn range(&self) -> &Range {
+        &self.range
     }
 
     pub fn init(&self) -> Option<&Expression> {
@@ -129,7 +129,7 @@ pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
         .map(|(identifier, init)| Net {
             identifier,
             net_type: net_type.clone(),
-            range: range.unwrap_or((0, 0)),
+            range: range.clone().unwrap_or(Range::SINGLE_BIT),
             delay: delay.unwrap_or(0),
             signed,
             init,
@@ -172,9 +172,9 @@ mod tests {
             net_declaration,
             "wire [7:0] a, b, c;",
             vec![
-                Net::new("a".into(), (7, 0), NetType::Wire, 0),
-                Net::new("b".into(), (7, 0), NetType::Wire, 0),
-                Net::new("c".into(), (7, 0), NetType::Wire, 0),
+                Net::new("a".into(), Range::Constant(7, 0), NetType::Wire, 0),
+                Net::new("b".into(), Range::Constant(7, 0), NetType::Wire, 0),
+                Net::new("c".into(), Range::Constant(7, 0), NetType::Wire, 0),
             ],
         );
 
@@ -182,9 +182,9 @@ mod tests {
             net_declaration,
             "tri0 a, b, c ;",
             vec![
-                Net::new("a".into(), (0, 0), NetType::Tri0, 0),
-                Net::new("b".into(), (0, 0), NetType::Tri0, 0),
-                Net::new("c".into(), (0, 0), NetType::Tri0, 0),
+                Net::new("a".into(), Range::Constant(0, 0), NetType::Tri0, 0),
+                Net::new("b".into(), Range::Constant(0, 0), NetType::Tri0, 0),
+                Net::new("c".into(), Range::Constant(0, 0), NetType::Tri0, 0),
             ],
         );
 
@@ -192,9 +192,9 @@ mod tests {
             net_declaration,
             "tri1 [3:0] x, y, z;",
             vec![
-                Net::new("x".into(), (3, 0), NetType::Tri1, 0),
-                Net::new("y".into(), (3, 0), NetType::Tri1, 0),
-                Net::new("z".into(), (3, 0), NetType::Tri1, 0),
+                Net::new("x".into(), Range::Constant(3, 0), NetType::Tri1, 0),
+                Net::new("y".into(), Range::Constant(3, 0), NetType::Tri1, 0),
+                Net::new("z".into(), Range::Constant(3, 0), NetType::Tri1, 0),
             ],
         );
     }
@@ -207,8 +207,8 @@ mod tests {
             net_declaration,
             "wire signed [7:0] a, b;",
             vec![
-                Net::new("a".into(), (7, 0), NetType::Wire, 0).with_signedness(true),
-                Net::new("b".into(), (7, 0), NetType::Wire, 0).with_signedness(true),
+                Net::new("a".into(), Range::Constant(7, 0), NetType::Wire, 0).with_signedness(true),
+                Net::new("b".into(), Range::Constant(7, 0), NetType::Wire, 0).with_signedness(true),
             ],
         );
 
@@ -216,14 +216,24 @@ mod tests {
         assert_parses_to(
             net_declaration,
             "wire unsigned [7:0] a;",
-            vec![Net::new("a".into(), (7, 0), NetType::Wire, 0)],
+            vec![Net::new(
+                "a".into(),
+                Range::Constant(7, 0),
+                NetType::Wire,
+                0,
+            )],
         );
 
         // A name that merely starts with the keyword is a name.
         assert_parses_to(
             net_declaration,
             "wire signed_value;",
-            vec![Net::new("signed_value".into(), (0, 0), NetType::Wire, 0)],
+            vec![Net::new(
+                "signed_value".into(),
+                Range::Constant(0, 0),
+                NetType::Wire,
+                0,
+            )],
         );
     }
 
@@ -240,7 +250,12 @@ mod tests {
         let (_, nets) = result.unwrap();
         assert_eq!(nets.len(), 1);
         let net = &nets[0];
-        let expected = Net::new(Identifier::new("z".to_string()), (7, 0), NetType::Wire, 10);
+        let expected = Net::new(
+            Identifier::new("z".to_string()),
+            Range::Constant(7, 0),
+            NetType::Wire,
+            10,
+        );
         assert_eq!(net, &expected);
     }
 
@@ -252,7 +267,12 @@ mod tests {
         assert_eq!(nets.len(), 1);
         let net = &nets[0];
 
-        let expected_net = Net::new(Identifier::new("z".to_string()), (7, 0), NetType::Wire, 0);
+        let expected_net = Net::new(
+            Identifier::new("z".to_string()),
+            Range::Constant(7, 0),
+            NetType::Wire,
+            0,
+        );
         assert_eq!(net, &expected_net);
     }
 
@@ -264,7 +284,12 @@ mod tests {
         assert_eq!(nets.len(), 1);
         let net = &nets[0];
 
-        let expected_net = Net::new(Identifier::new("z".to_string()), (0, 0), NetType::Wire, 0);
+        let expected_net = Net::new(
+            Identifier::new("z".to_string()),
+            Range::Constant(0, 0),
+            NetType::Wire,
+            0,
+        );
         assert_eq!(net, &expected_net);
     }
 
@@ -278,7 +303,7 @@ mod tests {
         for net in nets {
             assert_eq!(net.net_type, NetType::Wire);
             assert_eq!(net.delay, 5);
-            assert_eq!(net.range, (7, 0));
+            assert_eq!(net.range, Range::Constant(7, 0));
         }
     }
 
@@ -296,13 +321,19 @@ mod tests {
         assert_parses_to(
             net_declaration,
             "wire a = 1'b1;",
-            vec![Net::new("a".into(), (0, 0), NetType::Wire, 0).with_init(expression("1'b1"))],
+            vec![
+                Net::new("a".into(), Range::Constant(0, 0), NetType::Wire, 0)
+                    .with_init(expression("1'b1")),
+            ],
         );
 
         assert_parses_to(
             net_declaration,
             "wire [3:0] q = a + b;",
-            vec![Net::new("q".into(), (3, 0), NetType::Wire, 0).with_init(expression("a + b"))],
+            vec![
+                Net::new("q".into(), Range::Constant(3, 0), NetType::Wire, 0)
+                    .with_init(expression("a + b")),
+            ],
         );
     }
 
@@ -314,8 +345,10 @@ mod tests {
             net_declaration,
             "wire x = 1, y = 2;",
             vec![
-                Net::new("x".into(), (0, 0), NetType::Wire, 0).with_init(expression("1")),
-                Net::new("y".into(), (0, 0), NetType::Wire, 0).with_init(expression("2")),
+                Net::new("x".into(), Range::Constant(0, 0), NetType::Wire, 0)
+                    .with_init(expression("1")),
+                Net::new("y".into(), Range::Constant(0, 0), NetType::Wire, 0)
+                    .with_init(expression("2")),
             ],
         );
 
@@ -323,8 +356,9 @@ mod tests {
             net_declaration,
             "wire [7:0] a = 8'h0f, b;",
             vec![
-                Net::new("a".into(), (7, 0), NetType::Wire, 0).with_init(expression("8'h0f")),
-                Net::new("b".into(), (7, 0), NetType::Wire, 0),
+                Net::new("a".into(), Range::Constant(7, 0), NetType::Wire, 0)
+                    .with_init(expression("8'h0f")),
+                Net::new("b".into(), Range::Constant(7, 0), NetType::Wire, 0),
             ],
         );
     }

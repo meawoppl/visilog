@@ -89,6 +89,7 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
 mod tests {
     use super::*;
     use crate::parsers::helpers::assert_parses;
+    use crate::parsers::simple::Range;
 
     #[test]
     fn test_parse_module_statement_variants() {
@@ -127,7 +128,9 @@ mod tests {
                 assert_eq!(registers.len(), 2);
                 assert_eq!(registers[0].name, "result".into());
                 assert_eq!(registers[1].name, "b".into());
-                assert!(registers.iter().all(|r| r.range == Some((4, 0))));
+                assert!(registers
+                    .iter()
+                    .all(|r| r.range == Some(Range::Constant(4, 0))));
             }
             other => panic!("expected a register declaration, got {:?}", other),
         }
@@ -149,8 +152,8 @@ mod tests {
         match assert_parses(parse_module_statement, "reg [7:0] mem [0:255];") {
             ModuleStatement::RegisterDeclaration(registers) => {
                 assert_eq!(registers.len(), 1);
-                assert_eq!(registers[0].range, Some((7, 0)));
-                assert_eq!(registers[0].dimensions, Some((0, 255)));
+                assert_eq!(registers[0].range, Some(Range::Constant(7, 0)));
+                assert_eq!(registers[0].dimensions, Some(Range::Constant(0, 255)));
             }
             other => panic!("expected a memory declaration, got {:?}", other),
         }
@@ -170,7 +173,7 @@ mod tests {
 
         match assert_parses(parse_module_statement, "reg [3:0] b = 4'h5;") {
             ModuleStatement::RegisterDeclaration(registers) => {
-                assert_eq!(registers[0].range, Some((3, 0)));
+                assert_eq!(registers[0].range, Some(Range::Constant(3, 0)));
                 assert!(registers[0].init.is_some());
             }
             other => panic!("expected a register declaration, got {:?}", other),

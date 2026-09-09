@@ -16,7 +16,7 @@ use super::{
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
-    simple::{range, signedness, ws, ws_and_comments},
+    simple::{range, signedness, ws, ws_and_comments, Range},
     string::parse_verilog_string,
 };
 #[derive(Debug, PartialEq, Clone)]
@@ -661,7 +661,7 @@ pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
 #[derive(Debug, PartialEq, Clone)]
 pub struct FunctionVariable {
     pub name: Identifier,
-    pub range: (i64, i64),
+    pub range: Range,
     pub signed: bool,
 }
 
@@ -676,7 +676,7 @@ pub struct FunctionDeclaration {
     pub name: Identifier,
     /// The width of the value the function returns, which is the width of the
     /// variable its own name stands for.
-    pub range: (i64, i64),
+    pub range: Range,
     pub signed: bool,
     pub arguments: Vec<FunctionVariable>,
     /// Body-local `reg` and `integer` declarations.
@@ -691,9 +691,9 @@ pub struct FunctionDeclaration {
 /// item that names neither a direction nor a type is not a declaration — and
 /// what makes the 2001 argument list's `f(input [7:0] a, b)` give `b` the type
 /// of the element before it.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone)]
 struct DeclaredType {
-    range: (i64, i64),
+    range: Range,
     signed: bool,
     explicit: bool,
 }
@@ -701,7 +701,7 @@ struct DeclaredType {
 impl Default for DeclaredType {
     fn default() -> Self {
         DeclaredType {
-            range: (0, 0),
+            range: Range::SINGLE_BIT,
             signed: false,
             explicit: false,
         }
@@ -728,10 +728,10 @@ fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
     Ok((
         input,
         DeclaredType {
-            range: match (integer.is_some(), declared) {
-                (true, _) => (31, 0),
-                (false, Some(declared)) => declared,
-                (false, None) => (0, 0),
+            range: match (integer.is_some(), &declared) {
+                (true, _) => Range::Constant(31, 0),
+                (false, Some(declared)) => declared.clone(),
+                (false, None) => Range::SINGLE_BIT,
             },
             // An `integer` is signed by being an `integer`.
             signed: signed || integer.is_some(),
@@ -771,7 +771,7 @@ fn function_item(input: &str) -> IResult<&str, (bool, Vec<FunctionVariable>)> {
                 .into_iter()
                 .map(|name| FunctionVariable {
                     name,
-                    range: declared.range,
+                    range: declared.range.clone(),
                     signed: declared.signed,
                 })
                 .collect(),
@@ -806,7 +806,7 @@ fn ansi_function_arguments(input: &str) -> IResult<&str, Vec<FunctionVariable>> 
         }
         arguments.push(FunctionVariable {
             name,
-            range: inherited.range,
+            range: inherited.range.clone(),
             signed: inherited.signed,
         });
     }
@@ -1575,10 +1575,10 @@ mod tests {
         );
 
         assert_eq!(function.name, "do_add".into());
-        assert_eq!(function.range, (7, 0));
+        assert_eq!(function.range, Range::Constant(7, 0));
         assert_eq!(function.arguments.len(), 1);
         assert_eq!(function.arguments[0].name, "a".into());
-        assert_eq!(function.arguments[0].range, (7, 0));
+        assert_eq!(function.arguments[0].range, Range::Constant(7, 0));
         assert!(function.locals.is_empty());
         assert_eq!(function.statements.len(), 1);
     }
@@ -1595,7 +1595,10 @@ mod tests {
         assert_eq!(function.arguments.len(), 2);
         assert_eq!(function.arguments[0].name, "a".into());
         assert_eq!(function.arguments[1].name, "b".into());
-        assert!(function.arguments.iter().all(|a| a.range == (3, 0)));
+        assert!(function
+            .arguments
+            .iter()
+            .all(|a| a.range == Range::Constant(3, 0)));
     }
 
     /// A body-local variable is a declaration, not a statement, and is kept
@@ -1616,7 +1619,7 @@ mod tests {
         );
 
         // `integer` is a 32 bit signed variable, written instead of a range.
-        assert_eq!(function.range, (31, 0));
+        assert_eq!(function.range, Range::Constant(31, 0));
         assert!(function.signed);
         assert_eq!(function.arguments.len(), 1);
         assert_eq!(
@@ -1627,8 +1630,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["i", "seen"]
         );
-        assert_eq!(function.locals[0].range, (31, 0));
-        assert_eq!(function.locals[1].range, (3, 0));
+        assert_eq!(function.locals[0].range, Range::Constant(31, 0));
+        assert_eq!(function.locals[1].range, Range::Constant(3, 0));
     }
 
     /// A function that declares no width returns one bit, and one that
@@ -1637,7 +1640,7 @@ mod tests {
     fn test_parse_function_declaration_minimal() {
         let function = assert_parses(parse_function_declaration, "function f; f = 1; endfunction");
 
-        assert_eq!(function.range, (0, 0));
+        assert_eq!(function.range, Range::Constant(0, 0));
         assert!(function.arguments.is_empty());
         assert_eq!(function.statements.len(), 1);
     }

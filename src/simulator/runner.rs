@@ -102,6 +102,11 @@ pub enum SimulationError {
     NoConvergence { passes: usize },
     /// The expression evaluator rejected an assignment's right hand side.
     Eval(EvalError),
+    /// A declared range whose bounds are not constant where they are written:
+    /// `reg [n-1:0] q;` for an `n` that is not a parameter, or a bound that
+    /// evaluates to `x`. A width the simulator guessed at would be silently
+    /// wrong for the whole run, so the bound is named instead.
+    UnresolvedRange { bound: String, why: String },
 }
 
 impl fmt::Display for SimulationError {
@@ -145,6 +150,11 @@ impl fmt::Display for SimulationError {
             SimulationError::UnsupportedTarget(text) => {
                 write!(f, "cannot drive `{}`", text)
             }
+            SimulationError::UnresolvedRange { bound, why } => write!(
+                f,
+                "range bound `{}` is not a constant: {}",
+                bound, why
+            ),
             SimulationError::NotSetUp => write!(f, "the simulator has not been set up"),
             SimulationError::NoConvergence { passes } => write!(
                 f,

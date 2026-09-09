@@ -13,7 +13,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
-    simple::{range, signedness, ws, ws_and_comments},
+    simple::{range, signedness, ws, ws_and_comments, Range},
     statements::{parse_module_statement, ModuleStatement},
 };
 
@@ -28,7 +28,7 @@ pub struct VerilogModule {
 pub struct Port {
     pub direction: PortDirection,
     pub net_type: Option<NetType>,
-    pub range: (i64, i64),
+    pub range: Range,
     pub identifier: Identifier,
     /// Whether the declaration carried a `signed` qualifier —
     /// `input signed [3:0] a`.
@@ -90,7 +90,7 @@ fn parse_port(input: &str) -> IResult<&str, Port> {
         Port {
             direction,
             net_type,
-            range: range.unwrap_or((0, 0)),
+            range: range.unwrap_or(Range::SINGLE_BIT),
             identifier,
             signed,
         },
@@ -149,7 +149,7 @@ pub fn parse_port_declaration(input: &str) -> IResult<&str, Vec<Port>> {
             .map(|identifier| Port {
                 direction,
                 net_type,
-                range: port_range.unwrap_or((0, 0)),
+                range: port_range.clone().unwrap_or(Range::SINGLE_BIT),
                 identifier,
                 signed,
             })
@@ -422,7 +422,7 @@ mod tests {
             Port {
                 direction: PortDirection::Input,
                 net_type: Some(NetType::Wire),
-                range: (0, 0),
+                range: Range::Constant(0, 0),
                 identifier: "a".into(),
                 signed: false,
             },
@@ -433,7 +433,7 @@ mod tests {
             Port {
                 direction: PortDirection::Output,
                 net_type: Some(NetType::Reg),
-                range: (0, 0),
+                range: Range::Constant(0, 0),
                 identifier: "b".into(),
                 signed: false,
             },
@@ -444,7 +444,7 @@ mod tests {
             Port {
                 direction: PortDirection::InOut,
                 net_type: None,
-                range: (0, 0),
+                range: Range::Constant(0, 0),
                 identifier: "c".into(),
                 signed: false,
             },
@@ -460,21 +460,21 @@ mod tests {
                 Port {
                     direction: PortDirection::Input,
                     net_type: Some(NetType::Wire),
-                    range: (0, 0),
+                    range: Range::Constant(0, 0),
                     identifier: "a".into(),
                     signed: false,
                 },
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
-                    range: (0, 0),
+                    range: Range::Constant(0, 0),
                     identifier: "b".into(),
                     signed: false,
                 },
                 Port {
                     direction: PortDirection::InOut,
                     net_type: None,
-                    range: (0, 0),
+                    range: Range::Constant(0, 0),
                     identifier: "c".into(),
                     signed: false,
                 },
@@ -597,8 +597,28 @@ mod tests {
         assert_eq!(module.identifier, "commented".into());
         assert_eq!(module.ports.len(), 3);
         assert_eq!(module.ports[1].identifier, "b".into());
-        assert_eq!(module.ports[1].range, (7, 0));
+        assert_eq!(module.ports[1].range, Range::Constant(7, 0));
         assert_eq!(module.ports[2].identifier, "c".into());
+    }
+
+    /// A port width may be written in terms of a parameter, in either header
+    /// style. The bound is carried as an expression and resolved at
+    /// elaboration, where the parameter has a value.
+    #[test]
+    fn test_a_port_width_may_be_an_expression() {
+        let ansi = assert_parses(
+            parse_module_declaration,
+            "module m(input [WIDTH-1:0] a, output [0:COUNT-1] b); endmodule",
+        );
+        assert!(matches!(ansi.ports[0].range, Range::Expressions(_, _)));
+        assert!(matches!(ansi.ports[1].range, Range::Expressions(_, _)));
+
+        let non_ansi = assert_parses(
+            parse_module_declaration,
+            "module m(a, b); input [WIDTH-1:0] a; output [7:0] b; endmodule",
+        );
+        assert!(matches!(non_ansi.ports[0].range, Range::Expressions(_, _)));
+        assert!(matches!(non_ansi.ports[1].range, Range::Constant(7, 0)));
     }
 
     /// A comment between statements, between a statement and its semicolon, and
@@ -909,7 +929,7 @@ mod tests {
         Port {
             direction,
             net_type: None,
-            range: (0, 0),
+            range: Range::Constant(0, 0),
             identifier: name.into(),
             signed: false,
         }
@@ -938,7 +958,7 @@ mod tests {
                 Port {
                     direction: PortDirection::Output,
                     net_type: None,
-                    range: (11, 0),
+                    range: Range::Constant(11, 0),
                     identifier: "h".into(),
                     signed: false,
                 },
@@ -978,7 +998,7 @@ mod tests {
             Port {
                 direction: PortDirection::Input,
                 net_type: Some(NetType::Wire),
-                range: (3, 0),
+                range: Range::Constant(3, 0),
                 identifier: "a".into(),
                 signed: true,
             },
@@ -991,14 +1011,14 @@ mod tests {
                 Port {
                     direction: PortDirection::Output,
                     net_type: None,
-                    range: (11, 0),
+                    range: Range::Constant(11, 0),
                     identifier: "h".into(),
                     signed: true,
                 },
                 Port {
                     direction: PortDirection::Output,
                     net_type: None,
-                    range: (11, 0),
+                    range: Range::Constant(11, 0),
                     identifier: "g".into(),
                     signed: true,
                 },
@@ -1012,7 +1032,7 @@ mod tests {
             Port {
                 direction: PortDirection::Input,
                 net_type: None,
-                range: (0, 0),
+                range: Range::Constant(0, 0),
                 identifier: "signedness".into(),
                 signed: false,
             },
@@ -1028,14 +1048,14 @@ mod tests {
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
-                    range: (11, 0),
+                    range: Range::Constant(11, 0),
                     identifier: "h".into(),
                     signed: false,
                 },
                 Port {
                     direction: PortDirection::Output,
                     net_type: Some(NetType::Reg),
-                    range: (11, 0),
+                    range: Range::Constant(11, 0),
                     identifier: "g".into(),
                     signed: false,
                 },

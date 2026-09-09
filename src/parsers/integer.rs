@@ -15,7 +15,7 @@ use super::{
     expr::Expression,
     identifier::{identifier, Identifier},
     register::declared_name,
-    simple::ws,
+    simple::{ws, Range},
 };
 
 /// One name from an `integer a, b[0:3];` declaration.
@@ -27,7 +27,7 @@ use super::{
 #[derive(Debug, PartialEq)]
 pub struct IntegerDeclaration {
     pub name: Identifier,
-    pub dimensions: Option<(i64, i64)>,
+    pub dimensions: Option<Range>,
     /// The value an `integer i = 0;` declaration starts with, applied once at
     /// time zero the way a `reg` initialiser is.
     pub init: Option<Expression>,
@@ -40,7 +40,7 @@ pub struct IntegerDeclaration {
 #[derive(Debug, PartialEq)]
 pub struct TimeDeclaration {
     pub name: Identifier,
-    pub dimensions: Option<(i64, i64)>,
+    pub dimensions: Option<Range>,
     pub init: Option<Expression>,
 }
 
@@ -55,7 +55,7 @@ pub struct TimeDeclaration {
 #[derive(Debug, PartialEq)]
 pub struct RealDeclaration {
     pub name: Identifier,
-    pub dimensions: Option<(i64, i64)>,
+    pub dimensions: Option<Range>,
     pub init: Option<Expression>,
 }
 
@@ -75,7 +75,7 @@ pub struct EventDeclaration {
 fn variable_declaration<'a>(
     keyword: &'static str,
     input: &'a str,
-) -> IResult<&'a str, Vec<(Identifier, Option<(i64, i64)>, Option<Expression>)>> {
+) -> IResult<&'a str, Vec<(Identifier, Option<Range>, Option<Expression>)>> {
     let (input, _) = tag(keyword)(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_name))(input)?;
     let (input, _) = ws(char(';'))(input)?;
@@ -214,7 +214,7 @@ mod tests {
             "integer\n  counts [0:3];",
             vec![IntegerDeclaration {
                 name: "counts".into(),
-                dimensions: Some((0, 3)),
+                dimensions: Some(Range::Constant(0, 3)),
                 init: None,
             }],
         );
@@ -304,7 +304,7 @@ mod tests {
                 },
                 TimeDeclaration {
                     name: "marks".into(),
-                    dimensions: Some((0, 3)),
+                    dimensions: Some(Range::Constant(0, 3)),
                     init: None,
                 },
             ],
@@ -332,7 +332,7 @@ mod tests {
             "real array3[2:1];",
             vec![RealDeclaration {
                 name: "array3".into(),
-                dimensions: Some((2, 1)),
+                dimensions: Some(Range::Constant(2, 1)),
                 init: None,
             }],
         );
