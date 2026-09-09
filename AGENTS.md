@@ -228,6 +228,16 @@ nothing is an error naming the file and every directory tried — never an empty
 memory, which would leave the design reading `x` and look exactly like one that
 simply ran.
 
+**Writing has the mirror seam, `Simulator::set_output_directory`.** A relative
+`$fopen` or `$writemem…` name hangs off it, and it defaults to the process
+working directory so a caller that never said otherwise gets what it always got.
+It lives on the `StateStore` (`resolve_write_path`) rather than on the
+`TaskContext`, because `$fopen` is a system *function* and `eval` is handed the
+store and nothing else. The corpus harness points it at a scratch directory
+under the temp directory with `work/` already made inside — which is exactly what
+iverilog's own test driver does before it runs one, and what keeps a corpus run
+from scattering files through the repository.
+
 **A width is resolved at elaboration, which is the first point at which it exists.**
 A `Range` reaches `elaborate` as two expressions, and `Elaborator::resolve_range` turns
 them into the two numbers the `StateStore` declares a signal with — evaluating them against
@@ -272,6 +282,43 @@ exiting the process; `advance` and `poke` become no-ops once it is set, and `now
 where it stopped. Which `$name`s exist is decided at *compile* time by `TaskCall::compile`,
 so an unrecognised task is an error naming it rather than a silent no-op — a design that
 quietly printed nothing would look just like one that passed.
+
+**A descriptor is a bit mask, and bit 0 is the buffer.** `$fopen("work/a.txt")` hands back
+a *multi-channel descriptor* — one hot, allocated from bit 1 upwards, so the first file is
+2, the second 4, the third 8 — and `$fdisplay`/`$fwrite`/`$fmonitor`/`$fstrobe` write to
+every channel whose bit is set. Bit 0 is standard output, which is why a corpus design
+writes `$fdisplay(fp|1, …)`: that is what puts the same line in the file *and* in the
+buffer `simulator.output()` hands back. Without the mask a file-writing design's output
+would never reach a test at all. `$fclose` frees the bit for the next `$fopen` (corpus
+`fopen2` opens a fourth file after closing its second and asserts it gets the second's bit
+back), and `$fflush` pushes the buffered writer out — with no argument at all, every one of
+them. The two-argument `$fopen(name, "w")` is the other form and returns a **file**
+descriptor: bit 31 set over a number allocated from 3, since 0, 1 and 2 are the standard
+streams. `$fgetc`, `$fscanf`, `$sscanf` and `$fread` are still names nothing implements.
+
+**`$fopen` is a system *function*, so the file table lives on the `StateStore`.** `eval` is
+handed a `&StateStore` and nothing else, so a table on the `TaskContext` would be
+unreachable from the one place a descriptor is produced — this is the same reasoning that
+put the `$random` stream there, and it has the same shape: a `RefCell` behind an `Rc`, so
+opening a file is a shared-reference operation and a function call's *frame* shares the
+table rather than throwing it away. `TaskContext::run` already took a `&mut StateStore`, so
+the writing side needed nothing.
+
+**A file that cannot be opened is 0, and a channel nothing opened is dropped.** Both are
+deliberate departures from "everything unimplemented is a named error", because neither is
+unimplemented: `if (fp == 0)` is how a design reports a failed open *itself*, and an error
+would take that report away from it, while iverilog answers a write to an unopened channel
+with a warning on standard error and carries on. What stays an error is a descriptor that
+is not a fully **known** value, and a `$f…` task with no descriptor at all.
+
+**`$sformat` and `$swrite` format into a register rather than printing.** The rendering is
+the same `render` every other task goes through; the text then becomes a bit vector of
+eight bit characters and is *driven* like any other assignment, so the target's width does
+the rest — a wider one is zero extended on the left, which `%s` renders back as leading
+spaces, and a narrower one keeps the **last** characters (`"abcdef"` into a `reg [15:0]` is
+`"ef"`, measured against iverilog 12.0). The one difference between the two spellings is
+which argument is the format string: `$sformat`'s second argument always is, even when it
+is a `reg` holding one, where `$swrite` follows the `$display` rule that only a literal is.
 
 **The end-of-timestep slot is `Simulator::end_of_timestep`, and it lives where
 `settle` already returns.** `$strobe` and `$monitor` both report *after*
@@ -333,7 +380,12 @@ prints in eleven columns rather than ten (corpus `pr1746848`, `test_dispwided`,
 `pr1002a`). `%s` pads to `bits / 8` characters, so a thirty-two bit register
 holding `"A"` is `"   A"`, and `%0s` is that text unpadded; `ascii` drops
 *leading* NULs but renders an interior one as a space, since it is a character
-the vector really has.
+the vector really has. A string **literal** goes through the same vector rather
+than being printed as its own text, which is the only way `%s` and `%0s` of
+`"\000a\000b"` come out as `" a b"` and `"a b"` and `%s` of `""` comes out as one
+space — a literal is a value wherever a number is wanted, and `%s` was the one
+specifier that did not treat it as one (corpus `string13`, `string14`, both of
+which iverilog 12.0 itself fails).
 
 **`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
 fractional digits, then the suffix, right-aligned in `min_width` (twenty by
@@ -346,7 +398,7 @@ convert between. That is the identity for the `` `timescale 1ns `` plus
 wrong by a power of ten when they disagree — corpus `timeform1` is the case.
 
 **A system *function* is an expression operand, and `eval` implements it.** `$time`,
-`$stime`, `$signed`, `$unsigned`, `$random`, `$bits` and `$clog2` parse anywhere an
+`$stime`, `$signed`, `$unsigned`, `$random`, `$fopen`, `$bits` and `$clog2` parse anywhere an
 operand is legal — `a = $random;`, `if ($time > 5)`, `assign y = $signed(a) | b;` — as
 `Expression::SystemFunctionCall(name, args)`, the name carried without its `$`. That is
 deliberately *not* `Expression::FunctionCall`, which names a function the design declares
@@ -354,11 +406,12 @@ and resolves down a different path. A `$name` nothing implements is
 `EvalError::UnknownSystemFunction`, never a zero, and a wrong argument count is
 `EvalError::SystemFunctionArity`.
 
-`eval` is handed a `&StateStore` and nothing else, so the two system functions that are
+`eval` is handed a `&StateStore` and nothing else, so the system functions that are
 not pure functions of their arguments reach the simulation *through the store*:
 `StateStore::set_time` carries the clock `$time` reads — `Simulator::advance` moves it
 with `now`, and it is the only clock, which is why `TaskContext` no longer holds one —
-and `StateStore::next_random` / `seed_random` own the `$random` stream. The stream is a
+`StateStore::open_channel` / `open_descriptor` own the files `$fopen` opens, and
+`StateStore::next_random` / `seed_random` own the `$random` stream. The stream is a
 `RefCell<StdRng>` seeded from a fixed constant (`DEFAULT_RANDOM_SEED`, 0), so a design
 that draws random stimulus draws the *same* stimulus on every run and a self-checking
 test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
@@ -1056,9 +1109,9 @@ telling apart.
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
-| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -1251,13 +1304,14 @@ tripwire.
 - **System task names are decomposed, not enumerated.** `split_task_name` peels an optional
   `f` prefix (takes a descriptor) and an optional `b`/`h`/`o` suffix (the default radix), so
   `$display`, `$writeh`, `$fdisplayb`, `$strobeh`, `$fmonitor` and `$readmemb` all come from
-  one table. The whole words are matched *first*, and there are five: `$finish` and
+  one table. The whole words are matched *first*, and there are six: `$finish` and
   `$timeformat` because `finish`'s `f` is not the prefix, `$monitoroff` because its trailing
-  `f` is not one either, and `$time` and `$monitoron` alongside them. `$readmem` and
+  `f` is not one either, `$fflush` because its trailing `h` is not a radix, and `$time` and
+  `$monitoron` alongside them. `$readmem` and
   `$readmemo` are consequently names nothing implements — the radix suffix is the file
-  format rather than a default, so only `b` and `h` spell a task. A descriptor other than
-  stdout is a **named error**, not a silent no-op — there is no `$fopen`, so no other
-  channel can legitimately be open.
+  format rather than a default, so only `b` and `h` spell a task. `$sformat` and `$swrite`
+  go through the same split although they take no descriptor, which is what gives
+  `$swriteb` its radix for free.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form. A gate primitive is one of those

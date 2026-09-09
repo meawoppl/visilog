@@ -27,8 +27,13 @@ use crate::parsers::expr::Expression;
 use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, string_bits, SYSTEM_FUNCTIONS};
+use crate::simulator::exec::drive;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+
+/// The descriptor a task outside the `$f…` family writes to: bit 0 of a
+/// multi-channel mask, which is standard output.
+const STANDARD_OUTPUT: u32 = 1;
 
 /// Everything a design has printed, as one buffer.
 ///
@@ -59,11 +64,6 @@ impl Output {
 
     fn push(&mut self, text: &str) {
         self.text.push_str(text);
-    }
-
-    fn push_line(&mut self, text: &str) {
-        self.text.push_str(text);
-        self.text.push('\n');
     }
 }
 
@@ -177,6 +177,19 @@ pub enum SystemTask {
     ReadMemory(Radix),
     /// `$writememh` / `$writememb` — the reverse: a memory's words to a file.
     WriteMemory(Radix),
+    /// `$sformat` / `$swrite` — format the arguments the way `$write` does and
+    /// write the text into a *register* instead of printing it, as one eight
+    /// bit character per byte.
+    ///
+    /// The flag is what tells the two apart: `$sformat`'s second argument is
+    /// **always** the format string, even when it is a `reg` holding one, while
+    /// `$swrite` follows the `$display` rule that only a literal is one.
+    Format(Print, bool),
+    /// `$fclose` — closes every file its descriptor names.
+    CloseFile,
+    /// `$fflush` — pushes what is buffered out to the files its descriptor
+    /// names, or to all of them when it is given none.
+    FlushFile,
     /// `$timeformat` — how `%t` renders a time value from here on.
     TimeFormat,
     /// End the simulation.
@@ -318,6 +331,9 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
         "timeformat" => return Ok(SystemTask::TimeFormat),
         "monitoron" => return Ok(SystemTask::MonitorControl(true)),
         "monitoroff" => return Ok(SystemTask::MonitorControl(false)),
+        // `$fflush` ends in an `h` that is not a radix, the same way
+        // `$monitoroff` ends in an `f` that is not the descriptor prefix.
+        "fflush" => return Ok(SystemTask::FlushFile),
         _ => {}
     }
 
@@ -345,6 +361,20 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
             radix,
             descriptor,
         })),
+        // `$sformat` and `$swrite` take a target rather than a descriptor, so
+        // the `f` prefix is not one of their spellings, but the radix suffix is:
+        // `$swriteb` comes out of the same split `$displayb` does. Which
+        // argument is the format string is the only difference between the two,
+        // and it rides on the flag.
+        "sformat" | "swrite" if !descriptor => Ok(SystemTask::Format(
+            Print {
+                newline: false,
+                radix,
+                descriptor: false,
+            },
+            base == "sformat",
+        )),
+        "close" if descriptor && radix == Radix::Decimal => Ok(SystemTask::CloseFile),
         // The memory-loading pair carry no descriptor and their radix is not a
         // default but the whole file format, so there is no `$readmem` and no
         // `$freadmemh`: those spellings are names nothing implements.
@@ -599,6 +629,24 @@ impl TaskContext {
                     enabled: true,
                 });
             }
+            SystemTask::Format(print, format_argument) => {
+                self.format_into(print, format_argument, call, store)?
+            }
+            SystemTask::CloseFile => {
+                let argument = call.arguments.first().ok_or_else(|| {
+                    SimulationError::SystemTask("`$fclose` needs a file descriptor".to_string())
+                })?;
+                let descriptor = self.channel_mask(argument, store)?;
+                store.close_channels(descriptor);
+            }
+            // A bare `$fflush;` names nothing, and flushes every open file.
+            SystemTask::FlushFile => {
+                let descriptor = match call.arguments.first() {
+                    Some(argument) => Some(self.channel_mask(argument, store)?),
+                    None => None,
+                };
+                store.flush_channels(descriptor);
+            }
             SystemTask::MonitorControl(enabled) => self.set_monitoring(enabled, store)?,
             SystemTask::ReadMemory(radix) => self.read_memory(call, radix, store)?,
             SystemTask::WriteMemory(radix) => self.write_memory(call, radix, store)?,
@@ -656,12 +704,18 @@ impl TaskContext {
             .collect()
     }
 
-    /// Formats an argument list and appends it to the output, checking the file
-    /// descriptor first when the task is one of the `$f…` family.
+    /// Formats an argument list and sends it wherever the task's descriptor
+    /// says, which for everything outside the `$f…` family is the design's
+    /// output buffer.
     ///
     /// This is what `$display` does when it runs and what `$strobe` and
     /// `$monitor` do when [`TaskContext::flush`] reaches them, so all three
     /// print the same way and only their timing differs.
+    ///
+    /// The arguments are rendered **before** the descriptor is consulted, and
+    /// deliberately even when it names nothing: `$fdisplay(0, …)` produces no
+    /// output but still evaluates what it was given, so a call to a design's
+    /// own function still has its side effect.
     fn print_call(
         &mut self,
         print: Print,
@@ -669,40 +723,84 @@ impl TaskContext {
         store: &StateStore,
         scope: &str,
     ) -> Result<(), SimulationError> {
-        let arguments = if print.descriptor {
+        let (descriptor, arguments) = if print.descriptor {
             let (descriptor, rest) = arguments.split_first().ok_or_else(|| {
                 SimulationError::SystemTask(
                     "a `$f…` task needs a file descriptor as its first argument".to_string(),
                 )
             })?;
-            self.check_descriptor(descriptor, store)?;
-            rest
+            (self.channel_mask(descriptor, store)?, rest)
         } else {
-            arguments
+            (STANDARD_OUTPUT, arguments)
         };
-        let text = self.render(arguments, store, print.radix, scope)?;
+        let mut text = self.render(arguments, store, print.radix, scope)?;
         if print.newline {
-            self.output.push_line(&text);
-        } else {
+            text.push('\n');
+        }
+        // Standard output is bit 0 of a multi-channel descriptor, which is what
+        // makes `$fdisplay(fp|1, …)` reach a file *and* the buffer a
+        // self-checking test reads.
+        if store.write_channels(descriptor, &text) {
             self.output.push(&text);
         }
         Ok(())
     }
 
-    /// Checks that a `$f…` descriptor names the one channel this simulator has.
+    /// `$sformat` / `$swrite` — the same formatting, written into the register
+    /// the first argument names instead of printed.
     ///
-    /// There is no file I/O here and the output sink is a buffer, so the only
-    /// descriptor that can be honoured is standard output: the multi-channel
-    /// descriptor `1`, or the file descriptor `32'h8000_0001`. Anything else
-    /// names a file nothing opened, and is an error saying so — writing it into
-    /// the buffer would put a design's file output where a test looks for its
-    /// terminal output, and dropping it would make a design that printed
-    /// nothing look exactly like one that passed.
-    fn check_descriptor(
+    /// The text becomes a bit vector of eight bit characters and is then driven
+    /// like any other assignment, so the target's width does the rest: a wider
+    /// one is zero extended on the left, which `%s` renders back as leading
+    /// spaces, and a narrower one keeps the *last* characters — `$sformat` of
+    /// `"abcdef"` into a `reg [15:0]` is `"ef"`, which is what iverilog 12.0
+    /// gives.
+    fn format_into(
+        &mut self,
+        print: Print,
+        format_argument: bool,
+        call: &TaskCall,
+        store: &mut StateStore,
+    ) -> Result<(), SimulationError> {
+        let (target, arguments) = call.arguments.split_first().ok_or_else(|| {
+            SimulationError::SystemTask(
+                "`$sformat` needs a variable to format into as its first argument".to_string(),
+            )
+        })?;
+        let TaskArgument::Value(target) = target else {
+            return Err(SimulationError::SystemTask(
+                "`$sformat` cannot format into a string literal".to_string(),
+            ));
+        };
+        // `$sformat(s, fmt, 7)` for a `reg` holding `"a=%0d"` formats with it,
+        // where the same argument to `$swrite` would be *printed*. Reading the
+        // register's characters here is the whole of that difference; past this
+        // point the two are one task.
+        let mut arguments = arguments.to_vec();
+        if format_argument {
+            if let Some(argument @ TaskArgument::Value(_)) = arguments.first() {
+                let text = ascii(&self.value_of(argument, store)?);
+                arguments[0] = TaskArgument::Text(text);
+            }
+        }
+        let text = self.render(&arguments, store, print.radix, &call.scope)?;
+        let target = target.clone();
+        drive(store, &target, &string_bits(&text))?;
+        Ok(())
+    }
+
+    /// The file descriptor or channel mask a `$f…` argument evaluates to.
+    ///
+    /// A descriptor decides where output goes, so a value that is not fully
+    /// known names nowhere and is an error saying so — dropping the call would
+    /// make a design that printed nothing look exactly like one that passed. A
+    /// *known* value naming a channel nothing opened is not an error: see
+    /// [`StateStore::write_channels`].
+    fn channel_mask(
         &self,
         argument: &TaskArgument,
         store: &StateStore,
-    ) -> Result<(), SimulationError> {
+    ) -> Result<u32, SimulationError> {
         let value = self.value_of(argument, store)?;
         let channel = value
             .to_u128()
@@ -713,24 +811,8 @@ impl TaskContext {
                     value.to_binary()
                 ))
             })?;
-
-        // Bit 31 marks a file descriptor; without it the value is a bit mask of
-        // multi-channel descriptors, whose bit 0 is standard output.
-        const FILE_DESCRIPTOR: u128 = 1 << 31;
-        let stdout = if channel & FILE_DESCRIPTOR != 0 {
-            channel & !FILE_DESCRIPTOR == 1
-        } else {
-            channel == 1
-        };
-        if stdout {
-            return Ok(());
-        }
-        Err(SimulationError::SystemTask(format!(
-            "a `$f…` task can only write to standard output, and descriptor `{}` names a file nothing opened",
-            channel
-        )))
+        Ok(channel as u32)
     }
-
     /// Formats an argument list the way `$display` does: a string argument is a
     /// format string and consumes as many of the arguments after it as it has
     /// specifiers; anything left over is printed in `radix`, the default the
@@ -874,19 +956,26 @@ impl TaskContext {
             // `"A"` prints as `"   A"`; `%0s` is the same text with the padding
             // left off. A literal is already exactly as wide as it is.
             if specifier.eq_ignore_ascii_case(&'s') {
-                let (rendered, default_width) = match argument {
-                    TaskArgument::Text(literal) => (literal.clone(), 0),
-                    other => {
-                        let value = self.value_of(other, store)?;
-                        // The bits of a real are an IEEE-754 encoding, not
-                        // characters, so there is no text in one to print.
-                        // iverilog warns and prints `<%s>`; there is no warning
-                        // channel here, so it is an error that says so.
-                        if value.is_real() {
-                            return Err(bad_format("`%s` has no meaning for a real value"));
-                        }
-                        (ascii(&value), value.width().div_ceil(8))
+                let (rendered, default_width) = {
+                    // A literal reaches `%s` as its own bytes, exactly as it
+                    // reaches `%d` as a number: `""` is one NUL character and
+                    // `"\000a\000b"` is four, so both pad to the characters the
+                    // vector has and both drop their *leading* NULs. Printing
+                    // the literal's text instead would make `%s` the one
+                    // specifier a string argument did not go through a vector
+                    // for (corpus `string13`, `string14`).
+                    let value = match argument {
+                        TaskArgument::Text(literal) => string_bits(literal),
+                        other => self.value_of(other, store)?,
+                    };
+                    // The bits of a real are an IEEE-754 encoding, not
+                    // characters, so there is no text in one to print.
+                    // iverilog warns and prints `<%s>`; there is no warning
+                    // channel here, so it is an error that says so.
+                    if value.is_real() {
+                        return Err(bad_format("`%s` has no meaning for a real value"));
                     }
+                    (ascii(&value), value.width().div_ceil(8))
                 };
                 text.push_str(&pad(rendered, width.unwrap_or(default_width), fill));
                 continue;
@@ -1115,10 +1204,15 @@ impl TaskContext {
             cursor += step;
         }
 
-        fs::write(&name, text).map_err(|error| {
+        // The same write path `$fopen` resolves against, so a design that
+        // writes a memory and a design that writes a file put their output in
+        // the same place.
+        let path = store.resolve_write_path(&name);
+        fs::write(&path, text).map_err(|error| {
             SimulationError::SystemTask(format!(
                 "`$writemem…` could not write `{}`: {}",
-                name, error
+                path.display(),
+                error
             ))
         })
     }
@@ -1779,7 +1873,7 @@ fn octal(register: &Register) -> String {
 /// register wide enough to have been zero extended. A NUL with text on both
 /// sides is a space instead: it is a character of the value, and dropping it
 /// would close a gap the vector really has.
-fn ascii(register: &Register) -> String {
+pub(crate) fn ascii(register: &Register) -> String {
     let bits = register.to_binary();
     let padding = (8 - bits.len() % 8) % 8;
     let bits = format!("{}{}", "0".repeat(padding), bits);
@@ -2320,13 +2414,22 @@ mod tests {
         assert_eq!(context.output().text(), "10101100");
     }
 
-    /// Any other descriptor names a file nothing opened. That is an error, not
-    /// a no-op: a design whose output vanished would look like one that passed.
+    /// A descriptor naming a channel nothing opened writes nowhere and does not
+    /// stop the design — which is what iverilog 12.0 does with one; it warns on
+    /// standard error and carries on. A descriptor that is not a *known* value
+    /// still is an error, and so is a `$f…` task with no descriptor at all.
     #[test]
-    fn test_fdisplay_to_a_file_is_an_error_rather_than_a_no_op() {
-        let message = error(r#"$fdisplay(4, "PASSED");"#);
+    fn test_an_unopened_channel_writes_nowhere_and_a_missing_one_is_an_error() {
+        assert_eq!(printed(r#"$fdisplay(4, "PASSED");"#, &store_with(&[])), "");
+        // Bit 0 is still standard output even beside a channel nothing opened.
+        assert_eq!(
+            printed(r#"$fdisplay(5, "PASSED");"#, &store_with(&[])),
+            "PASSED\n"
+        );
+
+        let message = error(r#"$fdisplay(1'bx, "PASSED");"#);
         assert!(
-            message.contains("nothing opened"),
+            message.contains("must be a known value"),
             "unexpected message: {}",
             message
         );
@@ -2336,6 +2439,129 @@ mod tests {
             "unexpected message: {}",
             message
         );
+    }
+
+    /// A scratch directory of this test's own, so two tests never share a file.
+    fn scratch(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("visilog-{}", name));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch directory should be creatable");
+        directory
+    }
+
+    /// `$fopen` allocates a *bit* of a multi-channel descriptor, from bit 1 up,
+    /// because bit 0 is standard output. Corpus `fopen1` and `fopen2` check the
+    /// numbers themselves: 2, then 4, then 8.
+    #[test]
+    fn test_fopen_allocates_multi_channel_descriptor_bits() {
+        let mut store = StateStore::new();
+        store.set_output_directory(scratch("mcd"));
+        assert_eq!(store.open_channel("one.txt"), 2);
+        assert_eq!(store.open_channel("two.txt"), 4);
+        assert_eq!(store.open_channel("three.txt"), 8);
+
+        // A closed bit goes back into the pool, which is what `fopen2` asserts
+        // by opening a fourth file after closing its second.
+        store.close_channels(4);
+        assert_eq!(store.open_channel("four.txt"), 4);
+    }
+
+    /// A file that cannot be opened is 0, not an error: `if (fp == 0)` is how
+    /// a design says so itself, and an error would take that report away.
+    #[test]
+    fn test_a_file_that_cannot_be_opened_is_zero() {
+        let store = StateStore::new();
+        assert_eq!(store.open_channel("/no/such/directory/anywhere.txt"), 0);
+        assert_eq!(store.open_descriptor("/no/such/directory/x.txt", "w"), 0);
+        // A mode nothing means is 0 too, rather than a file opened some other
+        // way round.
+        assert_eq!(store.open_descriptor("/no/such/directory/x.txt", "zz"), 0);
+    }
+
+    /// The whole point of the bit mask: `$fdisplay(fp|1, …)` writes to the file
+    /// *and* to the buffer a self-checking test reads. That is how a corpus
+    /// design's file output reaches the harness at all.
+    #[test]
+    fn test_fdisplay_writes_to_a_file_and_to_standard_output_at_once() {
+        let directory = scratch("both");
+        let mut store = StateStore::new();
+        store.set_output_directory(&directory);
+        let channel = store.open_channel("out.txt");
+        assert_eq!(channel, 2);
+        store.set_ranged("fp", Register::from_u128(channel as u128, 32), (31, 0));
+
+        let mut context = TaskContext::new();
+        run_in(&mut context, r#"$fdisplay(fp|1, "both");"#, &mut store);
+        run_in(&mut context, r#"$fdisplay(fp, "file only");"#, &mut store);
+        run_in(&mut context, r#"$fdisplay(1, "buffer only");"#, &mut store);
+        assert_eq!(context.output().text(), "both\nbuffer only\n");
+
+        // Closing is what flushes the buffered writer.
+        store.close_channels(channel);
+        let written = fs::read_to_string(directory.join("out.txt")).expect("file should exist");
+        assert_eq!(written, "both\nfile only\n");
+    }
+
+    /// `$fopen` is a system *function*, so it runs in `eval` against a
+    /// `&StateStore` — which is exactly why the file table lives on the store.
+    /// A name built out of a concatenation is the case corpus `sp2` and `pr1065`
+    /// need.
+    #[test]
+    fn test_fopen_is_an_expression_and_takes_a_built_up_name() {
+        let directory = scratch("expr");
+        let mut store = StateStore::new();
+        store.set_output_directory(&directory);
+        let expression = crate::parsers::expr::verilog_expression(r#"$fopen({"sub", ".txt"})"#)
+            .expect("expression should parse")
+            .1;
+        let value = eval(&expression, &store).expect("$fopen should evaluate");
+        assert_eq!(value.to_u128(), Some(2));
+        store.close_channels(2);
+        assert!(directory.join("sub.txt").is_file());
+    }
+
+    /// `$sformat` formats into a register instead of printing, and the target's
+    /// width does the rest — measured against iverilog 12.0: a wider target is
+    /// zero extended on the left, and a narrower one keeps the *last*
+    /// characters.
+    #[test]
+    fn test_sformat_writes_the_rendered_text_into_a_register() {
+        let mut store = store_with(&[("s", &"0".repeat(80)), ("narrow", "0000000000000000")]);
+        let mut context = TaskContext::new();
+        run_in(
+            &mut context,
+            r#"$sformat(s, "x=%0d y=%s", 42, "hi");"#,
+            &mut store,
+        );
+        assert_eq!(context.output().text(), "", "$sformat printed");
+        assert_eq!(ascii(&store.get("s").expect("s should exist")), "x=42 y=hi");
+
+        run_in(&mut context, r#"$sformat(narrow, "abcdef");"#, &mut store);
+        assert_eq!(
+            ascii(&store.get("narrow").expect("narrow should exist")),
+            "ef"
+        );
+
+        // `$swrite` is the same task under the other spelling, and its radix
+        // suffix decomposes the way every other one does.
+        run_in(&mut context, r#"$swriteb(s, 4'b1010);"#, &mut store);
+        assert_eq!(ascii(&store.get("s").expect("s should exist")), "1010");
+    }
+
+    /// The one difference between the two spellings: `$sformat`'s second
+    /// argument is the format string even when it is a register holding one,
+    /// where `$swrite` prints the same argument as a value.
+    #[test]
+    fn test_sformat_takes_a_variable_format_string_and_swrite_does_not() {
+        let mut store = store_with(&[("s", &"0".repeat(80))]);
+        store.set_ranged("fmt", string_bits("a=%0d").resize(40), (39, 0));
+        let mut context = TaskContext::new();
+
+        run_in(&mut context, r#"$sformat(s, fmt, 7);"#, &mut store);
+        assert_eq!(ascii(&store.get("s").expect("s should exist")), "a=7");
+
+        run_in(&mut context, r#"$swrite(s, fmt, 7);"#, &mut store);
+        assert_ne!(ascii(&store.get("s").expect("s should exist")), "a=7");
     }
 
     /// The `f` of `$finish` and the `f` at the end of `$monitoroff` are neither

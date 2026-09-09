@@ -59,6 +59,7 @@ use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, REAL_WIDTH, X, 
 use crate::simulator::exec::range_width;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{StateStore, MAX_CALL_DEPTH};
+use crate::simulator::tasks::ascii;
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
 /// Verilog uses the host `integer` width, which is 32 bits.
@@ -996,7 +997,8 @@ fn system_function_is_signed(name: &str) -> bool {
     match name {
         // `$realtobits` hands back a bit pattern rather than a number, so
         // there is no sign in it to read.
-        "unsigned" | "time" | "realtobits" => false,
+        // A descriptor is a bit mask, not a number to do arithmetic on.
+        "unsigned" | "time" | "realtobits" | "fopen" => false,
         _ => true,
     }
 }
@@ -1019,7 +1021,7 @@ const TIME_WIDTH: usize = 64;
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 12] = [
+pub const SYSTEM_FUNCTIONS: [&str; 13] = [
     "time",
     "stime",
     "realtime",
@@ -1032,6 +1034,7 @@ pub const SYSTEM_FUNCTIONS: [&str; 12] = [
     "itor",
     "realtobits",
     "bitstoreal",
+    "fopen",
 ];
 
 /// Evaluates `$name(...)`, the simulator's own functions.
@@ -1112,6 +1115,26 @@ fn eval_system_function_bits(
             } else {
                 0.0
             }))
+        }
+        // `$fopen` is a system *function* — it hands a descriptor back — which
+        // is why the file table lives on the [`StateStore`] beside the
+        // `$random` stream rather than on the `TaskContext`: this is all the
+        // evaluator is given. One argument opens a multi-channel descriptor, a
+        // one-hot bit allocated from bit 1 up because bit 0 is standard output;
+        // two opens a file descriptor in a C `fopen` mode. A file that cannot
+        // be opened is **0** rather than an error, because 0 is what the design
+        // itself tests for.
+        "fopen" => {
+            arity("a file name and an optional mode", &[1, 2])?;
+            let name = file_name(&arguments[0], store)?;
+            let descriptor = match arguments.get(1) {
+                None => store.open_channel(&name),
+                Some(mode) => store.open_descriptor(&name, &file_name(mode, store)?),
+            };
+            Ok(Register::from_u128(
+                descriptor as u128,
+                SYSTEM_FUNCTION_WIDTH,
+            ))
         }
         // The IEEE-754 encoding, and back. They are a pair of casts over the
         // same sixty-four bits: `$realtobits(1.5)` is `64'h3ff8000000000000`
@@ -1250,6 +1273,15 @@ fn string_width(text: &str) -> usize {
 
 /// A string literal as bits. Unsigned: it is a vector of bytes, not a number
 /// anyone declared a sign for.
+/// The text an expression spells, which is how a file name reaches `$fopen`.
+///
+/// A literal is the obvious case, but `$fopen({"work/", name})` is the one that
+/// matters: a design that builds a path out of a parameter and a `reg` hands
+/// over a bit vector, and eight bits at a time it is the same characters.
+fn file_name(expression: &Expression, store: &StateStore) -> Result<String, EvalError> {
+    Ok(ascii(&eval(expression, store)?))
+}
+
 pub(crate) fn string_bits(text: &str) -> Register {
     let mut bits = Vec::with_capacity(string_width(text));
     if text.is_empty() {
@@ -2719,6 +2751,9 @@ mod tests {
         for name in SYSTEM_FUNCTIONS {
             let source = match name {
                 "time" | "stime" | "realtime" | "random" => format!("${}", name),
+                // The empty path names no file, so this exercises `$fopen`
+                // without leaving one behind.
+                "fopen" => "$fopen(\"\")".to_string(),
                 other => format!("${}(a)", other),
             };
             eval(&parse(&source), &store)

@@ -1,6 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rand::rngs::StdRng;
@@ -48,6 +51,99 @@ pub struct RandomStream(RefCell<StdRng>);
 impl Default for RandomStream {
     fn default() -> Self {
         RandomStream(RefCell::new(StdRng::seed_from_u64(DEFAULT_RANDOM_SEED)))
+    }
+}
+
+/// Bit 31 of a descriptor marks a *file* descriptor rather than a
+/// multi-channel one, which is what tells `$fopen(name, "w")`'s answer from
+/// `$fopen(name)`'s.
+const FILE_DESCRIPTOR: u32 = 1 << 31;
+
+/// The highest multi-channel descriptor bit [`StateStore::open_channel`] hands
+/// out. Bit 31 means something else, so a channel cannot live there.
+const MAX_CHANNEL_BIT: u32 = 30;
+
+/// The file descriptors already spoken for: 0 is standard input, 1 standard
+/// output and 2 standard error, so the first one `$fopen` allocates is 3 —
+/// which is what iverilog 12.0 hands back.
+const FIRST_FILE_DESCRIPTOR: usize = 3;
+
+/// Standard output, as a file descriptor.
+const STDOUT_DESCRIPTOR: usize = 1;
+
+/// The files a design has open, and where a relative path is written.
+///
+/// This lives on the [`StateStore`] for the same reason the `$random` stream
+/// does: `$fopen` is a system *function*, so it is evaluated by
+/// [`eval`](crate::simulator::eval::eval), which is handed a `&StateStore` and
+/// nothing else. Hence the [`RefCell`] — opening a file has to be a
+/// shared-reference operation. The [`Rc`] is what shares the table with a
+/// function call's frame, so a file opened inside a `function` is a file the
+/// design has open rather than one thrown away with the frame.
+#[derive(Clone, Debug, Default)]
+pub struct FileTable(Rc<RefCell<OpenFiles>>);
+
+/// One open file, or the slot a closed one left behind.
+type Channel = Option<BufWriter<File>>;
+
+#[derive(Debug, Default)]
+struct OpenFiles {
+    /// The multi-channel descriptors, indexed by their bit. Bit 0 is standard
+    /// output and never a file, so slot 0 stays empty.
+    channels: Vec<Channel>,
+    /// The file descriptors, indexed by their number. The first three are
+    /// the standard streams and are never files either.
+    descriptors: Vec<Channel>,
+    /// Where a relative path is resolved. `None` is the process working
+    /// directory, which is what a caller that never said otherwise gets.
+    directory: Option<PathBuf>,
+}
+
+impl OpenFiles {
+    /// The first free slot at or after `first`, growing the list when every one
+    /// already in it is taken. `None` once `last` is in use as well.
+    fn free_slot(slots: &mut Vec<Channel>, first: usize, last: usize) -> Option<usize> {
+        while slots.len() <= first {
+            slots.push(None);
+        }
+        if let Some(index) = slots.iter().skip(first).position(Option::is_none) {
+            return Some(first + index);
+        }
+        if slots.len() > last {
+            return None;
+        }
+        slots.push(None);
+        Some(slots.len() - 1)
+    }
+
+    /// Every slot the descriptor names that really is an open file: one for a
+    /// file descriptor, and one per set bit for a channel mask.
+    fn named(&mut self, descriptor: u32) -> Vec<&mut BufWriter<File>> {
+        if descriptor & FILE_DESCRIPTOR != 0 {
+            let index = (descriptor & !FILE_DESCRIPTOR) as usize;
+            return self
+                .descriptors
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .into_iter()
+                .collect();
+        }
+        self.channels
+            .iter_mut()
+            .enumerate()
+            .filter(|(bit, _)| *bit >= 1 && descriptor & (1 << bit) != 0)
+            .filter_map(|(_, slot)| slot.as_mut())
+            .collect()
+    }
+
+    /// Every open file, whichever kind of descriptor named it — what a
+    /// `$fflush` with no argument flushes.
+    fn all(&mut self) -> Vec<&mut BufWriter<File>> {
+        self.channels
+            .iter_mut()
+            .chain(self.descriptors.iter_mut())
+            .filter_map(Option::as_mut)
+            .collect()
     }
 }
 
@@ -499,6 +595,9 @@ pub struct StateStore {
     /// `repeat` count does. It is deliberately not a signal: nothing in the
     /// design can name it, so journalling it would only manufacture edges.
     holds: HashMap<String, Register>,
+    /// The files `$fopen` has opened, and the directory a relative path is
+    /// written into. See [`FileTable`].
+    files: FileTable,
 }
 
 impl StateStore {
@@ -546,6 +645,149 @@ impl StateStore {
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
             holds: HashMap::new(),
+            // Shared, not fresh: `$fopen` is an expression, so it can be
+            // called from a function body, and a file it opened there has to
+            // outlive the frame the way a file opened anywhere else does.
+            files: self.files.clone(),
+        }
+    }
+
+    /// Where a relative `$fopen` or `$writememh` path is written, which
+    /// defaults to the process working directory.
+    ///
+    /// A `Simulator` is built from parsed modules and never learns which file
+    /// they came from, so it cannot put a design's output "next to the design"
+    /// on its own — this is the seam a caller that does know uses, the write
+    /// side of
+    /// [`Simulator::add_search_path`](crate::simulator::runner::Simulator::add_search_path).
+    pub fn set_output_directory(&mut self, directory: impl Into<PathBuf>) {
+        self.files.0.borrow_mut().directory = Some(directory.into());
+    }
+
+    /// The path a `$fopen` or `$writemem…` name denotes. An absolute one is
+    /// itself; a relative one hangs off the output directory.
+    pub fn resolve_write_path(&self, name: &str) -> PathBuf {
+        let path = Path::new(name);
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        match &self.files.0.borrow().directory {
+            Some(directory) => directory.join(path),
+            None => path.to_path_buf(),
+        }
+    }
+
+    /// `$fopen(name)` — opens `name` for writing and returns the multi-channel
+    /// descriptor bit standing for it: 2, then 4, then 8, allocated from bit 1
+    /// upwards because bit 0 is standard output.
+    ///
+    /// A file that cannot be opened is **0**, not an error, because 0 is what a
+    /// design tests for — `if (fp == 0) $display("FAILED")` is how these tests
+    /// are written, and an error would take the design's own report away from
+    /// it.
+    pub fn open_channel(&self, name: &str) -> u32 {
+        let path = self.resolve_write_path(name);
+        let mut files = self.files.0.borrow_mut();
+        let Some(bit) = OpenFiles::free_slot(&mut files.channels, 1, MAX_CHANNEL_BIT as usize)
+        else {
+            return 0;
+        };
+        match File::create(&path) {
+            Ok(file) => {
+                files.channels[bit] = Some(BufWriter::new(file));
+                1 << bit
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// `$fopen(name, mode)` — opens `name` in a C `fopen` mode and returns a
+    /// *file* descriptor: bit 31 set, over a number allocated from 3 upwards.
+    /// 0 on failure, exactly as [`open_channel`](StateStore::open_channel).
+    pub fn open_descriptor(&self, name: &str, mode: &str) -> u32 {
+        let path = self.resolve_write_path(name);
+        let mut options = OpenOptions::new();
+        match mode.trim_end_matches('b') {
+            "r" => options.read(true),
+            "r+" => options.read(true).write(true),
+            "w" => options.write(true).create(true).truncate(true),
+            "w+" => options.read(true).write(true).create(true).truncate(true),
+            "a" => options.append(true).create(true),
+            "a+" => options.read(true).append(true).create(true),
+            _ => return 0,
+        };
+        let mut files = self.files.0.borrow_mut();
+        let Some(index) = OpenFiles::free_slot(
+            &mut files.descriptors,
+            FIRST_FILE_DESCRIPTOR,
+            (!FILE_DESCRIPTOR) as usize,
+        ) else {
+            return 0;
+        };
+        match options.open(&path) {
+            Ok(file) => {
+                files.descriptors[index] = Some(BufWriter::new(file));
+                FILE_DESCRIPTOR | index as u32
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Writes `text` to every open file the descriptor names, and reports
+    /// whether **standard output** was among them — which is what makes
+    /// `$fdisplay(fp|1, …)` reach the design's output buffer as well as its
+    /// file.
+    ///
+    /// A bit naming a channel nothing opened is dropped, which is what iverilog
+    /// does with one: it warns on standard error and carries on. Refusing the
+    /// whole call instead would stop a design over a channel its output does
+    /// not depend on.
+    pub fn write_channels(&self, descriptor: u32, text: &str) -> bool {
+        let mut files = self.files.0.borrow_mut();
+        for file in files.named(descriptor) {
+            let _ = file.write_all(text.as_bytes());
+        }
+        if descriptor & FILE_DESCRIPTOR != 0 {
+            return (descriptor & !FILE_DESCRIPTOR) as usize == STDOUT_DESCRIPTOR;
+        }
+        descriptor & 1 != 0
+    }
+
+    /// `$fclose` — closes every file the descriptor names, freeing its bit for
+    /// the next `$fopen`. Standard output is not a file, so `$fclose(1)` closes
+    /// nothing.
+    pub fn close_channels(&self, descriptor: u32) {
+        let mut files = self.files.0.borrow_mut();
+        if descriptor & FILE_DESCRIPTOR != 0 {
+            let index = (descriptor & !FILE_DESCRIPTOR) as usize;
+            if index >= FIRST_FILE_DESCRIPTOR {
+                if let Some(slot) = files.descriptors.get_mut(index) {
+                    *slot = None;
+                }
+            }
+            return;
+        }
+        for bit in 1..=MAX_CHANNEL_BIT {
+            if descriptor & (1 << bit) == 0 {
+                continue;
+            }
+            if let Some(slot) = files.channels.get_mut(bit as usize) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// `$fflush` — pushes what is buffered out to the files the descriptor
+    /// names, or to every open file when there is no descriptor at all, which
+    /// is what a bare `$fflush;` means.
+    pub fn flush_channels(&self, descriptor: Option<u32>) {
+        let mut files = self.files.0.borrow_mut();
+        let open = match descriptor {
+            Some(descriptor) => files.named(descriptor),
+            None => files.all(),
+        };
+        for file in open {
+            let _ = file.flush();
         }
     }
 

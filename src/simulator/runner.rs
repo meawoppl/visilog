@@ -440,6 +440,13 @@ pub struct Simulator {
     /// Where system tasks print, what `$time` reads, and whether the design has
     /// called `$finish`.
     tasks: TaskContext,
+    /// Where a relative `$fopen` or `$writememh` path is written.
+    ///
+    /// It is kept here rather than only on the `StateStore` because
+    /// [`Simulator::setup`] builds a fresh store out of the elaboration, and a
+    /// directory the caller chose outlives any one elaboration — the same
+    /// reason the `$readmemh` search path is kept here.
+    output_directory: Option<PathBuf>,
 }
 
 impl Simulator {
@@ -476,6 +483,7 @@ impl Simulator {
             inputs: Vec::new(),
             is_setup: false,
             tasks: TaskContext::new(),
+            output_directory: None,
         }
     }
 
@@ -516,6 +524,9 @@ impl Simulator {
             .ok_or_else(|| SimulationError::UnknownModule(self.top.clone()))?;
         let elaborated = elaborate(&self.modules, top)?;
         self.state = elaborated.state;
+        if let Some(directory) = &self.output_directory {
+            self.state.set_output_directory(directory.clone());
+        }
         self.assignments = elaborated.assignments;
         // A design that names no delay on any `assign` keeps an empty vector,
         // so the propagation loop asks nothing per pass.
@@ -820,6 +831,17 @@ impl Simulator {
     /// the task state.
     pub fn add_search_path(&mut self, directory: impl Into<PathBuf>) {
         self.tasks.add_search_path(directory);
+    }
+
+    /// Where a relative `$fopen` or `$writemem…` path is written, which
+    /// defaults to the process working directory.
+    ///
+    /// This is [`Simulator::add_search_path`] the other way round, and it
+    /// exists for the same reason: a `Simulator` is built from parsed modules
+    /// and never learns which file they came from, so where a design's output
+    /// belongs is something only the caller knows.
+    pub fn set_output_directory(&mut self, directory: impl Into<PathBuf>) {
+        self.output_directory = Some(directory.into());
     }
 
     /// Everything the design has printed with `$display` and `$write`.
@@ -1578,6 +1600,43 @@ mod tests {
         .collect();
         let source = fs::read_to_string(&path).expect("unable to read example");
         simulator_for(&source)
+    }
+
+    /// A whole design opening a file, writing to it and to standard output at
+    /// once, and closing it — which is corpus `fopen1` and `fopen2` in
+    /// miniature. The `|1` is what makes the design's own report reach the
+    /// output buffer a self-checking test reads.
+    #[test]
+    fn test_a_design_writes_to_a_file_and_to_the_output_buffer() {
+        let directory = std::env::temp_dir().join("visilog-runner-fopen");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch directory should be creatable");
+
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module writer;
+                integer fp;
+                initial begin
+                    fp = $fopen("out.txt");
+                    if (fp != 2) $display("FAILED fp=%0d", fp);
+                    $fdisplay(fp, "to the file");
+                    $fdisplay(fp | 1, "to both");
+                    $fclose(fp);
+                    $display("PASSED");
+                end
+            endmodule
+        "#,
+        )
+        .unwrap();
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.set_output_directory(&directory);
+        simulator.setup().unwrap();
+        simulator.advance(10).unwrap();
+
+        assert_eq!(simulator.output().text(), "to both\nPASSED\n");
+        let written = fs::read_to_string(directory.join("out.txt")).expect("file should exist");
+        assert_eq!(written, "to the file\nto both\n");
     }
 
     #[test]
