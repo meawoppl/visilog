@@ -13,6 +13,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
+    parameter::parse_parameter_port_list,
     simple::{range, signedness, ws, ws_and_comments, Range},
     statements::{parse_module_statement, ModuleStatement},
 };
@@ -232,6 +233,10 @@ pub(crate) fn reconcile_ports(
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = ws(tag("module"))(input)?;
     let (input, mod_identifier) = ws(identifier)(input)?;
+    // `module m #(parameter W = 8) (…);` — an ANSI parameter port list. It
+    // becomes ordinary parameter *statements* below, so nothing downstream can
+    // tell one declared here from one declared in the body.
+    let (input, parameter_ports) = opt(parse_parameter_port_list)(input)?;
     let (input, header) = map(opt(parse_port_header), |header| {
         header.unwrap_or(PortHeader::Ansi(Vec::new()))
     })(input)?;
@@ -251,6 +256,12 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     // rather than left in it as a second description of the same thing.
     let mut declared = Vec::new();
     let mut statements = Vec::new();
+    // The parameter ports go in front of the body, because a body declaration
+    // may be written in terms of one — `#(parameter W = 8)` with
+    // `reg [W-1:0] r;` below it — and elaboration reads them in order.
+    if let Some(parameters) = parameter_ports {
+        statements.push(ModuleStatement::ParameterDeclaration(parameters));
+    }
     for statement in body {
         match statement {
             ModuleStatement::PortDeclaration(ports) => declared.extend(ports),
