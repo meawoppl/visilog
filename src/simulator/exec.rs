@@ -30,7 +30,7 @@ use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
 use crate::register::Register;
 use crate::simulator::eval::{eval, eval_sized, EvalError, SELF_DETERMINED};
-use crate::simulator::program::{resume, Program, Resume, DELAY_UNSUPPORTED};
+use crate::simulator::program::{resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::{Drive, DriveLevel, StateStore};
 use crate::simulator::tasks::TaskContext;
@@ -130,7 +130,10 @@ pub fn execute_statements(
     store: &mut StateStore,
     tasks: &mut TaskContext,
 ) -> Result<Vec<PendingUpdate>, SimulationError> {
-    let program = Program::compile(statements)?;
+    // Nothing that reaches this entry point has a task table to hand: it is
+    // the run-to-completion path, and a task's body is inlined by the compiler
+    // that elaboration drives. A task enabled here is `UnknownTask` by name.
+    let program = Program::compile(statements, &TaskTable::new())?;
     match resume(&program, 0, store, tasks)? {
         Resume::Halted { pending } => Ok(pending),
         Resume::Suspended { .. } => Err(DELAY_UNSUPPORTED),

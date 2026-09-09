@@ -3,8 +3,8 @@ use nom::{branch::alt, combinator::map, error::context, IResult};
 use super::{
     assignment::{parse_continuous_assignment, ContinuousAssignment},
     behavior::{
-        parse_always_block, parse_function_declaration, parse_initial_block, AlwaysBlock,
-        FunctionDeclaration, InitialBlock,
+        parse_always_block, parse_function_declaration, parse_initial_block,
+        parse_task_declaration, AlwaysBlock, FunctionDeclaration, InitialBlock, TaskDeclaration,
     },
     integer::{
         parse_event_declaration, parse_integer_declaration, parse_real_declaration,
@@ -39,6 +39,8 @@ pub enum ModuleStatement {
     /// `function [7:0] f; … endfunction` — a function the module's
     /// expressions may call.
     FunctionDeclaration(FunctionDeclaration),
+    /// `task t; … endtask` — a task the module's procedural blocks may enable.
+    TaskDeclaration(TaskDeclaration),
     Assignment(ContinuousAssignment),
     ModuleInstantiation(ModuleInstantiation),
 }
@@ -70,6 +72,9 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
             map(parse_initial_block, |d| ModuleStatement::InitialBlock(d)),
             map(parse_function_declaration, |d| {
                 ModuleStatement::FunctionDeclaration(d)
+            }),
+            map(parse_task_declaration, |d| {
+                ModuleStatement::TaskDeclaration(d)
             }),
             map(parse_always_block, |d| ModuleStatement::AlwaysBlock(d)),
             map(parse_continuous_assignment, |d| {
@@ -116,6 +121,10 @@ mod tests {
         assert!(matches!(
             assert_parses(parse_module_statement, "initial begin a = 'b1; end"),
             ModuleStatement::InitialBlock(_)
+        ));
+        assert!(matches!(
+            assert_parses(parse_module_statement, "task t; input a; b = a; endtask"),
+            ModuleStatement::TaskDeclaration(_)
         ));
     }
 

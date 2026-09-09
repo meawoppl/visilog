@@ -93,6 +93,18 @@ pub enum SimulationError {
     /// A module that instantiates itself, directly or around a cycle. No amount
     /// of flattening terminates on that.
     RecursiveInstantiation(String),
+    /// A task enable naming a task the module does not declare.
+    UnknownTask(String),
+    /// A task enable with the wrong number of arguments. A task's arguments are
+    /// how its results get out, so a missing one is never harmless.
+    TaskArity {
+        name: String,
+        expected: usize,
+        found: usize,
+    },
+    /// A task that enables itself, directly or around a cycle. A body is
+    /// inlined where it is enabled, and inlining a cycle does not terminate.
+    RecursiveTask(String),
     /// An `assign` whose left hand side is not something that can be driven.
     UnsupportedTarget(String),
     /// [`Simulator::setup`] has not run yet.
@@ -119,6 +131,19 @@ impl fmt::Display for SimulationError {
             }
             SimulationError::SystemTask(problem) => write!(f, "{}", problem),
             SimulationError::UnknownModule(name) => write!(f, "no module named `{}`", name),
+            SimulationError::UnknownTask(name) => write!(f, "no task named `{}`", name),
+            SimulationError::TaskArity {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "task `{}` takes {} arguments, but was enabled with {}",
+                name, expected, found
+            ),
+            SimulationError::RecursiveTask(name) => {
+                write!(f, "task `{}` enables itself", name)
+            }
             SimulationError::UnknownPort { module, port } => {
                 write!(f, "module `{}` has no port `{}`", module, port)
             }
@@ -2406,6 +2431,368 @@ mod tests {
             error
         );
     }
+    /// The substance of the feature: an `output` argument is copied back to
+    /// the caller's variable when the task returns, and an `inout` one is
+    /// copied both ways. Checked against iverilog, which gives `a = 3`,
+    /// `b = 12` at time 5.
+    #[test]
+    fn test_task_copies_output_and_inout_arguments_back() {
+        let mut simulator = simulator_for(
+            r#"
+            module copier();
+                reg [7:0] a, b;
+                task tk(input [7:0] x, output [7:0] y, inout [7:0] z);
+                    begin
+                        y = x + 1;
+                        z = z + 2;
+                        #5;
+                        y = y + 10;
+                    end
+                endtask
+
+                initial begin
+                    a = 8'd1;
+                    b = 8'd5;
+                    tk(a, b, a);
+                    $display("a=%0d b=%0d", a, b);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(3));
+        assert_eq!(simulator.get("b").unwrap().to_u128(), Some(12));
+        assert_eq!(simulator.output().text().trim(), "a=3 b=12");
+    }
+
+    /// An `input` argument is copied *in* and never back out, so a task that
+    /// writes one leaves the caller's variable alone.
+    #[test]
+    fn test_task_input_argument_is_not_copied_back() {
+        let mut simulator = simulator_for(
+            r#"
+            module one_way();
+                reg [7:0] a;
+                task tk(input [7:0] x);
+                    x = 8'd99;
+                endtask
+
+                initial begin
+                    a = 8'd7;
+                    tk(a);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(7));
+    }
+
+    /// A task may consume time, which is the whole reason its body is inlined
+    /// into the block that enables it: the resume point is a program counter,
+    /// and the body's instructions are in the same list.
+    #[test]
+    fn test_task_containing_a_delay_suspends_its_caller() {
+        let mut simulator = simulator_for(
+            r#"
+            module waiter(output reg [7:0] q);
+                task step;
+                    begin
+                        #10 q = q + 1;
+                        #10 q = q + 1;
+                    end
+                endtask
+
+                initial begin
+                    q = 0;
+                    step;
+                    $display("done at %0d with q=%0d", $time, q);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(5).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(0));
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(1));
+        simulator.advance(20).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(2));
+        assert_eq!(simulator.output().text().trim(), "done at 20 with q=2");
+    }
+
+    /// A task's arguments and locals are static storage of its own, so a name
+    /// it declares does not touch the design signal spelled the same way — and
+    /// two enables of one task share those variables the way the LRM says.
+    #[test]
+    fn test_task_locals_are_separate_from_the_design() {
+        let mut simulator = simulator_for(
+            r#"
+            module shadowed();
+                reg [7:0] tmp, out;
+                task add_two(input [7:0] value, output [7:0] result);
+                    reg [7:0] tmp;
+                    begin
+                        tmp = value + 2;
+                        result = tmp;
+                    end
+                endtask
+
+                initial begin
+                    tmp = 8'd50;
+                    add_two(8'd1, out);
+                    $display("tmp=%0d out=%0d", tmp, out);
+                    add_two(8'd10, out);
+                    $display("tmp=%0d out=%0d", tmp, out);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(
+            simulator.output().text().trim(),
+            "tmp=50 out=3\ntmp=50 out=12"
+        );
+    }
+
+    /// A task enabled by a task is inlined into it, so an enable two deep runs
+    /// exactly as one written out by hand does.
+    #[test]
+    fn test_a_task_may_enable_another_task() {
+        let mut simulator = simulator_for(
+            r#"
+            module nested(output reg [7:0] q);
+                task inner(input [7:0] value);
+                    q = q + value;
+                endtask
+
+                task outer(input [7:0] value);
+                    begin
+                        inner(value);
+                        inner(value);
+                    end
+                endtask
+
+                initial begin
+                    q = 0;
+                    outer(8'd3);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(6));
+    }
+
+    /// A task with no arguments is enabled by naming it, with no parentheses
+    /// at all — and one declared below the block that enables it is still
+    /// found, because Verilog puts no ordering requirement on module items.
+    #[test]
+    fn test_bare_task_enable_finds_a_task_declared_later() {
+        let mut simulator = simulator_for(
+            r#"
+            module bare();
+                initial announce;
+
+                task announce;
+                    $display("PASSED");
+                endtask
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.output().text().trim(), "PASSED");
+    }
+
+    /// Two instances of one module get a set of task variables each, because
+    /// they are qualified exactly as any other signal is.
+    #[test]
+    fn test_two_instances_do_not_share_task_variables() {
+        let source = r#"
+            module leaf(output reg [7:0] q);
+                parameter SEED = 0;
+
+                task scale(input [7:0] value, output [7:0] result);
+                    result = value * 2;
+                endtask
+
+                initial scale(SEED, q);
+            endmodule
+
+            module top();
+                wire [7:0] a, b;
+                leaf #(.SEED(3)) one (.q(a));
+                leaf #(.SEED(5)) two (.q(b));
+            endmodule
+        "#;
+        let (remaining, modules) = crate::parsers::source::parse_verilog_source(source).unwrap();
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().unwrap();
+        simulator.advance(1).unwrap();
+
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(6));
+        assert_eq!(simulator.get("b").unwrap().to_u128(), Some(10));
+        assert_eq!(simulator.get("one.scale.value").unwrap().to_u128(), Some(3));
+        assert_eq!(simulator.get("two.scale.value").unwrap().to_u128(), Some(5));
+    }
+
+    /// A task argument may be sized from a parameter, and a parameter override
+    /// in the parent reaches it: a task's widths are resolved at elaboration
+    /// like every other declaration's, not folded at parse time.
+    #[test]
+    fn test_a_task_argument_is_sized_from_a_parameter() {
+        let source = r#"
+            module leaf(output reg [31:0] q);
+                parameter WIDTH = 4;
+
+                task widen;
+                    input [WIDTH-1:0] a;
+                    output [31:0] result;
+                    result = a;
+                endtask
+
+                initial widen(8'hFF, q);
+            endmodule
+
+            module top();
+                wire [31:0] narrow, wide;
+                leaf #(.WIDTH(4)) small (.q(narrow));
+                leaf #(.WIDTH(8)) large (.q(wide));
+            endmodule
+        "#;
+        let (remaining, modules) = crate::parsers::source::parse_verilog_source(source).unwrap();
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().unwrap();
+        simulator.advance(1).unwrap();
+
+        // The argument truncates what it is handed to its own declared width,
+        // which is the parameter's — four bits in one instance, eight in the
+        // other.
+        assert_eq!(simulator.get("narrow").unwrap().to_u128(), Some(0xF));
+        assert_eq!(simulator.get("wide").unwrap().to_u128(), Some(0xFF));
+    }
+
+    /// A bound that names nothing is the same named error a `reg` gets, rather
+    /// than a width the simulator picked for itself.
+    #[test]
+    fn test_an_unresolved_task_argument_width_is_a_named_error() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module unresolved();
+                task t;
+                    input [n-1:0] a;
+                    b = a;
+                endtask
+                initial t(1);
+            endmodule
+        "#,
+        )
+        .expect("module should parse");
+
+        let error = Simulator::new(module)
+            .setup()
+            .expect_err("the bound should be rejected");
+        assert!(
+            matches!(error, SimulationError::UnresolvedRange { ref bound, .. } if bound == "n - 1"),
+            "unexpected error: {:?}",
+            error
+        );
+    }
+
+    /// A task's body is not in the statement tree, so an `@(*)` block that
+    /// enables one has to take its sensitivity list from the compiled
+    /// instructions — otherwise it would never wake on a signal only the task
+    /// reads.
+    #[test]
+    fn test_an_implicit_sensitivity_list_sees_what_a_task_reads() {
+        let mut simulator = simulator_for(
+            r#"
+            module sensitive(input [7:0] a, output reg [7:0] q);
+                reg [7:0] gain;
+                task scale(output [7:0] result);
+                    result = a * gain;
+                endtask
+
+                initial gain = 8'd3;
+                always @(*) scale(q);
+            endmodule
+        "#,
+        );
+
+        simulator.poke("a", Register::from_u128(2, 8)).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(6));
+        simulator.poke("a", Register::from_u128(5, 8)).unwrap();
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(15));
+    }
+
+    /// A task enabled inside another task keeps its own names: the outer
+    /// task's local `tmp` is not the design's `tmp`, and neither of them is the
+    /// inner task's. Renaming a body twice is what would confuse them.
+    #[test]
+    fn test_a_nested_enable_does_not_capture_the_outer_task_locals() {
+        let mut simulator = simulator_for(
+            r#"
+            module layered();
+                reg [7:0] tmp, out;
+
+                task inner(output [7:0] result);
+                    result = tmp;
+                endtask
+
+                task outer(output [7:0] result);
+                    reg [7:0] tmp;
+                    begin
+                        tmp = 8'd99;
+                        inner(result);
+                    end
+                endtask
+
+                initial begin
+                    tmp = 8'd4;
+                    outer(out);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.get("out").unwrap().to_u128(), Some(4));
+        assert_eq!(simulator.get("tmp").unwrap().to_u128(), Some(4));
+    }
+
+    /// What a task enable cannot do is an error naming it, never a statement
+    /// that quietly did nothing.
+    #[test]
+    fn test_task_enables_that_cannot_be_run_are_rejected() {
+        let rejected = [
+            (
+                "task tk; input a; tk = a; endtask initial tk(1, 2);",
+                "task `tk` takes 1 arguments, but was enabled with 2",
+            ),
+            ("initial missing(1);", "no task named `missing`"),
+            (
+                "task tk; input a; tk(a); endtask initial tk(1);",
+                "task `tk` enables itself",
+            ),
+        ];
+
+        for (body, expected) in rejected {
+            let source = format!("module rejected();\n{}\nendmodule", body);
+            let (_, module) = parse_module_declaration(&source).expect("module should parse");
+            let error = Simulator::new(module)
+                .setup()
+                .expect_err("the enable should be rejected");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
     /// The test that catches "every word is secretly one word": several
     /// addresses are written with different values and all of them are read
     /// back.

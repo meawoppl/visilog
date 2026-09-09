@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::parsers::{
     assignment::ContinuousAssignment,
-    behavior::{Event, EventControl, FunctionDeclaration, FunctionVariable},
+    behavior::{Event, EventControl, FunctionDeclaration, FunctionVariable, TaskDeclaration},
     expr::Expression,
     identifier::Identifier,
     modules::{ModuleInitArguments, ModuleInstantiation, Port, PortDirection, VerilogModule},
@@ -53,7 +53,8 @@ use crate::simulator::eval::eval;
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
 use crate::simulator::program::{
-    FrameVariable, FunctionDefinition, Instruction, Program, FUNCTION_DELAY_UNSUPPORTED,
+    FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition, TaskParameter,
+    TaskTable, FUNCTION_DELAY_UNSUPPORTED,
 };
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
@@ -263,7 +264,13 @@ impl<'m> Elaborator<'m> {
         // parameter that still cannot be evaluated then reports the reason it
         // could not, which is what it would have reported the first time.
         let deferred = self.declare_parameters(module, scope)?;
-        self.declare_functions(module, scope)?;
+        // Tasks sit between the parameters and the functions. A task's argument
+        // widths may be made of parameters, so it cannot be compiled before
+        // them; and a function is compiled against the task table so that a
+        // task enable written inside one is not read as a name nothing
+        // declares.
+        let tasks = self.declare_tasks(module, scope)?;
+        self.declare_functions(module, scope, &tasks)?;
         for statement in deferred {
             self.declare(statement, scope)?;
         }
@@ -276,7 +283,7 @@ impl<'m> Elaborator<'m> {
             }
         }
         for statement in &module.statements {
-            self.build(statement, scope)?;
+            self.build(statement, scope, &tasks)?;
         }
 
         self.stack.pop();
@@ -387,6 +394,86 @@ impl<'m> Elaborator<'m> {
         Ok(())
     }
 
+    /// Compiles every task this module declares and declares the variables its
+    /// arguments and locals name.
+    ///
+    /// A task's storage is static — one set of variables per task, not per
+    /// enable — so they are ordinary store entries under a dotted name:
+    /// `load.data` for the argument `data` of the task `load`. The body spells
+    /// them unqualified because it is spliced into a block that has yet to be
+    /// resolved into this instance's names, and resolving twice would prefix
+    /// them twice.
+    ///
+    /// A task may enable one declared further down the file, so this repeats
+    /// until a pass compiles nothing new. A pass that makes no progress at all
+    /// is a cycle in the enable graph, which inlining cannot terminate on.
+    fn declare_tasks(
+        &mut self,
+        module: &VerilogModule,
+        scope: &Scope,
+    ) -> Result<TaskTable, SimulationError> {
+        let declarations: Vec<&TaskDeclaration> = module
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                ModuleStatement::TaskDeclaration(task) => Some(task),
+                _ => None,
+            })
+            .collect();
+        let declared: BTreeSet<&str> = declarations
+            .iter()
+            .map(|task| task.name.name.as_str())
+            .collect();
+
+        let mut tasks = TaskTable::new();
+        let mut pending = declarations.clone();
+        while !pending.is_empty() {
+            let waiting = pending.len();
+            let mut deferred = Vec::new();
+            for task in pending {
+                match compile_task(task, &tasks) {
+                    Ok(definition) => {
+                        tasks.insert(task.name.name.clone(), definition);
+                    }
+                    // The task it enables may be one this pass has not reached
+                    // yet. A name this module never declares is a real error
+                    // and is reported where it was found.
+                    Err(SimulationError::UnknownTask(name)) if declared.contains(name.as_str()) => {
+                        deferred.push(task)
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if deferred.len() == waiting {
+                return Err(SimulationError::RecursiveTask(
+                    deferred[0].name.name.clone(),
+                ));
+            }
+            pending = deferred;
+        }
+
+        for task in &declarations {
+            for variable in task
+                .arguments
+                .iter()
+                .map(|argument| &argument.variable)
+                .chain(&task.locals)
+            {
+                // A task argument may be sized from a parameter — `input
+                // [WIDTH-1:0] a;` — exactly as any other declaration is, and
+                // this is the one place a task's widths are ever recorded.
+                let range = self.resolve_range(&variable.range, scope)?;
+                self.out.state.declare_signed(
+                    scope.qualified(&task_variable(&task.name.name, &variable.name.name)),
+                    range,
+                    variable.signed,
+                );
+            }
+        }
+
+        Ok(tasks)
+    }
+
     /// Compiles every function this module declares and puts it in the store
     /// under its qualified name, so a call anywhere in the design finds it.
     ///
@@ -397,11 +484,12 @@ impl<'m> Elaborator<'m> {
         &mut self,
         module: &VerilogModule,
         scope: &Scope,
+        tasks: &TaskTable,
     ) -> Result<(), SimulationError> {
         let mut staged: BTreeMap<String, FunctionDefinition> = BTreeMap::new();
         for statement in &module.statements {
             if let ModuleStatement::FunctionDeclaration(function) = statement {
-                let definition = self.compile_function(function, scope)?;
+                let definition = self.compile_function(function, scope, tasks)?;
                 staged.insert(definition.result.name.clone(), definition);
             }
         }
@@ -423,6 +511,7 @@ impl<'m> Elaborator<'m> {
         &self,
         function: &FunctionDeclaration,
         scope: &Scope,
+        tasks: &TaskTable,
     ) -> Result<FunctionDefinition, SimulationError> {
         let qualified = scope.qualified(&function.name.name);
 
@@ -457,7 +546,7 @@ impl<'m> Elaborator<'m> {
             frame_names.insert(declared.name.name.as_str(), frame.name.clone());
         }
 
-        let mut program = Program::compile(&function.statements)?;
+        let mut program = Program::compile(&function.statements, tasks)?;
         program.rename(&|name| match frame_names.get(name) {
             Some(qualified) => qualified.clone(),
             None => scope.resolve(name),
@@ -667,7 +756,12 @@ impl<'m> Elaborator<'m> {
     }
 
     /// The second pass: everything that runs.
-    fn build(&mut self, statement: &ModuleStatement, scope: &Scope) -> Result<(), SimulationError> {
+    fn build(
+        &mut self,
+        statement: &ModuleStatement,
+        scope: &Scope,
+        tasks: &TaskTable,
+    ) -> Result<(), SimulationError> {
         match statement {
             // `wire a = expr;` is a declaration plus a continuous assignment,
             // so the initialiser joins the same list an explicit `assign`
@@ -713,7 +807,7 @@ impl<'m> Elaborator<'m> {
                 ));
             }
             ModuleStatement::AlwaysBlock(block) => {
-                let mut program = Program::compile(&block.statements)?;
+                let mut program = Program::compile(&block.statements, tasks)?;
                 let control = match &block.event_control {
                     EventControl::None => EventControl::None,
                     EventControl::Implicit => EventControl::Implicit,
@@ -735,13 +829,20 @@ impl<'m> Elaborator<'m> {
                             .iter()
                             .map(|name| scope.resolve(name))
                             .collect();
+                        let names = BodyNames::of(&program);
                         // A call reads whatever the function it names reads, and
                         // an `@(*)` block is sensitive to everything it reads —
                         // so it has to wake when one of those moves too.
-                        for called in BodyNames::of(&program).calls {
+                        for called in names.calls {
                             if let Some(definition) = self.out.state.function(&called) {
                                 reads.extend(definition.reads.iter().cloned());
                             }
+                        }
+                        // An enabled task's body has been inlined into the
+                        // program, and the statement tree above kept no trace of
+                        // what it reads. The instructions did, already resolved.
+                        if program.inlines_a_task() {
+                            reads.extend(names.reads);
                         }
                         reads
                     }
@@ -756,7 +857,7 @@ impl<'m> Elaborator<'m> {
                 });
             }
             ModuleStatement::InitialBlock(block) => {
-                let mut program = Program::compile(&block.statements)?;
+                let mut program = Program::compile(&block.statements, tasks)?;
                 if !scope.is_root() {
                     program.rename(&|name| scope.resolve(name));
                 }
@@ -1139,6 +1240,58 @@ impl BodyNames {
             }
         }
     }
+}
+
+/// The store entry a task's argument or local lives in, before this instance's
+/// prefix is put on it.
+///
+/// A Verilog identifier cannot contain a `.`, so a task variable can never
+/// collide with a signal the design declares — it is the same shape a
+/// function's frame variables take.
+fn task_variable(task: &str, variable: &str) -> String {
+    format!("{}.{}", task, variable)
+}
+
+/// Compiles one task body into the shape an enable splices in.
+///
+/// The body is renamed through the task's own variables only: everything else
+/// is left as the module wrote it, because the block the body is spliced into
+/// is resolved into the instance's names afterwards and would prefix an
+/// already-qualified name twice.
+fn compile_task(
+    task: &TaskDeclaration,
+    tasks: &TaskTable,
+) -> Result<TaskDefinition, SimulationError> {
+    let names: HashMap<&str, String> = task
+        .arguments
+        .iter()
+        .map(|argument| &argument.variable)
+        .chain(&task.locals)
+        .map(|variable| {
+            (
+                variable.name.name.as_str(),
+                task_variable(&task.name.name, &variable.name.name),
+            )
+        })
+        .collect();
+
+    let mut program = Program::compile_body(&task.statements, tasks)?;
+    program.rename_local(&|name| match names.get(name) {
+        Some(qualified) => qualified.clone(),
+        None => name.to_string(),
+    });
+
+    Ok(TaskDefinition {
+        arguments: task
+            .arguments
+            .iter()
+            .map(|argument| TaskParameter {
+                name: task_variable(&task.name.name, &argument.variable.name.name),
+                direction: argument.direction,
+            })
+            .collect(),
+        program,
+    })
 }
 
 /// Adds to every function's read set the reads of the functions it calls, until
