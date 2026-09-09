@@ -269,6 +269,43 @@ pub fn drive_resolved(
     drive_at(state, target, value, DriveLevel::Procedural)
 }
 
+/// Which bits of `name` a drive stronger than `level` is holding.
+///
+/// Precedence is per *bit*, not per signal: `force bus[0] = 1;` holds one bit
+/// and leaves every other one writable. A drive on the whole signal, or one
+/// whose target cannot be resolved to bits, holds all of it.
+enum Held {
+    Nothing,
+    Bits(Vec<i64>),
+    Everything,
+}
+
+fn held_bits(state: &StateStore, name: &str, level: DriveLevel) -> Result<Held, SimulationError> {
+    // The overwhelmingly common case is a design that forces nothing, and it
+    // costs one length compare.
+    if !state.has_drives() {
+        return Ok(Held::Nothing);
+    }
+    let drives = state.drives();
+    let mut bits: Vec<i64> = Vec::new();
+    for drive in drives.iter() {
+        if drive.name() != name || drive.level() <= level {
+            continue;
+        }
+        match resolve_target(state, drive.target())? {
+            ResolvedTarget::Bits { indices, .. } => bits.extend(indices),
+            // A whole signal, a memory word or an event: nothing narrower to
+            // say, so the write is refused outright.
+            _ => return Ok(Held::Everything),
+        }
+    }
+    if bits.is_empty() {
+        Ok(Held::Nothing)
+    } else {
+        Ok(Held::Bits(bits))
+    }
+}
+
 /// [`drive_resolved`] for a write made *by* a drive, which lands only if
 /// nothing stronger holds the signal.
 pub fn drive_at(
@@ -277,7 +314,8 @@ pub fn drive_at(
     value: &Register,
     level: DriveLevel,
 ) -> Result<bool, SimulationError> {
-    if !state.permits_write(target.name(), level) {
+    let held = held_bits(state, target.name(), level)?;
+    if matches!(held, Held::Everything) {
         return Ok(false);
     }
     match target {
@@ -286,14 +324,51 @@ pub fn drive_at(
                 .get_signal(name)
                 .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
             let (width, range) = (signal.width(), signal.range());
-            let value = value.coerced(width);
+            let mut value = value.coerced(width);
+            // A write over a partly forced signal is *masked*, not refused:
+            // `force r[1] = 1; r = 4'b1100;` leaves `1110`, because only bit 1
+            // is held. iverilog agrees, and it is the only reading that makes
+            // a one-bit force mean one bit.
+            if let Held::Bits(bits) = &held {
+                let mut codes = value.get_raw().to_vec();
+                for index in bits {
+                    if let Some(position) = signal.bit_position(*index) {
+                        codes[position] = signal.bit(*index);
+                    }
+                }
+                value = Register::from_bits(codes);
+            }
             if signal.register() == &value {
                 return Ok(false);
             }
             state.set_ranged(name.clone(), value, range);
             Ok(true)
         }
-        ResolvedTarget::Bits { name, indices } => drive_bits(state, name, indices, value),
+        ResolvedTarget::Bits { name, indices } => {
+            // Drop the held bits from the write rather than the whole write:
+            // a `force bus[0]` says nothing about `bus[1]`.
+            if let Held::Bits(bits) = &held {
+                let kept: Vec<(usize, i64)> = indices
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, index)| !bits.contains(index))
+                    .collect();
+                if kept.len() != indices.len() {
+                    if kept.is_empty() {
+                        return Ok(false);
+                    }
+                    let value = value.coerced(indices.len());
+                    let codes: Vec<u8> = kept
+                        .iter()
+                        .map(|(offset, _)| value.get_raw()[*offset])
+                        .collect();
+                    let kept: Vec<i64> = kept.into_iter().map(|(_, index)| index).collect();
+                    return drive_bits(state, name, &kept, &Register::from_bits(codes));
+                }
+            }
+            drive_bits(state, name, indices, value)
+        }
         ResolvedTarget::Word { name, index } => drive_word(state, name, *index, value),
         ResolvedTarget::Event(name) => {
             state.trigger_event(name);
