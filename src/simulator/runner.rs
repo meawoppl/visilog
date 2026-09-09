@@ -135,6 +135,22 @@ pub enum SimulationError {
     /// evaluates to `x`. A width the simulator guessed at would be silently
     /// wrong for the whole run, so the bound is named instead.
     UnresolvedRange { bound: String, why: String },
+    /// A `generate` control expression that is not constant where it is
+    /// written: a loop bound, an `if` condition or a `case` subject. It
+    /// decides how much of the design exists, so a value the elaborator picked
+    /// for itself would be the wrong design rather than a wrong number.
+    UnresolvedGenerate { expression: String, why: String },
+    /// A `generate` loop that never stopped. Every iteration is a real copy of
+    /// the body, so this is an allocation nothing survives rather than a hang.
+    GenerateLoopBound { limit: usize },
+    /// A `generate` loop whose step assigns a variable other than the one its
+    /// initialiser named, which the LRM does not allow and which would
+    /// otherwise loop for ever.
+    GenerateLoopVariable { init: String, step: String },
+    /// A `defparam` naming a parameter no instance in the design declares. An
+    /// override that quietly did not happen leaves a design running at a width
+    /// it was told not to use.
+    UnappliedDefparam(String),
 }
 
 impl fmt::Display for SimulationError {
@@ -196,6 +212,24 @@ impl fmt::Display for SimulationError {
                 "range bound `{}` is not a constant: {}",
                 bound, why
             ),
+            SimulationError::UnresolvedGenerate { expression, why } => write!(
+                f,
+                "generate expression `{}` is not a constant: {}",
+                expression, why
+            ),
+            SimulationError::GenerateLoopBound { limit } => write!(
+                f,
+                "a generate loop ran past {} iterations without its condition going false",
+                limit
+            ),
+            SimulationError::GenerateLoopVariable { init, step } => write!(
+                f,
+                "a generate loop starts `{}` and steps `{}`",
+                init, step
+            ),
+            SimulationError::UnappliedDefparam(path) => {
+                write!(f, "`defparam {}` names no parameter in the design", path)
+            }
             SimulationError::GateTerminals { gate, found } => write!(
                 f,
                 "gate `{}` cannot be instantiated with {} terminals",

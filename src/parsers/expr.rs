@@ -1,7 +1,7 @@
 use super::{
     base::RawToken,
     constants::{verilog_const, VerilogConstant},
-    identifier::{identifier, Identifier},
+    identifier::{hierarchical_identifier, Identifier},
     operators::{unary_operator, BinaryOperator, UnaryOperator},
     simple::{ws, ws_and_comments},
 };
@@ -345,7 +345,7 @@ fn system_function_call(input: &str) -> IResult<&str, Expression> {
 }
 
 fn fn_call(input: &str) -> IResult<&str, Expression> {
-    let (input, id) = identifier(input)?;
+    let (input, id) = hierarchical_identifier(input)?;
     let (input, args) = delimited(
         tag("("),
         separated_list1(tag(","), ws(verilog_expression)),
@@ -382,7 +382,7 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         bit_select,
         indexed_part_select,
         part_select,
-        map(identifier, Expression::Identifier),
+        map(hierarchical_identifier, Expression::Identifier),
         map(verilog_const, Expression::Constant),
         parenthetical,
         concatenation,
@@ -396,7 +396,7 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
 /// widening of `operand_no_ws` and safe in a way that whitespace after a unary
 /// operator is not: `[` is not an operator, so nothing else can claim it.
 pub fn bit_select(input: &str) -> IResult<&str, Expression> {
-    let (input, expr) = identifier(input)?;
+    let (input, expr) = hierarchical_identifier(input)?;
     let (input, index) = preceded(
         ws_and_comments,
         delimited(tag("["), ws(verilog_expression), tag("]")),
@@ -409,7 +409,7 @@ pub fn bit_select(input: &str) -> IResult<&str, Expression> {
 /// Tried before [`part_select`], which would otherwise read the `:` of `+:` as
 /// its own separator and stop at a base expression it could not finish.
 pub fn indexed_part_select(input: &str) -> IResult<&str, Expression> {
-    let (input, id) = identifier(input)?;
+    let (input, id) = hierarchical_identifier(input)?;
     let (input, (base, upward, width)) = preceded(
         ws_and_comments,
         delimited(
@@ -436,7 +436,7 @@ pub fn indexed_part_select(input: &str) -> IResult<&str, Expression> {
 /// `a[msb:lsb]` — a range select. Both bounds are full expressions, and the
 /// `[` may be separated from the name: `v [3:0]`.
 pub fn part_select(input: &str) -> IResult<&str, Expression> {
-    let (input, ident) = identifier(input)?;
+    let (input, ident) = hierarchical_identifier(input)?;
     let (input, (start, end)) = preceded(
         ws_and_comments,
         delimited(

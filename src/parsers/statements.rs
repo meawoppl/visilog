@@ -7,6 +7,11 @@ use super::{
         parse_task_declaration, AlwaysBlock, FunctionDeclaration, InitialBlock, TaskDeclaration,
     },
     gates::{parse_gate_instantiation, GateInstantiation},
+    generate::{
+        parse_defparam, parse_generate_region, parse_genvar_declaration, DefparamAssignment,
+        GenerateItem,
+    },
+    identifier::Identifier,
     integer::{
         parse_event_declaration, parse_integer_declaration, parse_real_declaration,
         parse_time_declaration, EventDeclaration, IntegerDeclaration, RealDeclaration,
@@ -35,6 +40,17 @@ pub enum ModuleStatement {
     EventDeclaration(Vec<EventDeclaration>),
     WireDeclaration(Vec<Net>),
     ParameterDeclaration(Vec<ParameterDeclaration>),
+    /// `genvar i;` — a generate loop variable. It is an elaboration-time
+    /// integer and never becomes a signal, so the declaration carries nothing
+    /// but the names.
+    GenvarDeclaration(Vec<Identifier>),
+    /// `generate … endgenerate` — unrolled at elaboration into ordinary module
+    /// items, since a loop bound may be a parameter and a parameter has no
+    /// value until then.
+    GenerateRegion(Vec<GenerateItem>),
+    /// `defparam dut.WIDTH = 8;` — a parameter override addressed to an
+    /// instance by name.
+    Defparam(Vec<DefparamAssignment>),
     InitialBlock(InitialBlock),
     AlwaysBlock(AlwaysBlock),
     /// `function [7:0] f; … endfunction` — a function the module's
@@ -74,6 +90,13 @@ pub fn parse_module_statement(input: &str) -> IResult<&str, ModuleStatement> {
             map(parse_parameter_declaration, |d| {
                 ModuleStatement::ParameterDeclaration(d)
             }),
+            map(parse_genvar_declaration, |d| {
+                ModuleStatement::GenvarDeclaration(d)
+            }),
+            map(parse_generate_region, |d| {
+                ModuleStatement::GenerateRegion(d)
+            }),
+            map(parse_defparam, |d| ModuleStatement::Defparam(d)),
             map(parse_initial_block, |d| ModuleStatement::InitialBlock(d)),
             map(parse_function_declaration, |d| {
                 ModuleStatement::FunctionDeclaration(d)

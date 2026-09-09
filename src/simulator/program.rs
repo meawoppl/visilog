@@ -187,6 +187,28 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
     }
 }
 
+fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut Expression)) {
+    match instruction {
+        Instruction::Blocking { target, value }
+        | Instruction::NonBlocking { target, value }
+        | Instruction::Assign { target, value }
+        | Instruction::Force { target, value } => {
+            replace(target);
+            replace(value);
+        }
+        Instruction::Deassign(target) | Instruction::Release(target) => replace(target),
+        Instruction::JumpIfFalse { condition, .. } => replace(condition),
+        Instruction::CaseSubject(subject) => replace(subject),
+        Instruction::JumpIfMatch { label, .. } => replace(label),
+        Instruction::RepeatInit { count, .. } => replace(count),
+        Instruction::Task(call) => call.substitute(replace),
+        Instruction::Jump(_)
+        | Instruction::RepeatNext { .. }
+        | Instruction::Delay(_)
+        | Instruction::Halt => {}
+    }
+}
+
 impl Program {
     /// Flattens a statement body into instructions.
     ///
@@ -246,6 +268,19 @@ impl Program {
     pub fn rename(&mut self, resolve: &dyn Fn(&str) -> String) {
         for instruction in &mut self.instructions {
             rename_instruction(instruction, resolve);
+        }
+    }
+
+    /// Rewrites every expression the program holds through `replace`.
+    ///
+    /// [`rename`](Program::rename) can only map a name onto another name, and a
+    /// genvar is not a name at all by the time anything runs — it is the
+    /// integer the generate loop bound it to. Substituting it means replacing
+    /// an identifier *node* with a constant, which is why this takes the
+    /// expression rather than the name.
+    pub fn substitute(&mut self, replace: &dyn Fn(&mut Expression)) {
+        for instruction in &mut self.instructions {
+            substitute_instruction(instruction, replace);
         }
     }
 

@@ -64,6 +64,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `delay.rs` | `#<n>` delay terms, and `parse_gate_delay` for a gate's rise/fall list |
 | `nets.rs` | `wire`/`tri`/... declarations → `Net` |
 | `gates.rs` | the built-in primitives — `GateKind`, `DriveStrength`, `GateInstantiation` |
+| `generate.rs` | `generate … endgenerate`, `genvar` and `defparam` — the shapes, never the decisions |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
@@ -601,6 +602,88 @@ strength *reduction* is not modelled, and neither is strength *propagation* thro
 at all: corpus `resolv1` needs a `pmos` to carry a `pullup`'s `pull` strength through to its
 output, which would mean the store carrying a strength per bit beside its value.
 
+**A `generate` region is unrolled at elaboration, which is the same thing
+flattening an instance is, one level down.** `parsers/generate.rs` captures the
+*shape* — the loop, the branch, the case, the labels — and decides nothing, because a
+loop bound may be a parameter and a parameter has no value until elaboration.
+`Elaborator::expand_generate` then turns a region into a list of ordinary
+`ModuleStatement`s, each paired with the [`Scope`] its block gave it, and those go
+through exactly the two passes — declare, then build — that the module's own statements
+go through. Nothing about a generate block survives into the run loop, so an unrolled
+design costs what the hand-written equivalent costs.
+
+**Where it sits in `walk` is deliberate**: after the parameters, the tasks and the
+functions, because a loop bound, an `if` condition and a `case` subject are made of
+those; and *before* the declaration passes, because what a region unrolls **to** is
+declarations. A `parameter` written inside a block is the one thing evaluated as the
+block unrolls rather than in the pass that follows — a nested loop's bound may be made of
+it. A `function` or a `task` inside a block is a named error rather than a silent
+omission: `walk` compiled the module's subprograms before it got here, so one written
+inside a block would simply be missing from the store a call looks in.
+
+**A generate block is a *nested* scope, and that is the whole difference between it and
+an instance.** A module cannot see out of itself, so everything a module names is its
+own; a generate block can, so only what it *declares* is its own and everything else
+belongs to the module around it. That is `Scope::locals` — the names the blocks in scope
+declare, mapped to the store entries they took — and it is what `resolve` asks first. It
+is keyed by the **head** segment of a name, so a reference that reaches into a nested
+block (`inner[0].sig`) is qualified by the block that declares `inner`. The list is
+`declared_names`: the signals and parameters a block declares, the *instances* it
+creates, and the *labels* of the blocks nested in it, because a hierarchical reference
+reaches through all three.
+
+**A named block's label is the scope, and a loop indexes it**: `stage[0].u.count` is how
+a testbench reaches inside, and it is literally the store key. An unnamed block still
+gets a scope — `genblk1` — because two iterations of an unnamed loop body would otherwise
+declare the same names twice.
+
+**A genvar is an elaboration-time integer and never reaches the `StateStore`.** It is
+*substituted*, not renamed: `substitute_genvars` replaces the identifier node with a
+constant one, which is why it cannot go through `rename_expression` and why `program.rs`
+grew `Program::substitute` beside `Program::rename`. Substitution happens **before**
+qualification in `renamed`, since a genvar resolves to no signal at all. That is also
+what makes a range bound written inside a loop work — `reg [i:0] r;` reaches
+`resolve_range` with `i` already a number — and what tells `.a(i)` (a constant) from
+`.a(x)` (a signal to alias) at a port connection. A runaway loop is
+`GenerateLoopBound` after `MAX_GENERATE_ITERATIONS`: every iteration is a real copy of
+the body, so it is an allocation nothing survives rather than a hang.
+
+**`defparam` is collected before the build pass and applied where the instance is
+made.** The path it names — `dut.WIDTH`, `mid.leaf.WIDTH`, `stage[0].u.WIDTH` — is
+already the flat spelling the parameter ends up under, so the two meet with no
+translation; `Elaborator::defparams` holds them and `instantiate` *removes* the ones that
+name the instance it is creating, which is what makes an override beat a `#(...)` on the
+same instantiation the way the LRM asks. A `defparam` still in the map when `elaborate`
+returns named nothing, and that is `SimulationError::UnappliedDefparam` — an override
+that quietly did not happen leaves the design running on the value it was told not to
+use.
+
+**A hierarchical name is one identifier, folded at parse time.**
+`identifier::hierarchical_identifier` reads `dut.count` and `stage[0].u.count` into a
+single `Identifier` whose name is the whole dotted path, which is exactly the store key
+flattening produced — so nothing downstream had to learn about hierarchy. An index
+belongs to the *path* only when a `.` follows it, which is what tells `a[3]` (a bit
+select) from `a[3].b` (a name inside the fourth iteration of generate block `a`); nothing
+in the production skips whitespace, so an ordinary name pays one character comparison to
+find out it is not a hierarchical one. An **absolute** name starts at the top module by
+name — `main.dut.count` — and the top module is the root of the flat name space and
+carries no prefix, so `Scope::resolve` drops that leading segment. A scope of its own
+shadows it, which is why the `locals` lookup is asked first.
+
+**An output bound to a select is the alias run backwards.** `.y(bus[i])` — how a generate
+loop wires an instance per bit — cannot be aliased, because the port and `bus[i]` are not
+one store entry. The port keeps a signal of its own and a continuous assignment carries
+it *out* to the bit, which is `Binding::Driving` against `Binding::Driven`'s inward
+direction. An output bound to something that cannot be written at all (a concatenation,
+`a + 1`) is still `UndrivablePort`, and so is an `inout` bound to a select: it is read as
+well as written, and one assignment only runs one way.
+
+Still not modelled: a generate loop bound that reads a *signal* evaluates it rather than
+refusing — an `x` runs zero iterations where iverilog reports a non-constant bound, and
+`eval` cannot tell a parameter from a net through the store to say otherwise. `generate`
+items written outside `generate`/`endgenerate`, an `inout` bound to a select, and a
+`defparam` whose path indexes something other than a generate block are all unsupported.
+
 **`time` is a variable, `event` is not, and `real` is a named refusal.** `time t;` is a 64
 bit *unsigned* register and nothing else — `elaborate` declares it at a fixed width the way
 it declares an `integer` at 32 — so it round-trips through the store, through the memory
@@ -620,7 +703,7 @@ is read regardless so that a design using one says that is why it stopped, rathe
 dying on unfamiliar syntax several lines earlier.
 | File | Role |
 | --- | --- |
-| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope) and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
+| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
@@ -1069,6 +1152,18 @@ tripwire.
   an `integer` is 32 by being an `integer`. `behavior.rs::declared_type` reads the keyword
   rather than treating it as a bare storage class, so `output time stamp;` is a 64-bit
   unsigned argument.
+- **A generate block's items go through the same `declare` and `build` passes the
+  module's own statements do**, in the scope its label gave them. Adding a
+  `ModuleStatement` variant that means something inside a generate block means teaching
+  `declared_names`/`declared_by` about it too, or a name it declares will resolve
+  outwards to the module and collide with a sibling iteration's.
+- **A genvar is substituted, not renamed**, and the substitution runs *first*. It is not
+  a name that resolves to anything, so qualifying it would produce a signal nothing
+  declares — which is a silent `x` rather than an error. `Program::substitute` is the
+  instruction-list half of it; `TaskCall::substitute` the `$display` argument half.
+- **An unnamed generate block is numbered from a counter on the `Elaborator`**, and a
+  loop takes its label *once*, before the iterations — numbering per iteration would give
+  `genblk1[0]`, `genblk2[1]` and defeat the point.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

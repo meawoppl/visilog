@@ -2,13 +2,14 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1, take_while_m_n},
     character::complete::{alpha1, char, multispace1},
-    combinator::map_res,
-    multi::separated_list1,
+    combinator::{map, map_res, opt},
+    multi::{many0, separated_list1},
     sequence::tuple,
+    sequence::{delimited, pair},
     IResult,
 };
 
-use super::{base::RawToken, simple::ws};
+use super::{base::RawToken, simple::raw_pos_int, simple::ws};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Identifier {
@@ -79,6 +80,75 @@ fn simple_identifier(input: &str) -> IResult<&str, Identifier> {
             }
         },
     )(input)
+}
+
+/// The index of one generate block a hierarchical name descends through: the
+/// `[0]` of `stage[0].u`. It is a literal, because a name is written where no
+/// signal has a value yet.
+fn scope_index(input: &str) -> IResult<&str, i64> {
+    map(pair(opt(char('-')), raw_pos_int), |(sign, value)| {
+        if sign.is_some() {
+            -value
+        } else {
+            value
+        }
+    })(input)
+}
+
+/// One `.name` step of a hierarchical name, with the generate index that may
+/// stand in front of the dot.
+///
+/// The index is only part of the *path* when a `.` follows it: `a[3]` is a bit
+/// select and `a[3].b` is a name inside the fourth iteration of the generate
+/// block `a`. Nothing here skips whitespace, which is what keeps the two
+/// apart cheaply — a hierarchical name is written tight, and a bare
+/// identifier pays one character comparison to find out it is not one.
+fn hierarchical_step(input: &str) -> IResult<&str, (Option<i64>, Identifier)> {
+    let (input, index) = opt(delimited(char('['), ws(scope_index), char(']')))(input)?;
+    let (input, _) = char('.')(input)?;
+    let (input, name) = identifier(input)?;
+    Ok((input, (index, name)))
+}
+
+/// `dut.count`, `stage[0].u.count` — a name that reaches into an instance or a
+/// generate block.
+///
+/// Hierarchy is flattened into dotted store names at elaboration, so the whole
+/// path is folded into a single [`Identifier`] here and resolves like any
+/// other name. A name with no dot in it comes back exactly as [`identifier`]
+/// read it.
+pub fn hierarchical_identifier(input: &str) -> IResult<&str, Identifier> {
+    let (rest, first) = identifier(input)?;
+    // Only a `.` continues a path, and a bracket only does when a `.` follows
+    // the `]` — `a[3]` is a bit select and just `a[3].b` is a name inside a
+    // generate block. Asking that here rather than by parsing the index and
+    // backtracking is what keeps this off the expression grammar's hot path,
+    // where every operand tries this parser several times over.
+    let continues = match rest.as_bytes().first() {
+        Some(b'.') => true,
+        Some(b'[') => rest
+            .find(']')
+            .is_some_and(|at| rest[at + 1..].starts_with('.')),
+        _ => false,
+    };
+    if !continues {
+        return Ok((rest, first));
+    }
+    let (rest, steps) = many0(hierarchical_step)(rest)?;
+    if steps.is_empty() {
+        return Ok((rest, first));
+    }
+    let mut name = first.name;
+    for (index, step) in steps {
+        if let Some(index) = index {
+            name.push('[');
+            name.push_str(&index.to_string());
+            name.push(']');
+        }
+        name.push('.');
+        name.push_str(&step.name);
+    }
+    Ok((rest, Identifier::new(name)))
 }
 
 pub fn identifier_list(input: &str) -> IResult<&str, Vec<Identifier>> {
