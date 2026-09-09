@@ -258,15 +258,56 @@ at the time it is already at. A design that uses neither task pays
 the hook is a *question asked of the context* rather than a call into it.
 
 A `$strobe` is queued as its compiled `TaskCall` and rendered by `flush`, not
-when it ran, so it reports what the rest of the step went on to do. A `$monitor`
-prints once when it is armed and keeps the *values* that line was made of; the
-flush re-evaluates them and prints only if one moved, so a step that changes
-nothing it reads produces no line. Only one is ever armed — a second `$monitor`
-replaces the first — and `$monitoroff` / `$monitoron` toggle it, with
-`$monitoron` reporting immediately and re-basing the snapshot the way the LRM
-asks. A `$monitoroff` in the *same* timestep as a change suppresses that
+when it ran, so it reports what the rest of the step went on to do. **Arming a
+`$monitor` does not print either**: it reports at the end of a timestep, and
+that includes the one it was armed in, so `a = 1; $monitor("%b", a);` reports
+the 1 rather than whatever `a` held before the block ran. `Monitor::snapshot` is
+therefore an `Option` — `None` is "has not printed yet", which is what owes that
+first line to the next flush — and after a line is printed the flush
+re-evaluates the arguments and prints only when one has moved, so a step that
+changes nothing it reads produces no line. Printing at arm time instead shifts
+every line of a monitored design by one and starts it with a row of `x`s
+(corpus `shift1`, `pr632`).
+
+The **clock is not one of the values watched**: `TaskContext::snapshot` skips a
+`$time` / `$stime` / `$realtime` argument, because a `$monitor` watches the
+variables it prints and time moves every timestep — one that reported the clock
+would never stop (corpus `br_ml20150315`). Only one monitor is ever armed — a
+second `$monitor` replaces the first — and `$monitoroff` / `$monitoron` toggle
+it, with `$monitoron` reporting immediately and re-basing the snapshot the way
+the LRM asks. A `$monitoroff` in the *same* timestep as a change suppresses that
 timestep's line, where iverilog still prints it (corpus `monitor4`, which is a
 `vvp` test rather than a scored one).
+
+**Formatting is per digit, and the case of an unknown one says whether it
+mixes.** `Radix::render` goes through `tasks::digits`, which renders four bits
+at a time for `%h` and three for `%o`, so `12'b0000_0000_00xx` is `00X` rather
+than a single `x`: a digit whose bits *agree* — all `x`, or all `z` — prints in
+lower case, and one that mixes an unknown bit with a known one, or an `x` with a
+`z`, prints in upper case, because the lower case letter would claim the whole
+digit was unknown. An `x` outranks a `z`. `%b` never shows a capital, since a
+binary digit is one bit and cannot mix, and `%d` takes the same rule over the
+*whole* value — `4'bzzxx` is `X` and `4'b00zz` is `Z` (corpus `disp_dec`). A
+short top digit is judged on the bits it has rather than on a padded nibble, so
+`5'bxxxxx` is `xx`.
+
+**A `%` field is C's, and its leading zero is a fill rather than a width.**
+`%08d` pads with zeros where `%8d` pads with spaces, and the zeros go after a
+minus sign (`-0000010`). What is left after that zero is the width, so `%0d` and
+`%0h` ask for width *zero*, which means the narrowest rendering the value
+allows: in a base that pads with digits that is the value with its leading zeros
+dropped, one digit kept when they are all zero, and the trim stopping at an
+unknown digit since dropping one would move the value's bits (corpus
+`disp_leading_z`, `disp_parm`, `test_width`, `test_extended`).
+
+**A default `%d` field leaves room for a sign, and a default `%s` field is the
+vector's own bytes.** `decimal_width` sizes an unsigned value by `2**bits - 1`
+and a signed one by its most *negative* value, `-2**(bits-1)`, so an `integer`
+prints in eleven columns rather than ten (corpus `pr1746848`, `test_dispwided`,
+`pr1002a`). `%s` pads to `bits / 8` characters, so a thirty-two bit register
+holding `"A"` is `"   A"`, and `%0s` is that text unpadded; `ascii` drops
+*leading* NULs but renders an interior one as a space, since it is a character
+the vector really has.
 
 **`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
 fractional digits, then the suffix, right-aligned in `min_width` (twenty by

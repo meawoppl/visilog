@@ -2748,10 +2748,10 @@ mod tests {
 
         // The `@4` moved the load address, so word 3 was never written and
         // still reads `x` the way an untouched word does — and so does word 5,
-        // which is past the end of the file. (`%h` renders a wholly unknown
-        // value as a single `x` padded to the field, which is what every other
-        // unknown here already does.)
-        assert_eq!(simulator.output().lines(), vec!["10 11 12 255", " x  x"]);
+        // which is past the end of the file. (`%h` renders per *digit*, so an
+        // eight bit unknown is two unknown nibbles rather than one `x` padded
+        // out to the field.)
+        assert_eq!(simulator.output().lines(), vec!["10 11 12 255", "xx xx"]);
     }
 
     /// A data file that is not there is an error naming it — never an empty
