@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::parsers::{assignment::ContinuousAssignment, modules::VerilogModule};
 use crate::register::Register;
@@ -229,7 +230,9 @@ impl Simulator {
         self.now = 0;
         self.inputs.clear();
         self.is_setup = false;
-        self.tasks = TaskContext::new();
+        // Reset rather than replace: the search path a caller configured for
+        // `$readmemh` belongs to the caller, not to the elaboration.
+        self.tasks.reset();
 
         let top = self
             .modules
@@ -335,7 +338,9 @@ impl Simulator {
         self.state.clear_changes();
         self.set_input(name, value)?;
         self.propagate()?;
-        self.settle()
+        let deltas = self.settle()?;
+        self.end_of_timestep()?;
+        Ok(deltas)
     }
 
     /// One full clock pulse: low-to-high, then high-to-low. Edge-triggered
@@ -403,9 +408,41 @@ impl Simulator {
         })
     }
 
+    /// Runs whatever the timestep just finished deferred to its end.
+    ///
+    /// `$strobe` and `$monitor` both report *after* everything else in a
+    /// timestep has run, so they need a slot that only exists once the design
+    /// has stopped moving. That is exactly what a settled `settle` is, and the
+    /// two places a timestep can end here are the same two places `settle` is
+    /// called from: the end of one timestamp's work in
+    /// [`Simulator::advance`], and the end of a [`Simulator::poke`], which
+    /// settles the design at the time it is already at.
+    ///
+    /// A design that uses neither task pays [`TaskContext::has_deferred`] —
+    /// a load and a branch — per timestep.
+    fn end_of_timestep(&mut self) -> Result<(), SimulationError> {
+        if !self.tasks.has_deferred() {
+            return Ok(());
+        }
+        self.tasks.flush(&self.state)
+    }
+
     /// The current simulated time.
     pub fn now(&self) -> i64 {
         self.now
+    }
+
+    /// Adds a directory to look in for a relative `$readmemh` / `$readmemb`
+    /// file, after the process working directory.
+    ///
+    /// A `Simulator` is built from parsed modules and never learns which file
+    /// they came from, so it cannot resolve a data path "next to the design" on
+    /// its own. A caller that does know — a test harness walking a corpus, say
+    /// — says so here. The search path outlives [`Simulator::setup`], which is
+    /// why it is configured on the simulator rather than reset with the rest of
+    /// the task state.
+    pub fn add_search_path(&mut self, directory: impl Into<PathBuf>) {
+        self.tasks.add_search_path(directory);
     }
 
     /// Everything the design has printed with `$display` and `$write`.
@@ -487,6 +524,7 @@ impl Simulator {
             commit_updates(pending, &mut self.state)?;
             self.propagate()?;
             self.settle()?;
+            self.end_of_timestep()?;
 
             if self.finished() {
                 return Ok(());
@@ -2568,6 +2606,236 @@ mod tests {
             format!("{}", error).contains("memory `mem`"),
             "unexpected error: {}",
             error
+        );
+    }
+    /// `$strobe` is `$display` moved to the end of the timestep, and the point
+    /// of the move is that it sees what the rest of the step went on to do.
+    #[test]
+    fn test_strobe_reports_the_end_of_the_timestep_not_the_moment_it_ran() {
+        let simulator = simulator_for(
+            r#"
+            module deferred();
+                reg [3:0] a;
+                initial begin
+                    a = 4'd1;
+                    $display("display %0d", a);
+                    $strobe("strobe %0d", a);
+                    a = 4'd7;
+                    $display("display %0d", a);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["display 1", "display 7", "strobe 7"],
+            "a `$strobe` must print last, and must report the later value"
+        );
+    }
+
+    /// A `$monitor` prints once when it is armed and then only when one of the
+    /// values it printed has moved — a timestep that changes nothing it reads
+    /// produces no line at all.
+    #[test]
+    fn test_monitor_reprints_only_when_an_argument_moves() {
+        let mut simulator = simulator_for(
+            r#"
+            module watched();
+                reg [3:0] a;
+                initial begin
+                    a = 4'd0;
+                    $monitor("a=%0d", a);
+                    #10 a = 4'd1;
+                    #10 a = 4'd1;
+                    #10 a = 4'd2;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(40).expect("time should advance");
+
+        // Nothing for time 20, where the assignment wrote the value that was
+        // already there.
+        assert_eq!(simulator.output().lines(), vec!["a=0", "a=1", "a=2"]);
+    }
+
+    #[test]
+    fn test_monitoroff_suppresses_and_monitoron_resumes() {
+        let mut simulator = simulator_for(
+            r#"
+            module switched();
+                reg [3:0] a;
+                initial begin
+                    a = 4'd0;
+                    $monitor("a=%0d", a);
+                    #10 a = 4'd1;
+                    #10 $monitoroff;
+                    #10 a = 4'd2;
+                    #10 $monitoron;
+                    #10 a = 4'd3;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(60).expect("time should advance");
+
+        // `a = 2` at time 30 goes unreported; `$monitoron` at time 40 reports
+        // it at once, the way the LRM asks, and then time 50 reports the 3.
+        assert_eq!(simulator.output().lines(), vec!["a=0", "a=1", "a=2", "a=3"]);
+    }
+
+    /// Only one monitor is ever active, so a second `$monitor` takes the place
+    /// of the first rather than joining it.
+    #[test]
+    fn test_a_second_monitor_replaces_the_first() {
+        let mut simulator = simulator_for(
+            r#"
+            module replaced();
+                reg [3:0] a, b;
+                initial begin
+                    a = 4'd0;
+                    b = 4'd0;
+                    $monitor("a=%0d", a);
+                    #10 $monitor("b=%0d", b);
+                    #10 a = 4'd5;
+                    #10 b = 4'd6;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(40).expect("time should advance");
+
+        // Time 20 moves `a`, which nothing watches any more.
+        assert_eq!(simulator.output().lines(), vec!["a=0", "b=0", "b=6"]);
+    }
+
+    /// A directory of this test's own, so a data file cannot collide with
+    /// another test's or with anything in the repository.
+    fn scratch_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("visilog-{}", name));
+        fs::create_dir_all(&directory).expect("scratch directory should be creatable");
+        directory
+    }
+
+    #[test]
+    fn test_readmemh_loads_a_memory_including_comments_and_an_address_jump() {
+        let directory = scratch_directory("readmemh");
+        fs::write(
+            directory.join("words.hex"),
+            "// the first three words\n0a 0b /* and one more */ 0c\n@4\nff\n",
+        )
+        .expect("data file should be writable");
+
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module loader();
+                reg [7:0] mem [0:7];
+                initial begin
+                    $readmemh("words.hex", mem);
+                    $display("%0d %0d %0d %0d", mem[0], mem[1], mem[2], mem[4]);
+                    $display("%h %h", mem[3], mem[5]);
+                end
+            endmodule
+        "#,
+        )
+        .expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = Simulator::new(module);
+        simulator.add_search_path(directory);
+        simulator.setup().expect("design should run");
+
+        // The `@4` moved the load address, so word 3 was never written and
+        // still reads `x` the way an untouched word does — and so does word 5,
+        // which is past the end of the file. (`%h` renders a wholly unknown
+        // value as a single `x` padded to the field, which is what every other
+        // unknown here already does.)
+        assert_eq!(simulator.output().lines(), vec!["10 11 12 255", " x  x"]);
+    }
+
+    /// A data file that is not there is an error naming it — never an empty
+    /// memory, which would leave the design reading `x` and looking exactly
+    /// like one that simply ran.
+    #[test]
+    fn test_a_missing_memory_file_is_an_error_that_names_it() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module missing();
+                reg [7:0] mem [0:3];
+                initial $readmemh("no-such-file.hex", mem);
+            endmodule
+        "#,
+        )
+        .expect("design should parse");
+
+        let mut simulator = Simulator::new(module);
+        let error = simulator.setup().expect_err("the file does not exist");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-file.hex") && message.contains("looked in"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn test_writememh_writes_what_readmemh_reads_back() {
+        let directory = scratch_directory("writememh");
+        let written = directory.join("out.hex");
+        let source = format!(
+            r#"
+            module round_trip();
+                reg [7:0] source [0:3];
+                reg [7:0] copy [0:3];
+                initial begin
+                    source[0] = 8'h12;
+                    source[1] = 8'h34;
+                    source[2] = 8'h56;
+                    source[3] = 8'h78;
+                    $writememh("{}", source);
+                    $readmemh("{}", copy);
+                    $display("%h %h %h %h", copy[0], copy[1], copy[2], copy[3]);
+                end
+            endmodule
+        "#,
+            written.display(),
+            written.display()
+        );
+
+        let (remaining, module) = parse_module_declaration(&source).expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("design should run");
+
+        assert_eq!(simulator.output().lines(), vec!["12 34 56 78"]);
+    }
+
+    /// `%t` pads to twenty characters until `$timeformat` says otherwise, and
+    /// then renders exactly what it was asked for.
+    #[test]
+    fn test_timeformat_configures_how_percent_t_renders() {
+        let mut simulator = simulator_for(
+            r#"
+            module clocked();
+                initial begin
+                    #7 $display("default[%t]", $time);
+                    $timeformat(-9, 2, " ns", 10);
+                    $display("set[%t]", $time);
+                    $display("narrow[%0t]", $time);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "default[                   7]",
+                "set[   7.00 ns]",
+                "narrow[7.00 ns]",
+            ]
         );
     }
 }
