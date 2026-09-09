@@ -280,6 +280,17 @@ fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTre
                 collect_target_reads(assignment.lhs(), names);
                 collect_expression_reads(assignment.rhs(), names);
             }
+            // A drive statement reads what the drive's right hand side names —
+            // and, once installed, keeps reading it. Taking a drive away reads
+            // nothing but the indices its target names.
+            ProceduralStatements::Assign { target, value }
+            | ProceduralStatements::Force { target, value } => {
+                collect_target_reads(target, names);
+                collect_expression_reads(value, names);
+            }
+            ProceduralStatements::Deassign(target) | ProceduralStatements::Release(target) => {
+                collect_target_reads(target, names)
+            }
             ProceduralStatements::If(statement) => {
                 collect_expression_reads(&statement.condition, names);
                 collect_statement_reads(&statement.then_statements, names);

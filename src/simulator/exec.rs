@@ -29,10 +29,10 @@
 use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
 use crate::register::Register;
-use crate::simulator::eval::{eval, SELF_DETERMINED};
+use crate::simulator::eval::{eval, eval_sized, EvalError, SELF_DETERMINED};
 use crate::simulator::program::{resume, Program, Resume, DELAY_UNSUPPORTED};
 use crate::simulator::runner::SimulationError;
-use crate::simulator::state_store::StateStore;
+use crate::simulator::state_store::{Drive, DriveLevel, StateStore};
 use crate::simulator::tasks::TaskContext;
 
 /// An assignment target after its name and bit indices have been worked out,
@@ -223,11 +223,31 @@ pub fn drive(
 }
 
 /// [`drive`] for a target whose bits have already been worked out.
+///
+/// This is the ordinary write every assignment goes through, so it is where
+/// the precedence rule is enforced: a signal held by a `force` or a procedural
+/// `assign` swallows the write outright rather than taking it and being
+/// overwritten a moment later. Discarding it is what keeps it out of the
+/// store's journal, and so out of the edges that wake blocks.
 pub fn drive_resolved(
     state: &mut StateStore,
     target: &ResolvedTarget,
     value: &Register,
 ) -> Result<bool, SimulationError> {
+    drive_at(state, target, value, DriveLevel::Procedural)
+}
+
+/// [`drive_resolved`] for a write made *by* a drive, which lands only if
+/// nothing stronger holds the signal.
+pub fn drive_at(
+    state: &mut StateStore,
+    target: &ResolvedTarget,
+    value: &Register,
+    level: DriveLevel,
+) -> Result<bool, SimulationError> {
+    if !state.permits_write(target.name(), level) {
+        return Ok(false);
+    }
     match target {
         ResolvedTarget::Whole(name) => {
             let signal = state
@@ -251,6 +271,104 @@ pub fn drive_resolved(
             Ok(false)
         }
     }
+}
+
+/// Reads back exactly the bits a target names.
+///
+/// The mirror of [`drive_resolved`], and it exists for one caller: a `force`
+/// has to remember what it displaced so that a `release` can put it back.
+pub fn read_resolved(
+    state: &StateStore,
+    target: &ResolvedTarget,
+) -> Result<Register, SimulationError> {
+    match target {
+        ResolvedTarget::Whole(name) => state
+            .get(name)
+            .cloned()
+            .ok_or_else(|| SimulationError::UnknownSignal(name.clone())),
+        ResolvedTarget::Bits { name, indices } => {
+            let signal = state
+                .get_signal(name)
+                .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
+            let bits: Vec<u8> = indices.iter().map(|&index| signal.bit(index)).collect();
+            Ok(Register::from_bits(bits))
+        }
+        ResolvedTarget::Word { name, index } => state
+            .memory(name)
+            .map(|memory| memory.word(Some(*index)))
+            .ok_or_else(|| SimulationError::UnknownSignal(name.clone())),
+        // An event holds no value, so there is nothing for a `force` to
+        // displace and put back. Forcing one is illegal Verilog anyway; this
+        // reports it as the category error it is rather than inventing bits.
+        ResolvedTarget::Event(name) => Err(EvalError::EventAsValue(name.clone()).into()),
+    }
+}
+
+/// Installs a procedural continuous drive — an `assign` or a `force` — and
+/// applies it straight away.
+///
+/// The value lands here *before* the drive is recorded, which is what makes an
+/// `assign` written while a `force` is in place do nothing visible: the
+/// precedence rule is asked about the drives already installed, and the force
+/// is one of them.
+pub fn install_drive(
+    state: &mut StateStore,
+    target: &Expression,
+    value: &Expression,
+    level: DriveLevel,
+) -> Result<(), SimulationError> {
+    let resolved = resolve_target(state, target)?;
+    let displaced = match level {
+        DriveLevel::Force => Some(read_resolved(state, &resolved)?),
+        _ => None,
+    };
+    let evaluated = eval_sized(value, state, resolved.width(state))?;
+    drive_at(state, &resolved, &evaluated, level)?;
+    state.install_drive(Drive::new(
+        resolved.name(),
+        target.clone(),
+        value.clone(),
+        level,
+        displaced,
+    ));
+    Ok(())
+}
+
+/// Re-evaluates a drive and writes what it produces.
+///
+/// Called both when the drive is first installed and on every pass of the
+/// continuous-assignment fixpoint, which is what makes a forced signal follow
+/// its expression rather than freeze at the value it had when the `force` ran.
+pub fn apply_drive(state: &mut StateStore, drive: &Drive) -> Result<bool, SimulationError> {
+    let target = resolve_target(state, drive.target())?;
+    let value = eval_sized(drive.value(), state, target.width(state))?;
+    drive_at(state, &target, &value, drive.level())
+}
+
+/// `release v;` — drops the `force` on `v` and hands the signal back.
+///
+/// What it falls back to is whatever else has a claim on it: the procedural
+/// `assign` underneath, if one is still installed, and otherwise the value the
+/// force displaced. That value is still the signal's last *procedural* one,
+/// because every write made while it was forced was discarded rather than
+/// stored.
+pub fn release_drive(state: &mut StateStore, target: &Expression) -> Result<(), SimulationError> {
+    let resolved = resolve_target(state, target)?;
+    let released = state.remove_drive(resolved.name(), DriveLevel::Force);
+    if let Some(assign) = state.drive(resolved.name(), DriveLevel::Assign).cloned() {
+        apply_drive(state, &assign)?;
+    } else if let Some(displaced) = released.and_then(Drive::into_displaced) {
+        drive_resolved(state, &resolved, &displaced)?;
+    }
+    Ok(())
+}
+
+/// `deassign v;` — drops the procedural continuous assignment on `v`, leaving
+/// the value it last produced in place.
+pub fn deassign_drive(state: &mut StateStore, target: &Expression) -> Result<(), SimulationError> {
+    let resolved = resolve_target(state, target)?;
+    state.remove_drive(resolved.name(), DriveLevel::Assign);
+    Ok(())
 }
 
 /// Writes one word of a memory. An address outside the declared range discards

@@ -184,6 +184,27 @@ pub enum ProceduralStatements {
         statements: Vec<ProceduralStatements>,
     },
     Assignment(ProceduralAssignment),
+    /// `assign v = e;` written *inside* a procedural block — a procedural
+    /// continuous assignment, which is a different construct from the
+    /// module-level `assign` that
+    /// [`ContinuousAssignment`](crate::parsers::assignment::ContinuousAssignment)
+    /// carries. It installs a continuous drive on `v` that overrides ordinary
+    /// procedural writes until a `deassign`.
+    Assign {
+        target: Expression,
+        value: Expression,
+    },
+    /// `deassign v;` — removes the drive an `assign` installed. Whatever value
+    /// it last produced stays until something else writes it.
+    Deassign(Expression),
+    /// `force v = e;` — a continuous drive that overrides *everything*,
+    /// including a procedural continuous assignment, until a `release`.
+    Force {
+        target: Expression,
+        value: Expression,
+    },
+    /// `release v;` — drops the `force`.
+    Release(Expression),
     If(IfStatement),
     Case(CaseStatement),
     For(ForStatement),
@@ -211,6 +232,12 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
         map(parse_repeat_statement, |r| ProceduralStatements::Repeat(r)),
         map(parse_system_task, |t| ProceduralStatements::SystemTask(t)),
         parse_event_trigger,
+        // The four keyword-led drive statements. They cannot be confused with
+        // an ordinary assignment — `assign v = 2;` reads as the identifier
+        // `assign` followed by `v`, which is not an assignment at all — but
+        // they are keyword-led, so they belong with the rest of that family.
+        parse_procedural_drive,
+        parse_procedural_undrive,
         map(parse_assignment, |a| ProceduralStatements::Assignment(a)),
         // `#5;` is a statement in its own right, so it is tried before the
         // prefix form, whose body would have nothing to match.
@@ -260,6 +287,58 @@ fn parse_delayed_statement(input: &str) -> IResult<&str, ProceduralStatements> {
 /// makes progress.
 fn null_statement(input: &str) -> IResult<&str, ()> {
     value((), ws(char(';')))(input)
+}
+
+/// `assign v = e;` or `force v = e;` — the two procedural statements that
+/// install a continuous drive on a variable.
+///
+/// The grammar is the module-level `assign`'s, but the statement is a
+/// different construct: this one is executed when the block reaches it, and it
+/// overrides what ordinary procedural assignments to `v` do until it is taken
+/// away again.
+fn parse_procedural_drive(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, forced) = alt((
+        value(false, |i| keyword(i, "assign")),
+        value(true, |i| keyword(i, "force")),
+    ))(input)?;
+    let (input, target) = ws(assignment_lhs)(input)?;
+    let (input, _) = ws(char('='))(input)?;
+    let (input, driver) = verilog_expression(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        if forced {
+            ProceduralStatements::Force {
+                target,
+                value: driver,
+            }
+        } else {
+            ProceduralStatements::Assign {
+                target,
+                value: driver,
+            }
+        },
+    ))
+}
+
+/// `deassign v;` or `release v;` — the two statements that take a drive away.
+fn parse_procedural_undrive(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, forced) = alt((
+        value(false, |i| keyword(i, "deassign")),
+        value(true, |i| keyword(i, "release")),
+    ))(input)?;
+    let (input, target) = ws(assignment_lhs)(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+
+    Ok((
+        input,
+        if forced {
+            ProceduralStatements::Release(target)
+        } else {
+            ProceduralStatements::Deassign(target)
+        },
+    ))
 }
 
 /// The body of a conditional or case arm: a `begin`…`end` block, a null
@@ -1566,5 +1645,80 @@ mod tests {
 
         assert!(function.signed);
         assert!(function.arguments[0].signed);
+    }
+
+    /// `assign` inside a block is a *procedural* continuous assignment, and it
+    /// reads as one rather than as an assignment to a signal called `assign`.
+    #[test]
+    fn test_parse_procedural_assign() {
+        let statement = assert_parses(procedural_statement, "assign v = 2;");
+
+        let ProceduralStatements::Assign { target, .. } = statement else {
+            panic!("expected a procedural assign, got {:?}", statement);
+        };
+        assert_eq!(target, identifier_expression("v"));
+
+        // The place the corpus writes it: as the whole body of an `always`.
+        let block = assert_parses(parse_always_block, "always @(a) assign v = 2;");
+        assert!(matches!(
+            block.statements[0],
+            ProceduralStatements::Assign { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_procedural_deassign() {
+        let statement = assert_parses(procedural_statement, "deassign v;");
+        assert_eq!(
+            statement,
+            ProceduralStatements::Deassign(identifier_expression("v"))
+        );
+
+        let block = assert_parses(parse_always_block, "always @(a) deassign v;");
+        assert!(matches!(
+            block.statements[0],
+            ProceduralStatements::Deassign(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_force() {
+        let statement = assert_parses(procedural_statement, "force v[2] = a & b;");
+
+        let ProceduralStatements::Force { target, .. } = statement else {
+            panic!("expected a force, got {:?}", statement);
+        };
+        assert!(matches!(target, Expression::BitSelect(_, _)));
+    }
+
+    #[test]
+    fn test_parse_release() {
+        let statements = assert_parses(parse_block, "begin force v = 1; release v; end");
+
+        assert!(matches!(statements[0], ProceduralStatements::Force { .. }));
+        assert_eq!(
+            statements[1],
+            ProceduralStatements::Release(identifier_expression("v"))
+        );
+    }
+
+    /// The four keywords need a word boundary after them, or a signal whose
+    /// name merely starts with one would be swallowed.
+    #[test]
+    fn test_a_drive_keyword_does_not_swallow_a_longer_identifier() {
+        for source in [
+            "assignment = 1;",
+            "forced = 1;",
+            "released = 1;",
+            "deassigned = 1;",
+        ] {
+            let statement = assert_parses(procedural_statement, source);
+            assert!(
+                matches!(statement, ProceduralStatements::Assignment(_)),
+                "{} should be an ordinary assignment, got {:?}",
+                source,
+                statement
+            );
+        }
     }
 }

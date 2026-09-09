@@ -6,6 +6,7 @@ use std::rc::Rc;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
+use crate::parsers::expr::Expression;
 use crate::register::{Register, X};
 use crate::simulator::program::FunctionDefinition;
 
@@ -275,6 +276,90 @@ impl Memory {
     }
 }
 
+/// How strongly something drives a signal.
+///
+/// Verilog gives a variable more than one potential source, and says which one
+/// wins: a `force` beats a procedural continuous `assign`, which beats an
+/// ordinary procedural write. The order of these variants *is* that rule —
+/// [`StateStore::permits_write`] compares them — so keep them written weakest
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DriveLevel {
+    /// An ordinary write: a blocking or non-blocking assignment, a module-level
+    /// continuous assignment, a testbench driving an input. Everything that is
+    /// not one of the two below.
+    Procedural,
+    /// A procedural continuous assignment — `assign v = e;` inside a block.
+    Assign,
+    /// A `force`.
+    Force,
+}
+
+/// A continuous drive a procedural block installed with `assign` or `force`.
+///
+/// It is *continuous*: the value is not written once when the statement runs,
+/// it is re-evaluated whenever anything the design does could have moved one of
+/// its operands. The drive therefore has to outlive the statement that
+/// installed it, and it lives here rather than on the `Simulator` because the
+/// only thing a running procedural block is handed is a [`StateStore`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Drive {
+    /// The signal the target names, which is the key the precedence rule is
+    /// answered by.
+    name: String,
+    /// The left hand side, kept unresolved so that the drive re-resolves it the
+    /// way a module-level continuous assignment does — a variable index in
+    /// `force m[i] = e;` follows `i`.
+    target: Expression,
+    value: Expression,
+    level: DriveLevel,
+    /// What a `force` displaced when it was installed. A `release` with no
+    /// procedural `assign` underneath it puts this back: writes made while the
+    /// force was in place were discarded, so this is still the signal's last
+    /// procedural value. `None` for an `assign`, which a `deassign` does not
+    /// undo.
+    displaced: Option<Register>,
+}
+
+impl Drive {
+    pub fn new(
+        name: impl Into<String>,
+        target: Expression,
+        value: Expression,
+        level: DriveLevel,
+        displaced: Option<Register>,
+    ) -> Self {
+        Drive {
+            name: name.into(),
+            target,
+            value,
+            level,
+            displaced,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn target(&self) -> &Expression {
+        &self.target
+    }
+
+    pub fn value(&self) -> &Expression {
+        &self.value
+    }
+
+    pub fn level(&self) -> DriveLevel {
+        self.level
+    }
+
+    /// The value this drive displaced, consumed by the `release` that undoes it.
+    pub fn into_displaced(self) -> Option<Register> {
+        self.displaced
+    }
+}
+
 /// Name to value map for every signal in a simulation, together with a journal
 /// of everything written since the last marker.
 ///
@@ -349,6 +434,17 @@ pub struct StateStore {
     /// list rather than a set because a design has a handful of events at
     /// most, and taking an empty one costs nothing.
     triggers: Vec<String>,
+    /// The `force`s and procedural `assign`s currently installed, in the order
+    /// they were installed.
+    ///
+    /// A `Vec` and not a map: a design has a handful of these at most and most
+    /// have none, so the check every write makes is "is this list empty?" —
+    /// a length compare — rather than a hash. Behind an [`Rc`] so that the
+    /// driver can hold the list while writing through `&mut StateStore`,
+    /// which is what lets these join the continuous-assignment fixpoint;
+    /// installing one goes through [`Rc::make_mut`], the same way the function
+    /// table does.
+    drives: Rc<Vec<Drive>>,
 }
 
 impl StateStore {
@@ -385,7 +481,87 @@ impl StateStore {
             any_memory: false,
             events: HashSet::new(),
             triggers: Vec::new(),
+            // A frame holds only the call's own variables, and a function body
+            // may not install a drive — nothing here can be forced.
+            drives: Rc::new(Vec::new()),
         }
+    }
+
+    /// Whether an ordinary write to `name` lands, or is swallowed by something
+    /// driving the signal harder.
+    ///
+    /// This is the whole precedence rule, and it is asked of **every** write —
+    /// so the case it is tuned for is the one where the design forces nothing,
+    /// which it answers with a length compare and no hashing at all.
+    #[inline]
+    pub fn permits_write(&self, name: &str, level: DriveLevel) -> bool {
+        self.drives.is_empty() || self.strongest_drive(name) <= level
+    }
+
+    /// The strongest drive installed on `name`, or
+    /// [`DriveLevel::Procedural`] — what an ordinary write is — when nothing
+    /// drives it.
+    fn strongest_drive(&self, name: &str) -> DriveLevel {
+        self.drives
+            .iter()
+            .filter(|drive| drive.name == name)
+            .map(|drive| drive.level)
+            .max()
+            .unwrap_or(DriveLevel::Procedural)
+    }
+
+    /// Whether anything at all is forced or procedurally assigned. `false` is
+    /// exact, and is what keeps the drives off a design that uses none.
+    pub fn has_drives(&self) -> bool {
+        !self.drives.is_empty()
+    }
+
+    /// How many drives are installed, which is how many more rounds the
+    /// continuous-assignment fixpoint may need.
+    pub fn drive_count(&self) -> usize {
+        self.drives.len()
+    }
+
+    /// The installed drives, as a handle the caller may hold while writing
+    /// through the store — which is exactly what re-evaluating them needs.
+    pub fn drives(&self) -> Rc<Vec<Drive>> {
+        Rc::clone(&self.drives)
+    }
+
+    /// The drive of `level` installed on `name`, if there is one.
+    pub fn drive(&self, name: &str, level: DriveLevel) -> Option<&Drive> {
+        self.drives
+            .iter()
+            .find(|drive| drive.name == name && drive.level == level)
+    }
+
+    /// Installs a drive, replacing any of the same strength on the same signal.
+    ///
+    /// Re-`force`ing an already forced signal keeps what the *first* force
+    /// displaced: that is the value a `release` has to put back, and the
+    /// intervening one never reached the signal.
+    pub fn install_drive(&mut self, drive: Drive) {
+        let drives = Rc::make_mut(&mut self.drives);
+        match drives
+            .iter_mut()
+            .find(|existing| existing.name == drive.name && existing.level == drive.level)
+        {
+            Some(existing) => {
+                existing.target = drive.target;
+                existing.value = drive.value;
+            }
+            None => drives.push(drive),
+        }
+    }
+
+    /// Takes the drive of `level` off `name`, handing it back so that a
+    /// `release` can read what it displaced.
+    pub fn remove_drive(&mut self, name: &str, level: DriveLevel) -> Option<Drive> {
+        let position = self
+            .drives
+            .iter()
+            .position(|drive| drive.name == name && drive.level == level)?;
+        Some(Rc::make_mut(&mut self.drives).remove(position))
     }
 
     /// Records a function the design declared, under its qualified name.
