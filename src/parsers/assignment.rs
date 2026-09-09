@@ -1,11 +1,17 @@
 use nom::{
-    branch::alt, bytes::complete::tag, character::complete::char, combinator::map,
-    multi::separated_list0, sequence::delimited, IResult,
+    branch::alt,
+    bytes::complete::tag,
+    character::complete::char,
+    combinator::{map, opt},
+    multi::separated_list0,
+    sequence::delimited,
+    IResult,
 };
 
 use crate::parsers::expr::{
     bit_select, indexed_part_select, part_select, verilog_expression, Expression,
 };
+use crate::parsers::gates::{drive_strength, DriveStrength};
 use crate::parsers::identifier::identifier;
 
 use super::{
@@ -17,11 +23,24 @@ use super::{
 pub struct ContinuousAssignment {
     lhs: Expression,
     rhs: Expression,
+    strength: Option<DriveStrength>,
 }
 
 impl ContinuousAssignment {
     pub fn new(lhs: Expression, rhs: Expression) -> Self {
-        ContinuousAssignment { lhs, rhs }
+        ContinuousAssignment {
+            lhs,
+            rhs,
+            strength: None,
+        }
+    }
+
+    pub fn with_strength(
+        lhs: Expression,
+        rhs: Expression,
+        strength: Option<DriveStrength>,
+    ) -> Self {
+        ContinuousAssignment { lhs, rhs, strength }
     }
 
     /// The driven target, e.g. the `x` of `assign x = y;`.
@@ -33,16 +52,43 @@ impl ContinuousAssignment {
     pub fn rhs(&self) -> &Expression {
         &self.rhs
     }
+
+    /// The declared drive strengths, e.g. the `(strong1, highz0)` of
+    /// `assign (strong1, highz0) x = y;`. `None` is an assignment that named
+    /// none, which drives at `strong` like any other.
+    pub fn strength(&self) -> Option<DriveStrength> {
+        self.strength
+    }
 }
 
-pub fn parse_continuous_assignment(input: &str) -> IResult<&str, ContinuousAssignment> {
+/// `assign x = y;`, optionally carrying a drive strength pair and any number of
+/// comma-separated targets: `assign (weak1, weak0) a = 1, b = 2;`.
+///
+/// One `assign` is one strength pair shared by every target it names, the same
+/// way one declaration is one width shared by every name in its list. The pair
+/// is [`drive_strength`], the very production a gate primitive uses — an
+/// `assign` and a `bufif1` declare the same thing and resolve through the same
+/// [`resolve_bit`](crate::simulator::gates::resolve_bit).
+pub fn parse_continuous_assignment(input: &str) -> IResult<&str, Vec<ContinuousAssignment>> {
     let (input, _) = ws(tag("assign"))(input)?;
-    let (input, lhs) = assignment_lhs(input)?;
-    let (input, _) = ws(char('='))(input)?;
-    let (input, rhs) = verilog_expression(input)?;
-    let (input, _) = ws(char(';'))(input)?;
+    let (mut input, strength) = opt(drive_strength)(input)?;
 
-    Ok((input, ContinuousAssignment::new(lhs, rhs)))
+    let mut assignments = Vec::new();
+    loop {
+        let (rest, lhs) = ws(assignment_lhs)(input)?;
+        let (rest, _) = ws(char('='))(rest)?;
+        let (rest, rhs) = verilog_expression(rest)?;
+        assignments.push(ContinuousAssignment::with_strength(lhs, rhs, strength));
+
+        match ws(char(','))(rest) {
+            Ok((next, _)) => input = next,
+            Err(nom::Err::Error(_)) => {
+                let (rest, _) = ws(char(';'))(rest)?;
+                return Ok((rest, assignments));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -151,12 +197,23 @@ mod tests {
     use super::*;
     use crate::parsers::constants::VerilogConstant;
     use crate::parsers::expr::Expression;
+    use crate::parsers::gates::StrengthLevel;
     use crate::parsers::helpers::assert_parses_to;
     use crate::parsers::identifier::Identifier;
     use crate::parsers::operators::BinaryOperator;
 
     fn ident(name: &str) -> Expression {
         Expression::Identifier(Identifier::new(name.to_string()))
+    }
+
+    /// Parses one `assign` that names a single target, asserting it consumed
+    /// the whole input.
+    fn only(input: &str) -> ContinuousAssignment {
+        let (remaining, mut assignments) =
+            parse_continuous_assignment(input).expect("continuous assignment should parse");
+        assert!(remaining.is_empty(), "unparsed input: {}", remaining);
+        assert_eq!(assignments.len(), 1, "expected one target in `{}`", input);
+        assignments.pop().unwrap()
     }
 
     #[test]
@@ -372,9 +429,7 @@ mod tests {
 
     #[test]
     fn test_parse_continuous_assignment_with_variable_bit_select() {
-        let (remaining, assignment) = parse_continuous_assignment("assign mem[addr] = data;")
-            .expect("variable bit select should parse as a continuous assignment target");
-        assert!(remaining.is_empty());
+        let assignment = only("assign mem[addr] = data;");
         assert_eq!(
             assignment.lhs,
             Expression::BitSelect(Identifier::new("mem".to_string()), Box::new(ident("addr")))
@@ -462,11 +517,7 @@ mod tests {
 
     #[test]
     fn test_parse_continuous_assignment() {
-        let input = "assign a = b;";
-        let result = parse_continuous_assignment(input);
-        assert!(result.is_ok());
-        let (remaining, assignment) = result.unwrap();
-        assert!(remaining.is_empty());
+        let assignment = only("assign a = b;");
         assert_eq!(
             assignment.lhs,
             Expression::Identifier(Identifier::new("a".to_string()))
@@ -477,13 +528,99 @@ mod tests {
         );
     }
 
+    /// An `assign` that named no strength carries none, which the simulator
+    /// reads as the `strong` every driver has always had.
+    #[test]
+    fn test_continuous_assignment_without_a_strength() {
+        assert_eq!(only("assign a = b;").strength(), None);
+    }
+
+    /// The pair is `gates.rs`'s production, so an `assign` places each half by
+    /// the digit it ends with and takes either write order. Getting this wrong
+    /// would swap which polarity floats — a wrong answer, not a parse failure.
+    #[test]
+    fn test_continuous_assignment_strength_in_either_order() {
+        let expected = DriveStrength {
+            zero: StrengthLevel::Highz,
+            one: StrengthLevel::Strong,
+        };
+        assert_eq!(
+            only("assign (strong1, highz0) a = b;").strength(),
+            Some(expected)
+        );
+        assert_eq!(
+            only("assign (highz0, strong1) a = b;").strength(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn test_continuous_assignment_strength_levels() {
+        let cases = [
+            (
+                "assign (supply1, supply0) a = b;",
+                StrengthLevel::Supply,
+                StrengthLevel::Supply,
+            ),
+            (
+                "assign (weak0,   weak1) a = b;",
+                StrengthLevel::Weak,
+                StrengthLevel::Weak,
+            ),
+            (
+                "assign (pull1,strong0) a = b;",
+                StrengthLevel::Strong,
+                StrengthLevel::Pull,
+            ),
+            (
+                "assign (highz1,  strong0) a = b;",
+                StrengthLevel::Strong,
+                StrengthLevel::Highz,
+            ),
+        ];
+
+        for (source, zero, one) in cases {
+            assert_eq!(
+                only(source).strength(),
+                Some(DriveStrength { zero, one }),
+                "wrong strength for `{}`",
+                source
+            );
+        }
+    }
+
+    /// One `assign` may name several targets, the way one declaration names
+    /// several signals.
+    #[test]
+    fn test_parse_continuous_assignment_list() {
+        let (remaining, assignments) =
+            parse_continuous_assignment("assign a = 4'd5, b = 4'd8, c = 4'd12;").unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(assignments.len(), 3);
+        assert_eq!(assignments[0].lhs(), &ident("a"));
+        assert_eq!(assignments[1].lhs(), &ident("b"));
+        assert_eq!(assignments[2].lhs(), &ident("c"));
+    }
+
+    /// The strength belongs to the `assign` rather than to a target, so every
+    /// target in its list shares it — the same way one declaration's width is
+    /// shared by every name in it.
+    #[test]
+    fn test_continuous_assignment_list_shares_one_strength() {
+        let (remaining, assignments) =
+            parse_continuous_assignment("assign (weak1, weak0) a = 1, b = 0;").unwrap();
+        assert!(remaining.is_empty());
+        let expected = Some(DriveStrength {
+            zero: StrengthLevel::Weak,
+            one: StrengthLevel::Weak,
+        });
+        assert_eq!(assignments[0].strength(), expected);
+        assert_eq!(assignments[1].strength(), expected);
+    }
+
     #[test]
     fn test_parse_continuous_assignment_with_part_select() {
-        let input = "assign a[3:0] = b;";
-        let result = parse_continuous_assignment(input);
-        assert!(result.is_ok());
-        let (remaining, assignment) = result.unwrap();
-        assert!(remaining.is_empty());
+        let assignment = only("assign a[3:0] = b;");
         assert_eq!(
             assignment.lhs,
             Expression::PartSelect(
@@ -500,11 +637,7 @@ mod tests {
 
     #[test]
     fn test_parse_continuous_assignment_with_concatenation() {
-        let input = "assign {a, b, c} = d;";
-        let result = parse_continuous_assignment(input);
-        assert!(result.is_ok());
-        let (remaining, assignment) = result.unwrap();
-        assert!(remaining.is_empty());
+        let assignment = only("assign {a, b, c} = d;");
         assert_eq!(
             assignment.lhs,
             Expression::Concatenation(vec![

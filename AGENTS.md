@@ -66,7 +66,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `gates.rs` | the built-in primitives — `GateKind`, `DriveStrength`, `GateInstantiation` |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
-| `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
+| `assignment.rs` | `ContinuousAssignment` (`assign x = y;`), its optional `gates.rs` drive strength, and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
 | `parameter.rs` | `parameter` / `localparam` declarations → `ParameterDeclaration` |
 | `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end`, `if`/`else`, `case`, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
@@ -557,10 +557,20 @@ of driving its `0`, leaving a `pulldown` in charge.
 `parsers/gates.rs` is where the grammar for them lives and `gates::drive_strength` is the
 single parser for the token. A gate is simply the first driver form that could declare one.
 `assign (pull1, pull0) x = y;` is the same token in front of a continuous assignment, and
-wiring it up is two seams and no new machinery: the strength onto `ContinuousAssignment`,
-and the `DriveStrength::STRONG` constant in `propagate`'s assignment arm coming off the
-assignment instead. Everything past that point — `Contribution`, `resolve_contributions`,
-`resolve_bit` — already takes any driver at any strength.
+it is wired up through two seams and no machinery of its own: the strength rides on
+`ContinuousAssignment::strength()`, and `propagate`'s assignment arm hands it to
+`Contribution` in place of the `DriveStrength::STRONG` an assignment used to be assumed to
+have. Everything past that point — `Contribution`, `resolve_contributions`, `resolve_bit` —
+already took any driver at any strength.
+
+**A strength-bearing `assign` is a resolved net even in a design with no gate in it**,
+which is what `elaborate::push_assignment` adds to `resolved_nets` beside what
+`push_gate` does. `highz` is a half that does not drive at all, so
+`assign (strong1, highz0) x = 4'b1010;` is `1z1z` — and only `resolve_bit` knows that,
+where writing the net directly would put the `0`s straight through. `None` on a
+`ContinuousAssignment` is an `assign` that named no strength, which stays an ordinary
+write at `strong` exactly as it always was, so a design that declares no strength anywhere
+still pays the `HashSet::is_empty`.
 
 **The truth tables were measured against iverilog 12.0, not read off the LRM.** `and(0, x)`
 is `0` rather than `x` — an unknown input that cannot change the answer does not make the
@@ -1019,6 +1029,19 @@ tripwire.
   `statement_run` — what `parse_block` and a function body use — drops it from the list.
   Nothing downstream had to learn a node meaning "nothing". Each alternative consumes its
   own `;`, so the `many0` cannot spin.
+- **An `assign`'s strength resolves per bit over the whole net, not over its right hand
+  side.** A `0` the *target's* width introduced therefore floats exactly as one the
+  expression produced does: `assign (strong1, highz0) a = 1'b1;` on a `wire [3:0]` is
+  `zzz1` rather than `0001`. **Contention between two assignments is not an error** — they
+  resolve by level, so `pull` loses to `strong`, and drivers tied at the strongest level
+  agree on a bit or that bit is `x`: `4'b1100` against `4'b1010` is `1xx0`. That is
+  iverilog's answer and it is `resolve_bit`'s, so there is deliberately no second,
+  differently shaped rule for the same question.
+- **An `assign` is a declaration list too.** `assign a = 4'd5, b = 4'd8;` is two targets
+  under one keyword, so `parse_continuous_assignment` returns a `Vec` like every
+  declaration parser and `ModuleStatement::Assignment` wraps one. The strength belongs to
+  the `assign` rather than to a target, so every target in the list shares it, the same way
+  every name in a `reg [4:0] a, b;` shares one width.
 - **A blank port connection keeps its position.** `two U7 (,)`, `two U8 (w3,)` and
   `two U9 (,w4)` leave a port unconnected, so `ModuleInitArguments::Positional` holds
   `Vec<Option<Expression>>` and `elaborate::connections` filters the `None`s out *after*
