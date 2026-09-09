@@ -1538,6 +1538,41 @@ mod tests {
         assert_eq!(simulator.output().text(), "0 1 3 1\n");
     }
 
+    /// In an ANSI header a port with no direction of its own inherits the one
+    /// before it: `input clk, reset` declares two one-bit inputs.
+    ///
+    /// iverilog 12.0 prints `q=a5` for this design, which only works if
+    /// `reset` is a real input rather than something the header dropped.
+    #[test]
+    fn test_ansi_port_directions_carry_forward() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module ansireg(input clk, reset, input [7:0] d, output reg [7:0] q);
+                always @(posedge clk) q <= reset ? 8'h00 : d;
+            endmodule
+            module tb;
+                reg c, r;
+                reg [7:0] d;
+                wire [7:0] q;
+                ansireg u(c, r, d, q);
+                initial begin
+                    c = 0; r = 0; d = 8'hA5;
+                    #1 c = 1;
+                    #1 $display("q=%h", q);
+                end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(3).expect("time should advance");
+
+        assert_eq!(simulator.output().text(), "q=a5\n");
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(
