@@ -200,10 +200,29 @@ A memory write **is** journalled, in a list of its own: `always @(bus[index[0]])
 has to wake when `index[0]` moves. The journal keeps one before/after pair per
 memory *name* rather than per word, which over-approximates in the direction
 `event_fires` already does — a block may wake more often than it should, never
-less. `$readmemh` / `$readmemb` are **not** implemented: a system task is run
-against a `&StateStore` and so cannot write one. They are a named error saying
-so, never a silent no-op that would leave a memory `x` and look like a design
-that ran.
+less.
+
+**`$readmemh` writes a memory, which is why `TaskContext::run` takes a `&mut
+StateStore`.** A system task used to be an output and nothing else; loading a
+memory is the one that is not, and widening the one signature was the whole
+structural change. The file format is whitespace-separated words with `//` and
+`/* */` comments and `@<hex>` address jumps, and the load runs from `start`
+towards `finish` — which default to the memory's *declared* first and last
+addresses, so `mem [7:0]` loads downwards exactly as its declaration reads.
+Whether the design named a `finish` decides what a file with more words than
+that means: an explicit one is an instruction to stop there (`$readmemh(f, mem,
+0, 3)` against an eight word file loads four and leaves the rest alone, which is
+what corpus `readmemh3` asserts), a defaulted one is a description of the memory
+and a file too big for it is a named error. `$writememh` / `$writememb` are the
+reverse, one word per line.
+
+**A relative data path is resolved against the process working directory and
+then against `Simulator::add_search_path`.** A `Simulator` is built from parsed
+modules and never learns which *file* they came from, so it cannot resolve
+"next to the design" on its own; a caller that does know says so. Finding
+nothing is an error naming the file and every directory tried — never an empty
+memory, which would leave the design reading `x` and look exactly like one that
+simply ran.
 
 **Module hierarchy is flattened at elaboration, in `elaborate.rs`.** `Simulator::setup`
 walks the instantiation tree and inlines every child into the *same* flat `StateStore`,
@@ -226,9 +245,38 @@ which is exactly what a self-checking corpus test needs. `$finish` sets a flag r
 exiting the process; `advance` and `poke` become no-ops once it is set, and `now` stops
 where it stopped. Which `$name`s exist is decided at *compile* time by `TaskCall::compile`,
 so an unrecognised task is an error naming it rather than a silent no-op — a design that
-quietly printed nothing would look just like one that passed. `$strobe` and `$monitor` are
-rejected by name for the same reason: their output is deferred to the end of a time step,
-which nothing schedules yet.
+quietly printed nothing would look just like one that passed.
+
+**The end-of-timestep slot is `Simulator::end_of_timestep`, and it lives where
+`settle` already returns.** `$strobe` and `$monitor` both report *after*
+everything else in a timestep has run, so they need a moment when the design has
+stopped moving — which is exactly a settled `settle`. The two places a timestep
+can end are therefore the two places `settle` is called from: the end of one
+timestamp's work in `advance`, and the end of a `poke`, which settles the design
+at the time it is already at. A design that uses neither task pays
+`TaskContext::has_deferred` — a load and a branch — per timestep, which is why
+the hook is a *question asked of the context* rather than a call into it.
+
+A `$strobe` is queued as its compiled `TaskCall` and rendered by `flush`, not
+when it ran, so it reports what the rest of the step went on to do. A `$monitor`
+prints once when it is armed and keeps the *values* that line was made of; the
+flush re-evaluates them and prints only if one moved, so a step that changes
+nothing it reads produces no line. Only one is ever armed — a second `$monitor`
+replaces the first — and `$monitoroff` / `$monitoron` toggle it, with
+`$monitoron` reporting immediately and re-basing the snapshot the way the LRM
+asks. A `$monitoroff` in the *same* timestep as a change suppresses that
+timestep's line, where iverilog still prints it (corpus `monitor4`, which is a
+`vvp` test rather than a scored one).
+
+**`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
+fractional digits, then the suffix, right-aligned in `min_width` (twenty by
+default), with an explicit `%12t` overriding `min_width` and `%0t` meaning no
+padding at all. The `units` argument is range-checked and then taken to name the
+unit a tick already *is*: the clock counts ticks and nothing hands `Simulator`
+the `` `timescale `` the preprocessor recorded, so there is no second unit to
+convert between. That is the identity for the `` `timescale 1ns `` plus
+`$timeformat(-9, …)` pairing that covers nearly every design using either, and
+wrong by a power of ten when they disagree — corpus `timeform1` is the case.
 
 **A system *function* is an expression operand, and `eval` implements it.** `$time`,
 `$stime`, `$signed`, `$unsigned`, `$random`, `$bits` and `$clog2` parse anywhere an
@@ -352,8 +400,8 @@ but still unwired.
 | `events.rs` | `edges_between` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()`, the driver |
-| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` — system tasks, their format strings, and the buffer they print into |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings, the buffer they print into, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range and declared signedness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the design's `FunctionDefinition`s and the `frame()` a call runs in |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time`, FIFO within one timestamp |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
@@ -532,10 +580,14 @@ tripwire.
   values are still literal decimals — `#tPD` and `#(a:b:c)` with identifiers do not parse.
 - **System task names are decomposed, not enumerated.** `split_task_name` peels an optional
   `f` prefix (takes a descriptor) and an optional `b`/`h`/`o` suffix (the default radix), so
-  `$display`, `$writeh`, `$fdisplayb` and friends all come from one table. `$finish` and
-  `$time` are matched as whole words first, since `finish`'s `f` is not the prefix. A
-  descriptor other than stdout is a **named error**, not a silent no-op — there is no
-  `$fopen`, so no other channel can legitimately be open.
+  `$display`, `$writeh`, `$fdisplayb`, `$strobeh`, `$fmonitor` and `$readmemb` all come from
+  one table. The whole words are matched *first*, and there are five: `$finish` and
+  `$timeformat` because `finish`'s `f` is not the prefix, `$monitoroff` because its trailing
+  `f` is not one either, and `$time` and `$monitoron` alongside them. `$readmem` and
+  `$readmemo` are consequently names nothing implements — the radix suffix is the file
+  format rather than a default, so only `b` and `h` spell a task. A descriptor other than
+  stdout is a **named error**, not a silent no-op — there is no `$fopen`, so no other
+  channel can legitimately be open.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
   lets it shadow every keyword-led statement form.

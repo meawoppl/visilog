@@ -19,9 +19,12 @@
 //! no format specifier prints in, and what is left is the task itself. So
 //! `$fdisplayh` is "to a descriptor, one line, hex by default".
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
-use crate::register::Register;
+use crate::register::{Register, ONE, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, SYSTEM_FUNCTIONS};
 use crate::simulator::runner::SimulationError;
@@ -90,6 +93,13 @@ impl Radix {
         }
     }
 
+    /// Whether a memory file may be written in this base. `$readmemh` and
+    /// `$readmemb` are the whole family — there is no `$readmemo` and no
+    /// `$readmem`.
+    fn is_memory_file(self) -> bool {
+        matches!(self, Radix::Binary | Radix::Hexadecimal)
+    }
+
     /// A value in this base, together with the width it pads to when the caller
     /// did not ask for one: as wide as the widest value of that many bits.
     fn render(self, value: &Register) -> (String, usize) {
@@ -118,8 +128,25 @@ pub struct Print {
 /// A system task this simulator can carry out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemTask {
-    /// Format the arguments and print them.
+    /// Format the arguments and print them, now.
     Print(Print),
+    /// `$strobe` — format the arguments and print them at the *end* of the
+    /// current timestep, once everything else that runs in it has run.
+    Strobe(Print),
+    /// `$monitor` — arm a standing watch. It prints when it is armed and again
+    /// at the end of any timestep in which one of its arguments moved. Only one
+    /// is ever active: a second `$monitor` replaces the first.
+    Monitor(Print),
+    /// `$monitoron` (`true`) and `$monitoroff` (`false`) — whether the armed
+    /// monitor reports.
+    MonitorControl(bool),
+    /// `$readmemh` / `$readmemb` — fill a memory from a text file of words in
+    /// this radix.
+    ReadMemory(Radix),
+    /// `$writememh` / `$writememb` — the reverse: a memory's words to a file.
+    WriteMemory(Radix),
+    /// `$timeformat` — how `%t` renders a time value from here on.
+    TimeFormat,
     /// End the simulation.
     Finish,
     /// The current simulated time. Meaningful as an argument; as a statement of
@@ -150,10 +177,8 @@ impl TaskCall {
     /// Resolves a parsed `$name(...)` against the tasks the simulator
     /// implements.
     ///
-    /// Fails on a task that is not recognised, and on `$strobe` / `$monitor`,
-    /// which are recognised but defer their output to the end of a time step —
-    /// a scheduling slot that does not exist here. Both report the name, so a
-    /// design never prints nothing by accident.
+    /// Fails on a task that is not recognised, reporting the name, so a design
+    /// never prints nothing by accident.
     pub fn compile(call: &SystemTaskCall) -> Result<TaskCall, SimulationError> {
         let task = resolve_task(&call.name)?;
 
@@ -202,11 +227,15 @@ fn unknown_task(name: &str) -> SimulationError {
 
 /// Resolves a `$name` to the task it means.
 fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
-    // `$finish` starts with an `f` that is not the file-descriptor prefix, so
-    // the names that are whole words are matched before the family is split.
+    // `$finish` starts with an `f` that is not the file-descriptor prefix and
+    // `$monitoroff` ends with one that is not a radix, so the names that are
+    // whole words are matched before the family is split.
     match name {
         "finish" => return Ok(SystemTask::Finish),
         "time" => return Ok(SystemTask::Time),
+        "timeformat" => return Ok(SystemTask::TimeFormat),
+        "monitoron" => return Ok(SystemTask::MonitorControl(true)),
+        "monitoroff" => return Ok(SystemTask::MonitorControl(false)),
         _ => {}
     }
 
@@ -222,19 +251,23 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
             radix,
             descriptor,
         })),
-        "strobe" | "monitor" => Err(SimulationError::SystemTask(format!(
-            "`${}` defers its output to the end of a time step, which is not scheduled",
-            name
-        ))),
-        // `$readmemh` and `$readmemb` load a memory from a file. A task is run
-        // against a `&StateStore` — it prints, it does not write — so loading
-        // one needs a task path that can write, which is a bigger change than
-        // the file reading itself. Named rather than silently doing nothing: a
-        // design whose memory quietly stayed `x` would look like one that ran.
-        "readmem" => Err(SimulationError::SystemTask(format!(
-            "`${}` loads a memory from a file, which needs a system task that can write the store",
-            name
-        ))),
+        // `$strobe` and `$monitor` end a line the way `$display` does; what
+        // makes them different is only *when* the line is produced.
+        "strobe" => Ok(SystemTask::Strobe(Print {
+            newline: true,
+            radix,
+            descriptor,
+        })),
+        "monitor" => Ok(SystemTask::Monitor(Print {
+            newline: true,
+            radix,
+            descriptor,
+        })),
+        // The memory-loading pair carry no descriptor and their radix is not a
+        // default but the whole file format, so there is no `$readmem` and no
+        // `$freadmemh`: those spellings are names nothing implements.
+        "readmem" if !descriptor && radix.is_memory_file() => Ok(SystemTask::ReadMemory(radix)),
+        "writemem" if !descriptor && radix.is_memory_file() => Ok(SystemTask::WriteMemory(radix)),
         _ => Err(unknown_task(name)),
     }
 }
@@ -262,8 +295,88 @@ fn split_task_name(name: &str) -> (bool, &str, Radix) {
     (descriptor, name, radix)
 }
 
-/// What a system task acts on: where output goes, and whether the design has
-/// called `$finish`.
+/// How `%t` renders a time value.
+///
+/// `$timeformat(units, precision, suffix, min_width)` sets all four. The
+/// simulator's clock counts *ticks* and carries no timescale — nothing hands
+/// `Simulator` the `` `timescale `` the front end recorded — so `units` is
+/// range-checked and then taken to name the unit a tick already is. That is
+/// the identity for the `` `timescale 1ns `` plus `$timeformat(-9, …)` pairing
+/// that covers nearly every design using either, and it is why `units` is not
+/// stored: with no second unit to convert between there is nothing to scale by.
+///
+/// What is left is real formatting: `precision` fractional digits after the
+/// tick count, then `suffix`, right-aligned in `min_width`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimeFormat {
+    precision: usize,
+    suffix: String,
+    min_width: usize,
+}
+
+/// The field `%t` pads to when `$timeformat` has not said otherwise.
+const DEFAULT_TIME_WIDTH: usize = 20;
+
+/// The powers of ten `$timeformat` may name, seconds down to femtoseconds.
+/// Anything outside is a named error rather than a silently odd unit.
+const TIME_UNIT_BOUNDS: (i128, i128) = (-15, 2);
+
+impl Default for TimeFormat {
+    fn default() -> Self {
+        TimeFormat {
+            precision: 0,
+            suffix: String::new(),
+            min_width: DEFAULT_TIME_WIDTH,
+        }
+    }
+}
+
+impl TimeFormat {
+    /// One time value as this format asks for it — without the field padding,
+    /// which `%t` applies itself so an explicit `%12t` can override
+    /// `min_width`.
+    fn render(&self, value: &Register) -> String {
+        if value.has_unknown() {
+            return unknown(value);
+        }
+        let mut text = decimal(value);
+        if self.precision > 0 {
+            text.push('.');
+            for _ in 0..self.precision {
+                text.push('0');
+            }
+        }
+        text.push_str(&self.suffix);
+        text
+    }
+}
+
+/// The one standing `$monitor`.
+///
+/// The snapshot is what makes "an argument moved" answerable at the end of a
+/// timestep: it holds the values the last printed line was made of, so a step
+/// that moved nothing the monitor reads produces no line at all.
+#[derive(Clone, Debug)]
+struct Monitor {
+    call: TaskCall,
+    snapshot: Vec<Register>,
+    enabled: bool,
+}
+
+impl Monitor {
+    /// How the armed call prints. It is on the call already, so keeping a
+    /// second copy beside it could only ever disagree with it.
+    fn print(&self) -> Print {
+        match self.call.task {
+            SystemTask::Monitor(print) => print,
+            _ => unreachable!("only a `$monitor` is ever armed as one"),
+        }
+    }
+}
+
+/// What a system task acts on: where output goes, whether the design has
+/// called `$finish`, and what is owed to the *end* of the current timestep
+/// rather than to the moment a task ran.
 ///
 /// What time it is lives on the [`StateStore`] instead, because
 /// [`eval`] needs it too: `$time` is an expression operand as well as a task
@@ -272,6 +385,17 @@ fn split_task_name(name: &str) -> (bool, &str, Radix) {
 pub struct TaskContext {
     output: Output,
     finished: bool,
+    /// The `$strobe` calls made in the current timestep, in the order they were
+    /// made. Rendered by [`TaskContext::flush`] rather than when they ran,
+    /// which is the whole difference between `$strobe` and `$display`.
+    strobes: Vec<TaskCall>,
+    /// The one armed `$monitor`. A second `$monitor` replaces it.
+    monitor: Option<Monitor>,
+    /// How `%t` renders.
+    time_format: TimeFormat,
+    /// Directories a relative `$readmemh` path is looked for in, after the
+    /// process working directory. See [`TaskContext::resolve_read_path`].
+    search_paths: Vec<PathBuf>,
 }
 
 impl TaskContext {
@@ -289,33 +413,163 @@ impl TaskContext {
         self.finished
     }
 
-    /// Carries out one call, appending whatever it prints to the output.
-    pub fn run(&mut self, call: &TaskCall, store: &StateStore) -> Result<(), SimulationError> {
-        match call.task {
-            SystemTask::Print(print) => {
-                let arguments = if print.descriptor {
-                    let (descriptor, rest) = call.arguments.split_first().ok_or_else(|| {
-                        SimulationError::SystemTask(
-                            "a `$f…` task needs a file descriptor as its first argument"
-                                .to_string(),
-                        )
-                    })?;
-                    self.check_descriptor(descriptor, store)?;
-                    rest
-                } else {
-                    &call.arguments
-                };
-                let text = self.render(arguments, store, print.radix)?;
-                if print.newline {
-                    self.output.push_line(&text);
-                } else {
-                    self.output.push(&text);
-                }
+    /// Adds a directory to look in for a relative `$readmemh` / `$readmemb`
+    /// path. See [`TaskContext::resolve_read_path`].
+    pub fn add_search_path(&mut self, directory: impl Into<PathBuf>) {
+        self.search_paths.push(directory.into());
+    }
+
+    /// Forgets everything one elaboration produced — the output, the `$finish`
+    /// mark, the deferred queues and the `%t` format — while keeping the search
+    /// path, which belongs to the caller rather than to the design.
+    pub fn reset(&mut self) {
+        self.output = Output::default();
+        self.finished = false;
+        self.strobes.clear();
+        self.monitor = None;
+        self.time_format = TimeFormat::default();
+    }
+
+    /// Whether anything is owed to the end of the current timestep.
+    ///
+    /// [`Simulator::advance`](crate::simulator::runner::Simulator::advance)
+    /// asks once per timestep and `poke` once per call, so this sits on the hot
+    /// path: a design that uses neither task pays a load and a branch.
+    pub fn has_deferred(&self) -> bool {
+        !self.strobes.is_empty() || self.monitor.is_some()
+    }
+
+    /// Runs what the current timestep deferred: every `$strobe` made in it, in
+    /// call order, and then the armed `$monitor` if a value it last printed has
+    /// moved.
+    ///
+    /// This is the end-of-timestep slot the two deferred tasks needed. It reads
+    /// the store *after* the delta cycles have settled, which is exactly why a
+    /// `$strobe` reports a value a `$display` on the same line would have
+    /// missed.
+    pub fn flush(&mut self, store: &StateStore) -> Result<(), SimulationError> {
+        let strobes = std::mem::take(&mut self.strobes);
+        for call in &strobes {
+            let SystemTask::Strobe(print) = call.task else {
+                unreachable!("only a `$strobe` is ever queued as one");
+            };
+            self.print_call(print, &call.arguments, store)?;
+        }
+
+        // Taking the monitor out keeps `self` free to print with; nothing
+        // between here and putting it back can arm a different one.
+        let Some(mut monitor) = self.monitor.take() else {
+            return Ok(());
+        };
+        if monitor.enabled {
+            let values = self.snapshot(&monitor.call, store)?;
+            if values != monitor.snapshot {
+                monitor.snapshot = values;
+                self.print_call(monitor.print(), &monitor.call.arguments, store)?;
             }
+        }
+        self.monitor = Some(monitor);
+        Ok(())
+    }
+
+    /// Carries out one call, appending whatever it prints to the output.
+    ///
+    /// The store is taken by mutable reference because `$readmemh` writes one:
+    /// a system task is not only an output. Everything else here reads it.
+    pub fn run(&mut self, call: &TaskCall, store: &mut StateStore) -> Result<(), SimulationError> {
+        match call.task {
+            SystemTask::Print(print) => self.print_call(print, &call.arguments, store)?,
+            // A `$strobe` is kept rather than run: what it prints is whatever
+            // its arguments hold once the timestep has finished moving.
+            SystemTask::Strobe(_) => self.strobes.push(call.clone()),
+            SystemTask::Monitor(print) => {
+                // Arming prints once, immediately, and the values that line was
+                // made of become the baseline every later end-of-timestep is
+                // measured against — so the step that armed it does not then
+                // report itself a second time.
+                self.print_call(print, &call.arguments, store)?;
+                let snapshot = self.snapshot(call, store)?;
+                self.monitor = Some(Monitor {
+                    call: call.clone(),
+                    snapshot,
+                    enabled: true,
+                });
+            }
+            SystemTask::MonitorControl(enabled) => self.set_monitoring(enabled, store)?,
+            SystemTask::ReadMemory(radix) => self.read_memory(call, radix, store)?,
+            SystemTask::WriteMemory(radix) => self.write_memory(call, radix, store)?,
+            SystemTask::TimeFormat => self.set_time_format(&call.arguments, store)?,
             // `$finish` takes an optional diagnostic level, which says how much
             // the simulator should report about itself on the way out.
             SystemTask::Finish => self.finished = true,
             SystemTask::Time => {}
+        }
+        Ok(())
+    }
+
+    /// `$monitoron` / `$monitoroff`. Turning monitoring back on reports at
+    /// once, the way the LRM asks, and re-bases the snapshot so the end of that
+    /// same timestep does not repeat the line.
+    fn set_monitoring(&mut self, enabled: bool, store: &StateStore) -> Result<(), SimulationError> {
+        let Some(mut monitor) = self.monitor.take() else {
+            return Ok(());
+        };
+        let was_enabled = monitor.enabled;
+        monitor.enabled = enabled;
+        if enabled && !was_enabled {
+            self.print_call(monitor.print(), &monitor.call.arguments, store)?;
+            monitor.snapshot = self.snapshot(&monitor.call, store)?;
+        }
+        self.monitor = Some(monitor);
+        Ok(())
+    }
+
+    /// The values an armed `$monitor`'s arguments hold now — the expression
+    /// arguments only, since a format string cannot move.
+    fn snapshot(
+        &self,
+        call: &TaskCall,
+        store: &StateStore,
+    ) -> Result<Vec<Register>, SimulationError> {
+        call.arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                TaskArgument::Value(expression) => {
+                    Some(eval(expression, store).map_err(Into::into))
+                }
+                TaskArgument::Text(_) => None,
+            })
+            .collect()
+    }
+
+    /// Formats an argument list and appends it to the output, checking the file
+    /// descriptor first when the task is one of the `$f…` family.
+    ///
+    /// This is what `$display` does when it runs and what `$strobe` and
+    /// `$monitor` do when [`TaskContext::flush`] reaches them, so all three
+    /// print the same way and only their timing differs.
+    fn print_call(
+        &mut self,
+        print: Print,
+        arguments: &[TaskArgument],
+        store: &StateStore,
+    ) -> Result<(), SimulationError> {
+        let arguments = if print.descriptor {
+            let (descriptor, rest) = arguments.split_first().ok_or_else(|| {
+                SimulationError::SystemTask(
+                    "a `$f…` task needs a file descriptor as its first argument".to_string(),
+                )
+            })?;
+            self.check_descriptor(descriptor, store)?;
+            rest
+        } else {
+            arguments
+        };
+        let text = self.render(arguments, store, print.radix)?;
+        if print.newline {
+            self.output.push_line(&text);
+        } else {
+            self.output.push(&text);
         }
         Ok(())
     }
@@ -450,6 +704,16 @@ impl TaskContext {
                 continue;
             }
 
+            // `%t` is a time value, and `$timeformat` — not the radix the task
+            // name asked for — says how it reads. An explicit width still wins
+            // over the one `$timeformat` set, so `%0t` never pads.
+            if specifier.eq_ignore_ascii_case(&'t') {
+                let value = self.value_of(argument, store)?;
+                let rendered = self.time_format.render(&value);
+                text.push_str(&pad(rendered, width.unwrap_or(self.time_format.min_width)));
+                continue;
+            }
+
             let radix = Radix::from_specifier(specifier).ok_or_else(|| {
                 bad_format(&format!(
                     "`%{}` is not a format this simulator understands",
@@ -461,6 +725,285 @@ impl TaskContext {
             text.push_str(&pad(rendered, width.unwrap_or(default_width)));
         }
         Ok(())
+    }
+
+    /// `$timeformat(units, precision, suffix, min_width)`, or `$timeformat`
+    /// with no arguments, which puts `%t` back to its default.
+    fn set_time_format(
+        &mut self,
+        arguments: &[TaskArgument],
+        store: &StateStore,
+    ) -> Result<(), SimulationError> {
+        if arguments.is_empty() {
+            self.time_format = TimeFormat::default();
+            return Ok(());
+        }
+        if arguments.len() != 4 {
+            return Err(SimulationError::SystemTask(format!(
+                "`$timeformat` takes units, precision, a suffix and a minimum width, or nothing at all — not {} arguments",
+                arguments.len()
+            )));
+        }
+
+        // The units are checked even though nothing scales by them: a design
+        // that names a unit this simulator could not mean should hear so.
+        let units = self.integer_argument(&arguments[0], store, "`$timeformat` units")?;
+        if units < TIME_UNIT_BOUNDS.0 || units > TIME_UNIT_BOUNDS.1 {
+            return Err(SimulationError::SystemTask(format!(
+                "`$timeformat` units must be a power of ten between {} and {}, not {}",
+                TIME_UNIT_BOUNDS.0, TIME_UNIT_BOUNDS.1, units
+            )));
+        }
+        let precision = self.field_argument(&arguments[1], store, "`$timeformat` precision")?;
+        let suffix = self.text_argument(&arguments[2], store)?;
+        let min_width = self.field_argument(&arguments[3], store, "`$timeformat` minimum width")?;
+
+        self.time_format = TimeFormat {
+            precision,
+            suffix,
+            min_width,
+        };
+        Ok(())
+    }
+
+    /// `$readmemh(file, memory)` / `$readmemb(file, memory[, start[, finish]])`
+    /// — fills a memory from a text file of whitespace-separated words.
+    ///
+    /// The load runs from `start` towards `finish`, which default to the first
+    /// and last addresses the memory declares, so a `mem [15:0]` loads
+    /// downwards exactly as its declaration reads. An `@<hex>` entry in the
+    /// file moves the load address without ending the load.
+    fn read_memory(
+        &mut self,
+        call: &TaskCall,
+        radix: Radix,
+        store: &mut StateStore,
+    ) -> Result<(), SimulationError> {
+        let arguments = &call.arguments;
+        if arguments.len() < 2 || arguments.len() > 4 {
+            return Err(SimulationError::SystemTask(format!(
+                "`$readmem…` takes a file name, a memory, and optionally a start and a finish address — not {} arguments",
+                arguments.len()
+            )));
+        }
+
+        let name = self.text_argument(&arguments[0], store)?;
+        let memory_name = memory_argument(&arguments[1], "$readmem…")?;
+        let memory = store
+            .memory(&memory_name)
+            .ok_or_else(|| not_a_memory(&memory_name))?;
+        let (first, last) = memory.addresses();
+
+        let start = match arguments.get(2) {
+            Some(argument) => self.address_argument(argument, store, "start")?,
+            None => first,
+        };
+        // Whether the design said where to stop decides what a file with more
+        // words in it than that means. An explicit finish is an *instruction*
+        // to stop there — `$readmemh(f, mem, 0, 3)` against an eight word file
+        // loads four words and leaves the rest of the memory alone. A finish
+        // that came from the declaration is a *description* of the memory, and
+        // a file too big for it is a real mismatch between the two.
+        let bounded = arguments.len() > 3;
+        let finish = match arguments.get(3) {
+            Some(argument) => self.address_argument(argument, store, "finish")?,
+            None => last,
+        };
+
+        let path = self.resolve_read_path(&name)?;
+        let text = fs::read_to_string(&path).map_err(|error| {
+            SimulationError::SystemTask(format!(
+                "`$readmem…` could not read `{}`: {}",
+                path.display(),
+                error
+            ))
+        })?;
+
+        // Downwards is not an error: `mem [7:0]` declares its addresses that
+        // way round and loads in that order.
+        let step: i64 = if start <= finish { 1 } else { -1 };
+        let mut cursor = start;
+        for entry in memory_entries(&text, radix, &name)? {
+            match entry {
+                MemoryEntry::Address(address) => cursor = address,
+                MemoryEntry::Word(digits) => {
+                    if (step > 0 && cursor > finish) || (step < 0 && cursor < finish) {
+                        if bounded {
+                            return Ok(());
+                        }
+                        return Err(SimulationError::SystemTask(format!(
+                            "`$readmem…` ran off the end of `{}` at address {}: `{}` holds more words than addresses {}..{} can take",
+                            memory_name, cursor, name, start, finish
+                        )));
+                    }
+                    store.set_word(&memory_name, cursor, &memory_word(&digits, radix)?);
+                    cursor += step;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `$writememh(file, memory[, start[, finish]])` — the reverse of
+    /// [`TaskContext::read_memory`], one word per line.
+    ///
+    /// The path is taken as written: a file being created cannot be searched
+    /// for, so the search path plays no part and a relative name lands under
+    /// the process working directory.
+    fn write_memory(
+        &self,
+        call: &TaskCall,
+        radix: Radix,
+        store: &StateStore,
+    ) -> Result<(), SimulationError> {
+        let arguments = &call.arguments;
+        if arguments.len() < 2 || arguments.len() > 4 {
+            return Err(SimulationError::SystemTask(format!(
+                "`$writemem…` takes a file name, a memory, and optionally a start and a finish address — not {} arguments",
+                arguments.len()
+            )));
+        }
+
+        let name = self.text_argument(&arguments[0], store)?;
+        let memory_name = memory_argument(&arguments[1], "$writemem…")?;
+        let memory = store
+            .memory(&memory_name)
+            .ok_or_else(|| not_a_memory(&memory_name))?;
+        let (first, last) = memory.addresses();
+        let start = match arguments.get(2) {
+            Some(argument) => self.address_argument(argument, store, "start")?,
+            None => first,
+        };
+        let finish = match arguments.get(3) {
+            Some(argument) => self.address_argument(argument, store, "finish")?,
+            None => last,
+        };
+
+        let step: i64 = if start <= finish { 1 } else { -1 };
+        let mut text = String::new();
+        let mut cursor = start;
+        loop {
+            let word = memory.word(Some(cursor));
+            text.push_str(&match radix {
+                Radix::Binary => binary(&word),
+                _ => hex(&word),
+            });
+            text.push('\n');
+            if cursor == finish {
+                break;
+            }
+            cursor += step;
+        }
+
+        fs::write(&name, text).map_err(|error| {
+            SimulationError::SystemTask(format!(
+                "`$writemem…` could not write `{}`: {}",
+                name, error
+            ))
+        })
+    }
+
+    /// Finds the file a relative `$readmem…` path names.
+    ///
+    /// A design says `$readmemh("data.hex", mem)` and means "next to me", but
+    /// nothing hands this simulator the file the design was parsed from — a
+    /// `Simulator` is built from modules, not from paths. So a relative name is
+    /// resolved against the process working directory first and then against
+    /// every directory a caller added with
+    /// [`Simulator::add_search_path`](crate::simulator::runner::Simulator::add_search_path),
+    /// which is the seam a harness that *does* know where the design came from
+    /// uses. Finding nothing is an error naming the file and everywhere it was
+    /// looked for — never an empty memory, which would leave a design reading
+    /// `x` and looking exactly like one that simply ran.
+    fn resolve_read_path(&self, name: &str) -> Result<PathBuf, SimulationError> {
+        let path = Path::new(name);
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        if !path.is_absolute() {
+            for directory in &self.search_paths {
+                let candidate = directory.join(path);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        let mut tried = vec![match std::env::current_dir() {
+            Ok(directory) => directory.display().to_string(),
+            Err(_) => "the working directory".to_string(),
+        }];
+        tried.extend(
+            self.search_paths
+                .iter()
+                .map(|directory| directory.display().to_string()),
+        );
+        Err(SimulationError::SystemTask(format!(
+            "`$readmem…` cannot find `{}`; looked in {}",
+            name,
+            tried.join(", ")
+        )))
+    }
+
+    /// A string-valued argument: a literal, or a `reg` holding packed ASCII,
+    /// which is how a design that builds a file name at run time passes one.
+    fn text_argument(
+        &self,
+        argument: &TaskArgument,
+        store: &StateStore,
+    ) -> Result<String, SimulationError> {
+        match argument {
+            TaskArgument::Text(text) => Ok(text.clone()),
+            value => Ok(ascii(&self.value_of(value, store)?)),
+        }
+    }
+
+    /// A whole-number argument, read with the sign its value carries.
+    fn integer_argument(
+        &self,
+        argument: &TaskArgument,
+        store: &StateStore,
+        what: &str,
+    ) -> Result<i128, SimulationError> {
+        let value = self.value_of(argument, store)?;
+        integer_value(&value).ok_or_else(|| {
+            SimulationError::SystemTask(format!(
+                "{} must be a known whole number, and `{}` is not",
+                what,
+                value.to_binary()
+            ))
+        })
+    }
+
+    /// A field width or a digit count: a whole number that fits in a field this
+    /// simulator is prepared to pad out.
+    fn field_argument(
+        &self,
+        argument: &TaskArgument,
+        store: &StateStore,
+        what: &str,
+    ) -> Result<usize, SimulationError> {
+        let value = self.integer_argument(argument, store, what)?;
+        if value < 0 || value > MAX_TIME_FIELD {
+            return Err(SimulationError::SystemTask(format!(
+                "{} must be between 0 and {}, not {}",
+                what, MAX_TIME_FIELD, value
+            )));
+        }
+        Ok(value as usize)
+    }
+
+    /// A memory address bound for `$readmem…` / `$writemem…`.
+    fn address_argument(
+        &self,
+        argument: &TaskArgument,
+        store: &StateStore,
+        what: &str,
+    ) -> Result<i64, SimulationError> {
+        let value = self.integer_argument(argument, store, &format!("a `{}` address", what))?;
+        i64::try_from(value).map_err(|_| {
+            SimulationError::SystemTask(format!("the `{}` address {} is out of range", what, value))
+        })
     }
 
     fn value_of(
@@ -480,6 +1023,206 @@ impl TaskContext {
 
 fn bad_format(what: &str) -> SimulationError {
     SimulationError::SystemTask(format!("in a system task format string, {}", what))
+}
+
+/// The widest field `$timeformat` may ask `%t` to pad to, and the most
+/// fractional digits it may ask for. A bound rather than a machine integer's
+/// range because the padding is a real allocation.
+const MAX_TIME_FIELD: i128 = 1024;
+
+/// A whole number read out of a register with the sign the value carries.
+/// `None` for an unknown value or one too wide to hold.
+fn integer_value(register: &Register) -> Option<i128> {
+    if register.has_unknown() {
+        return None;
+    }
+    if register.is_signed() {
+        register.to_i128()
+    } else {
+        register
+            .to_u128()
+            .and_then(|value| i128::try_from(value).ok())
+    }
+}
+
+/// The name of the memory a `$readmem…` or `$writemem…` call is about.
+///
+/// It has to be a plain identifier: the argument names a *memory*, not a value,
+/// and there is nothing an expression could evaluate to that would name one.
+fn memory_argument(argument: &TaskArgument, task: &str) -> Result<String, SimulationError> {
+    match argument {
+        TaskArgument::Value(Expression::Identifier(identifier)) => Ok(identifier.name.clone()),
+        _ => Err(SimulationError::SystemTask(format!(
+            "`{}`'s second argument names the memory, and must be a plain identifier",
+            task
+        ))),
+    }
+}
+
+fn not_a_memory(name: &str) -> SimulationError {
+    SimulationError::SystemTask(format!(
+        "`{}` is not a memory, so there is nothing for a memory file to be read into or written from",
+        name
+    ))
+}
+
+/// One thing a memory file says: a word to load, or an address to load the next
+/// word at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MemoryEntry {
+    /// `@1f` — the load address moves here and the load carries on.
+    Address(i64),
+    /// A word, still as digits: how wide it ends up is the memory's business.
+    Word(String),
+}
+
+/// Reads a memory file: whitespace-separated words, `//` and `/* */` comments,
+/// and `@<hex>` address jumps.
+fn memory_entries(
+    text: &str,
+    radix: Radix,
+    name: &str,
+) -> Result<Vec<MemoryEntry>, SimulationError> {
+    let stripped = strip_memory_comments(text, name)?;
+    stripped
+        .split_whitespace()
+        .map(|token| match token.strip_prefix('@') {
+            Some(digits) => i64::from_str_radix(digits, 16)
+                .map(MemoryEntry::Address)
+                .map_err(|_| {
+                    SimulationError::SystemTask(format!(
+                        "in memory file `{}`, `@{}` is not a hexadecimal address",
+                        name, digits
+                    ))
+                }),
+            // The digits are only checked against the radix once the memory's
+            // width is known, which is where an unreadable one is reported.
+            None => Ok(MemoryEntry::Word(token.to_string())),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|entries| {
+            // Checking every word here rather than at load time means a file
+            // with a typo halfway through does not leave half a memory loaded.
+            for entry in &entries {
+                if let MemoryEntry::Word(digits) = entry {
+                    check_memory_digits(digits, radix, name)?;
+                }
+            }
+            Ok(entries)
+        })
+}
+
+/// Replaces every `//` and `/* */` comment with the whitespace that separates
+/// the tokens around it. An unterminated block comment is a named error: the
+/// alternative is silently swallowing the rest of the file.
+fn strip_memory_comments(text: &str, name: &str) -> Result<String, SimulationError> {
+    let mut stripped = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '/' {
+            stripped.push(character);
+            continue;
+        }
+        match characters.peek() {
+            Some('/') => {
+                for skipped in characters.by_ref() {
+                    if skipped == '\n' {
+                        break;
+                    }
+                }
+                stripped.push('\n');
+            }
+            Some('*') => {
+                characters.next();
+                let mut previous = '\0';
+                let mut closed = false;
+                for skipped in characters.by_ref() {
+                    if previous == '*' && skipped == '/' {
+                        closed = true;
+                        break;
+                    }
+                    previous = skipped;
+                }
+                if !closed {
+                    return Err(SimulationError::SystemTask(format!(
+                        "memory file `{}` ends inside a `/*` comment",
+                        name
+                    )));
+                }
+                stripped.push(' ');
+            }
+            _ => stripped.push(character),
+        }
+    }
+    Ok(stripped)
+}
+
+fn check_memory_digits(digits: &str, radix: Radix, name: &str) -> Result<(), SimulationError> {
+    memory_word(digits, radix).map(|_| ()).map_err(|_| {
+        SimulationError::SystemTask(format!(
+            "in memory file `{}`, `{}` is not a {} word",
+            name,
+            digits,
+            match radix {
+                Radix::Binary => "binary",
+                _ => "hexadecimal",
+            }
+        ))
+    })
+}
+
+/// One word of a memory file, at the width its digits give it.
+/// [`Memory::set_word`](crate::simulator::state_store::Memory::set_word) then
+/// sizes it to the memory: a short word is zero-filled on the left and a long
+/// one loses its most significant digits, which is what `$readmemh` does.
+///
+/// `x`, `z` and `?` are digits like any other: a memory file may leave a word
+/// or a nibble unknown, and `?` is the spelling `z` also goes by.
+fn memory_word(digits: &str, radix: Radix) -> Result<Register, SimulationError> {
+    let mut bits: Vec<u8> = Vec::with_capacity(digits.len() * 4);
+    for character in digits.chars() {
+        if character == '_' {
+            continue;
+        }
+        let (code, digit) = match character {
+            'x' | 'X' => (Some(X), None),
+            'z' | 'Z' | '?' => (Some(Z), None),
+            _ => (
+                None,
+                character.to_digit(if radix == Radix::Binary { 2 } else { 16 }),
+            ),
+        };
+        match (code, digit) {
+            (Some(code), _) if radix == Radix::Binary => bits.push(code),
+            (Some(code), _) => bits.extend([code; 4]),
+            (_, Some(value)) if radix == Radix::Binary => {
+                bits.push(if value == 1 { ONE } else { ZERO })
+            }
+            (_, Some(value)) => {
+                bits.extend((0..4).rev().map(
+                    |bit| {
+                        if (value >> bit) & 1 == 1 {
+                            ONE
+                        } else {
+                            ZERO
+                        }
+                    },
+                ))
+            }
+            _ => {
+                return Err(SimulationError::SystemTask(format!(
+                    "`{}` is not a digit a memory file can hold",
+                    character
+                )))
+            }
+        }
+    }
+    if bits.is_empty() {
+        return Err(SimulationError::SystemTask(
+            "a memory file word has no digits".to_string(),
+        ));
+    }
+    Ok(Register::from_bits(bits))
 }
 
 /// Left-pads with spaces to `width`, which a wider value simply overflows.
@@ -599,11 +1342,12 @@ mod tests {
     /// Runs one `$…;` statement against a store and returns everything printed.
     fn printed(source: &str, store: &StateStore) -> String {
         let mut context = TaskContext::new();
-        run_in(&mut context, source, store);
+        let mut store = store.clone();
+        run_in(&mut context, source, &mut store);
         context.output().text().to_string()
     }
 
-    fn run_in(context: &mut TaskContext, source: &str, store: &StateStore) {
+    fn run_in(context: &mut TaskContext, source: &str, store: &mut StateStore) {
         let (remaining, call) = parse_system_task(source).expect("task should parse");
         assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
         let call = TaskCall::compile(&call).expect("task should compile");
@@ -612,13 +1356,13 @@ mod tests {
 
     fn error(source: &str) -> String {
         let (_, call) = parse_system_task(source).expect("task should parse");
-        let store = store_with(&[]);
+        let mut store = store_with(&[]);
         let compiled = match TaskCall::compile(&call) {
             Err(error) => return error.to_string(),
             Ok(compiled) => compiled,
         };
         TaskContext::new()
-            .run(&compiled, &store)
+            .run(&compiled, &mut store)
             .expect_err("task should fail")
             .to_string()
     }
@@ -633,14 +1377,14 @@ mod tests {
 
     #[test]
     fn test_write_does_not_end_the_line() {
-        let store = store_with(&[]);
+        let mut store = store_with(&[]);
         let mut context = TaskContext::new();
-        run_in(&mut context, r#"$write("PAS");"#, &store);
-        run_in(&mut context, r#"$write("SED");"#, &store);
+        run_in(&mut context, r#"$write("PAS");"#, &mut store);
+        run_in(&mut context, r#"$write("SED");"#, &mut store);
         assert_eq!(context.output().text(), "PASSED");
         assert_eq!(context.output().lines(), vec!["PASSED"]);
 
-        run_in(&mut context, r#"$display("!");"#, &store);
+        run_in(&mut context, r#"$display("!");"#, &mut store);
         assert_eq!(context.output().text(), "PASSED!\n");
     }
 
@@ -737,7 +1481,7 @@ mod tests {
         let mut store = store_with(&[]);
         store.set_time(42);
         let mut context = TaskContext::new();
-        run_in(&mut context, r#"$display("t=%0d", $time);"#, &store);
+        run_in(&mut context, r#"$display("t=%0d", $time);"#, &mut store);
         assert_eq!(context.output().text(), "t=42\n");
     }
 
@@ -771,11 +1515,11 @@ mod tests {
     /// `$write` has the same family, and still does not end the line.
     #[test]
     fn test_radix_variants_of_write() {
-        let store = store_with(&[("a", "10101100")]);
+        let mut store = store_with(&[("a", "10101100")]);
         let mut context = TaskContext::new();
-        run_in(&mut context, r#"$writeb(a);"#, &store);
-        run_in(&mut context, r#"$writeh(a);"#, &store);
-        run_in(&mut context, r#"$writeo(a);"#, &store);
+        run_in(&mut context, r#"$writeb(a);"#, &mut store);
+        run_in(&mut context, r#"$writeh(a);"#, &mut store);
+        run_in(&mut context, r#"$writeo(a);"#, &mut store);
         assert_eq!(context.output().text(), "10101100ac254");
     }
 
@@ -808,7 +1552,7 @@ mod tests {
     /// one descriptor that can be honoured is standard output — the buffer.
     #[test]
     fn test_fdisplay_to_standard_output_prints_into_the_buffer() {
-        let store = store_with(&[("a", "10101100")]);
+        let mut store = store_with(&[("a", "10101100")]);
         assert_eq!(printed(r#"$fdisplay(1, "PASSED");"#, &store), "PASSED\n");
         // `32'h8000_0001` is the same channel written as a file descriptor.
         assert_eq!(
@@ -817,7 +1561,7 @@ mod tests {
         );
         assert_eq!(printed(r#"$fdisplayh(1, a);"#, &store), "ac\n");
         let mut context = TaskContext::new();
-        run_in(&mut context, r#"$fwriteb(1, a);"#, &store);
+        run_in(&mut context, r#"$fwriteb(1, a);"#, &mut store);
         assert_eq!(context.output().text(), "10101100");
     }
 
@@ -839,23 +1583,42 @@ mod tests {
         );
     }
 
-    /// The `f` of `$finish` is not the file-descriptor prefix, and the deferred
-    /// tasks stay rejected in every spelling.
+    /// The `f` of `$finish` and the `f` at the end of `$monitoroff` are neither
+    /// of them the family's affixes, and the deferred tasks decompose the same
+    /// way the printing ones do.
     #[test]
     fn test_the_task_family_is_split_without_swallowing_other_names() {
         assert_eq!(
             resolve_task("finish").expect("finish should resolve"),
             SystemTask::Finish
         );
-        for name in ["strobeh", "fmonitor", "fstrobeb"] {
-            let message = resolve_task(name)
-                .expect_err("should be rejected")
-                .to_string();
-            assert!(
-                message.contains("defers its output"),
-                "unexpected message for ${}: {}",
-                name,
-                message
+        assert_eq!(
+            resolve_task("monitoroff").expect("monitoroff should resolve"),
+            SystemTask::MonitorControl(false)
+        );
+        assert_eq!(
+            resolve_task("monitoron").expect("monitoron should resolve"),
+            SystemTask::MonitorControl(true)
+        );
+        for (name, expected) in [
+            (
+                "strobeh",
+                SystemTask::Strobe(print(true, Radix::Hexadecimal, false)),
+            ),
+            (
+                "fmonitor",
+                SystemTask::Monitor(print(true, Radix::Decimal, true)),
+            ),
+            (
+                "fstrobeb",
+                SystemTask::Strobe(print(true, Radix::Binary, true)),
+            ),
+        ] {
+            assert_eq!(
+                resolve_task(name).expect("should resolve"),
+                expected,
+                "unexpected task for ${}",
+                name
             );
         }
         assert_eq!(
@@ -866,22 +1629,36 @@ mod tests {
         );
     }
 
+    fn print(newline: bool, radix: Radix, descriptor: bool) -> Print {
+        Print {
+            newline,
+            radix,
+            descriptor,
+        }
+    }
+
     #[test]
     fn test_finish_is_recorded_rather_than_exiting() {
-        let store = store_with(&[]);
+        let mut store = store_with(&[]);
         let mut context = TaskContext::new();
         assert!(!context.finished());
-        run_in(&mut context, "$finish;", &store);
+        run_in(&mut context, "$finish;", &mut store);
         assert!(context.finished());
     }
 
     #[test]
     fn test_an_unknown_task_is_an_error_that_names_it() {
         assert_eq!(error("$nosuchthing;"), "unknown system task `$nosuchthing`");
-        // `$readmemh` is recognised and refused by name, not mistaken for a
-        // task nobody has heard of.
-        assert!(error("$readmemh(\"f.hex\", mem);").contains("`$readmemh` loads a memory"));
-        assert!(error("$readmemb(\"f.bin\", mem);").contains("`$readmemb` loads a memory"));
+        // A name that only looks like one of the memory-file tasks is still
+        // nothing this simulator has heard of.
+        assert_eq!(
+            error("$readmem(\"f.hex\", mem);"),
+            "unknown system task `$readmem`"
+        );
+        assert_eq!(
+            error("$readmemo(\"f.oct\", mem);"),
+            "unknown system task `$readmemo`"
+        );
         assert_eq!(
             error(r#"$display("%0d", $nosuchfunction);"#),
             "unknown system task `$nosuchfunction`"
@@ -889,15 +1666,18 @@ mod tests {
     }
 
     #[test]
-    fn test_deferred_output_tasks_are_rejected_by_name() {
-        for source in [r#"$strobe("a");"#, r#"$monitor("a");"#] {
-            let message = error(source);
-            assert!(
-                message.contains("defers its output"),
-                "unexpected message: {}",
-                message
-            );
-        }
+    fn test_a_strobe_prints_nothing_until_the_timestep_ends() {
+        let mut store = store_with(&[("a", "0001")]);
+        let mut context = TaskContext::new();
+        run_in(&mut context, r#"$strobe("a=%0d", a);"#, &mut store);
+        assert_eq!(context.output().text(), "", "a `$strobe` printed early");
+        assert!(context.has_deferred());
+
+        store.set("a", Register::from_binary("0111"));
+        context.flush(&store).expect("flush should succeed");
+        assert_eq!(context.output().text(), "a=7\n");
+        // The queue is emptied by the flush, so the next timestep starts clean.
+        assert!(!context.has_deferred());
     }
 
     #[test]
@@ -913,6 +1693,166 @@ mod tests {
             message.contains("no argument left"),
             "unexpected message: {}",
             message
+        );
+    }
+    #[test]
+    fn test_a_memory_file_is_read_as_words_comments_and_address_jumps() {
+        let entries = memory_entries(
+            "// header\n0a 0b /* skipped */ @1f\n0c\n",
+            Radix::Hexadecimal,
+            "f.hex",
+        )
+        .expect("the file should read");
+        assert_eq!(
+            entries,
+            vec![
+                MemoryEntry::Word("0a".to_string()),
+                MemoryEntry::Word("0b".to_string()),
+                MemoryEntry::Address(31),
+                MemoryEntry::Word("0c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_memory_file_that_cannot_be_read_is_an_error_that_says_why() {
+        let message = memory_entries("0a /* never closed", Radix::Hexadecimal, "f.hex")
+            .expect_err("the comment never ends")
+            .to_string();
+        assert!(
+            message.contains("ends inside a `/*` comment"),
+            "{}",
+            message
+        );
+
+        let message = memory_entries("0a 0g", Radix::Hexadecimal, "f.hex")
+            .expect_err("`g` is not a hex digit")
+            .to_string();
+        assert!(
+            message.contains("`0g` is not a hexadecimal word"),
+            "{}",
+            message
+        );
+
+        let message = memory_entries("@zz", Radix::Hexadecimal, "f.hex")
+            .expect_err("the address is not hexadecimal")
+            .to_string();
+        assert!(
+            message.contains("`@zz` is not a hexadecimal"),
+            "{}",
+            message
+        );
+    }
+
+    /// `x`, `z` and `?` are digits a memory file may hold, and one hex digit of
+    /// them is four bits of them.
+    #[test]
+    fn test_a_memory_file_word_may_be_unknown() {
+        assert_eq!(
+            memory_word("1x", Radix::Hexadecimal).expect("should read"),
+            Register::from_binary("0001xxxx")
+        );
+        assert_eq!(
+            memory_word("1?0", Radix::Binary).expect("should read"),
+            Register::from_binary("1z0")
+        );
+    }
+
+    #[test]
+    /// A file with more words in it than the load can take means two different
+    /// things depending on who chose the bound.
+    #[test]
+    fn test_a_finish_address_bounds_the_load_but_a_declaration_does_not() {
+        let directory = std::env::temp_dir().join("visilog-readmem-bounds");
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let file = directory.join("eight.hex");
+        std::fs::write(&file, "0 1 2 3 4 5 6 7\n").expect("data file");
+
+        let mut store = StateStore::new();
+        store.declare_memory("mem", (0, 3), (7, 0), false);
+        let mut context = TaskContext::new();
+
+        // An explicit finish says where to stop, so the four words past it are
+        // simply not loaded.
+        let source = format!(r#"$readmemh("{}", mem, 0, 3);"#, file.display());
+        run_in(&mut context, &source, &mut store);
+        assert_eq!(
+            store.memory("mem").expect("mem").word(Some(3)),
+            Register::from_u128(3, 8)
+        );
+
+        // With no finish the bound came from the declaration, and a file that
+        // does not fit it is a mismatch worth reporting.
+        let (_, call) =
+            parse_system_task(&format!(r#"$readmemh("{}", mem);"#, file.display())).expect("parse");
+        let call = TaskCall::compile(&call).expect("compile");
+        let message = TaskContext::new()
+            .run(&call, &mut store)
+            .expect_err("the file is twice the size of the memory")
+            .to_string();
+        assert!(message.contains("ran off the end of `mem`"), "{}", message);
+    }
+
+    #[test]
+    fn test_readmem_argument_mistakes_are_reported() {
+        let message = error(r#"$readmemh("f.hex");"#);
+        assert!(
+            message.contains("`$readmem…` takes a file name"),
+            "{}",
+            message
+        );
+
+        let message = error(r#"$readmemh("f.hex", 1 + 2);"#);
+        assert!(
+            message.contains("must be a plain identifier"),
+            "{}",
+            message
+        );
+
+        // `mem` here is not declared at all, which is the same answer as a name
+        // that is a signal: there is no memory to fill.
+        let message = error(r#"$readmemh("f.hex", mem);"#);
+        assert!(message.contains("`mem` is not a memory"), "{}", message);
+    }
+
+    #[test]
+    fn test_timeformat_checks_its_arguments() {
+        let message = error(r#"$timeformat(-9, 2);"#);
+        assert!(
+            message.contains("takes units, precision, a suffix and a minimum width"),
+            "{}",
+            message
+        );
+
+        let message = error(r#"$timeformat(-40, 2, "ns", 10);"#);
+        assert!(
+            message.contains("must be a power of ten between -15 and 2"),
+            "{}",
+            message
+        );
+
+        let message = error(r#"$timeformat(-9, 2, "ns", 99999);"#);
+        assert!(
+            message.contains("must be between 0 and 1024"),
+            "{}",
+            message
+        );
+    }
+
+    /// `$timeformat` with no arguments puts `%t` back where it started.
+    #[test]
+    fn test_timeformat_with_no_arguments_restores_the_default() {
+        let mut store = store_with(&[]);
+        store.set_time(5);
+        let mut context = TaskContext::new();
+        run_in(&mut context, r#"$timeformat(-9, 1, "ns", 6);"#, &mut store);
+        run_in(&mut context, r#"$display("[%t]", $time);"#, &mut store);
+        run_in(&mut context, "$timeformat;", &mut store);
+        run_in(&mut context, r#"$display("[%t]", $time);"#, &mut store);
+
+        assert_eq!(
+            context.output().lines(),
+            vec!["[ 5.0ns]", "[                   5]"]
         );
     }
 }
