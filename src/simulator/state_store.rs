@@ -281,8 +281,7 @@ impl Memory {
 /// Verilog gives a variable more than one potential source, and says which one
 /// wins: a `force` beats a procedural continuous `assign`, which beats an
 /// ordinary procedural write. The order of these variants *is* that rule —
-/// [`StateStore::permits_write`] compares them — so keep them written weakest
-/// first.
+/// `exec::held_bits` compares them — so keep them written weakest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DriveLevel {
     /// An ordinary write: a blocking or non-blocking assignment, a module-level
@@ -472,29 +471,6 @@ impl StateStore {
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
         }
-    }
-
-    /// Whether an ordinary write to `name` lands, or is swallowed by something
-    /// driving the signal harder.
-    ///
-    /// This is the whole precedence rule, and it is asked of **every** write —
-    /// so the case it is tuned for is the one where the design forces nothing,
-    /// which it answers with a length compare and no hashing at all.
-    #[inline]
-    pub fn permits_write(&self, name: &str, level: DriveLevel) -> bool {
-        self.drives.is_empty() || self.strongest_drive(name) <= level
-    }
-
-    /// The strongest drive installed on `name`, or
-    /// [`DriveLevel::Procedural`] — what an ordinary write is — when nothing
-    /// drives it.
-    fn strongest_drive(&self, name: &str) -> DriveLevel {
-        self.drives
-            .iter()
-            .filter(|drive| drive.name == name)
-            .map(|drive| drive.level)
-            .max()
-            .unwrap_or(DriveLevel::Procedural)
     }
 
     /// Whether anything at all is forced or procedurally assigned. `false` is
