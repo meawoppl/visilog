@@ -86,6 +86,10 @@ pub enum EvalError {
     /// of one. Only a word select (`mem[addr]`) reads a memory, so this is a
     /// name that exists reported as what it is rather than as unknown.
     MemoryAsValue(String),
+    /// A named event read as though it were a value. An event has no value at
+    /// all — it is triggered by `-> e;` and waited on by `@(e)` — so a name
+    /// that exists is reported as what it is rather than as unknown.
+    EventAsValue(String),
     /// A call to a function the design does not declare, so there is no body
     /// to run.
     UnsupportedFunctionCall(String),
@@ -129,6 +133,9 @@ impl fmt::Display for EvalError {
             }
             EvalError::MemoryAsValue(name) => {
                 write!(f, "memory `{}` has no value without a word select", name)
+            }
+            EvalError::EventAsValue(name) => {
+                write!(f, "event `{}` has no value; it can only be triggered", name)
             }
             EvalError::UnsupportedFunctionCall(name) => {
                 write!(f, "function call `{}` is not supported", name)
@@ -377,6 +384,8 @@ fn eval_in_context(
 fn unresolved(name: &str, store: &StateStore) -> EvalError {
     if store.memory(name).is_some() {
         EvalError::MemoryAsValue(name.to_string())
+    } else if store.is_event(name) {
+        EvalError::EventAsValue(name.to_string())
     } else {
         EvalError::UnknownIdentifier(name.to_string())
     }

@@ -170,6 +170,24 @@ pub fn memory_edges(changes: Vec<(String, Register, Register)>) -> Vec<SignalEdg
         .collect()
 }
 
+/// The edges a round's event triggers produce.
+///
+/// A named event has no value, so there is nothing to diff: the edge is
+/// synthesised, a one-bit `0 -> 1` transition under the event's own name. That
+/// satisfies the bare `@(done)` a trigger is normally waited on with, and a
+/// `posedge` of one as well, while a `negedge` never fires — a trigger only
+/// ever happens, it never un-happens.
+pub fn trigger_edges(triggered: Vec<String>) -> Vec<SignalEdge> {
+    triggered
+        .into_iter()
+        .map(|name| SignalEdge {
+            name,
+            before: Register::from_u128(0, 1),
+            after: Register::from_u128(1, 1),
+        })
+        .collect()
+}
+
 /// Whether an `always` block's event control fires given the edges observed.
 ///
 /// `implicit_reads` is only consulted for [`EventControl::Implicit`]; it is the

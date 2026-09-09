@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
@@ -335,6 +335,20 @@ pub struct StateStore {
     /// every bit-select write, and for a design with no memories this answers
     /// it without hashing the name.
     any_memory: bool,
+    /// The named events the design declares: `event done;`.
+    ///
+    /// An event has no value, so it is deliberately not a signal — a third
+    /// namespace beside the signals and the memories rather than a zero-width
+    /// entry in either. That is what makes reading one a named error instead
+    /// of a plausible pattern of bits.
+    events: HashSet<String>,
+    /// Every event triggered since the last marker, in trigger order.
+    ///
+    /// This is the whole of an event's state. A trigger is momentary: it is
+    /// journalled here, turned into an edge by the settle loop, and gone. A
+    /// list rather than a set because a design has a handful of events at
+    /// most, and taking an empty one costs nothing.
+    triggers: Vec<String>,
 }
 
 impl StateStore {
@@ -369,6 +383,8 @@ impl StateStore {
             call_depth: Cell::new(self.call_depth.get()),
             any_signed: false,
             any_memory: false,
+            events: HashSet::new(),
+            triggers: Vec::new(),
         }
     }
 
@@ -462,6 +478,52 @@ impl StateStore {
     pub fn clear_changes(&mut self) {
         self.journal.clear();
         self.memory_journal.clear();
+        self.triggers.clear();
+    }
+
+    /// Records a named event: `event done;`.
+    ///
+    /// It goes in a namespace of its own rather than into the signal map,
+    /// because an event has no value to hold and reading one has to be an
+    /// error rather than a number.
+    pub fn declare_event(&mut self, name: impl Into<String>) {
+        self.events.insert(name.into());
+    }
+
+    /// Whether `name` was declared as an event.
+    pub fn is_event(&self, name: &str) -> bool {
+        !self.events.is_empty() && self.events.contains(name)
+    }
+
+    /// Whether the design declares any event at all. `false` is exact, and it
+    /// is what keeps the settle loop from asking anything else of a design
+    /// that has none.
+    pub fn any_event(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    /// Fires a named event, reporting whether the name was one.
+    ///
+    /// Nothing is stored but the fact that it happened: the settle loop takes
+    /// the trigger, turns it into an edge, and the event is over. Triggering
+    /// the same event twice before a round takes them wakes a block once,
+    /// which is what two triggers inside one time step mean.
+    pub fn trigger_event(&mut self, name: &str) -> bool {
+        if !self.is_event(name) {
+            return false;
+        }
+        if !self.triggers.iter().any(|fired| fired == name) {
+            self.triggers.push(name.to_string());
+        }
+        true
+    }
+
+    /// Every event triggered since the last call, clearing the journal so the
+    /// next round is measured from here. This is what makes a trigger wake a
+    /// block exactly once: the round that takes it is the only round that can
+    /// see it.
+    pub fn take_triggers(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.triggers)
     }
 
     /// Declares a signal over `(msb, lsb)`, initialized to all `x` the way an

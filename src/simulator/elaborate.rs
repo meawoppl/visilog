@@ -81,6 +81,18 @@ const FUNCTION_SIDE_EFFECT_UNSUPPORTED: SimulationError =
 const FUNCTION_RANDOM_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("`$random` inside a function");
 
+/// How wide a `time` variable is. A `time` counts simulated time and is
+/// defined to be 64 bits, unsigned — the one fixed width beside an `integer`'s
+/// 32.
+const TIME_RANGE: (i64, i64) = (63, 0);
+
+/// A `real` is IEEE-754 floating point, which is not a four-state bit vector:
+/// there is no `x` in a float, none of the arithmetic is the same, and the
+/// expression grammar has no floating point literal to feed one with. The
+/// front end reads the declaration so that a design using one stops here, by
+/// name, rather than on a parse error somewhere in the middle of it.
+const REAL_UNSUPPORTED: SimulationError = SimulationError::Unsupported("a `real` variable");
+
 /// The most words a memory may declare.
 ///
 /// A memory is `n` real registers, so a nonsense dimension is an allocation the
@@ -420,6 +432,36 @@ impl<'m> Elaborator<'m> {
                     }
                 }
             }
+            ModuleStatement::TimeDeclaration(times) => {
+                for declaration in times {
+                    // A `time` is 64 bits wide and unsigned; like an `integer`
+                    // the keyword is the whole of its type, so there is no
+                    // range or qualifier to read.
+                    match declaration.dimensions {
+                        Some(addresses) => self.declare_memory(
+                            &declaration.name.name,
+                            addresses,
+                            TIME_RANGE,
+                            false,
+                            scope,
+                        )?,
+                        None => {
+                            self.declare_local(&declaration.name.name, TIME_RANGE, false, scope)
+                        }
+                    }
+                }
+            }
+            ModuleStatement::RealDeclaration(_) => return Err(REAL_UNSUPPORTED),
+            ModuleStatement::EventDeclaration(events) => {
+                for declaration in events {
+                    // An event is neither a signal nor a memory: it holds no
+                    // value, so it goes into a namespace of its own and
+                    // reading it is an error rather than a number.
+                    self.out
+                        .state
+                        .declare_event(scope.qualified(&declaration.name.name));
+                }
+            }
             ModuleStatement::ParameterDeclaration(parameters) => {
                 for parameter in parameters {
                     let local = &parameter.name.name;
@@ -538,6 +580,13 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::IntegerDeclaration(integers) => {
                 for declaration in integers {
+                    if let Some(init) = &declaration.init {
+                        self.initialise(&declaration.name.name, init, scope)?;
+                    }
+                }
+            }
+            ModuleStatement::TimeDeclaration(times) => {
+                for declaration in times {
                     if let Some(init) = &declaration.init {
                         self.initialise(&declaration.name.name, init, scope)?;
                     }

@@ -52,6 +52,9 @@ pub enum ResolvedTarget {
     /// One word of a memory, as in `mem[addr] <= d;`. Written the same way as a
     /// bit select and told apart from one by the declaration alone.
     Word { name: String, index: i64 },
+    /// A named event, as in `-> done;`. It holds no value, so the write that
+    /// lands on it is a trigger and whatever was evaluated for it is dropped.
+    Event(String),
 }
 
 impl ResolvedTarget {
@@ -61,6 +64,7 @@ impl ResolvedTarget {
             ResolvedTarget::Whole(name) => name,
             ResolvedTarget::Bits { name, .. } => name,
             ResolvedTarget::Word { name, .. } => name,
+            ResolvedTarget::Event(name) => name,
         }
     }
 
@@ -82,6 +86,9 @@ impl ResolvedTarget {
             ResolvedTarget::Word { name, .. } => state
                 .memory(name)
                 .map_or(SELF_DETERMINED, |memory| memory.width()),
+            // Nothing is written into an event, so the value a trigger carries
+            // is sized by itself and then thrown away.
+            ResolvedTarget::Event(_) => SELF_DETERMINED,
         }
     }
 }
@@ -155,6 +162,12 @@ pub fn resolve_target(
     match target {
         Expression::Identifier(id) => {
             if !state.contains(&id.name) {
+                // A name that is not a signal may still be a declared event,
+                // which `-> done;` writes to. Only a miss on the signal map
+                // asks, so an ordinary assignment costs the one hash it did.
+                if state.is_event(&id.name) {
+                    return Ok(ResolvedTarget::Event(id.name.clone()));
+                }
                 return Err(SimulationError::UnknownSignal(id.name.clone()));
             }
             Ok(ResolvedTarget::Whole(id.name.clone()))
@@ -230,6 +243,13 @@ pub fn drive_resolved(
         }
         ResolvedTarget::Bits { name, indices } => drive_bits(state, name, indices, value),
         ResolvedTarget::Word { name, index } => drive_word(state, name, *index, value),
+        ResolvedTarget::Event(name) => {
+            state.trigger_event(name);
+            // A trigger moves no stored value, and saying otherwise would keep
+            // the continuous-assignment fixpoint from ever settling. The wake
+            // it causes comes from the trigger journal, not from this flag.
+            Ok(false)
+        }
     }
 }
 
