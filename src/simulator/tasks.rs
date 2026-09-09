@@ -1758,7 +1758,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// A file with more words in it than the load can take means two different
     /// things depending on who chose the bound.
     #[test]
