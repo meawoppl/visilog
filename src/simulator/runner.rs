@@ -380,6 +380,10 @@ pub struct Simulator {
     /// no delay. Empty for a design that names none anywhere, which is what
     /// keeps the question off the propagation hot path.
     delays: Vec<Option<DelayedDrive>>,
+    /// Writes an `a <= #5 b;` scheduled but has not yet made. Each holds the
+    /// value its right hand side had when the statement ran, so nothing about
+    /// it is re-read when it lands. Empty for a design that writes none.
+    scheduled: Vec<(i64, PendingUpdate)>,
     /// The design's gate primitives, which are continuous drivers and settle
     /// in the same fixpoint the assignments do.
     gates: Vec<Gate>,
@@ -432,6 +436,7 @@ impl Simulator {
             state: StateStore::new(),
             assignments: Vec::new(),
             delays: Vec::new(),
+            scheduled: Vec::new(),
             gates: Vec::new(),
             udps: Vec::new(),
             resolved_nets: HashSet::new(),
@@ -462,6 +467,7 @@ impl Simulator {
         self.gates.clear();
         self.udps.clear();
         self.resolved_nets.clear();
+        self.scheduled.clear();
         self.pulled_nets.clear();
         self.blocks.clear();
         self.waiting.clear();
@@ -836,6 +842,9 @@ impl Simulator {
             // its new value before anything runs, so a block scheduled for
             // this instant reads the net as it is at this instant.
             self.land_due_drives(time);
+            // A write scheduled for this instant lands before anything runs,
+            // for the same reason: a block resuming now must read it.
+            self.land_due_writes(time)?;
             let mut pending = Vec::new();
             let mut resumptions = 0;
 
@@ -884,6 +893,7 @@ impl Simulator {
             .iter()
             .flatten()
             .filter_map(|drive| drive.pending.as_ref().map(|(time, _)| *time))
+            .chain(self.scheduled.iter().map(|(at, _)| *at))
             .min();
         match (self.queue.peek_time(), due) {
             (Some(queued), Some(due)) => Some(queued.min(due)),
@@ -898,6 +908,51 @@ impl Simulator {
     /// Nothing is written here: the assignment is a continuous driver, so the
     /// value reaches the net through the very same
     /// [`propagate`](Simulator::propagate) pass an undelayed one goes through.
+    /// Commits every scheduled write due at or before `time`.
+    ///
+    /// Unlike a delayed `assign`, which keeps driving, one of these is a
+    /// **one-shot**: it lands once and is gone, which is what a non-blocking
+    /// assignment means.
+    fn land_due_writes(&mut self, time: i64) -> Result<bool, SimulationError> {
+        if self.scheduled.is_empty() {
+            return Ok(false);
+        }
+        // In scheduled order, so two writes landing at the same instant happen
+        // the way the design wrote them.
+        let mut due = Vec::new();
+        let mut later = Vec::new();
+        for (at, update) in self.scheduled.drain(..) {
+            if at <= time {
+                due.push(update);
+            } else {
+                later.push((at, update));
+            }
+        }
+        self.scheduled = later;
+        let mut changed = false;
+        for update in due {
+            changed |= drive_resolved(&mut self.state, update.target(), update.value())?;
+        }
+        Ok(changed)
+    }
+
+    /// Takes the scheduled writes out of a block's pending updates and holds
+    /// them until their time. What is left is the ordinary non-blocking
+    /// updates, which commit at the end of this delta cycle.
+    fn hold_scheduled(&mut self, pending: Vec<PendingUpdate>) -> Vec<PendingUpdate> {
+        if pending.iter().all(|update| update.at().is_none()) {
+            return pending;
+        }
+        let mut immediate = Vec::with_capacity(pending.len());
+        for update in pending {
+            match update.at() {
+                Some(at) => self.scheduled.push((at, update)),
+                None => immediate.push(update),
+            }
+        }
+        immediate
+    }
+
     fn land_due_drives(&mut self, time: i64) {
         for drive in self.delays.iter_mut().flatten() {
             let Some((at, _)) = &drive.pending else {
@@ -939,6 +994,11 @@ impl Simulator {
             else {
                 let (mut updates, halted) = self.settled_resume(id, outcome)?;
                 carried.append(&mut updates);
+                // A scheduled write leaves the block here and waits on the
+                // time wheel instead of committing with this delta cycle's
+                // updates. Filtering at the one place updates leave a block
+                // means no caller has to know the difference.
+                let carried = self.hold_scheduled(carried);
                 return Ok((carried, halted));
             };
             carried.extend(pending);
@@ -1837,6 +1897,44 @@ mod tests {
             simulator.output().text(),
             "a=4 b=2 c=5\na=1 b=2 c=3\ny1=1\n"
         );
+    }
+
+    /// `a <= #5 b;` reads `b` **now** and writes `a` five ticks later, and it
+    /// does **not** suspend the block — so a `#2` after it measures from the
+    /// statement rather than from the write.
+    ///
+    /// iverilog 12.0 traces `t=0 a=1 b=10`, `t=3 a=1 b=99`, `t=6 a=10 b=99`:
+    /// `b` changing to 99 at t=3 does not reach the write that lands at t=6.
+    #[test]
+    fn test_non_blocking_intra_assignment_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [7:0] a, b;
+                initial begin
+                    a = 8'd1;
+                    b = 8'd10;
+                    #1 a <= #5 b;
+                    #2 b = 8'd99;
+                    #20 $display("t=%0d a=%0d b=%0d", $time, a, b);
+                end
+            endmodule
+        "#,
+        );
+
+        // The block reached `#2 b = 99` at t=3, so it did not suspend on the
+        // scheduled write.
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.get("b").unwrap().to_u128(), Some(99));
+        // The write has not landed yet.
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(1));
+
+        simulator.advance(3).expect("time should advance");
+        // It lands at t=6, carrying the value `b` held at t=1.
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(10));
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "t=23 a=10 b=99\n");
     }
 
     #[test]

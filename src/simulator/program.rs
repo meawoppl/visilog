@@ -195,6 +195,18 @@ pub enum Instruction {
     },
     /// The second half: write what `slot` has been holding to `target`.
     WriteHeld { slot: String, target: Expression },
+    /// `a <= #5 b;` — read the right hand side **now** and schedule the write
+    /// for `delay` from now, **without suspending the block**.
+    ///
+    /// That is the whole difference from the blocking form, which suspends and
+    /// so can be a `Hold` / `Delay` / `WriteHeld` triple: a non-blocking
+    /// assignment schedules its write and lets the block carry on, so the
+    /// value has to leave with the update rather than wait in a slot.
+    ScheduleWrite {
+        target: Expression,
+        value: Expression,
+        delay: Delay,
+    },
     /// `$display(…)` and friends — a call to a system task.
     Task(TaskCall),
     /// `disable blk;` — terminate the activity of the named scope.
@@ -321,6 +333,17 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
             *slot = resolve(slot);
             rename_expression(target, resolve);
         }
+        Instruction::ScheduleWrite {
+            target,
+            value,
+            delay,
+        } => {
+            rename_expression(target, resolve);
+            rename_expression(value, resolve);
+            for expression in delay.expressions_mut() {
+                rename_expression(expression, resolve);
+            }
+        }
         // `#(period / 2)` names a parameter, and a parameter belongs to the
         // instance that declared it like anything else.
         Instruction::Delay(delay) => {
@@ -365,6 +388,17 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
             replace(value);
         }
         Instruction::WriteHeld { target, .. } => replace(target),
+        Instruction::ScheduleWrite {
+            target,
+            value,
+            delay,
+        } => {
+            replace(target);
+            replace(value);
+            for expression in delay.expressions_mut() {
+                replace(expression);
+            }
+        }
         // A generate loop may write its own index into a delay: `#(i * 10)`.
         Instruction::Delay(delay) => {
             for expression in delay.expressions_mut() {
@@ -712,7 +746,21 @@ impl Program {
             assignment.assignment_type(),
             ProceduralAssignmentType::NonBlocking
         ) {
-            return Err(NONBLOCKING_TIMING_UNSUPPORTED);
+            // `a <= #5 b;` reads `b` now and schedules the write, without
+            // suspending — one instruction, where the blocking form needs the
+            // `Hold` / wait / `WriteHeld` triple precisely because it *does*
+            // suspend. An **event** control on a non-blocking assignment would
+            // need a watch that outlives the block, which nothing here has, so
+            // it stays a named error.
+            let AssignmentTiming::Delay(delay) = timing else {
+                return Err(NONBLOCKING_TIMING_UNSUPPORTED);
+            };
+            self.emit(Instruction::ScheduleWrite {
+                target,
+                value,
+                delay: delay.clone(),
+            });
+            return Ok(());
         }
 
         // The right hand side is read *now* and written when the control
@@ -1300,6 +1348,20 @@ pub fn resume(
                 pending.push(PendingUpdate::new(target, value));
                 pc += 1;
             }
+            Instruction::ScheduleWrite {
+                target,
+                value,
+                delay,
+            } => {
+                // Read now, land later, and carry on — the block is *not*
+                // suspended, so a `#2` after this one measures from here
+                // rather than from when the write happens.
+                let target = resolve_target(store, target)?;
+                let value = eval_sized(value, store, target.width(store))?;
+                let at = store.time() + delay.ticks(store)?;
+                pending.push(PendingUpdate::scheduled(target, value, at));
+                pc += 1;
+            }
             Instruction::Assign { target, value } => {
                 install_drive(store, target, value, DriveLevel::Assign)?;
                 pc += 1;
@@ -1836,9 +1898,28 @@ mod tests {
         assert_eq!(value(&store, "a"), "1111");
     }
 
+    /// `a <= #5 b;` compiles to a single `ScheduleWrite`, not the `Hold` /
+    /// wait / `WriteHeld` triple the blocking form needs — because it does not
+    /// suspend the block.
     #[test]
-    fn test_intra_assignment_timing_on_a_non_blocking_assignment_is_rejected() {
+    fn test_non_blocking_delay_compiles_to_one_scheduled_write() {
         let (_, statements) = parse_block("begin a <= #5 b; end").unwrap();
+        let program = Program::compile(&statements, &TaskTable::new()).expect("should compile");
+        assert!(
+            matches!(
+                program.instructions().first(),
+                Some(Instruction::ScheduleWrite { .. })
+            ),
+            "expected a scheduled write, got {:?}",
+            program.instructions().first()
+        );
+    }
+
+    /// An **event** control on a non-blocking assignment stays a named error:
+    /// it needs a watch that outlives the block, which nothing here has.
+    #[test]
+    fn test_non_blocking_event_control_is_rejected() {
+        let (_, statements) = parse_block("begin a <= @(posedge clk) b; end").unwrap();
         assert_eq!(
             Program::compile(&statements, &TaskTable::new()),
             Err(NONBLOCKING_TIMING_UNSUPPORTED)
