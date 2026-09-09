@@ -11,9 +11,9 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
     character::complete::{alpha1, char},
-    combinator::{map, map_res, opt, recognize, value},
+    combinator::{map, map_res, not, opt, recognize, value},
     multi::{fold_many0, many1, separated_list0, separated_list1},
-    sequence::{pair, preceded, tuple},
+    sequence::{pair, preceded, terminated, tuple},
     IResult,
 };
 use nom::{combinator::peek, sequence::delimited};
@@ -502,18 +502,29 @@ pub fn part_select(input: &str) -> IResult<&str, Expression> {
 // by composing layers of order of operation here. There are 14 layers as a result
 // They are enumerated below with a brief description of the operation(s)
 
+/// `&` that is not the first half of `&&`, and `|` that is not `||`.
+///
+/// The doubled forms belong to the *logical* layers above these, so a fold
+/// that matched on the first character alone would take the operator apart.
+/// Asking here is what lets a unary operator be separated from its operand by
+/// whitespace: `a && b` can no longer be read as `a & (& b)`, because the
+/// bitwise layer never matches the `&` of a `&&` at all.
+fn lone(symbol: char) -> impl Fn(&str) -> IResult<&str, char> {
+    move |input| terminated(char(symbol), peek(not(char(symbol))))(input)
+}
+
 // Layer 1: Unary operators
 fn unary_operator_layer(input: &str) -> IResult<&str, Expression> {
     alt((
         // `ws` wraps the unary *term*, exactly as `operand` wraps a bare one,
         // so the whitespace on either side of `-a` belongs to the term and the
-        // operator that follows it gets a chance to match. The junction between
-        // the operator and what it applies to stays `operand_no_ws`, and that
-        // is load-bearing: allow whitespace there and `a && b` reads as
-        // `a & (&b)`, because the first `&` matches the bitwise layer and the
-        // second is then a reduction operator applied to ` b`.
+        // operator that follows it gets a chance to match. Whitespace between
+        // the operator and what it applies to is legal — `~ clk` is a real
+        // spelling in real designs — and is safe because [`lone`] stops the
+        // bitwise layers matching half of a `&&` or `||`, which is what made
+        // this junction load-bearing before.
         ws(map_res(
-            tuple((many1(unary_operator), operand_no_ws)),
+            tuple((many1(ws(unary_operator)), operand)),
             |(ops, exp)| {
                 let mut result = exp;
 
@@ -646,9 +657,9 @@ fn bitwise_and_layer(input: &str) -> IResult<&str, Expression> {
     let (input, init) = equality_layer(input)?;
 
     fold_many0(
-        pair(tag("&"), equality_layer),
+        pair(lone('&'), equality_layer),
         move || init.clone(),
-        |acc, (_, val): (&str, Expression)| {
+        |acc, (_, val): (char, Expression)| {
             Expression::Binary(Box::new(acc), BinaryOperator::BitwiseAnd, Box::new(val))
         },
     )(input)
@@ -676,9 +687,9 @@ fn bitwise_or_layer(input: &str) -> IResult<&str, Expression> {
     let (input, init) = bitwise_xor_xnor_layer(input)?;
 
     fold_many0(
-        pair(tag("|"), bitwise_xor_xnor_layer),
+        pair(lone('|'), bitwise_xor_xnor_layer),
         move || init.clone(),
-        |acc, (_, val): (&str, Expression)| {
+        |acc, (_, val): (char, Expression)| {
             Expression::Binary(Box::new(acc), BinaryOperator::BitwiseOr, Box::new(val))
         },
     )(input)
@@ -688,7 +699,10 @@ fn logical_and_layer(input: &str) -> IResult<&str, Expression> {
     let (input, init) = bitwise_or_layer(input)?;
 
     fold_many0(
-        pair(tag("&&"), bitwise_or_layer),
+        pair(
+            terminated(tag("&&"), peek(not(char('&')))),
+            bitwise_or_layer,
+        ),
         move || init.clone(),
         |acc, (_, val): (&str, Expression)| {
             Expression::Binary(Box::new(acc), BinaryOperator::LogicalAnd, Box::new(val))
@@ -1014,9 +1028,18 @@ mod tests {
                 Expression::Binary(Box::new(a()), op, Box::new(b())),
             );
         }
-        // Whitespace between a unary operator and its operand is still not an
-        // expression at all, rather than a reduction of the operand.
-        assert!(!matches!(verilog_expression("a & & b"), Ok(("", _))));
+        // `a & & b` is a bitwise `&` whose right operand is the *reduction*
+        // of `b`, and the space is legal: iverilog prints `0000` for
+        // `4'b1100 & & 4'b1111`. The doubled form is still the logical
+        // operator, which is what `lone` keeps apart.
+        assert!(matches!(
+            verilog_expression("a & & b"),
+            Ok(("", Expression::Binary(_, BinaryOperator::BitwiseAnd, _)))
+        ));
+        assert!(matches!(
+            verilog_expression("a && b"),
+            Ok(("", Expression::Binary(_, BinaryOperator::LogicalAnd, _)))
+        ));
     }
 
     #[test]
@@ -1986,5 +2009,26 @@ mod tests {
             assert_parses(verilog_expression, "a[3 -: 2]"),
             Expression::IndexedPartSelect { upward: false, .. }
         ));
+    }
+
+    /// Whitespace between a unary operator and its operand is legal, and real
+    /// designs write it: `always #5 clk = ~ clk;`.
+    ///
+    /// It was refused because the bitwise layer would otherwise match the
+    /// first `&` of a `&&` and read `a && b` as `a & (& b)`. `lone` moves that
+    /// question to where it belongs — the binary operator — so the spacing
+    /// rule is no longer load-bearing.
+    #[test]
+    fn test_a_unary_operator_may_be_separated_from_its_operand() {
+        for source in ["~ clk", "- a", "! flag", "& bus", "~& bus", "~ ~ a"] {
+            assert_parses(verilog_expression, source);
+        }
+    }
+
+    /// `&&&` is the `specify` timing-check conditioning operator, so `&&` must
+    /// not match the first two characters of one.
+    #[test]
+    fn test_logical_and_does_not_split_a_timing_check_condition() {
+        assert!(!matches!(verilog_expression("a &&& b"), Ok(("", _))));
     }
 }
