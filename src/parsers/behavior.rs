@@ -225,10 +225,38 @@ fn parse_delayed_statement(input: &str) -> IResult<&str, ProceduralStatements> {
     Ok((input, ProceduralStatements::Delayed { delay, statements }))
 }
 
-/// The body of a conditional or case arm: either a `begin`…`end` block or a
-/// single statement.
+/// A bare `;` — the null statement, which does nothing.
+///
+/// It is deliberately **not** a [`ProceduralStatements`] variant: it compiles
+/// to no instructions at all, so the places that admit one produce an empty
+/// statement list instead and nothing downstream has to learn a node that
+/// means "nothing". The parser consumes the `;`, so a `many0` over it always
+/// makes progress.
+fn null_statement(input: &str) -> IResult<&str, ()> {
+    value((), ws(char(';')))(input)
+}
+
+/// The body of a conditional or case arm: a `begin`…`end` block, a null
+/// statement (`else ;`), or a single statement.
 fn statement_body(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
-    alt((parse_block, map(procedural_statement, |s| vec![s])))(input)
+    alt((
+        parse_block,
+        map(null_statement, |_| Vec::new()),
+        map(procedural_statement, |s| vec![s]),
+    ))(input)
+}
+
+/// A run of statements, with null statements dropped.
+///
+/// Each alternative consumes at least its own `;`, so the `many0` cannot spin.
+fn statement_run(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
+    map(
+        many0(alt((
+            map(null_statement, |_| None),
+            map(procedural_statement, Some),
+        ))),
+        |statements| statements.into_iter().flatten().collect(),
+    )(input)
 }
 
 fn parenthesized_expression(input: &str) -> IResult<&str, Expression> {
@@ -479,7 +507,11 @@ pub fn parse_sensitivity_list(input: &str) -> IResult<&str, EventControl> {
 
 pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
     let (input, _) = ws(tag("initial"))(input)?;
-    let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
+    let (input, assignments) = alt((
+        parse_block,
+        map(null_statement, |_| Vec::new()),
+        many1(procedural_statement),
+    ))(input)?;
     let initial_block = InitialBlock::new(assignments);
     Ok((input, initial_block))
 }
@@ -490,7 +522,11 @@ pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
         control.unwrap_or(EventControl::None)
     })(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, assignments) = alt((parse_block, many1(procedural_statement)))(input)?;
+    let (input, assignments) = alt((
+        parse_block,
+        map(null_statement, |_| Vec::new()),
+        many1(procedural_statement),
+    ))(input)?;
 
     let block = AlwaysBlock::new(event_control, assignments);
 
@@ -500,7 +536,7 @@ pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
 pub fn parse_block(input: &str) -> IResult<&str, Vec<ProceduralStatements>> {
     let (input, _) = ws(tag("begin"))(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, assignments) = many0(procedural_statement)(input)?;
+    let (input, assignments) = statement_run(input)?;
     let (input, _) = ws(tag("end"))(input)?;
     Ok((input, assignments))
 }
@@ -682,7 +718,7 @@ pub fn parse_function_declaration(input: &str) -> IResult<&str, FunctionDeclarat
     // The LRM allows one statement, which is a `begin`…`end` block when the
     // body does more than one thing; `many0` also lets an empty function be
     // written, and a body that runs several statements without a block.
-    let (input, statements) = alt((parse_block, many0(procedural_statement)))(input)?;
+    let (input, statements) = alt((parse_block, statement_run))(input)?;
     let (input, _) = ws(tag("endfunction"))(input)?;
 
     let mut arguments = ansi.unwrap_or_default();
@@ -1212,6 +1248,85 @@ mod tests {
     fn test_whitespace_between_a_hash_and_its_value_in_a_block() {
         let statements = assert_parses(parse_block, "begin # 3 a = 1; # 4 ; end");
         assert_eq!(statements.len(), 2);
+    }
+
+    /// A bare `;` is a legal statement that does nothing, so it leaves no node
+    /// behind: a block containing one is a block of the statements around it.
+    #[test]
+    fn test_a_null_statement_parses_and_produces_no_node() {
+        let statements = assert_parses(parse_block, "begin ; a = 1; ; b = 2; ;; end");
+        assert_eq!(statements.len(), 2);
+
+        let empty = assert_parses(parse_block, "begin ; end");
+        assert!(empty.is_empty());
+
+        // A `;` after a statement that already ate its own is a second,
+        // separate null statement rather than a parse error.
+        let trailing = assert_parses(parse_block, "begin a = 1;; end");
+        assert_eq!(trailing.len(), 1);
+    }
+
+    /// `else ;` is an `if` whose else branch is a null statement, which is an
+    /// empty branch rather than an absent one.
+    #[test]
+    fn test_a_null_statement_is_a_conditional_branch() {
+        let statement = assert_parses(procedural_statement, "if (a) b = 1; else ;");
+        match statement {
+            ProceduralStatements::If(conditional) => {
+                assert_eq!(conditional.then_statements.len(), 1);
+                assert_eq!(conditional.else_statements, Some(Vec::new()));
+            }
+            other => panic!("expected an if statement, got {:?}", other),
+        }
+
+        let empty_then = assert_parses(procedural_statement, "if (a) ; else b = 1;");
+        match empty_then {
+            ProceduralStatements::If(conditional) => {
+                assert!(conditional.then_statements.is_empty());
+                assert_eq!(conditional.else_statements.map(|arm| arm.len()), Some(1));
+            }
+            other => panic!("expected an if statement, got {:?}", other),
+        }
+    }
+
+    /// The other bodies a statement may fill: a case arm, a loop, and the
+    /// whole of an `initial` or `always` block.
+    #[test]
+    fn test_a_null_statement_fills_any_statement_body() {
+        for source in [
+            "case (x) 1: ; default: a = 1; endcase",
+            "for (i = 0; i < 4; i = i + 1) ;",
+            "while (a) ;",
+            "repeat (4) ;",
+            "#5 ;",
+        ] {
+            assert_parses(procedural_statement, source);
+        }
+
+        let initial = assert_parses(parse_initial_block, "initial ;");
+        assert!(initial.statements.is_empty());
+
+        let always = assert_parses(parse_always_block, "always @(a) ;");
+        assert!(always.statements.is_empty());
+    }
+
+    /// End to end: a null statement runs as nothing at all, and the statements
+    /// around it still run.
+    #[test]
+    fn test_a_null_statement_simulates_as_a_no_op() {
+        let source = "module m(); reg a; reg b;\n\
+                      initial begin ; a = 1; ; if (a) ; else b = 0; b = 1; ; end\n\
+                      endmodule";
+        let (remaining, module) =
+            crate::parsers::modules::parse_module_declaration(source).expect("module should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = crate::simulator::runner::Simulator::new(module);
+        simulator.setup().expect("setup should succeed");
+        simulator.advance(1).expect("advance should succeed");
+
+        assert_eq!(simulator.get("a").expect("a should exist").to_binary(), "1");
+        assert_eq!(simulator.get("b").expect("b should exist").to_binary(), "1");
     }
 
     #[test]
