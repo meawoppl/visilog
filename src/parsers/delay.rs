@@ -2,6 +2,7 @@ use nom::{
     branch::alt,
     bytes::complete::tag,
     combinator::{map, map_res, opt},
+    multi::separated_list1,
     sequence::delimited,
     IResult,
 };
@@ -80,6 +81,40 @@ pub fn parse_delay(input: &str) -> IResult<&str, Delay> {
     let (input, delay) = alt((parenthesised_delay, map(delay_value, Delay::new)))(input)?;
     let (input, _) = ws_and_comments(input)?;
     Ok((input, delay))
+}
+
+/// `#5`, `#(2, 7)`, `#(2, 7, 9)`, `#(1:2:3, 4:5:6)` — the delay a *gate*
+/// primitive carries.
+///
+/// A gate writes up to three delays rather than one — rise, fall and turn-off —
+/// which is the whole difference from [`parse_delay`]. Only the first is kept:
+/// the simulator settles a gate in zero time along with every other continuous
+/// driver, so nothing downstream can tell one delay from three, and a `Delay`
+/// that pretended to hold all of them would be a shape no caller reads.
+pub fn parse_gate_delay(input: &str) -> IResult<&str, Delay> {
+    let (input, _) = tag("#")(input)?;
+    let (input, _) = ws_and_comments(input)?;
+    let (input, delays) = alt((
+        delimited(
+            tag("("),
+            separated_list1(tag(","), ws(delay_term)),
+            tag(")"),
+        ),
+        map(delay_term, |delay| vec![delay]),
+    ))(input)?;
+    let (input, _) = ws_and_comments(input)?;
+    Ok((
+        input,
+        delays
+            .into_iter()
+            .next()
+            .expect("a separated list holds at least one delay"),
+    ))
+}
+
+/// One delay, in either of the two spellings a single value may take.
+fn delay_term(input: &str) -> IResult<&str, Delay> {
+    alt((delay_triple, map(delay_value, Delay::new)))(input)
 }
 
 /// One unsigned delay value.

@@ -61,8 +61,9 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `keywords.rs` | the `VerilogKeyword` enum and lookup for what SystemVerilog added, and `is_reserved_word` for the IEEE 1364-2005 set |
 | `operators.rs` | `UnaryOperator` / `BinaryOperator` and their token parsers |
 | `expr.rs` | the expression grammar — the biggest and trickiest file |
-| `delay.rs` | `#<n>` delay terms |
+| `delay.rs` | `#<n>` delay terms, and `parse_gate_delay` for a gate's rise/fall list |
 | `nets.rs` | `wire`/`tri`/... declarations → `Net` |
+| `gates.rs` | the built-in primitives — `GateKind`, `DriveStrength`, `GateInstantiation` |
 | `register.rs` | `reg` and memory declarations → `RegisterDeclaration` |
 | `integer.rs` | the keyword-led variable declarations: `integer`, `time`, `real` and `event` |
 | `assignment.rs` | `ContinuousAssignment` (`assign x = y;`) and `ProceduralAssignment` (`x = y;`, `x <= y;`) |
@@ -525,6 +526,71 @@ counter) and concatenation as an assignment target. A drive is also tracked per 
 `force bus[0] = 1;` blocks a write to `bus[1]` as well — corpus `pr1832097a`, `pr245`,
 `pr527` and the `_pv` pair are that one gap. `signals.rs` is built but still unwired.
 
+**A gate primitive is a continuous driver, and it is what made net resolution
+necessary.** `and g1 (out, a, b);` elaborates to a `simulator::gates::Gate` on the same
+`propagate` fixpoint the `assign` statements settle in — not to a procedural block — so its
+output follows its inputs for the whole simulation and its writes journal edges like any
+other. The keyword is what tells one from a module instantiation, so
+`parse_gate_instantiation` sits **immediately before** `parse_module_instantiation_statement`
+in `parse_module_statement`'s `alt`: an instantiation is an identifier followed by an
+argument block and would otherwise read `and` as a module name.
+
+An ordinary `assign` writes its net and that is the end of it, which is why the simulator
+never had to ask what two drivers of one net mean. A three-state bus forces the question —
+`bufif1 (bus, a, ena);` beside `bufif1 (bus, b, enb);` are two drivers, each `z` when it is
+not enabled, and *whichever wrote last* is exactly the wrong answer. So `elaborate` records
+`resolved_nets`, the names a gate drives, and `propagate` routes every continuous driver of
+one of those — gates *and* `assign` statements alike — into `resolve_contributions` instead
+of writing it. Each **bit** is settled on its own by `gates::resolve_bit`: a driver that is
+`z` contributes nothing, the strongest of the rest wins outright, and drivers tied at the
+strongest level either agree or the bit is `x`. A bit no driver reaches keeps what it held,
+so a driver of `bus[0]` says nothing about `bus[1]`. A design with no gates in it pays a
+`HashSet::is_empty` for the question, the same shape `any_signed` and `any_memory` use.
+
+Strength is what makes a `pullup` mean anything: it drives at `pull` where a gate drives at
+`strong`, so it holds a net every buffer has let go of and loses the moment one drives.
+`(strong0, pull1)` parses and reaches the same rule, and because the two halves are
+independent, `(highz0, strong1)` is a real open drain — it drives its `1` and floats instead
+of driving its `0`, leaving a `pulldown` in charge.
+
+**`StrengthLevel` and `DriveStrength` are net-driver concepts, not gate ones**, even though
+`parsers/gates.rs` is where the grammar for them lives and `gates::drive_strength` is the
+single parser for the token. A gate is simply the first driver form that could declare one.
+`assign (pull1, pull0) x = y;` is the same token in front of a continuous assignment, and
+wiring it up is two seams and no new machinery: the strength onto `ContinuousAssignment`,
+and the `DriveStrength::STRONG` constant in `propagate`'s assignment arm coming off the
+assignment instead. Everything past that point — `Contribution`, `resolve_contributions`,
+`resolve_bit` — already takes any driver at any strength.
+
+**The truth tables were measured against iverilog 12.0, not read off the LRM.** `and(0, x)`
+is `0` rather than `x` — an unknown input that cannot change the answer does not make the
+answer unknown — and `or(1, z)` is `1`. A `z` reaching a *logic* gate is read as an `x`,
+which is the one place the switch family differs: `nmos` conducting a `z` passes a `z`,
+where `bufif1` enabled on a `z` gives an `x`. A three-state buffer whose control is unknown
+drives `x`, where the LRM allows the weaker `L`/`H`. `cmos` is deliberately **not** two
+resolved switches — `cmos(0, 1, x)` is `0`, where resolving a strong `0` against the `x` a
+half-open `pmos` reports would give `x` — so it asks whether *either* half conducts instead.
+
+An **array of instances** (`bufif1 drv [7:0] (bus, data, enable);`) is expanded at
+elaboration into one gate per index, because nothing downstream has a notion of an instance
+at all. Its bounds are a `simple::Range` like a declaration's, so they go through
+`resolve_range` and `buf drv [N-1:0] (…)` is sized by the parameters in scope. A terminal
+one bit wide is shared by every instance and a terminal exactly as wide
+as the array is sliced a bit apiece; the two are told apart by `expression_width`, and a
+terminal that is neither — or one that is wide but not a plain signal, like
+`{16'b0, data}` — is `SimulationError::GateArrayTerminal` rather than a silent
+misconnection. Both the array and the terminal are walked from their least significant end,
+so which way round either range was declared cannot matter.
+
+Not modelled, each by name where it can be: **a gate delay is parsed and ignored** — the
+gate settles in zero time along with every other continuous driver, and `#(rise, fall)`
+keeps only the first value. The **bidirectional** switches (`tran`, `tranif0`, `rtranif1`, …)
+conduct both ways and have no output terminal, so `Gate::new` refuses them by name. The
+`r`-prefixed switches pass the same values as their non-resistive counterparts because the
+strength *reduction* is not modelled, and neither is strength *propagation* through a switch
+at all: corpus `resolv1` needs a `pmos` to carry a `pullup`'s `pull` strength through to its
+output, which would mean the store carrying a strength per bit beside its value.
+
 **`time` is a variable, `event` is not, and `real` is a named refusal.** `time t;` is a 64
 bit *unsigned* register and nothing else — `elaborate` declares it at a fixed width the way
 it declares an `integer` at 32 — so it round-trips through the store, through the memory
@@ -547,6 +613,7 @@ dying on unfamiliar syntax several lines earlier.
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope) and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
+| `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay` and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, and `TaskDefinition` / `Program::splice`, which inlines one into another |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in |
@@ -727,6 +794,9 @@ tripwire.
   three values; `Delay::ticks()` returns the *typical* one and is the single place the
   selection happens, so a `+mindelays`/`+maxdelays` mode is a one-function change. Delay
   values are still literal decimals — `#tPD` and `#(a:b:c)` with identifiers do not parse.
+  A **gate** writes up to three delays rather than one — `#(rise, fall, turn_off)` — which
+  is what `parse_gate_delay` is for; it keeps the first and drops the rest, since nothing
+  downstream schedules a gate delay at all.
 - **System task names are decomposed, not enumerated.** `split_task_name` peels an optional
   `f` prefix (takes a descriptor) and an optional `b`/`h`/`o` suffix (the default radix), so
   `$display`, `$writeh`, `$fdisplayb`, `$strobeh`, `$fmonitor` and `$readmemb` all come from
@@ -739,7 +809,9 @@ tripwire.
   channel can legitimately be open.
 - **Module instantiation must stay last in `parse_module_statement`'s `alt(...)`.** An
   instantiation is just an identifier followed by an argument block, so putting it earlier
-  lets it shadow every keyword-led statement form.
+  lets it shadow every keyword-led statement form. A gate primitive is one of those
+  keyword-led forms and looks *exactly* like an instantiation once the keyword is past, so
+  `parse_gate_instantiation` sits directly before it and nothing may be put between them.
 - **`src/verilog/examples/*.v` are the corpus, and two tests walk the whole directory.**
   `test_parse_verilog_examples` in `modules.rs` asserts every file parses with nothing left
   over; `test_every_example_module_simulates` in `runner.rs` asserts every file also
