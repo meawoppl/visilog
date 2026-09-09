@@ -39,7 +39,7 @@ use crate::parsers::{
     modules::VerilogModule,
 };
 use crate::register::Register;
-use crate::simulator::elaborate::{elaborate, BlockKind, TimedBlock};
+use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
 use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events;
@@ -246,6 +246,8 @@ pub struct Simulator {
     /// drivers rather than written by whichever one ran last. Empty for a
     /// design with no gates, which is what keeps the question off the hot path.
     resolved_nets: HashSet<String>,
+    /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
+    pulled_nets: Vec<PulledNet>,
     blocks: Vec<TimedBlock>,
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
@@ -279,6 +281,7 @@ impl Simulator {
             assignments: Vec::new(),
             gates: Vec::new(),
             resolved_nets: HashSet::new(),
+            pulled_nets: Vec::new(),
             blocks: Vec::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
@@ -302,6 +305,7 @@ impl Simulator {
         self.assignments.clear();
         self.gates.clear();
         self.resolved_nets.clear();
+        self.pulled_nets.clear();
         self.blocks.clear();
         self.aliases.clear();
         self.queue = EventQueue::new();
@@ -322,6 +326,7 @@ impl Simulator {
         self.assignments = elaborated.assignments;
         self.gates = elaborated.gates;
         self.resolved_nets = elaborated.resolved_nets;
+        self.pulled_nets = elaborated.pulled_nets;
         self.blocks = elaborated.blocks;
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
@@ -676,6 +681,25 @@ impl Simulator {
         for pass in 1..=limit {
             let mut changed = false;
             let mut contributions: Vec<Contribution> = Vec::new();
+            // A `supply` or `tri0`/`tri1` net drives itself, every pass, at its
+            // own strength. Seeding it as the first contribution is what makes
+            // `tri0 c; assign c = d;` read `0` while `d` is `z` and `1` once
+            // `d` is `1` — the same resolution rule as any other contention,
+            // with no separate case for a net that has no other driver.
+            for pulled in &self.pulled_nets {
+                let width = self
+                    .state
+                    .get_signal(&pulled.name)
+                    .map_or(1, |signal| signal.width());
+                contributions.push(Contribution {
+                    target: ResolvedTarget::Whole(pulled.name.clone()),
+                    value: Register::from_bits(vec![pulled.code; width]),
+                    strength: DriveStrength {
+                        zero: pulled.strength,
+                        one: pulled.strength,
+                    },
+                });
+            }
             for assignment in &self.assignments {
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
@@ -1087,6 +1111,44 @@ mod tests {
         assert_eq!(simulator.get("avariable").unwrap().to_binary(), "x");
         // `output reg q` is a variable however it is spelled.
         assert_eq!(simulator.get("q").unwrap().to_binary(), "x");
+    }
+
+    /// `supply0`/`supply1` sit at their rail and `tri0`/`tri1` are pulled to a
+    /// value that any real driver overrides.
+    ///
+    /// iverilog 12.0 prints `a=0 b=1 g=0 v=1` for the undriven cases, and for
+    /// a driven `tri0`: `z` leaves it at `0`, `1` pulls it to `1`, `0` to `0`.
+    #[test]
+    fn test_supply_and_pulled_nets() {
+        let mut simulator = simulator_for(
+            r#"
+            module m(input d);
+                tri0    a;
+                tri1    b;
+                supply0 g;
+                supply1 v;
+                tri0    c;
+                assign c = d;
+            endmodule
+        "#,
+        );
+
+        simulator
+            .set_input("d", Register::from_binary("z"))
+            .unwrap();
+        simulator.run().unwrap();
+        assert_eq!(simulator.get("a").unwrap().to_binary(), "0");
+        assert_eq!(simulator.get("b").unwrap().to_binary(), "1");
+        assert_eq!(simulator.get("g").unwrap().to_binary(), "0");
+        assert_eq!(simulator.get("v").unwrap().to_binary(), "1");
+        // Nothing but the pull reaches `c`, so it holds the pull value.
+        assert_eq!(simulator.get("c").unwrap().to_binary(), "0");
+
+        // A real driver is `strong`, which outranks `pull` either way.
+        simulator.poke("d", one()).unwrap();
+        assert_eq!(simulator.get("c").unwrap().to_binary(), "1");
+        simulator.poke("d", zero()).unwrap();
+        assert_eq!(simulator.get("c").unwrap().to_binary(), "0");
     }
 
     #[test]

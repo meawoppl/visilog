@@ -44,15 +44,16 @@ use crate::parsers::{
     behavior::{Event, EventControl, FunctionDeclaration, FunctionVariable, TaskDeclaration},
     constants::VerilogConstant,
     expr::Expression,
-    gates::{GateInstantiation, GateKind},
+    gates::{GateInstantiation, GateKind, StrengthLevel},
     identifier::Identifier,
     modules::{
         ModuleInitArguments, ModuleInstantiation, NetType, Port, PortDirection, VerilogModule,
     },
+    nets::NetType as WireKind,
     simple::Range,
     statements::ModuleStatement,
 };
-use crate::register::Register;
+use crate::register::{Register, ONE, ZERO};
 use crate::simulator::eval::{eval, expression_width};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
@@ -160,12 +161,30 @@ pub struct Elaborated {
     /// anything. Empty for a design with no gates in it, which is what keeps
     /// the question off the propagation hot path.
     pub resolved_nets: HashSet<String>,
+    /// Nets that drive themselves: `supply0`/`supply1`, which sit at their
+    /// rail at `supply` strength, and `tri0`/`tri1`, which are pulled to a
+    /// value at `pull` strength so any real driver overrides them.
+    ///
+    /// Held as one more contribution rather than as a value written into the
+    /// store, because that is exactly what they are — a permanent driver — and
+    /// it is what lets `resolve_bit` decide between them and everything else
+    /// without a second rule.
+    pub pulled_nets: Vec<PulledNet>,
     pub blocks: Vec<TimedBlock>,
     /// The *top* module's input ports, the only ones a testbench may drive.
     pub inputs: Vec<String>,
     /// Qualified name to the store entry it aliases, for ports that were bound
     /// to a parent signal and so have no entry of their own.
     pub aliases: HashMap<String, String>,
+}
+
+/// A net that drives itself, and the bit and strength it drives at.
+#[derive(Debug, Clone)]
+pub struct PulledNet {
+    pub name: String,
+    /// The raw four-state bit code this net holds when nothing else drives it.
+    pub code: u8,
+    pub strength: StrengthLevel,
 }
 
 /// Flattens `modules[top]` and everything it instantiates.
@@ -177,6 +196,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             assignments: Vec::new(),
             gates: Vec::new(),
             resolved_nets: HashSet::new(),
+            pulled_nets: Vec::new(),
             blocks: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
@@ -601,7 +621,9 @@ impl<'m> Elaborator<'m> {
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
                     let range = self.resolve_range(net.range(), scope)?;
-                    self.declare_local_net(&net.identifier().name, range, net.is_signed(), scope);
+                    let local = &net.identifier().name;
+                    self.declare_local_net(local, range, net.is_signed(), scope);
+                    self.record_pull(local, net.kind(), scope);
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -827,6 +849,35 @@ impl<'m> Elaborator<'m> {
             }
         }
         self.out.assignments.push(assignment);
+    }
+
+    /// Records a net that drives itself — `supply0`/`supply1` at their rail,
+    /// `tri0`/`tri1` pulled to a value that any real driver overrides.
+    ///
+    /// A pulled net is one more contribution, so it also has to be *resolved*
+    /// rather than written: `tri0 c; assign c = d;` is `0` when `d` is `z` and
+    /// `1` when `d` is `1`, which only `resolve_bit` can say.
+    fn record_pull(&mut self, local: &str, net_type: WireKind, scope: &Scope) {
+        let (code, strength) = match net_type {
+            WireKind::Supply0 => (ZERO, StrengthLevel::Supply),
+            WireKind::Supply1 => (ONE, StrengthLevel::Supply),
+            WireKind::Tri0 => (ZERO, StrengthLevel::Pull),
+            WireKind::Tri1 => (ONE, StrengthLevel::Pull),
+            _ => return,
+        };
+        // A net that is also a port bound to a parent signal has no entry of
+        // its own, so the pull belongs on the entry it aliases — otherwise it
+        // names a signal the store does not have and setup fails.
+        let name = match scope.bindings.get(local) {
+            Some(Binding::Alias(target)) => target.clone(),
+            _ => scope.qualified(local),
+        };
+        self.out.resolved_nets.insert(name.clone());
+        self.out.pulled_nets.push(PulledNet {
+            name,
+            code,
+            strength,
+        });
     }
 
     /// Records a gate and the nets it drives, which are the ones that have to

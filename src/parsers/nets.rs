@@ -13,7 +13,7 @@ use super::{
     simple::{range, signedness, ws, Range},
 };
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum NetType {
     Supply0,
     Supply1,
@@ -83,6 +83,12 @@ impl Net {
 
     pub fn init(&self) -> Option<&Expression> {
         self.init.as_ref()
+    }
+
+    /// Which flavour of net this declaration named. `supply0`/`supply1` and
+    /// `tri0`/`tri1` drive themselves, so elaboration has to ask.
+    pub fn kind(&self) -> NetType {
+        self.net_type
     }
 }
 
