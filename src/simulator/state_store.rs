@@ -196,7 +196,22 @@ pub struct Memory {
 impl Memory {
     /// A memory of `addresses` words, each `range` wide and every bit `x`.
     pub fn new(addresses: (i64, i64), range: (i64, i64), signed: bool) -> Self {
-        let word = Register::unknown(range_width(range)).with_signedness(signed);
+        Memory::filled(addresses, range, signed, Register::unknown)
+    }
+
+    /// An **array of nets**, whose undriven words read `z` rather than `x` for
+    /// the same reason a scalar net does — see [`StateStore::declare_net`].
+    pub fn of_nets(addresses: (i64, i64), range: (i64, i64), signed: bool) -> Self {
+        Memory::filled(addresses, range, signed, Register::high_impedance)
+    }
+
+    fn filled(
+        addresses: (i64, i64),
+        range: (i64, i64),
+        signed: bool,
+        fill: fn(usize) -> Register,
+    ) -> Self {
+        let word = fill(range_width(range)).with_signedness(signed);
         Memory {
             words: vec![word; range_width(addresses)],
             addresses,
@@ -740,10 +755,25 @@ impl StateStore {
         range: (i64, i64),
         signed: bool,
     ) {
+        self.insert_memory(name, Memory::new(addresses, range, signed), signed);
+    }
+
+    /// [`declare_memory`](StateStore::declare_memory) for an array of *nets*,
+    /// whose undriven words read `z`.
+    pub fn declare_net_memory(
+        &mut self,
+        name: impl Into<String>,
+        addresses: (i64, i64),
+        range: (i64, i64),
+        signed: bool,
+    ) {
+        self.insert_memory(name, Memory::of_nets(addresses, range, signed), signed);
+    }
+
+    fn insert_memory(&mut self, name: impl Into<String>, memory: Memory, signed: bool) {
         self.any_signed |= signed;
         self.any_memory = true;
-        self.name_to_memory
-            .insert(name.into(), Memory::new(addresses, range, signed));
+        self.name_to_memory.insert(name.into(), memory);
     }
 
     /// Whether the design declares any memory. `false` is exact.
