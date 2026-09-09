@@ -229,6 +229,17 @@ impl TaskCall {
             }
         }
     }
+
+    /// Rewrites every argument expression through `replace`, which may put a
+    /// different node in an argument's place — what substituting a genvar for
+    /// the integer it is bound to has to do.
+    pub fn substitute(&mut self, replace: &dyn Fn(&mut Expression)) {
+        for argument in &mut self.arguments {
+            if let TaskArgument::Value(expression) = argument {
+                replace(expression);
+            }
+        }
+    }
 }
 
 fn unknown_task(name: &str) -> SimulationError {

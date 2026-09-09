@@ -45,11 +45,13 @@ use crate::parsers::{
     constants::VerilogConstant,
     expr::Expression,
     gates::{GateInstantiation, GateKind, StrengthLevel},
+    generate::{DefparamAssignment, GenerateBlock, GenerateItem, GenerateLoop},
     identifier::Identifier,
     modules::{
         ModuleInitArguments, ModuleInstantiation, NetType, Port, PortDirection, VerilogModule,
     },
     nets::NetType as WireKind,
+    operators::BinaryOperator,
     simple::Range,
     statements::ModuleStatement,
 };
@@ -113,6 +115,20 @@ const REAL_UNSUPPORTED: SimulationError = SimulationError::Unsupported("a `real`
 /// host has to make before anything can go wrong with it. This is well past any
 /// memory a design plausibly declares and well short of exhausting memory.
 const MAX_MEMORY_DEPTH: usize = 1 << 20;
+
+/// The most iterations one `generate` loop may unroll.
+///
+/// Every iteration is a real copy of the body in the flat model, so a bound
+/// that never goes false is an allocation nothing survives rather than a hang.
+/// This is well past any design that plausibly elaborates.
+const MAX_GENERATE_ITERATIONS: usize = 4096;
+
+/// `walk` compiles a module's functions and tasks before it unrolls a
+/// generate region, so one written *inside* a block would be missing from the
+/// store a call looks in — a call that quietly found nothing is the hardest
+/// kind of wrong answer to find.
+const GENERATE_SUBPROGRAM_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a function or task declared inside a generate block");
 
 /// A memory bigger than [`MAX_MEMORY_DEPTH`] words.
 const MEMORY_TOO_LARGE: SimulationError =
@@ -202,54 +218,128 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             aliases: HashMap::new(),
         },
         stack: Vec::new(),
+        defparams: BTreeMap::new(),
+        blocks_generated: 0,
     };
-    elaborator.walk(top, &Scope::root())?;
+    elaborator.walk(top, &Scope::root(&modules[top].identifier.name))?;
+    // A `defparam` is consumed by the instantiation it names. One that is
+    // still here named nothing, and an override that quietly did not happen
+    // leaves the design running at a width it was told not to use.
+    if let Some(path) = elaborator.defparams.keys().next() {
+        return Err(SimulationError::UnappliedDefparam(path.clone()));
+    }
     Ok(elaborator.out)
 }
 
 /// How a child port was connected by its parent.
+#[derive(Clone)]
 enum Binding {
     /// A plain identifier: the port *is* the parent's signal.
     Alias(String),
     /// A general expression, already rewritten into the flat name space.
     Driven(Expression),
+    /// An output bound to something that is not a plain signal but can still
+    /// be written — a bit or part select of a parent vector. The port gets a
+    /// signal of its own and a continuous assignment carries it outwards,
+    /// which is the alias run backwards.
+    Driving(Expression),
 }
 
-/// One instance's view of the flat name space.
+/// One instance's — or one generate block's — view of the flat name space.
+///
+/// A module instance and a generate block are the same kind of thing to the
+/// flat model: both give the names inside them a dotted prefix. They differ in
+/// what "inside" means. A module cannot see out of itself, so *everything* it
+/// names is its own; a generate block is a nested scope, so only the names it
+/// declares are, and the rest belong to the module around it. That difference
+/// is [`locals`](Scope::locals), and it is the whole of it.
+#[derive(Clone)]
 struct Scope {
-    /// `""` for the top module, `"dut."` for its instance `dut`, and
-    /// `"dut.inner."` one level further down.
+    /// Where a name declared *here* goes: `""` for the top module, `"dut."`
+    /// for its instance `dut`, and `"dut.stage[0]."` inside a generate block
+    /// within that instance.
     prefix: String,
+    /// The prefix of the enclosing module *instance*, which is where a name a
+    /// generate block does not declare belongs. Equal to `prefix` outside one.
+    module_prefix: String,
     /// This module's port names, as its parent connected them.
     bindings: HashMap<String, Binding>,
     /// Parameter values the parent overrode, already evaluated in the parent's
     /// scope.
     overrides: HashMap<String, Register>,
+    /// What the generate blocks in scope declare, to the store entries they
+    /// took. Empty outside a generate block, which is what keeps an ordinary
+    /// module's resolution exactly what it was.
+    locals: HashMap<String, String>,
+    /// The genvars the generate loops in scope have bound. A genvar is an
+    /// elaboration-time integer and never reaches the [`StateStore`].
+    genvars: HashMap<String, i64>,
+    /// The top module's name with a `.` on it, which is how an *absolute*
+    /// hierarchical name is spelled — `main.dut.count`. The top module is the
+    /// root of the flat name space and carries no prefix of its own, so that
+    /// leading segment is dropped rather than kept.
+    root_name: String,
 }
 
 impl Scope {
-    fn root() -> Self {
+    fn root(module: &str) -> Self {
         Scope {
             prefix: String::new(),
+            module_prefix: String::new(),
             bindings: HashMap::new(),
             overrides: HashMap::new(),
+            locals: HashMap::new(),
+            genvars: HashMap::new(),
+            root_name: format!("{}.", module),
         }
     }
 
     fn is_root(&self) -> bool {
-        self.prefix.is_empty()
+        self.prefix.is_empty() && self.locals.is_empty()
+    }
+
+    /// Whether a name written in this scope can come out different.
+    ///
+    /// Not the same question as [`is_root`](Scope::is_root): the top module
+    /// has no prefix, but a name written *inside* it may still start at the
+    /// top module by name and have that segment dropped.
+    fn needs_renaming(&self) -> bool {
+        !self.is_root() || !self.root_name.is_empty()
     }
 
     /// The store entry a name written inside this module refers to.
     ///
-    /// An aliased port resolves to the parent's signal — possibly one the
-    /// parent itself aliased, so a chain of connections collapses to the single
-    /// signal at the top of it. Everything else is local and takes the
-    /// instance's prefix.
+    /// A name a generate block in scope declares takes that block's prefix,
+    /// and it is looked up by the *head* of the name so that a hierarchical
+    /// reference into a nested block — `inner[0].sig` — is qualified by the
+    /// block that declares `inner`. An aliased port resolves to the parent's
+    /// signal — possibly one the parent itself aliased, so a chain of
+    /// connections collapses to the single signal at the top of it. Everything
+    /// else is local to the module and takes the instance's prefix.
     fn resolve(&self, local: &str) -> String {
+        if !self.locals.is_empty() {
+            let head = match local.find(|c| c == '.' || c == '[') {
+                Some(at) => &local[..at],
+                None => local,
+            };
+            if let Some(full) = self.locals.get(head) {
+                return format!("{}{}", full, &local[head.len()..]);
+            }
+        }
+        // An absolute name starts at the top module, which is the root of the
+        // flat name space — `main.dut.count` is the store's `dut.count`. A
+        // scope of its own shadows it, which is why this is asked second.
+        if let Some(rest) = local.strip_prefix(self.root_name.as_str()) {
+            return rest.to_string();
+        }
         match self.bindings.get(local) {
             Some(Binding::Alias(outer)) => outer.clone(),
-            _ => self.qualified(local),
+            _ => {
+                let mut name = String::with_capacity(self.module_prefix.len() + local.len());
+                name.push_str(&self.module_prefix);
+                name.push_str(local);
+                name
+            }
         }
     }
 
@@ -269,6 +359,14 @@ struct Elaborator<'m> {
     /// now. A module that reaches itself through this is recursive, which no
     /// amount of flattening can terminate.
     stack: Vec<usize>,
+    /// The `defparam` overrides seen so far, by the flat name of the parameter
+    /// each one addresses. An instantiation takes the ones that name it; what
+    /// is left over at the end named nothing and is reported.
+    defparams: BTreeMap<String, Register>,
+    /// How many unnamed generate blocks have been given a `genblk` number.
+    /// A block with no label still needs a scope — two iterations of an
+    /// unnamed loop body would otherwise declare the same names twice.
+    blocks_generated: usize,
 }
 
 impl<'m> Elaborator<'m> {
@@ -313,17 +411,275 @@ impl<'m> Elaborator<'m> {
         for port in &module.ports {
             self.declare_port(port, scope)?;
         }
+        // A `defparam` overrides a parameter of an instance this module has yet
+        // to create, so it is collected before the build pass reaches that
+        // instantiation and applied where the instance is made. Its value is
+        // written in *this* module's terms, so it is evaluated here, where the
+        // parameters it may name already have values.
+        self.collect_defparams(&module.statements, scope)?;
+
+        // A generate region is unrolled once the parameters and the functions
+        // are known — a loop bound, an `if` condition and a `case` subject are
+        // made of them — and before the declaration passes, because what a
+        // region unrolls *to* is declarations. The items it yields then go
+        // through exactly the two passes the module's own statements do, each
+        // in the scope its block gave it.
+        let mut generated: Vec<(&ModuleStatement, Scope)> = Vec::new();
+        for statement in &module.statements {
+            if let ModuleStatement::GenerateRegion(items) = statement {
+                self.expand_generate(items, scope, &mut generated)?;
+            }
+        }
+
         for statement in &module.statements {
             if !matches!(statement, ModuleStatement::ParameterDeclaration(_)) {
                 self.declare(statement, scope)?;
             }
         }
+        for (statement, inner) in &generated {
+            self.declare(statement, inner)?;
+        }
         for statement in &module.statements {
             self.build(statement, scope, &tasks)?;
+        }
+        for (statement, inner) in &generated {
+            self.build(statement, inner, &tasks)?;
         }
 
         self.stack.pop();
         Ok(())
+    }
+
+    /// Records the `defparam`s written in this scope, keyed by the flat name of
+    /// the parameter each one addresses.
+    fn collect_defparams(
+        &mut self,
+        statements: &'m [ModuleStatement],
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        for statement in statements {
+            if let ModuleStatement::Defparam(assignments) = statement {
+                self.record_defparams(assignments, scope)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_defparams(
+        &mut self,
+        assignments: &[DefparamAssignment],
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        for assignment in assignments {
+            let value = eval(&renamed(&assignment.value, scope), &self.out.state)?;
+            self.defparams
+                .insert(scope.resolve(&assignment.path), value);
+        }
+        Ok(())
+    }
+
+    /// Unrolls a generate region into the module items it describes, each
+    /// paired with the scope its block gives it.
+    ///
+    /// Nothing here runs: a region is a *description* of what the module
+    /// contains, and unrolling it is choosing which description. That is why it
+    /// happens at elaboration and not in the parser — a loop bound may be a
+    /// parameter, and a parameter has no value until now.
+    fn expand_generate(
+        &mut self,
+        items: &'m [GenerateItem],
+        scope: &Scope,
+        out: &mut Vec<(&'m ModuleStatement, Scope)>,
+    ) -> Result<(), SimulationError> {
+        for item in items {
+            match item {
+                GenerateItem::Item(statement) => match statement {
+                    // A parameter declared inside a block is evaluated as the
+                    // block unrolls rather than in the declaration pass that
+                    // follows, because a nested loop's bound may be made of it.
+                    ModuleStatement::ParameterDeclaration(_) => self.declare(statement, scope)?,
+                    ModuleStatement::Defparam(assignments) => {
+                        self.record_defparams(assignments, scope)?
+                    }
+                    ModuleStatement::FunctionDeclaration(_)
+                    | ModuleStatement::TaskDeclaration(_) => {
+                        return Err(GENERATE_SUBPROGRAM_UNSUPPORTED)
+                    }
+                    _ => out.push((statement, scope.clone())),
+                },
+                GenerateItem::Block(block) => self.expand_block(block, None, scope, out)?,
+                GenerateItem::Loop(repeated) => self.expand_loop(repeated, scope, out)?,
+                GenerateItem::If(branch) => {
+                    let taken = if self.generate_condition(&branch.condition, scope)? {
+                        Some(&branch.then_block)
+                    } else {
+                        branch.else_block.as_ref()
+                    };
+                    if let Some(block) = taken {
+                        self.expand_block(block, None, scope, out)?;
+                    }
+                }
+                GenerateItem::Case(choice) => {
+                    let mut chosen: Option<&'m GenerateBlock> = None;
+                    let mut fallback: Option<&'m GenerateBlock> = None;
+                    for arm in &choice.items {
+                        if arm.labels.is_empty() {
+                            fallback = Some(&arm.block);
+                            continue;
+                        }
+                        for label in &arm.labels {
+                            // Identity, not equality: a generate `case` picks
+                            // its arm the way a `case` statement does, so an `x`
+                            // label matches an `x` subject and nothing else.
+                            let test = Expression::Binary(
+                                Box::new(choice.subject.clone()),
+                                BinaryOperator::CaseEquality,
+                                Box::new(label.clone()),
+                            );
+                            if self.generate_condition(&test, scope)? {
+                                chosen = Some(&arm.block);
+                                break;
+                            }
+                        }
+                        if chosen.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some(block) = chosen.or(fallback) {
+                        self.expand_block(block, None, scope, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unrolls one generate block into the scope its label gives it.
+    fn expand_block(
+        &mut self,
+        block: &'m GenerateBlock,
+        label: Option<&str>,
+        scope: &Scope,
+        out: &mut Vec<(&'m ModuleStatement, Scope)>,
+    ) -> Result<(), SimulationError> {
+        let numbered;
+        let label = match label {
+            Some(label) => label,
+            None => {
+                numbered = self.block_label(block);
+                &numbered
+            }
+        };
+        let inner = self.generate_scope(scope, label, &block.items);
+        self.expand_generate(&block.items, &inner, out)
+    }
+
+    /// Unrolls `for (i = 0; i < N; i = i + 1) begin : stage … end`.
+    ///
+    /// The genvar is bound to the iteration's value in a scope of its own, so
+    /// every expression the body holds — a range bound, a port connection, an
+    /// index inside an `always` block — is handed the *integer* rather than a
+    /// name it could look up. Nothing of the genvar survives into the run.
+    fn expand_loop(
+        &mut self,
+        repeated: &'m GenerateLoop,
+        scope: &Scope,
+        out: &mut Vec<(&'m ModuleStatement, Scope)>,
+    ) -> Result<(), SimulationError> {
+        if repeated.genvar != repeated.step_variable {
+            return Err(SimulationError::GenerateLoopVariable {
+                init: repeated.genvar.name.clone(),
+                step: repeated.step_variable.name.clone(),
+            });
+        }
+        let label = self.block_label(&repeated.body);
+        let mut value = self.generate_value(&repeated.init, scope)?;
+        for _ in 0..MAX_GENERATE_ITERATIONS {
+            let mut bound = scope.clone();
+            bound.genvars.insert(repeated.genvar.name.clone(), value);
+            if !self.generate_condition(&repeated.condition, &bound)? {
+                return Ok(());
+            }
+            let indexed = format!("{}[{}]", label, value);
+            self.expand_block(&repeated.body, Some(&indexed), &bound, out)?;
+            value = self.generate_value(&repeated.step, &bound)?;
+        }
+        Err(SimulationError::GenerateLoopBound {
+            limit: MAX_GENERATE_ITERATIONS,
+        })
+    }
+
+    /// The label a generate block's scope takes.
+    ///
+    /// A named block keeps its name, because that is how a testbench reaches
+    /// inside it — `stage[0].u.count`. An unnamed one is numbered instead: it
+    /// still needs a scope of its own, since two iterations of an unnamed loop
+    /// body would otherwise declare the same names twice.
+    fn block_label(&mut self, block: &GenerateBlock) -> String {
+        match &block.name {
+            Some(name) => name.name.clone(),
+            None => {
+                self.blocks_generated += 1;
+                format!("genblk{}", self.blocks_generated)
+            }
+        }
+    }
+
+    /// The scope a generate block's items are elaborated in: the enclosing one
+    /// with the block's prefix put on, and the block's own declarations
+    /// recorded so that they resolve into it while everything else still
+    /// resolves outwards.
+    fn generate_scope(&self, parent: &Scope, label: &str, items: &[GenerateItem]) -> Scope {
+        let mut inner = parent.clone();
+        inner.prefix = format!("{}{}.", parent.prefix, label);
+        for name in declared_names(items) {
+            let full = format!("{}{}", inner.prefix, name);
+            inner.locals.insert(name, full);
+        }
+        inner
+    }
+
+    /// A generate control expression, evaluated where it was written.
+    fn generate_eval(
+        &self,
+        expression: &Expression,
+        scope: &Scope,
+    ) -> Result<Register, SimulationError> {
+        eval(&renamed(expression, scope), &self.out.state).map_err(|why| {
+            SimulationError::UnresolvedGenerate {
+                expression: expression.to_contracted_string(),
+                why: why.to_string(),
+            }
+        })
+    }
+
+    /// The same, as the integer a loop bound has to be.
+    fn generate_value(
+        &self,
+        expression: &Expression,
+        scope: &Scope,
+    ) -> Result<i64, SimulationError> {
+        let value = self.generate_eval(expression, scope)?;
+        let wide = if value.is_signed() {
+            value.to_i128()
+        } else {
+            value.to_u128().and_then(|value| i128::try_from(value).ok())
+        };
+        wide.and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| SimulationError::UnresolvedGenerate {
+                expression: expression.to_contracted_string(),
+                why: "it does not evaluate to an integer".to_string(),
+            })
+    }
+
+    /// Whether a generate condition selects its branch. An `x` or a `z` is
+    /// false, exactly as it is for an `if` statement.
+    fn generate_condition(
+        &self,
+        expression: &Expression,
+        scope: &Scope,
+    ) -> Result<bool, SimulationError> {
+        Ok(self.generate_eval(expression, scope)?.has_one())
     }
 
     /// Evaluates every `parameter` and `localparam` this module declares,
@@ -403,6 +759,27 @@ impl<'m> Elaborator<'m> {
                 self.out.assignments.push(ContinuousAssignment::new(
                     Expression::Identifier(Identifier::new(name)),
                     expression.clone(),
+                ));
+                return Ok(());
+            }
+            Some(Binding::Driving(target)) => {
+                let name = scope.qualified(local);
+                let range = self.resolve_range(&port.range, scope)?;
+                // The port has an entry of its own, so it is filled the way any
+                // other declaration of its kind is: `output reg q` is a
+                // variable and starts at `x`, a plain one is a net and starts
+                // at `z`. A child that never drives it therefore carries `z`
+                // outwards rather than `x`.
+                if port_is_variable(port) {
+                    self.out
+                        .state
+                        .declare_signed(name.clone(), range, port.signed);
+                } else {
+                    self.out.state.declare_net(name.clone(), range, port.signed);
+                }
+                self.out.assignments.push(ContinuousAssignment::new(
+                    target.clone(),
+                    Expression::Identifier(Identifier::new(name)),
                 ));
                 return Ok(());
             }
@@ -1015,6 +1392,10 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::AlwaysBlock(block) => {
                 let mut program = Program::compile(&block.statements, tasks)?;
+                if !scope.genvars.is_empty() {
+                    program
+                        .substitute(&|expression| substitute_genvars(expression, &scope.genvars));
+                }
                 let control = match &block.event_control {
                     EventControl::None => EventControl::None,
                     EventControl::Implicit => EventControl::Implicit,
@@ -1027,13 +1408,14 @@ impl<'m> Elaborator<'m> {
                             .collect(),
                     ),
                 };
-                if !scope.is_root() {
+                if scope.needs_renaming() {
                     program.rename(&|name| scope.resolve(name));
                 }
                 let implicit_reads = match block.event_control {
                     EventControl::Implicit => {
                         let mut reads: BTreeSet<String> = signals_read(&block.statements)
                             .iter()
+                            .filter(|name| !scope.genvars.contains_key(name.as_str()))
                             .map(|name| scope.resolve(name))
                             .collect();
                         let names = BodyNames::of(&program);
@@ -1065,7 +1447,11 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::InitialBlock(block) => {
                 let mut program = Program::compile(&block.statements, tasks)?;
-                if !scope.is_root() {
+                if !scope.genvars.is_empty() {
+                    program
+                        .substitute(&|expression| substitute_genvars(expression, &scope.genvars));
+                }
+                if scope.needs_renaming() {
                     program.rename(&|name| scope.resolve(name));
                 }
                 self.out.blocks.push(TimedBlock {
@@ -1097,15 +1483,31 @@ impl<'m> Elaborator<'m> {
             .ok_or_else(|| SimulationError::UnknownModule(wanted.clone()))?;
         let child = &modules[index];
 
+        // A module cannot see out of itself, so the instance's prefix is the
+        // whole of what a name inside it resolves to — the generate block it
+        // may stand in is already part of the prefix it was created under.
+        let prefix = format!("{}{}.", scope.prefix, instantiation.instance_name.name);
         let mut inner = Scope {
-            prefix: format!("{}{}.", scope.prefix, instantiation.instance_name.name),
+            module_prefix: prefix.clone(),
+            prefix,
             bindings: HashMap::new(),
             overrides: HashMap::new(),
+            locals: HashMap::new(),
+            genvars: HashMap::new(),
+            root_name: scope.root_name.clone(),
         };
 
         for (port, connection) in connections(child, &instantiation.arguments)? {
             let local = &port.identifier.name;
-            let binding = match plain_identifier(connection) {
+            // A genvar reaches a port connection as an *index* — `.a(x[i])` —
+            // and as a whole connection in `.a(i)`, which is a constant rather
+            // than a signal that could be aliased. Substituting first is what
+            // tells the two apart.
+            let mut connection = connection.clone();
+            if !scope.genvars.is_empty() {
+                substitute_genvars(&mut connection, &scope.genvars);
+            }
+            let binding = match plain_identifier(&connection) {
                 Some(id) => {
                     let outer = scope.resolve(&id.name);
                     if !self.out.state.contains(&outer) {
@@ -1116,23 +1518,44 @@ impl<'m> Elaborator<'m> {
                         .insert(format!("{}{}", inner.prefix, local), outer.clone());
                     Binding::Alias(outer)
                 }
+                None if matches!(port.direction, PortDirection::Input) => {
+                    Binding::Driven(renamed(&connection, scope))
+                }
+                // An output the parent bound to a *select* — `.y(bus[i])`,
+                // which is how a generate loop wires an instance per bit — is
+                // the alias run backwards: the port keeps a signal of its own
+                // and a continuous assignment carries it out to the bit. An
+                // output bound to anything that cannot be written at all, like
+                // a concatenation or `a + 1`, is still a named error, because
+                // there is nowhere for the child's value to go — and so is an
+                // `inout`, which is read as well as written and would need the
+                // assignment to run both ways.
+                None if port.direction == PortDirection::Output
+                    && assigned_name(&connection).is_some() =>
+                {
+                    Binding::Driving(renamed(&connection, scope))
+                }
                 None => {
-                    // The child drives an output, and there is no way to push a
-                    // value back through an arbitrary expression.
-                    if !matches!(port.direction, PortDirection::Input) {
-                        return Err(SimulationError::UndrivablePort {
-                            instance: instantiation.instance_name.name.clone(),
-                            port: local.clone(),
-                            connection: connection.to_contracted_string(),
-                        });
-                    }
-                    Binding::Driven(renamed(connection, scope))
+                    return Err(SimulationError::UndrivablePort {
+                        instance: instantiation.instance_name.name.clone(),
+                        port: local.clone(),
+                        connection: connection.to_contracted_string(),
+                    })
                 }
             };
             inner.bindings.insert(local.clone(), binding);
         }
 
         inner.overrides = self.overrides(child, instantiation, scope)?;
+        // A `defparam` addresses the instance it overrides by name, so it is
+        // applied here, where that instance is made — and it beats a `#(...)`
+        // written on the instantiation, which is the order the LRM gives.
+        for parameter in parameter_names(child) {
+            let path = format!("{}{}", inner.prefix, parameter);
+            if let Some(value) = self.defparams.remove(&path) {
+                inner.overrides.insert(parameter.to_string(), value);
+            }
+        }
 
         self.walk(index, &inner)
     }
@@ -1145,16 +1568,7 @@ impl<'m> Elaborator<'m> {
         instantiation: &ModuleInstantiation,
         scope: &Scope,
     ) -> Result<HashMap<String, Register>, SimulationError> {
-        let declared: Vec<&str> = child
-            .statements
-            .iter()
-            .filter_map(|statement| match statement {
-                ModuleStatement::ParameterDeclaration(parameters) => Some(parameters),
-                _ => None,
-            })
-            .flatten()
-            .map(|parameter| parameter.name.name.as_str())
-            .collect();
+        let declared = parameter_names(child);
 
         let mut pairs: Vec<(&str, &Expression)> = Vec::new();
         match &instantiation.parameters {
@@ -1202,6 +1616,20 @@ impl<'m> Elaborator<'m> {
         }
         Ok(overrides)
     }
+}
+
+/// The parameters a module declares, in the order it declares them.
+fn parameter_names(module: &VerilogModule) -> Vec<&str> {
+    module
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            ModuleStatement::ParameterDeclaration(parameters) => Some(parameters),
+            _ => None,
+        })
+        .flatten()
+        .map(|parameter| parameter.name.name.as_str())
+        .collect()
 }
 
 /// Pairs each connected port with the expression the parent bound to it.
@@ -1556,10 +1984,141 @@ fn close_reads(functions: &mut BTreeMap<String, FunctionDefinition>) {
 /// store.
 fn renamed(expression: &Expression, scope: &Scope) -> Expression {
     let mut copy = expression.clone();
-    if !scope.is_root() {
+    // A genvar goes first, and has to: it is not a name that resolves to
+    // anything, so qualifying it would produce a signal nothing declares.
+    if !scope.genvars.is_empty() {
+        substitute_genvars(&mut copy, &scope.genvars);
+    }
+    if scope.needs_renaming() {
         rename_expression(&mut copy, &|name| scope.resolve(name));
     }
     copy
+}
+
+/// Replaces every genvar an expression names with the integer it is bound to.
+///
+/// A genvar is an elaboration-time integer: nothing of it survives into the
+/// run, so a body that reads one has to be handed the *value* rather than a
+/// name it could look up. That is also why this cannot be a rename — an
+/// identifier node is replaced by a constant one, which is a different shape.
+/// A genvar is never the name being *selected from*, only an index, so the
+/// select arms walk their subexpressions and leave the name alone.
+fn substitute_genvars(expression: &mut Expression, genvars: &HashMap<String, i64>) {
+    match expression {
+        Expression::Constant(_) => {}
+        Expression::Identifier(id) => {
+            if let Some(value) = genvars.get(&id.name) {
+                *expression = Expression::Constant(VerilogConstant::from_int(*value));
+            }
+        }
+        Expression::Unary(_, inner) | Expression::Parenthetical(inner) => {
+            substitute_genvars(inner, genvars)
+        }
+        Expression::Binary(lhs, _, rhs) => {
+            substitute_genvars(lhs, genvars);
+            substitute_genvars(rhs, genvars);
+        }
+        Expression::Conditional(condition, when_true, when_false) => {
+            substitute_genvars(condition, genvars);
+            substitute_genvars(when_true, genvars);
+            substitute_genvars(when_false, genvars);
+        }
+        Expression::Concatenation(parts) => {
+            for part in parts {
+                substitute_genvars(part, genvars);
+            }
+        }
+        Expression::Replication(count, parts) => {
+            substitute_genvars(count, genvars);
+            for part in parts {
+                substitute_genvars(part, genvars);
+            }
+        }
+        Expression::FunctionCall(_, arguments) | Expression::SystemFunctionCall(_, arguments) => {
+            for argument in arguments {
+                substitute_genvars(argument, genvars);
+            }
+        }
+        Expression::BitSelect(_, index) => substitute_genvars(index, genvars),
+        Expression::PartSelect(_, msb, lsb) => {
+            substitute_genvars(msb, genvars);
+            substitute_genvars(lsb, genvars);
+        }
+        Expression::IndexedPartSelect { base, width, .. } => {
+            substitute_genvars(base, genvars);
+            substitute_genvars(width, genvars);
+        }
+    }
+}
+
+/// Every name a generate block's items declare directly.
+///
+/// A generate block is a *scope*, so only what it declares is renamed into it
+/// and everything else belongs to the module around it. Which makes this the
+/// list of what "inside" means: the signals and parameters the block declares,
+/// the instances it creates, and the labels of the blocks nested in it — a
+/// hierarchical reference reaches through all three.
+fn declared_names(items: &[GenerateItem]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut label = |block: &GenerateBlock| {
+        if let Some(name) = &block.name {
+            names.push(name.name.clone());
+        }
+    };
+    let mut declarations = Vec::new();
+    for item in items {
+        match item {
+            GenerateItem::Item(statement) => declarations.push(statement),
+            GenerateItem::Block(block) => label(block),
+            GenerateItem::Loop(repeated) => label(&repeated.body),
+            GenerateItem::If(branch) => {
+                label(&branch.then_block);
+                if let Some(block) = &branch.else_block {
+                    label(block);
+                }
+            }
+            GenerateItem::Case(choice) => {
+                for arm in &choice.items {
+                    label(&arm.block);
+                }
+            }
+        }
+    }
+    for statement in declarations {
+        declared_by(statement, &mut names);
+    }
+    names
+}
+
+/// The names one module statement brings into existence.
+fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
+    match statement {
+        ModuleStatement::WireDeclaration(nets) => {
+            names.extend(nets.iter().map(|net| net.identifier().name.clone()))
+        }
+        ModuleStatement::RegisterDeclaration(registers) => {
+            names.extend(registers.iter().map(|register| register.name.name.clone()))
+        }
+        ModuleStatement::IntegerDeclaration(integers) => {
+            names.extend(integers.iter().map(|integer| integer.name.name.clone()))
+        }
+        ModuleStatement::TimeDeclaration(times) => {
+            names.extend(times.iter().map(|time| time.name.name.clone()))
+        }
+        ModuleStatement::RealDeclaration(reals) => {
+            names.extend(reals.iter().map(|real| real.name.name.clone()))
+        }
+        ModuleStatement::EventDeclaration(events) => {
+            names.extend(events.iter().map(|event| event.name.name.clone()))
+        }
+        ModuleStatement::ParameterDeclaration(parameters) => {
+            names.extend(parameters.iter().map(|it| it.name.name.clone()))
+        }
+        ModuleStatement::ModuleInstantiation(instantiation) => {
+            names.push(instantiation.instance_name.name.clone())
+        }
+        _ => {}
+    }
 }
 
 /// Rewrites every name an expression uses through `resolve`.
@@ -1719,6 +2278,361 @@ mod tests {
     fn reset(simulator: &mut Simulator) {
         simulator.poke("rst", one()).unwrap();
         simulator.poke("rst", zero()).unwrap();
+    }
+
+    /// A four-bit inverter built out of four one-bit instances, which is the
+    /// shape a generate loop exists for: the instance name is indexed by the
+    /// genvar, and the ports are wired a bit apiece.
+    const BIT_INVERTER: &str = r#"
+        module bit_inverter(input a, output y);
+            assign y = ~a;
+        endmodule
+    "#;
+
+    const INVERTER_ARRAY: &str = r#"
+        module inverter_array(input [3:0] x, output [3:0] y);
+            genvar i;
+            generate
+                for (i = 0; i < 4; i = i + 1) begin : stage
+                    bit_inverter u (.a(x[i]), .y(y[i]));
+                end
+            endgenerate
+        endmodule
+    "#;
+
+    /// A generate loop unrolls into one real instance per iteration, each in a
+    /// scope named after the loop's block and its index.
+    #[test]
+    fn test_generate_loop_instantiates_once_per_iteration() {
+        let mut simulator = simulator_for(&[INVERTER_ARRAY, BIT_INVERTER], "inverter_array");
+        for index in 0..4 {
+            assert!(
+                simulator.get(&format!("stage[{}].u.a", index)).is_ok(),
+                "the instance in iteration {} should exist under its indexed scope",
+                index
+            );
+        }
+        assert!(
+            simulator.get("stage[4].u.a").is_err(),
+            "the loop should stop when its condition goes false"
+        );
+
+        simulator.poke("x", Register::from_u128(0b1010, 4)).unwrap();
+        assert_eq!(
+            simulator.get("y").unwrap().to_u128(),
+            Some(0b0101),
+            "every bit should be inverted by its own instance"
+        );
+    }
+
+    /// The genvar is an elaboration-time integer: nothing of it reaches the
+    /// store, because by the time anything runs there is one copy of the body
+    /// per value rather than one body reading a variable.
+    #[test]
+    fn test_a_genvar_is_not_a_signal() {
+        let simulator = simulator_for(&[INVERTER_ARRAY, BIT_INVERTER], "inverter_array");
+        assert!(simulator.get("i").is_err());
+        assert!(simulator.get("stage[0].i").is_err());
+    }
+
+    /// A signal declared inside a generate block belongs to the block, and a
+    /// name it does not declare still belongs to the module around it.
+    #[test]
+    fn test_a_generate_block_is_a_nested_scope() {
+        let source = r#"
+            module top(input a, output y);
+                wire outer;
+                assign outer = ~a;
+                generate
+                    if (1) begin : only
+                        wire inner;
+                        assign inner = outer;
+                        assign y = inner;
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        assert!(
+            simulator.get("only.inner").is_ok(),
+            "a name the block declares takes the block's scope"
+        );
+        assert!(
+            simulator.get("only.outer").is_err(),
+            "a name it does not declare still belongs to the module"
+        );
+        simulator.poke("a", zero()).unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(1));
+    }
+
+    /// A generate `if` elaborates one arm and *only* one: the branch not taken
+    /// contributes nothing at all, not even its declarations.
+    #[test]
+    fn test_generate_if_takes_one_arm() {
+        let source = r#"
+            module top(output [7:0] q);
+                parameter WIDE = 1;
+                generate
+                    if (WIDE > 0) begin : wide
+                        wire [7:0] chosen;
+                        assign chosen = 8'hA5;
+                        assign q = chosen;
+                    end else begin : narrow
+                        wire [7:0] chosen;
+                        assign chosen = 8'h5A;
+                        assign q = chosen;
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.run().expect("the design should settle");
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(0xA5));
+        assert!(simulator.get("wide.chosen").is_ok());
+        assert!(
+            simulator.get("narrow.chosen").is_err(),
+            "the arm not taken contributes nothing"
+        );
+    }
+
+    /// A generate `case` picks its arm by identity, and falls through to
+    /// `default` when nothing matches.
+    #[test]
+    fn test_generate_case_picks_an_arm() {
+        let source = r#"
+            module top(output [7:0] q);
+                parameter MODE = 2;
+                generate
+                    case (MODE)
+                        0: begin : m0 assign q = 8'd10; end
+                        1, 2: begin : m1 assign q = 8'd20; end
+                        default: begin : md assign q = 8'd30; end
+                    endcase
+                endgenerate
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.run().expect("the design should settle");
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(20));
+
+        let fallback = source.replace("parameter MODE = 2;", "parameter MODE = 7;");
+        let mut simulator = simulator_for(&[&fallback], "top");
+        simulator.run().expect("the design should settle");
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(30));
+    }
+
+    /// A range bound written inside a generate loop may name the genvar, so the
+    /// genvar has to be in scope when the declaration's width is resolved.
+    #[test]
+    fn test_a_genvar_sizes_a_declaration() {
+        let source = r#"
+            module top;
+                genvar i;
+                generate
+                    for (i = 0; i < 3; i = i + 1) begin : sized
+                        reg [i:0] r;
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let simulator = simulator_for(&[source], "top");
+        for index in 0..3 {
+            let name = format!("sized[{}].r", index);
+            assert_eq!(
+                simulator
+                    .get(&name)
+                    .expect("the register should exist")
+                    .width(),
+                index + 1,
+                "`reg [i:0]` should be i+1 bits wide in iteration {}",
+                index
+            );
+        }
+    }
+
+    /// A loop unrolled twice gives each iteration its own procedural state,
+    /// which is what the indexed scope name is for.
+    #[test]
+    fn test_a_loop_body_runs_once_per_iteration() {
+        let source = r#"
+            module top;
+                genvar i;
+                generate
+                    for (i = 0; i < 3; i = i + 1) begin : counted
+                        reg [7:0] seen;
+                        initial seen = i * 2;
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(1).expect("the design should run");
+        for index in 0..3u128 {
+            assert_eq!(
+                simulator
+                    .get(&format!("counted[{}].seen", index))
+                    .unwrap()
+                    .to_u128(),
+                Some(index * 2)
+            );
+        }
+    }
+
+    const VALUED: &str = r#"
+        module valued(output [7:0] q);
+            parameter VALUE = 1;
+            assign q = VALUE;
+        endmodule
+    "#;
+
+    /// `defparam` overrides a parameter of an instance the module names, and
+    /// beats a `#(...)` written on that same instantiation.
+    #[test]
+    fn test_defparam_overrides_an_instance_parameter() {
+        let source = r#"
+            module top(output [7:0] a, output [7:0] b);
+                valued one (.q(a));
+                valued #(.VALUE(3)) two (.q(b));
+                defparam one.VALUE = 9;
+                defparam two.VALUE = 4;
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source, VALUED], "top");
+        simulator.run().expect("the design should settle");
+        assert_eq!(simulator.get("a").unwrap().to_u128(), Some(9));
+        assert_eq!(
+            simulator.get("b").unwrap().to_u128(),
+            Some(4),
+            "a defparam beats the instantiation's own override"
+        );
+    }
+
+    /// A `defparam` reaches through more than one level, because the path it
+    /// names is exactly the flat name the parameter ends up under.
+    #[test]
+    fn test_defparam_reaches_through_a_hierarchy() {
+        let middle = r#"
+            module middle(output [7:0] q);
+                valued leaf (.q(q));
+            endmodule
+        "#;
+        let source = r#"
+            module top(output [7:0] q);
+                middle mid (.q(q));
+                defparam mid.leaf.VALUE = 7;
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source, middle, VALUED], "top");
+        simulator.run().expect("the design should settle");
+        assert_eq!(simulator.get("q").unwrap().to_u128(), Some(7));
+    }
+
+    /// A `defparam` that names nothing is reported. An override that quietly
+    /// did not happen leaves the design running on the value it was told not
+    /// to use, which is indistinguishable from one that was never written.
+    #[test]
+    fn test_an_unapplied_defparam_is_named() {
+        let source = r#"
+            module top(output [7:0] q);
+                valued one (.q(q));
+                defparam one.MISSPELT = 9;
+            endmodule
+        "#;
+        match setup_error(&[source, VALUED], "top") {
+            SimulationError::UnappliedDefparam(path) => assert_eq!(path, "one.MISSPELT"),
+            other => panic!("expected an unapplied defparam, got {:?}", other),
+        }
+    }
+
+    /// A loop whose condition never goes false is reported rather than run:
+    /// every iteration is a real copy of the body.
+    #[test]
+    fn test_a_runaway_generate_loop_is_reported() {
+        let source = r#"
+            module top;
+                genvar i;
+                generate
+                    for (i = 0; i >= 0; i = i + 1) begin : forever_more
+                        wire w;
+                    end
+                endgenerate
+            endmodule
+        "#;
+        assert!(matches!(
+            setup_error(&[source], "top"),
+            SimulationError::GenerateLoopBound { .. }
+        ));
+    }
+
+    /// A loop bound the elaborator cannot evaluate is named, the way a range
+    /// bound is. A width or a count the simulator picked for itself would be
+    /// the wrong design rather than a wrong number.
+    #[test]
+    fn test_a_non_constant_generate_bound_is_named() {
+        let source = r#"
+            module top;
+                genvar i;
+                generate
+                    for (i = 0; i < nothing_declares_this; i = i + 1) begin : sized
+                        wire w;
+                    end
+                endgenerate
+            endmodule
+        "#;
+        assert!(matches!(
+            setup_error(&[source], "top"),
+            SimulationError::UnresolvedGenerate { .. }
+        ));
+    }
+
+    /// A hierarchical name reaches into an instance and into a generate block,
+    /// because flattening gives both of them exactly the dotted spelling the
+    /// reference is written with.
+    #[test]
+    fn test_a_hierarchical_name_reads_inside_a_scope() {
+        let source = r#"
+            module top(input [3:0] x, output first, output third);
+                wire [3:0] inverted;
+                assign first = stage[0].u.y;
+                assign third = top.stage[2].u.y;
+                genvar i;
+                generate
+                    for (i = 0; i < 4; i = i + 1) begin : stage
+                        bit_inverter u (.a(x[i]), .y(inverted[i]));
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source, BIT_INVERTER], "top");
+        simulator.poke("x", Register::from_u128(0b0100, 4)).unwrap();
+        assert_eq!(
+            simulator.get("first").unwrap().to_u128(),
+            Some(1),
+            "a relative hierarchical name reaches the first instance"
+        );
+        assert_eq!(
+            simulator.get("third").unwrap().to_u128(),
+            Some(0),
+            "a name starting at the top module reaches the third"
+        );
+    }
+
+    /// An output bound to a bit select is the alias run backwards: the port
+    /// keeps a signal of its own and a continuous assignment carries it out.
+    /// That is how a generate loop wires an instance per bit.
+    #[test]
+    fn test_an_output_bound_to_a_select_drives_the_parent() {
+        let source = r#"
+            module top(input a, output [3:0] y);
+                bit_inverter u (.a(a), .y(y[2]));
+                assign y[0] = 1'b0;
+                assign y[1] = 1'b0;
+                assign y[3] = 1'b0;
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source, BIT_INVERTER], "top");
+        simulator.poke("a", zero()).unwrap();
+        assert_eq!(simulator.get("y").unwrap().to_u128(), Some(0b0100));
     }
 
     /// A `signed` qualifier is a property of the declaration, so it has to

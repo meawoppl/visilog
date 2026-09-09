@@ -5,6 +5,7 @@ pub mod constants;
 pub mod delay;
 pub mod expr;
 pub mod gates;
+pub mod generate;
 pub mod helpers;
 pub mod identifier;
 pub mod integer;
