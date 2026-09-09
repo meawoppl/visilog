@@ -17,8 +17,13 @@
 //!
 //! Then: `cargo test --test ivtest_corpus -- --ignored --nocapture`
 //!
-//! Both tests are `#[ignore]`d: they need that clone, so they must never make
-//! CI depend on the network.
+//! Every corpus test is `#[ignore]`d: they need that clone, so they must never
+//! make CI depend on the network. The control tests below them are not, so a
+//! broken harness cannot masquerade as a low score.
+//!
+//! The corpus validates a test one of two ways, and the list says which: most
+//! entries print `PASSED`, while a `gold=<file>` entry is judged by comparing
+//! its output to `ivtest/gold/<file>`. Both count towards closure.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,23 +49,33 @@ fn corpus_root() -> Option<PathBuf> {
         .then_some(root)
 }
 
-/// One entry of a `regress-*.list`: a test name and what is expected of it.
+/// One entry of a `regress-*.list`: a test name, what is expected of it, and —
+/// for the quarter of the corpus that is validated by comparison rather than by
+/// printing `PASSED` — the gold file its output must match.
 struct Entry {
     name: String,
     kind: String,
+    gold: Option<String>,
 }
 
-/// Parses a regression list. Lines are `name<tab>kind<tab>directory [# comment]`.
+/// Parses a regression list. Lines are
+/// `name<tab>kind<tab>directory [modulename] [gold=file] [# comment]`.
+///
+/// `gold=` is optional and may sit in either trailing field, because the
+/// optional top-module name comes first when it is present — so every field
+/// past the directory is scanned rather than one fixed position.
 fn entries(list: &str) -> Vec<Entry> {
     list.lines()
         .map(|line| line.split('#').next().unwrap_or("").trim())
         .filter(|line| !line.is_empty())
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
-            Some(Entry {
-                name: fields.next()?.to_string(),
-                kind: fields.next()?.to_string(),
-            })
+            let name = fields.next()?.to_string();
+            let kind = fields.next()?.to_string();
+            let gold = fields
+                .find_map(|field| field.strip_prefix("gold="))
+                .map(str::to_string);
+            Some(Entry { name, kind, gold })
         })
         .collect()
 }
@@ -377,17 +392,70 @@ enum Outcome {
     /// answer. This is the only outcome that indicates a correctness bug
     /// rather than a missing feature.
     WrongAnswer,
+    /// It is validated against a gold file, and its output matched. A pass,
+    /// kept distinct from [`Outcome::Passed`] so the two validation styles
+    /// stay separable in the report.
+    GoldMatch,
+    /// It is validated against a gold file, ran, and produced *different*
+    /// output. Like [`Outcome::WrongAnswer`], a correctness bug rather than a
+    /// missing feature. Carries a rendering of the first differing line.
+    GoldMismatch(String),
     /// It ran and printed nothing, so it never reached its own check.
     Silent,
 }
 
+/// The gold-file lines a comparison is made over.
+///
+/// Three normalisations, each for a reason:
+///
+/// * **Trailing whitespace is trimmed per line.** Leading whitespace is *not* —
+///   column alignment is often exactly what a `$display` test is checking.
+/// * **`VCD info:` lines are dropped from both sides.** iverilog's `$dumpfile`
+///   writes `VCD info: dumpfile … opened for output.` into seven of the gold
+///   files. visilog has no waveform dumper, so it never emits one; keeping the
+///   line would fail those comparisons on an unimplemented side effect rather
+///   than on the output the test is actually about.
+/// * **A trailing newline is not a difference.** `str::lines` yields the same
+///   sequence for `"a\n"` and `"a"`, so a gold file written either way compares
+///   equal.
+fn gold_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.starts_with("VCD info:"))
+        .collect()
+}
+
+/// The first line at which the output departs from the gold file, rendered for
+/// a report. `None` when they agree.
+fn first_difference(expected: &str, got: &str) -> Option<String> {
+    let (expected, got) = (gold_lines(expected), gold_lines(got));
+    let show = |line: Option<&&str>| match line {
+        Some(text) if text.chars().count() > 60 => {
+            format!("{:?}...", text.chars().take(60).collect::<String>())
+        }
+        Some(text) => format!("{:?}", text),
+        None => "<end of output>".to_string(),
+    };
+    (0..expected.len().max(got.len()))
+        .find(|at| expected.get(*at) != got.get(*at))
+        .map(|at| {
+            format!(
+                "line {}: expected {} got {}",
+                at + 1,
+                show(expected.get(at)),
+                show(got.get(at))
+            )
+        })
+}
+
 fn judge(source: &str) -> Outcome {
-    judge_with(&Preprocessor::new(), source)
+    judge_with(&Preprocessor::new(), source, None)
 }
 
 /// [`judge`], with an include path — which only the corpus itself needs, since
-/// its files include one another by relative path.
-fn judge_with(preprocessor: &Preprocessor, source: &str) -> Outcome {
+/// its files include one another by relative path — and with the contents of
+/// the entry's gold file, when it has one.
+fn judge_with(preprocessor: &Preprocessor, source: &str, gold: Option<&str>) -> Outcome {
     let Ok(parsed) = front_end(preprocessor, source) else {
         return Outcome::ParseFailed;
     };
@@ -405,6 +473,23 @@ fn judge_with(preprocessor: &Preprocessor, source: &str) -> Outcome {
     }
 
     let output = simulator.output().text();
+    if let Some(gold) = gold {
+        // A design that printed nothing is Silent, never a match — not even
+        // against a gold file that is also empty, because "produced exactly
+        // the right emptiness" and "never reached its own checks" cannot be
+        // told apart from here and only one of them is a pass. No `normal`
+        // entry actually names an empty gold file today, so the rule only
+        // reroutes designs that produced nothing against a gold file that
+        // expected something; those are failures either way, and calling them
+        // Silent keeps the mismatch list to designs that really did print.
+        if gold_lines(&output).is_empty() {
+            return Outcome::Silent;
+        }
+        return match first_difference(gold, &output) {
+            None => Outcome::GoldMatch,
+            Some(difference) => Outcome::GoldMismatch(difference),
+        };
+    }
     // A corpus test prints FAILED for every check it fails and PASSED once at
     // the end, so any FAILED outweighs a PASSED.
     if output.contains("FAILED") {
@@ -442,11 +527,33 @@ fn ivtest_corpus_closure_rate() {
     let preprocessor = corpus_preprocessor(&root);
 
     let mut outcomes: Vec<(String, Outcome)> = Vec::new();
+    let mut gold_entries = 0usize;
+    let mut gold_missing = 0usize;
+    let mut gold_names: Vec<String> = Vec::new();
     for entry in entries.iter().filter(|e| e.kind.starts_with("normal")) {
         let Ok(source) = std::fs::read_to_string(dir.join(format!("{}.v", entry.name))) else {
             continue;
         };
-        outcomes.push((entry.name.clone(), judge_with(&preprocessor, &source)));
+        // A `gold=` entry is judged by comparison, not by looking for PASSED.
+        // If the file the list names is absent, fall back to PASSED scoring
+        // rather than scoring the entry against nothing.
+        let gold = entry.gold.as_ref().map(|name| {
+            gold_entries += 1;
+            gold_names.push(entry.name.clone());
+            std::fs::read_to_string(root.join("ivtest").join("gold").join(name))
+        });
+        let gold = match gold {
+            Some(Ok(text)) => Some(text),
+            Some(Err(_)) => {
+                gold_missing += 1;
+                None
+            }
+            None => None,
+        };
+        outcomes.push((
+            entry.name.clone(),
+            judge_with(&preprocessor, &source, gold.as_deref()),
+        ));
     }
 
     let total = outcomes.len();
@@ -454,30 +561,100 @@ fn ivtest_corpus_closure_rate() {
 
     let parsed = count(&|o| *o != Outcome::ParseFailed);
     let elaborated = count(&|o| !matches!(o, Outcome::ParseFailed | Outcome::SetupFailed(_)));
-    let ran = count(&|o| matches!(o, Outcome::Passed | Outcome::WrongAnswer | Outcome::Silent));
+    let ran = count(&|o| {
+        matches!(
+            o,
+            Outcome::Passed
+                | Outcome::WrongAnswer
+                | Outcome::GoldMatch
+                | Outcome::GoldMismatch(_)
+                | Outcome::Silent
+        )
+    });
     let passed = count(&|o| *o == Outcome::Passed);
     let wrong = count(&|o| *o == Outcome::WrongAnswer);
+    let gold_match = count(&|o| *o == Outcome::GoldMatch);
+    let gold_mismatch = count(&|o| matches!(o, Outcome::GoldMismatch(_)));
     let silent = count(&|o| *o == Outcome::Silent);
+    // Gold entries that ran and printed nothing. Deliberately *not* matches,
+    // even against an empty gold file: see `judge_with`. Counted so the choice
+    // stays visible rather than being an invisible subtraction from closure.
+    let gold_silent = outcomes
+        .iter()
+        .filter(|(name, outcome)| {
+            *outcome == Outcome::Silent && gold_names.iter().any(|gold| gold == name)
+        })
+        .count();
+    // A gold test that matches its file is a passing test, so closure is the
+    // two populations together — not the `PASSED` count alone, which is blind
+    // to the quarter of the corpus that never prints the word.
+    let closure = passed + gold_match;
 
     let pct = |n: usize| 100.0 * n as f64 / total.max(1) as f64;
     println!("\n=== ivtest closure: `regress-vlg.list`, `normal` tests ===");
     println!("{:>5}         corpus files", total);
+    println!(
+        "{:>5}         of them validated against a gold file",
+        gold_entries
+    );
     println!("{:>5}  {:>5.1}%  parsed", parsed, pct(parsed));
     println!("{:>5}  {:>5.1}%  elaborated", elaborated, pct(elaborated));
     println!("{:>5}  {:>5.1}%  ran without error", ran, pct(ran));
-    println!("{:>5}  {:>5.1}%  PASSED   <-- closure", passed, pct(passed));
+    println!(
+        "{:>5}  {:>5.1}%  closure (PASSED + gold match)",
+        closure,
+        pct(closure)
+    );
+    println!(
+        "{:>5}  {:>5.1}%    of which printed PASSED",
+        passed,
+        pct(passed)
+    );
+    println!(
+        "{:>5}  {:>5.1}%    of which matched a gold file",
+        gold_match,
+        pct(gold_match)
+    );
     println!("{:>5}  {:>5.1}%  wrong answer", wrong, pct(wrong));
+    println!(
+        "{:>5}  {:>5.1}%  gold mismatch",
+        gold_mismatch,
+        pct(gold_mismatch)
+    );
     println!(
         "{:>5}  {:>5.1}%  ran but printed nothing",
         silent,
         pct(silent)
     );
+    println!(
+        "{:>5}         of those, gold entries that printed nothing (never a match)",
+        gold_silent
+    );
+    if gold_missing > 0 {
+        println!(
+            "{:>5}         gold file named by the list but not present (scored by PASSED instead)",
+            gold_missing
+        );
+    }
 
     // One machine-readable line, so CI reports the trend by grepping a stable
     // key rather than by scraping the table above — which is free to change.
+    // Keys are only ever added, never renamed or dropped.
     println!(
-        "\nCORPUS_METRICS total={} parsed={} elaborated={} ran={} passed={} wrong={} silent={}",
-        total, parsed, elaborated, ran, passed, wrong, silent
+        "\nCORPUS_METRICS total={} parsed={} elaborated={} ran={} passed={} wrong={} silent={} \
+         gold={} gold_match={} gold_mismatch={} gold_silent={} closure={}",
+        total,
+        parsed,
+        elaborated,
+        ran,
+        passed,
+        wrong,
+        silent,
+        gold_entries,
+        gold_match,
+        gold_mismatch,
+        gold_silent,
+        closure
     );
 
     // Where the ones that never ran fell over.
@@ -514,13 +691,35 @@ fn ivtest_corpus_closure_rate() {
         }
     }
 
+    // The same treatment for the gold population: a file that ran and produced
+    // *different* output is a precise, self-maintaining bug list. A short
+    // first-difference for the leading few is what makes it actionable without
+    // burying the rest.
+    let mismatches: Vec<(&str, &str)> = outcomes
+        .iter()
+        .filter_map(|(name, outcome)| match outcome {
+            Outcome::GoldMismatch(difference) => Some((name.as_str(), difference.as_str())),
+            _ => None,
+        })
+        .collect();
+    if !mismatches.is_empty() {
+        println!("\n--- gold mismatches (ran, but output differs from the gold file) ---");
+        for (at, (name, difference)) in mismatches.iter().enumerate() {
+            if at < 12 {
+                println!("  {}\n      {}", name, difference);
+            } else {
+                println!("  {}", name);
+            }
+        }
+    }
+
     assert!(total > 0, "corpus present but no tests were attempted");
     // A floor, not a target: this guards against a change that silently stops
     // designs running at all. Raise it when closure improves.
     assert!(
-        passed >= 80,
-        "closure dropped to {}; it has been at least 80",
-        passed
+        closure >= 440,
+        "closure dropped to {}; it has been at least 440",
+        closure
     );
 }
 
@@ -557,4 +756,66 @@ fn harness_reports_a_wrong_answer_rather_than_passing_it() {
         endmodule
     "#;
     assert_eq!(judge(source), Outcome::WrongAnswer);
+}
+
+/// The control for the *other* validation style, and the reason the gold half
+/// of the closure number can be trusted: a design whose output matches its gold
+/// file must score a match, and one that differs must score a mismatch.
+///
+/// A comparator that said "match" to everything would inflate closure by 358
+/// with nothing to show for it, and a comparator that said "mismatch" to
+/// everything would look exactly like a simulator that got 358 answers wrong.
+/// Neither can hide behind an `#[ignore]`, because this test is not ignored.
+#[test]
+fn harness_scores_a_gold_test_by_comparing_its_output() {
+    // Two lines, indented, so the comparison is over something with structure
+    // rather than a single word that a substring search would also have found.
+    let source = r#"
+        module main;
+            initial begin
+                $display("  a = %0d", 3);
+                $display("  b = %0d", 4);
+            end
+        endmodule
+    "#;
+    let gold = "  a = 3\n  b = 4\n";
+    assert_eq!(
+        judge_with(&Preprocessor::new(), source, Some(gold)),
+        Outcome::GoldMatch
+    );
+
+    // Trailing whitespace and a missing final newline are normalised away; the
+    // leading indent is not, because column alignment is what these tests check.
+    let sloppy = "  a = 3   \n  b = 4";
+    assert_eq!(
+        judge_with(&Preprocessor::new(), source, Some(sloppy)),
+        Outcome::GoldMatch
+    );
+
+    // A different value must be reported as a mismatch, naming where it parted.
+    let wrong = "  a = 3\n  b = 5\n";
+    let outcome = judge_with(&Preprocessor::new(), source, Some(wrong));
+    match outcome {
+        Outcome::GoldMismatch(difference) => {
+            assert!(
+                difference.starts_with("line 2:"),
+                "should point at the first differing line, got {:?}",
+                difference
+            );
+        }
+        other => panic!("expected a gold mismatch, got {:?}", other),
+    }
+
+    // And a design that prints nothing is not a match against an empty gold
+    // file — that pairing cannot be told apart from one that never ran.
+    let mute = r#"
+        module main;
+            reg a;
+            initial a = 1;
+        endmodule
+    "#;
+    assert_eq!(
+        judge_with(&Preprocessor::new(), mute, Some("")),
+        Outcome::Silent
+    );
 }
