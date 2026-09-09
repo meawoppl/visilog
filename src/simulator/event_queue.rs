@@ -41,6 +41,15 @@ impl EventQueue {
         self.entries.pop_front()
     }
 
+    /// Drops every queued cursor `discard` answers `true` for, in queue order.
+    ///
+    /// This is what a `disable` of an already suspended block needs: the block
+    /// is not running, it is a cursor waiting for its timestamp, and cancelling
+    /// it means taking that cursor out before the clock reaches it.
+    pub fn retain(&mut self, mut discard: impl FnMut(&ExecutionCursor) -> bool) {
+        self.entries.retain(|(_, cursor)| !discard(cursor));
+    }
+
     /// The time of the earliest cursor, without consuming it.
     pub fn peek_time(&self) -> Option<i64> {
         self.entries.front().map(|(time, _)| *time)

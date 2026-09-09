@@ -285,8 +285,9 @@ pub fn signals_read(statements: &[ProceduralStatements]) -> BTreeSet<String> {
 fn collect_statement_reads(statements: &[ProceduralStatements], names: &mut BTreeSet<String>) {
     for statement in statements {
         match statement {
-            // A `#5;` delay reads nothing.
-            ProceduralStatements::Delay(_) => {}
+            // A `#5;` delay reads nothing, and neither does a `disable`: its
+            // operand is a scope, not a signal.
+            ProceduralStatements::Delay(_) | ProceduralStatements::Disable(_) => {}
             // A delay reads nothing, but the statement it prefixes does.
             ProceduralStatements::Delayed { statements, .. } => {
                 collect_statement_reads(statements, names)

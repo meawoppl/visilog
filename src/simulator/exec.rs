@@ -143,6 +143,10 @@ pub fn execute_statements(
         Resume::Halted { pending } => Ok(pending),
         Resume::Suspended { .. } => Err(DELAY_UNSUPPORTED),
         Resume::Waiting { .. } => Err(WAIT_UNSUPPORTED),
+        // A `disable` of a block this body is inside never gets here — it is a
+        // jump. One naming anything else reaches for a block only the driver
+        // holds, and this entry point has no driver behind it.
+        Resume::Disabled { scope, .. } => Err(SimulationError::UnknownScope(scope)),
     }
 }
 

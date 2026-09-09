@@ -157,6 +157,11 @@ pub enum SimulationError {
     /// override that quietly did not happen leaves a design running at a width
     /// it was told not to use.
     UnappliedDefparam(String),
+    /// A `disable` naming a scope the design has nowhere: no named block and
+    /// no task spells it, anywhere. Disabling a scope that exists but is not
+    /// running is a legitimate no-op — disabling one that does not exist is a
+    /// design that thinks it cancelled something.
+    UnknownScope(String),
 }
 
 impl fmt::Display for SimulationError {
@@ -240,6 +245,9 @@ impl fmt::Display for SimulationError {
             ),
             SimulationError::UnappliedDefparam(path) => {
                 write!(f, "`defparam {}` names no parameter in the design", path)
+            }
+            SimulationError::UnknownScope(scope) => {
+                write!(f, "`disable {}` names no block or task in the design", scope)
             }
             SimulationError::GateTerminals { gate, found } => write!(
                 f,
@@ -329,6 +337,35 @@ impl EventWatch {
     }
 }
 
+/// What one continuous assignment carrying a `#delay` is driving, and what it
+/// is about to drive.
+///
+/// A delayed `assign` is still a continuous driver — it re-asserts its value on
+/// every propagation pass exactly as an undelayed one does. The only difference
+/// is *which* value: not the one its right hand side has now, but the one it
+/// had `#n` ago.
+#[derive(Clone, Debug, Default)]
+struct DelayedDrive {
+    /// What the assignment is driving at this instant. `None` until the first
+    /// transaction lands, which is what makes the net read `x` rather than the
+    /// `z` of a net nothing drives — something *is* driving it, it simply has
+    /// not said what yet.
+    applied: Option<Register>,
+    /// The value in flight and the time it lands.
+    pending: Option<(i64, Register)>,
+}
+
+impl DelayedDrive {
+    /// What the assignment will be driving once everything in flight has
+    /// landed, which is what a new value is compared against.
+    fn destination(&self) -> Option<&Register> {
+        self.pending
+            .as_ref()
+            .map(|(_, value)| value)
+            .or(self.applied.as_ref())
+    }
+}
+
 /// A parsed design, elaborated into signals and runnable blocks.
 pub struct Simulator {
     /// Every module the design may draw on. Only the top one is walked
@@ -339,6 +376,10 @@ pub struct Simulator {
     top: String,
     state: StateStore,
     assignments: Vec<ContinuousAssignment>,
+    /// One slot per entry in `assignments`, `None` for an assignment that named
+    /// no delay. Empty for a design that names none anywhere, which is what
+    /// keeps the question off the propagation hot path.
+    delays: Vec<Option<DelayedDrive>>,
     /// The design's gate primitives, which are continuous drivers and settle
     /// in the same fixpoint the assignments do.
     gates: Vec<Gate>,
@@ -390,6 +431,7 @@ impl Simulator {
             top: top.into(),
             state: StateStore::new(),
             assignments: Vec::new(),
+            delays: Vec::new(),
             gates: Vec::new(),
             udps: Vec::new(),
             resolved_nets: HashSet::new(),
@@ -416,6 +458,7 @@ impl Simulator {
     pub fn setup(&mut self) -> Result<(), SimulationError> {
         self.state = StateStore::new();
         self.assignments.clear();
+        self.delays.clear();
         self.gates.clear();
         self.udps.clear();
         self.resolved_nets.clear();
@@ -439,6 +482,16 @@ impl Simulator {
         let elaborated = elaborate(&self.modules, top)?;
         self.state = elaborated.state;
         self.assignments = elaborated.assignments;
+        // A design that names no delay on any `assign` keeps an empty vector,
+        // so the propagation loop asks nothing per pass.
+        self.delays = if self.assignments.iter().any(|a| a.delay().is_some()) {
+            self.assignments
+                .iter()
+                .map(|a| a.delay().map(|_| DelayedDrive::default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.gates = elaborated.gates;
         self.udps = elaborated.udps;
         self.resolved_nets = elaborated.resolved_nets;
@@ -459,10 +512,19 @@ impl Simulator {
             }
         }
 
+        // A delayed `assign` is driving from the first instant, and what it is
+        // driving before its first transaction lands is `x` — not the `z` of a
+        // net nothing drives. One pass puts that on the net and puts the first
+        // transaction in flight, both of which a block running at time zero can
+        // already see. It is deliberately conditional: settling unconditionally
+        // here would make a module that never converges fail at setup rather
+        // than when someone actually asks it to run.
+        if !self.delays.is_empty() {
+            self.propagate()?;
+        }
+
         // Drain time zero. This is a no-op for a module with no procedural
-        // blocks, which matters: settling unconditionally here would make a
-        // module that never converges fail at setup rather than when someone
-        // actually asks it to run.
+        // blocks, for the same reason.
         self.advance(0)?;
 
         Ok(())
@@ -757,7 +819,7 @@ impl Simulator {
         }
 
         let target = self.now + duration;
-        while let Some(time) = self.queue.peek_time() {
+        while let Some(time) = self.next_time() {
             if time > target {
                 break;
             }
@@ -770,6 +832,10 @@ impl Simulator {
             // Everything the resumptions below move is an edge for the settle
             // that follows them.
             self.state.clear_changes();
+            // A delayed `assign` whose transaction is due now starts driving
+            // its new value before anything runs, so a block scheduled for
+            // this instant reads the net as it is at this instant.
+            self.land_due_drives(time);
             let mut pending = Vec::new();
             let mut resumptions = 0;
 
@@ -807,6 +873,44 @@ impl Simulator {
         Ok(())
     }
 
+    /// The next instant the design has something to do at: a queued block
+    /// resumption, or a delayed `assign` whose new value is due to land.
+    ///
+    /// A design that names no delay on an `assign` answers out of the queue
+    /// alone — `delays` is empty and the iterator ends immediately.
+    fn next_time(&self) -> Option<i64> {
+        let due = self
+            .delays
+            .iter()
+            .flatten()
+            .filter_map(|drive| drive.pending.as_ref().map(|(time, _)| *time))
+            .min();
+        match (self.queue.peek_time(), due) {
+            (Some(queued), Some(due)) => Some(queued.min(due)),
+            (queued, None) => queued,
+            (None, due) => due,
+        }
+    }
+
+    /// Moves every delayed `assign` transaction due at or before `time` onto
+    /// the value it drives.
+    ///
+    /// Nothing is written here: the assignment is a continuous driver, so the
+    /// value reaches the net through the very same
+    /// [`propagate`](Simulator::propagate) pass an undelayed one goes through.
+    fn land_due_drives(&mut self, time: i64) {
+        for drive in self.delays.iter_mut().flatten() {
+            let Some((at, _)) = &drive.pending else {
+                continue;
+            };
+            if *at > time {
+                continue;
+            }
+            let (_, value) = drive.pending.take().expect("the slot was just matched");
+            drive.applied = Some(value);
+        }
+    }
+
     /// Resumes one block, queueing its continuation if it hits a delay. Returns
     /// its deferred updates and whether it ran to the end.
     fn resume_block(
@@ -814,12 +918,100 @@ impl Simulator {
         id: usize,
         pc: usize,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
-        match program::resume(
-            &self.blocks[id].program,
-            pc,
-            &mut self.state,
-            &mut self.tasks,
-        )? {
+        let mut pc = pc;
+        let mut carried = Vec::new();
+        // A `disable` of another block does not suspend the block that wrote
+        // it: the driver cancels what it named and control comes straight back
+        // here. Looping rather than recursing keeps the store borrow inside
+        // `resume` and lets the cancellation have the simulator mutably.
+        loop {
+            let outcome = program::resume(
+                &self.blocks[id].program,
+                pc,
+                &mut self.state,
+                &mut self.tasks,
+            )?;
+            let Resume::Disabled {
+                scope,
+                pc: next,
+                pending,
+            } = outcome
+            else {
+                let (mut updates, halted) = self.settled_resume(id, outcome)?;
+                carried.append(&mut updates);
+                return Ok((carried, halted));
+            };
+            carried.extend(pending);
+            self.cancel_scope(&scope)?;
+            pc = next;
+        }
+    }
+
+    /// Cancels every suspended block currently inside `scope`, re-queueing each
+    /// one at the instruction its scope ends on.
+    ///
+    /// That is the whole of what disabling somebody else means: the LRM says
+    /// execution continues with the statement following the disabled block, and
+    /// a resume point here is a program counter, so "continue after it" is the
+    /// scope's `end`. Queueing rather than resuming inline is what puts the
+    /// cancelled block's remaining output *after* the block that disabled it,
+    /// which is where iverilog puts it.
+    ///
+    /// A scope the design has nowhere is [`SimulationError::UnknownScope`]. A
+    /// scope that exists but is not running anywhere is a no-op, which is what
+    /// the LRM asks for — `always #6 disable foo;` cancels the enable of `foo`
+    /// that happens to be in flight and says nothing about the times it is not.
+    fn cancel_scope(&mut self, scope: &str) -> Result<(), SimulationError> {
+        let known = self
+            .blocks
+            .iter()
+            .any(|block| block.program.scopes().iter().any(|it| it.name == scope));
+        if !known {
+            return Err(SimulationError::UnknownScope(scope.to_string()));
+        }
+
+        let blocks = &self.blocks;
+        let mut cancelled = Vec::new();
+        self.queue.retain(|cursor| {
+            match blocks[cursor.block]
+                .program
+                .scope_end_containing(scope, cursor.pc)
+            {
+                Some(end) => {
+                    cancelled.push(ExecutionCursor::new(cursor.block, end));
+                    true
+                }
+                None => false,
+            }
+        });
+        self.waiting.retain(|waiting| {
+            match blocks[waiting.cursor.block]
+                .program
+                .scope_end_containing(scope, waiting.cursor.pc)
+            {
+                Some(end) => {
+                    cancelled.push(ExecutionCursor::new(waiting.cursor.block, end));
+                    false
+                }
+                None => true,
+            }
+        });
+
+        for cursor in cancelled {
+            self.queue.insert(self.now, cursor);
+        }
+        Ok(())
+    }
+
+    /// What the driver does with a [`Resume`] that is not a
+    /// [`Resume::Disabled`]: queue a delay, arm a wait, or restart a
+    /// free-running block that ran off its end.
+    fn settled_resume(
+        &mut self,
+        id: usize,
+        outcome: Resume,
+    ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
+        match outcome {
             // A free-running `always` restarts the moment it finishes, which
             // is how `always begin #50 … end` keeps going forever — and how
             // `always value = @(ev) 5;` waits for the event again after the
@@ -848,6 +1040,8 @@ impl Simulator {
                 });
                 Ok((pending, false))
             }
+            // `resume_block` takes this one before it gets here.
+            Resume::Disabled { scope, .. } => Err(SimulationError::UnknownScope(scope)),
         }
     }
 
@@ -906,12 +1100,45 @@ impl Simulator {
                     },
                 });
             }
-            for assignment in &self.assignments {
+            for (index, assignment) in self.assignments.iter().enumerate() {
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
                 // target is resolved before the right hand side is evaluated.
                 let target = resolve_target(&self.state, assignment.lhs())?;
-                let value = eval_sized(assignment.rhs(), &self.state, target.width(&self.state))?;
+                let width = target.width(&self.state);
+                let value = eval_sized(assignment.rhs(), &self.state, width)?;
+                // A delay does not stop the assignment being a continuous
+                // driver — it only changes which value it drives. The fresh
+                // one goes into flight; what comes out here is the one that
+                // has already landed.
+                let value = match self.delays.get_mut(index).and_then(Option::as_mut) {
+                    None => value,
+                    Some(_) => {
+                        let ticks = assignment
+                            .delay()
+                            .expect("a delay slot belongs to a delayed assignment")
+                            .ticks(&self.state)?;
+                        let drive = self.delays[index]
+                            .as_mut()
+                            .expect("the slot was just matched");
+                        // Inertial, not transport: a new value replaces
+                        // whatever was in flight rather than queueing behind
+                        // it, so a pulse shorter than the delay never reaches
+                        // the net at all.
+                        if drive.destination() != Some(&value) {
+                            if ticks == 0 {
+                                drive.applied = Some(value);
+                                drive.pending = None;
+                            } else {
+                                drive.pending = Some((self.now + ticks, value));
+                            }
+                        }
+                        match &drive.applied {
+                            Some(applied) => applied.clone(),
+                            None => Register::unknown(width),
+                        }
+                    }
+                };
                 // A net a gate also drives is resolved rather than written:
                 // the assignment is one driver of it, not the only one. An
                 // `assign` drives at `strong` unless it says otherwise, and
@@ -5351,5 +5578,355 @@ mod tests {
             error,
             SimulationError::Unsupported("an `@(*)` event control that reads nothing")
         );
+    }
+
+    /// `disable` of the block the statement is written inside is an early exit
+    /// from it: the statements after the `disable` but still inside the block
+    /// never run, and the ones after the block do.
+    #[test]
+    fn test_disable_of_the_enclosing_block_is_an_early_exit() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    begin : body
+                        $display("in");
+                        disable body;
+                        $display("not reached");
+                    end
+                    $display("after");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "in\nafter\n");
+    }
+
+    /// The same, out of a loop several levels down: a `disable` inside a `for`
+    /// inside the named block leaves the whole block, not just the iteration.
+    #[test]
+    fn test_disable_leaves_a_loop_nested_inside_the_block_it_names() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer i;
+                initial begin
+                    begin : configloop
+                        for (i = 0; i < 4; i = i + 1) begin
+                            $display("%0d", i);
+                            if (i == 1) disable configloop;
+                        end
+                        $display("not reached");
+                    end
+                    $display("i is %0d", i);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0\n1\ni is 1\n");
+    }
+
+    /// `disable <task>` written inside the task itself is how Verilog spells an
+    /// early return, and the body is inlined where it was enabled — so the
+    /// caller carries on with the statement after the enable.
+    #[test]
+    fn test_disable_of_a_task_from_inside_it_returns_to_the_caller() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                task t;
+                    begin
+                        $display("entered");
+                        disable t;
+                        $display("not reached");
+                    end
+                endtask
+                initial begin
+                    t;
+                    $display("back");
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "entered\nback\n");
+    }
+
+    /// A block suspended on a `#delay` is cancelled by a `disable` written in
+    /// another block: the statements it had left never run.
+    #[test]
+    fn test_disable_cancels_a_block_suspended_on_a_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg working;
+                initial begin : my_block
+                    working = 1;
+                    #10;
+                    working = 0;
+                end
+                initial begin
+                    #5 disable my_block;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(20).expect("time should advance");
+        assert_eq!(simulator.get("working").unwrap().to_binary(), "1");
+    }
+
+    /// The disabled block picks up at the statement following the block it
+    /// named, at the time it was disabled — and after whatever the block that
+    /// disabled it went on to print, which is where iverilog puts it.
+    #[test]
+    fn test_a_disabled_block_continues_after_the_scope_it_named() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                initial begin
+                    begin : b
+                        #10;
+                        $display("%0t inside b", $time);
+                    end
+                    $display("%0t after b", $time);
+                end
+                initial begin
+                    #5 disable b;
+                    $display("%0t disabled", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(20).expect("time should advance");
+        assert_eq!(simulator.output().text(), "5 disabled\n5 after b\n");
+    }
+
+    /// A block waiting on the design rather than on the clock is cancelled the
+    /// same way, and a *free-running* `always` then starts again — which is
+    /// what makes `disable` the way a design restarts one.
+    #[test]
+    fn test_disable_restarts_a_free_running_always_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                always begin : restartable
+                    $display("%0t runs", $time);
+                    wait (0);
+                    $display("FAILED");
+                end
+                initial begin
+                    #10 disable restartable;
+                    #10 $finish;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 runs\n10 runs\n");
+    }
+
+    /// An edge-triggered `always` block that was disabled mid-activation is
+    /// simply not running any more, and the next edge starts it afresh.
+    #[test]
+    fn test_disable_cancels_one_activation_of_an_edge_triggered_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg clk, q;
+                always @(posedge clk) begin : ff
+                    #2;
+                    q = ~q;
+                end
+                initial begin
+                    q = 0;
+                    clk = 0;
+                    #1 clk = 1;
+                    #1 disable ff;
+                    #5 clk = 0;
+                    #1 clk = 1;
+                    #5 $display("q is %b", q);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "q is 1\n");
+    }
+
+    /// Disabling a scope that exists but is not running anywhere is the LRM's
+    /// no-op — `always #6 disable t;` says nothing about the times no enable of
+    /// `t` is in flight.
+    #[test]
+    fn test_disabling_a_scope_that_is_not_running_does_nothing() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] value;
+                task t;
+                    value = #2 1;
+                endtask
+                initial begin
+                    value = 0;
+                    #5 t;
+                    #4 $display("value is %0d", value);
+                end
+                always #6 disable t;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
+        assert_eq!(simulator.output().text(), "value is 0\n");
+    }
+
+    /// A `disable` naming nothing the design has is an error saying so. A
+    /// design that thought it cancelled something and did not is the hardest
+    /// kind of wrong answer to find.
+    #[test]
+    fn test_disabling_a_scope_the_design_does_not_have_is_a_named_error() {
+        let error = setup_error(
+            r#"
+            module main();
+                initial disable nowhere;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(error, SimulationError::UnknownScope("nowhere".to_string()));
+    }
+
+    /// A delay is an expression, so a clock generator may be written in terms
+    /// of the parameter that gives its period — which is how nearly every
+    /// design writes one.
+    #[test]
+    fn test_a_delay_expression_reads_the_parameter_it_names() {
+        let mut simulator = simulator_for(
+            r#"
+            module oscillator(output reg clk);
+                parameter PERIOD = 20;
+                initial clk = 1'b0;
+                always #(PERIOD / 2) clk = ~clk;
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "0");
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "1");
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.get("clk").unwrap().to_binary(), "0");
+    }
+
+    /// `#n` for a variable `n` is read when the block reaches it, not when the
+    /// block was compiled — so a design that changes `n` waits differently the
+    /// next time round.
+    #[test]
+    fn test_a_delay_naming_a_variable_is_read_when_it_is_waited_on() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer n;
+                initial begin
+                    n = 3;
+                    #n $display("%0t first", $time);
+                    n = 7;
+                    #n $display("%0t second", $time);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).unwrap();
+        assert_eq!(simulator.output().text(), "3 first\n10 second\n");
+    }
+
+    /// `assign #10 a = b;` — the net follows its expression ten time units
+    /// later, and reads `x` until the first value lands. Measured against
+    /// iverilog 12.0.
+    #[test]
+    fn test_a_delayed_continuous_assignment_lands_after_its_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg b;
+                wire a;
+                assign #10 a = b;
+                initial begin
+                    $display("%0t a=%b", $time, a);
+                    b = 1;
+                    #5 $display("%0t a=%b", $time, a);
+                    #10 $display("%0t a=%b", $time, a);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(50).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 a=x\n5 a=x\n15 a=1\n");
+    }
+
+    /// The delay is **inertial**, not transport: a pulse shorter than the
+    /// delay never reaches the net, because the value in flight is replaced
+    /// rather than queued behind. Measured against iverilog 12.0.
+    #[test]
+    fn test_a_delayed_assignment_swallows_a_pulse_shorter_than_its_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg b;
+                wire a;
+                assign #10 a = b;
+                initial $monitor("%0t a=%b b=%b", $time, a, b);
+                initial begin
+                    b = 0;
+                    #20 b = 1;
+                    #5  b = 0;
+                    #40 b = 1;
+                    #20 b = 0;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(125).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "0 a=x b=0\n10 a=0 b=0\n20 a=0 b=1\n25 a=0 b=0\n\
+             65 a=0 b=1\n75 a=1 b=1\n85 a=1 b=0\n95 a=0 b=0\n"
+        );
+    }
+
+    /// A delay on an `assign` may be an expression naming a parameter, and a
+    /// comma-separated list shares it exactly as it shares a strength.
+    #[test]
+    fn test_a_delayed_assignment_list_shares_one_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                parameter LAG = 4;
+                reg d;
+                wire x, y;
+                assign #(LAG) x = d, y = ~d;
+                initial d = 1;
+            endmodule
+        "#,
+        );
+
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.get("x").unwrap().to_binary(), "x");
+        assert_eq!(simulator.get("y").unwrap().to_binary(), "x");
+
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.get("x").unwrap().to_binary(), "1");
+        assert_eq!(simulator.get("y").unwrap().to_binary(), "0");
     }
 }

@@ -1582,10 +1582,21 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::Assignment(assignments) => {
                 for assignment in assignments {
-                    self.push_assignment(ContinuousAssignment::with_strength(
+                    // `assign #(PERIOD) a = b;` names a parameter, which
+                    // belongs to the instance that declared it like every
+                    // other name the assignment holds.
+                    let delay = assignment.delay().map(|delay| {
+                        let mut delay = delay.clone();
+                        for expression in delay.expressions_mut() {
+                            *expression = renamed(expression, scope);
+                        }
+                        delay
+                    });
+                    self.push_assignment(ContinuousAssignment::with_timing(
                         renamed(assignment.lhs(), scope),
                         renamed(assignment.rhs(), scope),
                         assignment.strength(),
+                        delay,
                     ));
                 }
             }
@@ -1951,6 +1962,14 @@ fn analyse_function_body(
         }
     }
 
+    // A `disable` of a block the function is written inside is a jump and
+    // costs the frame nothing. One naming anything else reaches out of the
+    // frame at a block the evaluator cannot see, so it is named here rather
+    // than quietly doing nothing when the call runs.
+    if let Some(scope) = program.nonlocal_disable() {
+        return Err(SimulationError::UnknownScope(scope.to_string()));
+    }
+
     let mut names = BodyNames::of(program);
     if names.random {
         return Err(FUNCTION_RANDOM_UNSUPPORTED);
@@ -2052,10 +2071,13 @@ impl BodyNames {
                 self.expression(value);
             }
             Instruction::WriteHeld { target, .. } => self.target(target),
+            // A `disable` names a scope rather than a signal, so there is
+            // nothing in one for a frame to copy in.
             Instruction::Jump(_)
             | Instruction::RepeatNext { .. }
             | Instruction::Task(_)
             | Instruction::Delay(_)
+            | Instruction::Disable(_)
             | Instruction::Halt => {}
         }
     }
