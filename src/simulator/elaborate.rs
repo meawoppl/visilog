@@ -1087,8 +1087,27 @@ impl<'m> Elaborator<'m> {
                 for net in nets {
                     let range = self.resolve_range(net.range(), scope)?;
                     let local = &net.identifier().name;
-                    self.declare_local_net(local, range, net.is_signed(), scope);
-                    self.record_pull(local, net.kind(), scope);
+                    // An address dimension makes the name an *array of nets*,
+                    // which is a memory in the store exactly as `reg [7:0]
+                    // mem [0:15];` is — the same distinction, recorded the
+                    // same way. A pull belongs to a net that has a value, so
+                    // an array does not take one.
+                    match net.dimensions() {
+                        Some(addresses) => {
+                            let addresses = self.resolve_range(addresses, scope)?;
+                            self.declare_net_memory(
+                                local,
+                                addresses,
+                                range,
+                                net.is_signed(),
+                                scope,
+                            )?
+                        }
+                        None => {
+                            self.declare_local_net(local, range, net.is_signed(), scope);
+                            self.record_pull(local, net.kind(), scope);
+                        }
+                    }
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -1292,6 +1311,25 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .declare_memory(scope.qualified(local), addresses, range, signed);
+        Ok(())
+    }
+
+    /// [`declare_memory`](Elaborator::declare_memory) for an array of nets,
+    /// whose undriven words read `z` rather than `x`.
+    fn declare_net_memory(
+        &mut self,
+        local: &str,
+        addresses: (i64, i64),
+        range: (i64, i64),
+        signed: bool,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        if range_width(addresses) > MAX_MEMORY_DEPTH {
+            return Err(MEMORY_TOO_LARGE);
+        }
+        self.out
+            .state
+            .declare_net_memory(scope.qualified(local), addresses, range, signed);
         Ok(())
     }
 

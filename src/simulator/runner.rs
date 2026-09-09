@@ -1369,6 +1369,36 @@ mod tests {
         assert_eq!(simulator.get("c").unwrap().to_binary(), "0");
     }
 
+    /// An array of nets is a memory in the store, exactly as a `reg` array is,
+    /// and its undriven words read `z` because a net with no driver does.
+    ///
+    /// iverilog 12.0 prints `arr[1]=10 arr[2]=01 n[0]=zzz` for this design.
+    #[test]
+    fn test_net_arrays_simulate() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                wire [1:0] arr[2:1];
+                wire signed [2:0] n [0:3];
+                reg  [1:0] d0, d1;
+                assign arr[1] = d0;
+                assign arr[2] = d1;
+                initial begin
+                    d0 = 2'b10;
+                    d1 = 2'b01;
+                    #1 $display("arr[1]=%b arr[2]=%b n[0]=%b", arr[1], arr[2], n[0]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(
+            simulator.output().text().trim(),
+            "arr[1]=10 arr[2]=01 n[0]=zzz"
+        );
+    }
+
     #[test]
     fn test_parameters_are_visible_to_assignments() {
         let mut simulator = simulator_for(

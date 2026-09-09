@@ -10,7 +10,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, signedness, ws, Range},
+    simple::{range, signedness, ws, ws_and_comments, Range},
 };
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -42,6 +42,13 @@ pub struct Net {
     /// simulation. It belongs to the name rather than to the declaration, so
     /// `wire x = 1, y = 2;` gives `x` and `y` different drivers.
     init: Option<Expression>,
+    /// The address dimension of `wire [1:0] bus[3:0];` — an array of nets.
+    ///
+    /// It belongs to the *name* rather than to the declaration, exactly as a
+    /// `reg` memory's does, which is what makes `wire a, bus[3:0];` legal and
+    /// what keeps this from being a second net production to order against the
+    /// first.
+    dimensions: Option<Range>,
 }
 
 impl Net {
@@ -53,6 +60,7 @@ impl Net {
             delay,
             signed: false,
             init: None,
+            dimensions: None,
         }
     }
 
@@ -83,6 +91,11 @@ impl Net {
 
     pub fn init(&self) -> Option<&Expression> {
         self.init.as_ref()
+    }
+
+    /// The address dimension, when the declaration named an array of nets.
+    pub fn dimensions(&self) -> Option<&Range> {
+        self.dimensions.as_ref()
     }
 
     /// Which flavour of net this declaration named. `supply0`/`supply1` and
@@ -118,8 +131,11 @@ fn parse_delay(input: &str) -> IResult<&str, u32> {
 }
 
 /// One declared net name plus the optional expression that drives it.
-fn declared_net(input: &str) -> IResult<&str, (Identifier, Option<Expression>)> {
-    pair(identifier, opt(preceded(ws(char('=')), verilog_expression)))(input)
+fn declared_net(input: &str) -> IResult<&str, (Identifier, Option<Range>, Option<Expression>)> {
+    let (input, name) = identifier(input)?;
+    let (input, dimensions) = opt(preceded(ws_and_comments, range))(input)?;
+    let (input, init) = opt(preceded(ws(char('=')), verilog_expression))(input)?;
+    Ok((input, (name, dimensions, init)))
 }
 
 pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
@@ -132,13 +148,14 @@ pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
 
     let nets: Vec<Net> = names
         .into_iter()
-        .map(|(identifier, init)| Net {
+        .map(|(identifier, dimensions, init)| Net {
             identifier,
             net_type: net_type.clone(),
             range: range.clone().unwrap_or(Range::SINGLE_BIT),
             delay: delay.unwrap_or(0),
             signed,
             init,
+            dimensions,
         })
         .collect();
 
@@ -367,5 +384,30 @@ mod tests {
                 Net::new("b".into(), Range::Constant(7, 0), NetType::Wire, 0),
             ],
         );
+    }
+
+    /// `wire [1:0] bus[3:0];` — an array of nets. The address dimension
+    /// belongs to the *name*, exactly as a `reg` memory's does, which is what
+    /// makes `wire a, bus[3:0];` legal in one declaration.
+    #[test]
+    fn test_net_arrays() {
+        let nets = net_declaration("wire [1:0] arr[2:1];")
+            .expect("should parse")
+            .1;
+        assert_eq!(nets.len(), 1);
+        assert_eq!(nets[0].dimensions(), Some(&Range::Constant(2, 1)));
+
+        let mixed = net_declaration("wire a, bus[3:0];")
+            .expect("should parse")
+            .1;
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[0].dimensions(), None);
+        assert_eq!(mixed[1].dimensions(), Some(&Range::Constant(3, 0)));
+
+        let signed = net_declaration("wire signed [2:0] n [0:3];")
+            .expect("should parse")
+            .1;
+        assert_eq!(signed[0].dimensions(), Some(&Range::Constant(0, 3)));
+        assert!(signed[0].is_signed());
     }
 }
