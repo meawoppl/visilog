@@ -431,6 +431,18 @@ fn first_difference(expected: &str, got: &str) -> Option<String> {
         })
 }
 
+/// Where a corpus design's `$fopen` and `$writemem…` output goes, with the
+/// `work/` subdirectory the corpus expects already made inside it.
+///
+/// One directory for the whole run rather than one per test: a design is judged
+/// on what it *prints*, so a file it wrote is a side effect nothing here reads,
+/// and two designs writing the same name is not a difference anything can see.
+fn scratch_directory() -> PathBuf {
+    let directory = std::env::temp_dir().join("visilog-ivtest-work");
+    let _ = std::fs::create_dir_all(directory.join("work"));
+    directory
+}
+
 fn judge(source: &str) -> Outcome {
     judge_with(&Preprocessor::new(), source, None, &[])
 }
@@ -459,6 +471,14 @@ fn judge_with(
     for directory in search_paths {
         simulator.add_search_path(directory.clone());
     }
+    // A corpus design that opens a file writes it *next to itself* — every one
+    // of them names `work/…`, which is the directory iverilog's own test driver
+    // runs them in. Pointing that at a scratch directory of the harness's own
+    // keeps a run from scattering files through the repository, and creating
+    // `work/` inside it is what that driver does before it starts: `$fopen` of
+    // a path whose directory does not exist is 0, and a design that checks its
+    // descriptor would then report a failure that is the harness's, not its own.
+    simulator.set_output_directory(scratch_directory());
     if let Err(error) = simulator.setup() {
         return Outcome::SetupFailed(error_kind(&error));
     }
