@@ -104,11 +104,21 @@ impl Radix {
     /// did not ask for one: as wide as the widest value of that many bits.
     fn render(self, value: &Register) -> (String, usize) {
         match self {
-            Radix::Decimal => (decimal(value), decimal_width(value.width())),
+            Radix::Decimal => (
+                decimal(value),
+                decimal_width(value.width(), value.is_signed()),
+            ),
             Radix::Binary => (binary(value), value.width()),
             Radix::Hexadecimal => (hex(value), value.width().div_ceil(4)),
             Radix::Octal => (octal(value), value.width().div_ceil(3)),
         }
+    }
+
+    /// Whether this base pads a value out with *digits* rather than spaces, so
+    /// that a `%0…` asking for the narrowest rendering has leading zeros to
+    /// drop. Decimal never grows a leading zero in the first place.
+    fn pads_with_digits(self) -> bool {
+        !matches!(self, Radix::Decimal)
     }
 }
 
@@ -355,11 +365,14 @@ impl TimeFormat {
 ///
 /// The snapshot is what makes "an argument moved" answerable at the end of a
 /// timestep: it holds the values the last printed line was made of, so a step
-/// that moved nothing the monitor reads produces no line at all.
+/// that moved nothing the monitor reads produces no line at all. It is `None`
+/// until the first line is printed, because arming a `$monitor` does not print
+/// — it *asks* to print at the end of the timestep it was armed in, so a value
+/// the same block goes on to write is the value the first line carries.
 #[derive(Clone, Debug)]
 struct Monitor {
     call: TaskCall,
-    snapshot: Vec<Register>,
+    snapshot: Option<Vec<Register>>,
     enabled: bool,
 }
 
@@ -463,8 +476,11 @@ impl TaskContext {
         };
         if monitor.enabled {
             let values = self.snapshot(&monitor.call, store)?;
-            if values != monitor.snapshot {
-                monitor.snapshot = values;
+            // A monitor that has not printed yet has no snapshot to differ
+            // from, which is how the line owed to the timestep it was armed in
+            // gets printed even though nothing moved.
+            if monitor.snapshot.as_ref() != Some(&values) {
+                monitor.snapshot = Some(values);
                 self.print_call(monitor.print(), &monitor.call.arguments, store)?;
             }
         }
@@ -482,16 +498,15 @@ impl TaskContext {
             // A `$strobe` is kept rather than run: what it prints is whatever
             // its arguments hold once the timestep has finished moving.
             SystemTask::Strobe(_) => self.strobes.push(call.clone()),
-            SystemTask::Monitor(print) => {
-                // Arming prints once, immediately, and the values that line was
-                // made of become the baseline every later end-of-timestep is
-                // measured against — so the step that armed it does not then
-                // report itself a second time.
-                self.print_call(print, &call.arguments, store)?;
-                let snapshot = self.snapshot(call, store)?;
+            // Arming does not print. `$monitor` reports at the *end* of a
+            // timestep, and that includes the timestep it was armed in, so
+            // `a = 1; $monitor("%b", a);` reports the 1 rather than whatever
+            // `a` held before the block ran. Leaving the snapshot empty is what
+            // owes that first line to the next flush.
+            SystemTask::Monitor(_) => {
                 self.monitor = Some(Monitor {
                     call: call.clone(),
-                    snapshot,
+                    snapshot: None,
                     enabled: true,
                 });
             }
@@ -518,14 +533,19 @@ impl TaskContext {
         monitor.enabled = enabled;
         if enabled && !was_enabled {
             self.print_call(monitor.print(), &monitor.call.arguments, store)?;
-            monitor.snapshot = self.snapshot(&monitor.call, store)?;
+            monitor.snapshot = Some(self.snapshot(&monitor.call, store)?);
         }
         self.monitor = Some(monitor);
         Ok(())
     }
 
-    /// The values an armed `$monitor`'s arguments hold now — the expression
-    /// arguments only, since a format string cannot move.
+    /// The values an armed `$monitor`'s arguments hold now — the ones that can
+    /// move, which is what the next end of timestep compares against.
+    ///
+    /// A format string is left out because it cannot move, and so is the
+    /// simulated clock: a `$monitor` watches the *variables* it prints, so
+    /// `$monitor("%0t %b", $time, a)` reports when `a` moves rather than once
+    /// per timestep for ever.
     fn snapshot(
         &self,
         call: &TaskCall,
@@ -534,10 +554,10 @@ impl TaskContext {
         call.arguments
             .iter()
             .filter_map(|argument| match argument {
-                TaskArgument::Value(expression) => {
+                TaskArgument::Value(expression) if !is_clock(expression) => {
                     Some(eval(expression, store).map_err(Into::into))
                 }
-                TaskArgument::Text(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -637,7 +657,7 @@ impl TaskContext {
                 argument => {
                     let value = self.value_of(argument, store)?;
                     let (rendered, width) = radix.render(&value);
-                    text.push_str(&pad(rendered, width));
+                    text.push_str(&pad(rendered, width, ' '));
                     index += 1;
                 }
             }
@@ -669,15 +689,22 @@ impl TaskContext {
                 continue;
             }
 
-            // A width of `0` means "as narrow as the value allows", which is
-            // what `%0d` — by far the most common specifier in the wild — asks
-            // for. Any other width pads on the left.
+            // A leading `0` is a zero *fill*, exactly as in C: `%08d` pads with
+            // zeros where `%8d` pads with spaces. What is left after it is the
+            // width, and a width of `0` — plain `%0d`, `%0h` — means "as narrow
+            // as the value allows", which is by far the most common specifier
+            // in the wild. Any other width pads on the left.
+            let zero_fill = characters.peek() == Some(&'0');
+            if zero_fill {
+                characters.next();
+            }
             let mut width = String::new();
             while characters.peek().is_some_and(|c| c.is_ascii_digit()) {
                 width.push(characters.next().expect("peeked digit must exist"));
             }
+            let fill = if zero_fill { '0' } else { ' ' };
             let width: Option<usize> = match width.as_str() {
-                "" => None,
+                "" => zero_fill.then_some(0),
                 digits => Some(digits.parse().map_err(|_| {
                     SimulationError::SystemTask(format!("format width `{}` is too large", digits))
                 })?),
@@ -695,12 +722,19 @@ impl TaskContext {
             })?;
             *index += 1;
 
+            // `%s` on a vector pads to the characters the vector *has* rather
+            // than to the characters it spells, so a 32 bit register holding
+            // `"A"` prints as `"   A"`; `%0s` is the same text with the padding
+            // left off. A literal is already exactly as wide as it is.
             if specifier.eq_ignore_ascii_case(&'s') {
-                let rendered = match argument {
-                    TaskArgument::Text(literal) => literal.clone(),
-                    other => ascii(&self.value_of(other, store)?),
+                let (rendered, default_width) = match argument {
+                    TaskArgument::Text(literal) => (literal.clone(), 0),
+                    other => {
+                        let value = self.value_of(other, store)?;
+                        (ascii(&value), value.width().div_ceil(8))
+                    }
                 };
-                text.push_str(&pad(rendered, width.unwrap_or(0)));
+                text.push_str(&pad(rendered, width.unwrap_or(default_width), fill));
                 continue;
             }
 
@@ -710,7 +744,11 @@ impl TaskContext {
             if specifier.eq_ignore_ascii_case(&'t') {
                 let value = self.value_of(argument, store)?;
                 let rendered = self.time_format.render(&value);
-                text.push_str(&pad(rendered, width.unwrap_or(self.time_format.min_width)));
+                text.push_str(&pad(
+                    rendered,
+                    width.unwrap_or(self.time_format.min_width),
+                    fill,
+                ));
                 continue;
             }
 
@@ -722,7 +760,15 @@ impl TaskContext {
             })?;
             let value = self.value_of(argument, store)?;
             let (rendered, default_width) = radix.render(&value);
-            text.push_str(&pad(rendered, width.unwrap_or(default_width)));
+            // `%0h` asks for the narrowest rendering, and in a base that pads
+            // with digits that means dropping the leading zeros: `%h` of a
+            // fourteen bit `65` is `0041` and `%0h` of it is `41`.
+            let rendered = if width == Some(0) && radix.pads_with_digits() {
+                without_leading_zeros(rendered)
+            } else {
+                rendered
+            };
+            text.push_str(&pad(rendered, width.unwrap_or(default_width), fill));
         }
         Ok(())
     }
@@ -1225,35 +1271,136 @@ fn memory_word(digits: &str, radix: Radix) -> Result<Register, SimulationError> 
     Ok(Register::from_bits(bits))
 }
 
-/// Left-pads with spaces to `width`, which a wider value simply overflows.
-fn pad(text: String, width: usize) -> String {
-    if text.len() >= width {
+/// Left-pads to `width` with `fill`, which a wider value simply overflows.
+///
+/// A zero fill goes *after* a minus sign — `%08d` of -10 is `-0000010`, the way
+/// C writes it — because a sign in the middle of a number is not a number.
+fn pad(text: String, width: usize, fill: char) -> String {
+    let length = text.chars().count();
+    if length >= width {
         return text;
     }
-    let mut padded = " ".repeat(width - text.len());
-    padded.push_str(&text);
+    let mut padded = String::with_capacity(width);
+    let body = match text.strip_prefix('-') {
+        Some(rest) if fill == '0' => {
+            padded.push('-');
+            rest
+        }
+        _ => &text,
+    };
+    for _ in 0..width - length {
+        padded.push(fill);
+    }
+    padded.push_str(body);
     padded
 }
 
-/// How many decimal digits the widest value of `bits` bits takes.
-fn decimal_width(bits: usize) -> usize {
-    if bits >= 128 {
-        // log10(2) * bits, which is exact enough to size a value no radix
-        // conversion in this crate can produce anyway.
-        return (bits as f64 * std::f64::consts::LOG10_2).floor() as usize + 1;
+/// The same digits with the leading zeros dropped, which is what a width of
+/// `0` asks for. All of them being zero leaves one behind: a number has to have
+/// a digit. An unknown digit is not a zero and stops the trim, so `%0h` of
+/// `12'bxxxx_0000_0001` is still `x01`.
+fn without_leading_zeros(text: String) -> String {
+    match text.trim_start_matches('0') {
+        "" => "0".to_string(),
+        trimmed => trimmed.to_string(),
     }
-    ((1u128 << bits) - 1).to_string().len().max(1)
 }
 
-/// `x` or `z` — what an unknown value renders as in a radix that cannot show
-/// individual bits. A value that is entirely high-impedance reads as `z`; any
-/// other unknown bit makes it `x`.
-fn unknown(register: &Register) -> String {
-    if register.to_binary().chars().all(|bit| bit == 'z') {
-        "z".to_string()
-    } else {
-        "x".to_string()
+/// How many decimal digits the widest value of `bits` bits takes, counting the
+/// room a signed value needs for its sign.
+///
+/// A signed value's widest field is its most *negative* one — a 32 bit
+/// `integer` reaches -2147483648, eleven characters — so a signed field is one
+/// wider than the unsigned field of the same magnitude, not of the same width.
+fn decimal_width(bits: usize, signed: bool) -> usize {
+    match (signed, bits) {
+        (_, 0) => 1,
+        // `2**bits - 1` has as many digits as `2**bits` for every width but
+        // zero, since no power of two past one is a power of ten.
+        (false, bits) => digits_of_power_of_two(bits),
+        (true, bits) => digits_of_power_of_two(bits - 1) + 1,
     }
+}
+
+/// How many decimal digits `2**power` takes.
+fn digits_of_power_of_two(power: usize) -> usize {
+    match 1u128.checked_shl(power as u32) {
+        Some(value) => value.to_string().len(),
+        // log10(2) * power, which is exact enough to size a value no radix
+        // conversion in this crate can produce anyway.
+        None => (power as f64 * std::f64::consts::LOG10_2).floor() as usize + 1,
+    }
+}
+
+/// The character a group of bits renders as when any of them is unknown, or
+/// `None` when they are all known.
+///
+/// Verilog's rule is about *agreement*. A digit whose bits are all `x`, or all
+/// `z`, prints that in lower case; a digit that mixes an unknown bit with a
+/// known one — or an `x` with a `z` — prints in upper case. So `4'bxxxx` is `x`
+/// and `4'bzzxx` is `X`: the capital says there is something in this digit that
+/// the letter cannot show. An `x` outranks a `z`, so any `x` at all makes the
+/// digit one of the `x` pair.
+fn unknown_digit(codes: impl Iterator<Item = u8>) -> Option<char> {
+    let (mut any_x, mut any_z, mut any_known) = (false, false, false);
+    for code in codes {
+        match code {
+            X => any_x = true,
+            Z => any_z = true,
+            _ => any_known = true,
+        }
+    }
+    match (any_x, any_z, any_known) {
+        (false, false, _) => None,
+        (true, false, false) => Some('x'),
+        (false, true, false) => Some('z'),
+        (true, _, _) => Some('X'),
+        _ => Some('Z'),
+    }
+}
+
+/// `x`, `X`, `z` or `Z` — what an unknown value renders as in a radix that
+/// shows the whole value as one digit. See [`unknown_digit`] for which case.
+fn unknown(register: &Register) -> String {
+    unknown_digit(bit_codes(register, 0..register.width()))
+        .expect("the caller has already found an unknown bit")
+        .to_string()
+}
+
+/// The bit codes at `range`, counted from the least significant end.
+fn bit_codes(register: &Register, range: std::ops::Range<usize>) -> impl Iterator<Item = u8> + '_ {
+    range.map(|index| {
+        register
+            .bit_from_lsb(index)
+            .expect("the range is inside the register's width")
+    })
+}
+
+/// A value in a radix that shows `bits` of it per digit, most significant digit
+/// first.
+///
+/// The top digit is short when the width is not a whole number of digits, and
+/// it is judged on the bits it actually has rather than on a padded nibble:
+/// `5'bxxxxx` is `xx` in hexadecimal, not `Xx`.
+fn digits(register: &Register, bits: usize) -> String {
+    let count = register.width().div_ceil(bits);
+    let mut text = String::with_capacity(count);
+    for digit in (0..count).rev() {
+        let low = digit * bits;
+        let range = low..(low + bits).min(register.width());
+        text.push(match unknown_digit(bit_codes(register, range.clone())) {
+            Some(character) => character,
+            None => {
+                let value = bit_codes(register, range)
+                    .enumerate()
+                    .fold(0u32, |value, (place, code)| {
+                        value | ((code as u32 & 1) << place)
+                    });
+                char::from_digit(value, 1 << bits).expect("a digit of this many bits")
+            }
+        });
+    }
+    text
 }
 
 /// Decimal, going through `to_u128` rather than `Register::to_decimal` because
@@ -1274,39 +1421,41 @@ fn decimal(register: &Register) -> String {
         register
     };
     if register.is_signed() {
-        return register
+        register
             .to_i128()
-            .map_or_else(|| unknown(register), |value| value.to_string());
+            .expect("a known value of at most 128 bits")
+            .to_string()
+    } else {
+        register
+            .to_u128()
+            .expect("a known value of at most 128 bits")
+            .to_string()
     }
-    register
-        .to_u128()
-        .map_or_else(|| unknown(register), |value| value.to_string())
 }
 
-/// Binary, which is the one radix that shows an `x` or a `z` bit by bit.
+/// Binary, which is the one radix whose digit is a single bit — so a digit is
+/// never a mixture and an unknown one is always lower case.
 fn binary(register: &Register) -> String {
     register.to_binary()
 }
 
-/// Hexadecimal, lower case the way Verilog prints it. The register is first
-/// widened to a whole number of nibbles, so that its most significant bits land
-/// in the digit they belong to.
+/// Hexadecimal, lower case the way Verilog prints it.
 fn hex(register: &Register) -> String {
-    let widened = register.resize(register.width().div_ceil(4) * 4);
-    widened
-        .to_hex()
-        .map_or_else(|| unknown(register), |hex| hex.to_lowercase())
+    digits(register, 4)
 }
 
-/// Octal, widened to a whole number of digits the way [`hex`] is.
+/// Octal, a digit to every three bits.
 fn octal(register: &Register) -> String {
-    let widened = register.resize(register.width().div_ceil(3) * 3);
-    widened.to_octal().unwrap_or_else(|| unknown(register))
+    digits(register, 3)
 }
 
 /// A register read as text, most significant byte first, the way `%s` prints a
-/// vector. Padding NULs are dropped, which is what makes `"ok"` come back out
-/// of a register wide enough to have been zero extended.
+/// vector.
+///
+/// *Leading* NULs are dropped, which is what makes `"ok"` come back out of a
+/// register wide enough to have been zero extended. A NUL with text on both
+/// sides is a space instead: it is a character of the value, and dropping it
+/// would close a gap the vector really has.
 fn ascii(register: &Register) -> String {
     let bits = register.to_binary();
     let padding = (8 - bits.len() % 8) % 8;
@@ -1319,8 +1468,19 @@ fn ascii(register: &Register) -> String {
             });
             char::from_u32(code).unwrap_or('?')
         })
-        .filter(|character| *character != '\0')
+        .skip_while(|character| *character == '\0')
+        .map(|character| if character == '\0' { ' ' } else { character })
         .collect()
+}
+
+/// Whether an argument is the simulated clock rather than something the design
+/// drives. See [`TaskContext::snapshot`].
+fn is_clock(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::SystemFunctionCall(name, _)
+            if matches!(name.as_str(), "time" | "stime" | "realtime")
+    )
 }
 
 #[cfg(test)]
@@ -1334,6 +1494,20 @@ mod tests {
         for (name, bits) in signals {
             let register = Register::from_binary(bits);
             let range = (register.width() as i64 - 1, 0);
+            store.set_ranged(*name, register, range);
+        }
+        store
+    }
+
+    /// [`store_with`], for signals whose declaration carried a `signed`
+    /// qualifier — which `%d` can tell apart, since a signed field has to leave
+    /// room for a minus sign.
+    fn signed_store_with(signals: &[(&str, &str)]) -> StateStore {
+        let mut store = StateStore::new();
+        for (name, bits) in signals {
+            let register = Register::from_binary(bits);
+            let range = (register.width() as i64 - 1, 0);
+            store.declare_signed(*name, range, true);
             store.set_ranged(*name, register, range);
         }
         store
@@ -1447,11 +1621,13 @@ mod tests {
     #[test]
     fn test_unknown_and_high_impedance_values() {
         let store = store_with(&[("a", "01x1"), ("b", "zzzz")]);
-        // Binary is the radix that can show which bits are unknown; the others
-        // report the whole value as `x`, or as `z` when nothing else is left.
+        // Binary shows which bits are unknown. `%d` shows the whole value as
+        // one character, and `%h` one character per nibble — upper case for a
+        // nibble that mixes an unknown bit with a known one, since a lower case
+        // `x` would claim the whole nibble was unknown.
         assert_eq!(printed(r#"$display("%b", a);"#, &store), "01x1\n");
-        assert_eq!(printed(r#"$display("%0d", a);"#, &store), "x\n");
-        assert_eq!(printed(r#"$display("%h", a);"#, &store), "x\n");
+        assert_eq!(printed(r#"$display("%0d", a);"#, &store), "X\n");
+        assert_eq!(printed(r#"$display("%h", a);"#, &store), "X\n");
         assert_eq!(printed(r#"$display("%0d", b);"#, &store), "z\n");
         assert_eq!(printed(r#"$display("%b", b);"#, &store), "zzzz\n");
     }
@@ -1534,18 +1710,274 @@ mod tests {
     }
 
     /// An unknown value renders in a radix variant exactly as it does under the
-    /// matching specifier: binary shows which bits are unknown, the others
-    /// report the whole value as `x`, or `z` when nothing else is left.
+    /// matching specifier: binary shows which bits are unknown, and the others
+    /// show a digit at a time, in upper case wherever a digit mixes.
     #[test]
     fn test_unknown_values_in_each_radix_variant() {
         let store = store_with(&[("nibble", "01x1"), ("three", "x01"), ("hiz", "zzzz")]);
         assert_eq!(printed(r#"$displayb(nibble);"#, &store), "01x1\n");
-        assert_eq!(printed(r#"$displayh(nibble);"#, &store), "x\n");
-        assert_eq!(printed(r#"$displayo(three);"#, &store), "x\n");
-        assert_eq!(printed(r#"$display(nibble);"#, &store), " x\n");
+        assert_eq!(printed(r#"$displayh(nibble);"#, &store), "X\n");
+        assert_eq!(printed(r#"$displayo(three);"#, &store), "X\n");
+        assert_eq!(printed(r#"$display(nibble);"#, &store), " X\n");
         assert_eq!(printed(r#"$displayb(hiz);"#, &store), "zzzz\n");
         assert_eq!(printed(r#"$displayh(hiz);"#, &store), "z\n");
-        assert_eq!(printed(r#"$displayo(three);"#, &store), "x\n");
+        assert_eq!(printed(r#"$displayo(three);"#, &store), "X\n");
+    }
+
+    /// The whole of Verilog's case rule for an unknown digit, in every radix
+    /// that has digits.
+    ///
+    /// A digit whose bits *agree* — all `x`, or all `z` — prints in lower case;
+    /// one that mixes an unknown bit with a known one, or an `x` with a `z`,
+    /// prints in upper case, because the lower case letter would claim the
+    /// whole digit was unknown. `iverilog` prints `12'b0000_0000_00xx` as
+    /// `00X` in hexadecimal and `000X` in octal for exactly that reason.
+    #[test]
+    fn test_an_unknown_digit_is_upper_case_only_when_it_mixes() {
+        let store = store_with(&[
+            ("all_x", "xxxxxxxxxxxx"),
+            ("all_z", "zzzzzzzzzzzz"),
+            ("low_x", "0000000000xx"),
+            ("low_z", "00000000zz11"),
+            ("x_and_z", "xxxxzzzz0000"),
+        ]);
+
+        // A hexadecimal digit is four bits, an octal one is three, so the same
+        // value can mix in one radix and agree in the other: the low octal
+        // digit of `x_and_z` is `zz0`, which is a `Z`, while its low nibble is
+        // four zeros.
+        for (name, hex, octal, binary) in [
+            ("all_x", "xxx", "xxxx", "xxxxxxxxxxxx"),
+            ("all_z", "zzz", "zzzz", "zzzzzzzzzzzz"),
+            ("low_x", "00X", "000X", "0000000000xx"),
+            ("low_z", "00Z", "00ZZ", "00000000zz11"),
+            ("x_and_z", "xz0", "xXZ0", "xxxxzzzz0000"),
+        ] {
+            assert_eq!(
+                printed(&format!(r#"$display("%h", {});"#, name), &store),
+                format!("{}\n", hex),
+                "hexadecimal of {}",
+                name
+            );
+            assert_eq!(
+                printed(&format!(r#"$display("%o", {});"#, name), &store),
+                format!("{}\n", octal),
+                "octal of {}",
+                name
+            );
+            // A binary digit is one bit and so can never mix, which is why
+            // binary is the radix that never shows a capital.
+            assert_eq!(
+                printed(&format!(r#"$display("%b", {});"#, name), &store),
+                format!("{}\n", binary),
+                "binary of {}",
+                name
+            );
+        }
+    }
+
+    /// `%d` shows the whole value as one digit, and takes the same case rule:
+    /// `4'bxxxx` is `x`, `4'bzzxx` is `X` and `4'b00zz` is `Z`. This is corpus
+    /// `disp_dec`, line for line.
+    #[test]
+    fn test_decimal_takes_the_same_case_rule_over_the_whole_value() {
+        let store = store_with(&[]);
+        for (literal, expected) in [
+            ("4'bxxxx", " x"),
+            ("4'bzzxx", " X"),
+            ("4'bzzzz", " z"),
+            ("4'b00zz", " Z"),
+            ("4'b0000", " 0"),
+            ("4'b0011", " 3"),
+        ] {
+            assert_eq!(
+                printed(&format!(r#"$display("%d", {});"#, literal), &store),
+                format!("{}\n", expected),
+                "decimal of {}",
+                literal
+            );
+        }
+    }
+
+    /// A width that is not a whole number of digits leaves a short digit at the
+    /// top, and it is judged on the bits it actually has rather than on a
+    /// nibble padded out with zeros — `5'bxxxxx` is `xx`, not `Xx`.
+    #[test]
+    fn test_a_short_top_digit_is_judged_on_the_bits_it_has() {
+        let store = store_with(&[("five", "1xxxx"), ("five_x", "xxxxx")]);
+        assert_eq!(printed(r#"$display("%h", five);"#, &store), "1x\n");
+        assert_eq!(printed(r#"$display("%o", five);"#, &store), "Xx\n");
+        assert_eq!(printed(r#"$display("%h", five_x);"#, &store), "xx\n");
+        assert_eq!(printed(r#"$display("%o", five_x);"#, &store), "xx\n");
+    }
+
+    /// A width of `0` asks for the narrowest rendering, and in a base that pads
+    /// with digits that means dropping the leading zeros. This is corpus
+    /// `disp_leading_z` and `disp_parm`.
+    #[test]
+    fn test_a_zero_width_drops_leading_zeros() {
+        let store = store_with(&[("wide", "0000000011"), ("zero", "0000000000")]);
+        assert_eq!(
+            printed(r#"$display("|%b|", wide);"#, &store),
+            "|0000000011|\n"
+        );
+        assert_eq!(printed(r#"$display("|%0b|", wide);"#, &store), "|11|\n");
+        // Every digit being zero still leaves one behind: a number has to have
+        // a digit.
+        assert_eq!(
+            printed(r#"$display("|%b|", zero);"#, &store),
+            "|0000000000|\n"
+        );
+        assert_eq!(printed(r#"$display("|%0b|", zero);"#, &store), "|0|\n");
+
+        let store = store_with(&[("word", "00000001000001")]);
+        assert_eq!(printed(r#"$display("|%0h|", word);"#, &store), "|41|\n");
+        assert_eq!(printed(r#"$display("|%0o|", word);"#, &store), "|101|\n");
+        assert_eq!(
+            printed(r#"$display("|%0b|", word);"#, &store),
+            "|1000001|\n"
+        );
+    }
+
+    /// An unknown digit is not a zero, so it stops the trim: dropping it would
+    /// move the value's bits.
+    #[test]
+    fn test_a_zero_width_stops_at_an_unknown_digit() {
+        let store = store_with(&[("high_x", "xxxx00000001"), ("low_x", "00000000xxxx")]);
+        assert_eq!(printed(r#"$display("%0h", high_x);"#, &store), "x01\n");
+        assert_eq!(printed(r#"$display("%0h", low_x);"#, &store), "x\n");
+    }
+
+    /// A *leading* zero in the width is a zero fill, exactly as in C: `%08d`
+    /// pads with zeros where `%8d` pads with spaces, and the zeros go after a
+    /// minus sign. This is corpus `test_extended`.
+    #[test]
+    fn test_a_leading_zero_in_the_width_fills_with_zeros() {
+        let store = store_with(&[("word", "00000001000001")]);
+        assert_eq!(
+            printed(r#"$display("|%08d|", word);"#, &store),
+            "|00000065|\n"
+        );
+        assert_eq!(
+            printed(r#"$display("|%8d|", word);"#, &store),
+            "|      65|\n"
+        );
+        assert_eq!(printed(r#"$display("|%03d|", word);"#, &store), "|065|\n");
+        assert_eq!(printed(r#"$display("|%3d|", word);"#, &store), "| 65|\n");
+        assert_eq!(
+            printed(r#"$display("|%08h|", word);"#, &store),
+            "|00000041|\n"
+        );
+        // A sign is not a digit, so it stays at the front of the field.
+        assert_eq!(
+            printed(r#"$display("|%08d|", -10);"#, &store),
+            "|-0000010|\n"
+        );
+    }
+
+    /// The default field a `%d` pads to is as wide as the widest value the
+    /// signal can hold — and for a signed signal that is its most *negative*
+    /// value, so the field is one wider than the same bits read unsigned. An
+    /// `integer` holding `4` therefore prints in eleven columns, which is
+    /// corpus `pr1746848`.
+    #[test]
+    fn test_a_signed_decimal_field_leaves_room_for_the_sign() {
+        let unsigned = store_with(&[
+            ("four", "0100"),
+            ("sixteen", "0000000000000001"),
+            ("thirty_two", "00000000000000000000000000000001"),
+        ]);
+        assert_eq!(printed(r#"$display("|%d|", four);"#, &unsigned), "| 4|\n");
+        assert_eq!(
+            printed(r#"$display("|%d|", sixteen);"#, &unsigned),
+            "|    1|\n"
+        );
+        assert_eq!(
+            printed(r#"$display("|%d|", thirty_two);"#, &unsigned),
+            "|         1|\n"
+        );
+
+        let signed = signed_store_with(&[
+            ("four", "0100"),
+            ("sixteen", "0000000000000001"),
+            ("thirty_two", "00000000000000000000000000000001"),
+        ]);
+        assert_eq!(printed(r#"$display("|%d|", four);"#, &signed), "| 4|\n");
+        assert_eq!(
+            printed(r#"$display("|%d|", sixteen);"#, &signed),
+            "|     1|\n"
+        );
+        assert_eq!(
+            printed(r#"$display("|%d|", thirty_two);"#, &signed),
+            "|          1|\n"
+        );
+    }
+
+    /// `%s` on a vector pads to the characters the vector *has* rather than to
+    /// the characters it spells, so a thirty-two bit register holding `"A"`
+    /// prints in four columns. `%0s` is the same text with the padding left
+    /// off, and a NUL between two characters is a space rather than nothing —
+    /// it is a character the vector really has. Corpus `test_width`.
+    #[test]
+    fn test_string_format_pads_a_vector_to_its_own_bytes() {
+        let store = store_with(&[
+            ("word", "00000001000001"),
+            ("wide", "00000000000000000000000001000001"),
+            ("gapped", "010000010000000001000010"),
+        ]);
+        assert_eq!(printed(r#"$display("|%s|", word);"#, &store), "| A|\n");
+        assert_eq!(printed(r#"$display("|%0s|", word);"#, &store), "|A|\n");
+        assert_eq!(printed(r#"$display("|%s|", wide);"#, &store), "|   A|\n");
+        assert_eq!(printed(r#"$display("|%s|", gapped);"#, &store), "|A B|\n");
+        // A literal is already exactly as wide as it is, and its spaces are
+        // characters like any other.
+        assert_eq!(printed(r#"$display("|%s|", "   A");"#, &store), "|   A|\n");
+        assert_eq!(printed(r#"$display("|%0s|", "   A");"#, &store), "|   A|\n");
+    }
+
+    /// Arming a `$monitor` does not print. It reports at the *end* of a
+    /// timestep, and that includes the one it was armed in, so the block that
+    /// armed it can go on to write the value the first line carries.
+    #[test]
+    fn test_a_monitor_prints_at_the_end_of_the_step_that_armed_it() {
+        let mut store = store_with(&[("a", "0000")]);
+        let mut context = TaskContext::new();
+        run_in(&mut context, r#"$monitor("a=%0d", a);"#, &mut store);
+        assert_eq!(context.output().text(), "", "arming printed early");
+        assert!(context.has_deferred());
+
+        store.set("a", Register::from_binary("0111"));
+        context.flush(&store).expect("flush should succeed");
+        assert_eq!(context.output().text(), "a=7\n");
+
+        // And a later timestep that moves nothing it reads adds no line.
+        context.flush(&store).expect("flush should succeed");
+        assert_eq!(context.output().text(), "a=7\n");
+    }
+
+    /// A `$monitor` watches the *variables* it prints. The clock moves every
+    /// timestep, so a monitor that reports it would otherwise never stop —
+    /// which is corpus `br_ml20150315`.
+    #[test]
+    fn test_a_monitor_does_not_report_the_clock_moving() {
+        let mut store = store_with(&[("a", "0001")]);
+        store.set_time(1);
+        let mut context = TaskContext::new();
+        run_in(
+            &mut context,
+            r#"$monitor("t=%0t a=%0d", $time, a);"#,
+            &mut store,
+        );
+        context.flush(&store).expect("flush should succeed");
+        assert_eq!(context.output().text(), "t=1 a=1\n");
+
+        store.set_time(2);
+        context.flush(&store).expect("flush should succeed");
+        assert_eq!(
+            context.output().text(),
+            "t=1 a=1\n",
+            "the clock alone triggered a `$monitor`"
+        );
     }
 
     /// `$fdisplay` writes to a descriptor. There is no file I/O here, so the
