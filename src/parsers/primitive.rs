@@ -119,6 +119,24 @@ pub enum EdgeSymbol {
     Any,
 }
 
+impl EdgeSymbol {
+    /// Whether this edge describes the transition `from` → `to`.
+    ///
+    /// An edge is a *change*: a column whose value did not move is not an
+    /// edge whatever the symbol says, so even `*` — `(??)` — needs one.
+    pub fn matches(&self, from: u8, to: u8) -> bool {
+        if from == to {
+            return false;
+        }
+        match self {
+            EdgeSymbol::Pair(before, after) => before.matches(from) && after.matches(to),
+            EdgeSymbol::Positive => matches!((from, to), (ZERO, ONE) | (ZERO, X) | (X, ONE)),
+            EdgeSymbol::Negative => matches!((from, to), (ONE, ZERO) | (ONE, X) | (X, ZERO)),
+            EdgeSymbol::Any => true,
+        }
+    }
+}
+
 /// One input column of one row.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum InputSymbol {
@@ -183,6 +201,83 @@ impl UdpTable {
         }
         X
     }
+
+    /// What a **sequential** table drives next, when the inputs go from
+    /// `previous` to `levels`.
+    ///
+    /// Inputs that moved together are taken **one at a time**, in terminal
+    /// order, each against the state the one before it left — which is how
+    /// iverilog 12.0 processes them, and it matters. A set/reset latch going
+    /// `(x, x) -> (0, 0)` passes through `(0, x)`, which no row covers, so its
+    /// state goes to `x` even though `(0, 0)` alone would have held it: that is
+    /// why iverilog prints `x` at time zero for a latch whose `initial` said 1.
+    pub fn sequential_output(&self, previous: Option<&[u8]>, levels: &[u8], state: u8) -> u8 {
+        let Some(before) = previous else {
+            return self.lookup(None, levels, state);
+        };
+        let mut seen = before.to_vec();
+        let mut state = state;
+        let mut moved = false;
+        for column in 0..levels.len() {
+            if seen[column] == levels[column] {
+                continue;
+            }
+            let from = seen.clone();
+            seen[column] = levels[column];
+            state = self.lookup(Some(&from), &seen, state);
+            moved = true;
+        }
+        if moved {
+            state
+        } else {
+            self.lookup(Some(before), levels, state)
+        }
+    }
+
+    /// One lookup of a **sequential** table, for inputs that moved in a
+    /// single step from `previous` to `levels`.
+    ///
+    /// `previous` is the inputs as they stood at the last lookup — `None` the
+    /// first time, before anything has had a chance to move — and `state` is
+    /// the output the primitive holds. Measured against iverilog 12.0:
+    ///
+    /// - A row with an edge column matches only when that input really
+    ///   changed in the way the edge says. Its level columns are matched
+    ///   against the present values, and its `current` column against
+    ///   `state`.
+    /// - `-` holds `state`.
+    /// - When something moved and **no** row matches, the output becomes `x`
+    ///   rather than holding: iverilog prints `x` for a clock going `1 -> x`
+    ///   that the table says nothing about.
+    /// - When nothing moved and no row matches, it holds — there was no new
+    ///   question to ask. That is also what makes asking twice harmless.
+    /// - Rows that match and disagree give `x`, since the LRM leaves which
+    ///   one wins undefined.
+    fn lookup(&self, previous: Option<&[u8]>, levels: &[u8], state: u8) -> u8 {
+        let changed = previous.is_some_and(|before| before != levels);
+        let mut answer: Option<u8> = None;
+        for row in &self.rows {
+            if !row.matches_sequential(previous, levels, state) {
+                continue;
+            }
+            let driven = match row.output {
+                OutputSymbol::Zero => ZERO,
+                OutputSymbol::One => ONE,
+                OutputSymbol::Unknown => X,
+                OutputSymbol::NoChange => state,
+            };
+            match answer {
+                None => answer = Some(driven),
+                Some(existing) if existing != driven => return X,
+                Some(_) => {}
+            }
+        }
+        match answer {
+            Some(value) => value,
+            None if changed => X,
+            None => state,
+        }
+    }
 }
 
 impl UdpRow {
@@ -198,6 +293,28 @@ impl UdpRow {
             .all(|(symbol, &code)| match symbol {
                 InputSymbol::Level(level) => level.matches(code),
                 InputSymbol::Edge(_) => false,
+            })
+    }
+
+    /// Whether this row of a **sequential** table matches.
+    ///
+    /// An edge column asks about the transition from `previous`, so with no
+    /// previous values — the very first lookup — a row with an edge in it
+    /// cannot match, and only the level-sensitive rows are consulted.
+    fn matches_sequential(&self, previous: Option<&[u8]>, levels: &[u8], state: u8) -> bool {
+        if let Some(current) = self.current {
+            if !current.matches(state) {
+                return false;
+            }
+        }
+        self.inputs
+            .iter()
+            .enumerate()
+            .all(|(column, symbol)| match symbol {
+                InputSymbol::Level(level) => level.matches(levels[column]),
+                InputSymbol::Edge(edge) => {
+                    previous.is_some_and(|before| edge.matches(before[column], levels[column]))
+                }
             })
     }
 }
