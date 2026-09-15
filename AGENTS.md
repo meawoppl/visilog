@@ -212,7 +212,10 @@ memory is the one that is not, and widening the one signature was the whole
 structural change. The file format is whitespace-separated words with `//` and
 `/* */` comments and `@<hex>` address jumps, and the load runs from `start`
 towards `finish` — which default to the memory's *declared* first and last
-addresses, so `mem [7:0]` loads downwards exactly as its declaration reads.
+addresses, so `mem [7:0]` loads downwards exactly as its declaration reads. **That default
+is wrong against iverilog 12.0**, which takes the 1364-2005 reading — an unranged load
+always runs from the *lowest* address up — and corpus `writememh2` / `writememb2` fail on
+exactly that once they can read back the file they wrote.
 Whether the design named a `finish` decides what a file with more words than
 that means: an explicit one is an instruction to stop there (`$readmemh(f, mem,
 0, 3)` against an eight word file loads four and leaves the rest alone, which is
@@ -294,7 +297,8 @@ would never reach a test at all. `$fclose` frees the bit for the next `$fopen` (
 back), and `$fflush` pushes the buffered writer out — with no argument at all, every one of
 them. The two-argument `$fopen(name, "w")` is the other form and returns a **file**
 descriptor: bit 31 set over a number allocated from 3, since 0, 1 and 2 are the standard
-streams. `$fgetc`, `$fscanf`, `$sscanf` and `$fread` are still names nothing implements.
+streams. Reading takes that second form — see below. `$fread` and `$ferror` are still
+names nothing implements.
 
 **`$fopen` is a system *function*, so the file table lives on the `StateStore`.** `eval` is
 handed a `&StateStore` and nothing else, so a table on the `TaskContext` would be
@@ -319,6 +323,63 @@ spaces, and a narrower one keeps the **last** characters (`"abcdef"` into a `reg
 `"ef"`, measured against iverilog 12.0). The one difference between the two spellings is
 which argument is the format string: `$sformat`'s second argument always is, even when it
 is a `reg` holding one, where `$swrite` follows the `$display` rule that only a literal is.
+
+**`$sscanf` and `$fscanf` are system functions that write through their arguments.**
+`code = $sscanf(s, "%d %h", a, b)` hands back a count *and* fills `a` and `b` — the one
+kind of expression that changes the store, while `eval` is handed a `&StateStore`. So
+`eval` resolves each argument to a `ResolvedTarget` up front, the scan runs, and the
+values are queued with `StateStore::owe_fill`, behind a `RefCell` like the file table.
+`program::resume` drains the queue at the **top of every instruction**: that is the first
+moment the statement that evaluated the call has finished with it, so `code` is written
+first and both are in place before the next statement reads either — including after the
+block's last statement, since the drain comes before the fetch of `Halt`. A design with no
+scan pays one `RefCell` length check per instruction. A frame gets a fresh queue rather
+than a shared one, so a `$sscanf` in a function fills the function's own variables. A
+continuous assignment is re-evaluated every pass, so one that owes a fill is refused by
+name in `propagate` rather than reading a file an unpredictable number of times.
+
+The conversions live in `scan.rs`, one engine over a `Source` that is either the string
+or the file's `Reader`, and every rule was measured against iverilog 12.0:
+
+- **`-1` means there was nothing to read at all, decided once before the format is
+  walked.** `$sscanf("", "%d", a)` is `-1` and `$sscanf("  ", "%d", a)` is `0`. Every
+  later failure — a conversion or a literal that does not match — stops the scan and
+  answers the count so far, having written what it converted and left the rest alone.
+  That distinction is the whole reason a design can loop on the answer.
+- **Whitespace in the format matches a run of whitespace or none; any other character
+  must match exactly with nothing skipped in front of it** (`","` does not match
+  `"  ,"`). Every conversion but `%c` skips leading whitespace itself.
+- `%d` is an optional sign then digits, `_` between them but not leading, or a single
+  `x`/`z`/`?` standing for the whole value at the target's width. `%b`/`%o`/`%h`/`%x`
+  treat `x`, `z` and `?` as digits within the run. `%f`/`%e`/`%g` are C's number with
+  iverilog's two departures: a trailing point is fine (`"2."`) and an `e` with no digits
+  after it fails the whole conversion (`"2.ea"` is no match). `%s` is a run of
+  non-whitespace, landing at the target's low end. A width (`%5s`) counts consumed
+  characters, `*` suppresses the store and the count but not the match, and `%%` is a
+  literal. An unknown format string is `-1` (corpus `scanf4`).
+- **Named errors, not zeros:** `%t` (it rounds to the `$timeformat` precision, which is
+  on the `TaskContext`, and scales by the timescale nothing models), `%u` and `%z` (raw
+  binary, which the text-shaped buffer cannot carry — corpus `sscanf_u`/`_z`,
+  `fscanf_u`/`_z`), `%m`, an unknown conversion, and a format asking for more arguments
+  than it was given.
+
+**A file opened for reading is a `Reader` with one byte of push-back.** `peek` reads a
+byte into the slot and `bump` consumes it, so a scan that stops at a character it does not
+want leaves the stream *before* it and `$ftell` answers what C does; `$ungetc` is the same
+slot filled by hand. `$fgets` reads up to the target's width in bytes, stopping after a
+newline, answers the count and leaves the target alone at end of file. `$feof` is sticky
+like C's — reaching the last byte is not end of file, a read that finds nothing is — and
+`$fseek`/`$rewind` clear it. `$fopen(name, "r")` resolves a relative name through the same
+search path `$readmemh` uses, which is why that list moved from the `TaskContext` onto the
+`StateStore`: `$fopen` is evaluated by `eval`.
+
+**Reading something that is not a readable file is end of file**, because that is what
+iverilog answers and what a design can act on: a multi-channel descriptor (write-only by
+construction), a file opened for writing, and one nothing has open are all `-1` from
+`$fscanf`/`$fgetc`/`$ftell` and `0` from `$fgets`. A file opened in an **update** mode
+(`r+`, `w+`, `a+`) is the exception and a named error: it asks for a handle that reads and
+writes at once, which is not implemented, and a silent `-1` would look exactly like a file
+that had simply run out.
 
 **The end-of-timestep slot is `Simulator::end_of_timestep`, and it lives where
 `settle` already returns.** `$strobe` and `$monitor` both report *after*
@@ -1103,7 +1164,8 @@ telling apart.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them, and `call_function` for the design's own |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — and `call_function` for the design's own |
+| `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
@@ -1111,7 +1173,7 @@ telling apart.
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills`) a scan writes its arguments through, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |

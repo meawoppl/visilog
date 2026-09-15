@@ -1564,6 +1564,16 @@ pub fn resume(
         if steps > MAX_INSTRUCTIONS {
             return Err(SimulationError::NoConvergence { passes: steps });
         }
+        // The writes a `$sscanf` or `$fgets` made through its arguments land
+        // here, at the instruction boundary after the one that evaluated it —
+        // so `code = $sscanf(s, "%d", a);` has written both `code` and `a`
+        // before the next statement reads either. Asked before the fetch so
+        // that a call in the block's last statement lands before `Halt`.
+        if store.owes_fills() {
+            for (target, value) in store.take_fills() {
+                drive_resolved(store, &target, &value)?;
+            }
+        }
 
         let Some(instruction) = program.instructions.get(pc) else {
             return Ok(Resume::Halted { pending });

@@ -438,6 +438,10 @@ pub struct Simulator {
     /// directory the caller chose outlives any one elaboration — the same
     /// reason the `$readmemh` search path is kept here.
     output_directory: Option<PathBuf>,
+    /// Where a relative `$readmemh` or `$fopen(name, "r")` path is looked for,
+    /// after the process working directory. Kept here and handed to each fresh
+    /// store for the same reason `output_directory` is.
+    search_paths: Vec<PathBuf>,
 }
 
 impl Simulator {
@@ -475,6 +479,7 @@ impl Simulator {
             is_setup: false,
             tasks: TaskContext::new(),
             output_directory: None,
+            search_paths: Vec::new(),
         }
     }
 
@@ -504,8 +509,6 @@ impl Simulator {
         self.now = 0;
         self.inputs.clear();
         self.is_setup = false;
-        // Reset rather than replace: the search path a caller configured for
-        // `$readmemh` belongs to the caller, not to the elaboration.
         self.tasks.reset();
 
         let top = self
@@ -518,6 +521,7 @@ impl Simulator {
         if let Some(directory) = &self.output_directory {
             self.state.set_output_directory(directory.clone());
         }
+        self.state.set_search_paths(self.search_paths.clone());
         self.assignments = elaborated.assignments;
         // A design that names no delay on any `assign` keeps an empty vector,
         // so the propagation loop asks nothing per pass.
@@ -812,7 +816,8 @@ impl Simulator {
     }
 
     /// Adds a directory to look in for a relative `$readmemh` / `$readmemb`
-    /// file, after the process working directory.
+    /// file, or one a design opens with `$fopen(name, "r")`, after the process
+    /// working directory.
     ///
     /// A `Simulator` is built from parsed modules and never learns which file
     /// they came from, so it cannot resolve a data path "next to the design" on
@@ -821,7 +826,8 @@ impl Simulator {
     /// why it is configured on the simulator rather than reset with the rest of
     /// the task state.
     pub fn add_search_path(&mut self, directory: impl Into<PathBuf>) {
-        self.tasks.add_search_path(directory);
+        self.search_paths.push(directory.into());
+        self.state.set_search_paths(self.search_paths.clone());
     }
 
     /// Where a relative `$fopen` or `$writemem…` path is written, which
@@ -1394,6 +1400,15 @@ impl Simulator {
                     changed |= drive_resolved(&mut self.state, &target, &value)?;
                 }
             }
+            // A continuous assignment is re-evaluated on every pass, so one
+            // whose right hand side reads a file or writes its arguments would
+            // do so an unpredictable number of times. That is refused by name
+            // rather than applied or dropped.
+            if self.state.owes_fills() {
+                return Err(SimulationError::Unsupported(
+                    "a `$sscanf`, `$fscanf` or `$fgets` in a continuous assignment",
+                ));
+            }
             for gate in &self.gates {
                 let code = gate.evaluate(&self.state)?;
                 for output in &gate.outputs {
@@ -1628,6 +1643,201 @@ mod tests {
         assert_eq!(simulator.output().text(), "to both\nPASSED\n");
         let written = fs::read_to_string(directory.join("out.txt")).expect("file should exist");
         assert_eq!(written, "to the file\nto both\n");
+    }
+
+    /// Runs a one-module design to completion against a scratch directory,
+    /// which is both where it writes and where it looks for what it reads.
+    fn run_with_files(name: &str, source: &str, files: &[(&str, &str)]) -> Simulator {
+        let directory = std::env::temp_dir().join(format!("visilog-runner-{}", name));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch directory should be creatable");
+        for (file, text) in files {
+            fs::write(directory.join(file), text).expect("scratch file should be writable");
+        }
+        let (remaining, module) = parse_module_declaration(source).unwrap();
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.set_output_directory(&directory);
+        simulator.add_search_path(&directory);
+        simulator.setup().unwrap();
+        simulator.advance(10).unwrap();
+        simulator
+    }
+
+    /// `$sscanf` both answers a count and writes through its arguments, and
+    /// the writes have landed by the next statement — corpus `scanf` in
+    /// miniature, plus the partial match that stops part way.
+    #[test]
+    fn test_sscanf_writes_through_its_arguments() {
+        let simulator = run_with_files(
+            "sscanf",
+            r#"
+            module top;
+                integer cnt;
+                reg [31:0] a1, a2, a3;
+                initial begin
+                    cnt = $sscanf("123 hex beaf bin 01xz", "%d hex %h bin %b", a1, a2, a3);
+                    $display("%0d %0d %h %b", cnt, a1, a2, a3[3:0]);
+                    a2 = 0;
+                    cnt = $sscanf("12;34", "%d,%d", a1, a2);
+                    $display("%0d %0d %0d", cnt, a1, a2);
+                    cnt = $sscanf("", "%d", a1);
+                    $display("%0d", cnt);
+                end
+            endmodule
+        "#,
+            &[],
+        );
+        assert_eq!(
+            simulator.output().text(),
+            "3 123 0000beaf 01xz\n1 12 0\n-1\n"
+        );
+    }
+
+    /// A file opened for reading is found through the search path, and reading
+    /// it runs out as `-1` rather than as a quiet `0` — corpus `pr2824189`.
+    #[test]
+    fn test_fscanf_reads_to_end_of_file() {
+        let simulator = run_with_files(
+            "fscanf",
+            r#"
+            module top;
+                integer fd, n, v;
+                initial begin
+                    fd = $fopen("data.txt", "r");
+                    n = $fscanf(fd, " %d ", v);
+                    $display("%0d %0d", n, v);
+                    n = $fscanf(fd, " %d ", v);
+                    $display("%0d %0d", n, v);
+                    n = $fscanf(fd, "%d", v);
+                    $display("%0d %0d", n, v);
+                    n = $fscanf(fd, "%d", v);
+                    $display("%0d %0d", n, v);
+                    $fclose(fd);
+                end
+            endmodule
+        "#,
+            &[("data.txt", "7\n8\nq\n")],
+        );
+        // The `q` is not a digit, so the third scan is a real `0` — and it
+        // leaves the `q` where it was, so the fourth is `0` again rather than
+        // end of file.
+        assert_eq!(simulator.output().text(), "1 7\n1 8\n0 8\n0 8\n");
+    }
+
+    /// A file the design wrote under a relative name is found again under the
+    /// same name when it is opened to read — through the output directory,
+    /// with no search path configured at all (corpus `pr1876798`).
+    #[test]
+    fn test_a_design_reads_back_what_it_wrote() {
+        let directory = std::env::temp_dir().join("visilog-runner-roundtrip");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("work")).expect("scratch directory should be creatable");
+        let (_, module) = parse_module_declaration(
+            r#"
+            module top;
+                integer f, i, n;
+                integer v [0:3];
+                initial begin
+                    f = $fopen("work/temp.txt", "w");
+                    for (i = 0; i < 4; i = i + 1) $fdisplay(f, "%d", i);
+                    $fclose(f);
+                    f = $fopen("work/temp.txt", "r");
+                    for (i = 0; i < 4; i = i + 1) n = $fscanf(f, " %d ", v[i]);
+                    $fclose(f);
+                    $display("%0d %0d %0d %0d", v[0], v[1], v[2], v[3]);
+                end
+            endmodule
+        "#,
+        )
+        .unwrap();
+        let mut simulator = Simulator::new(module);
+        simulator.set_output_directory(&directory);
+        simulator.setup().unwrap();
+        simulator.advance(10).unwrap();
+        assert_eq!(simulator.output().text(), "0 1 2 3\n");
+    }
+
+    /// `$fgets`, `$feof`, `$ftell`, `$rewind`, `$fgetc` and `$ungetc` against
+    /// one file, with the answers measured against iverilog 12.0.
+    #[test]
+    fn test_line_and_character_reads() {
+        let simulator = run_with_files(
+            "fgets",
+            r#"
+            module top;
+                integer fd, r, c;
+                reg [8*20:1] s;
+                initial begin
+                    fd = $fopen("in.txt", "r");
+                    r = $fgets(s, fd);
+                    $display("%0d <%0s> %0d %0d", r, s[8*20:9], $ftell(fd), $feof(fd));
+                    r = $fgets(s, fd);
+                    $display("%0d <%0s> %0d %0d", r, s[8*20:9], $ftell(fd), $feof(fd));
+                    r = $fgets(s, fd);
+                    $display("%0d %0d", r, $feof(fd));
+                    r = $rewind(fd);
+                    c = $fgetc(fd);
+                    r = $ungetc(c, fd);
+                    $display("%0d %0d %0d %0d", r, c, $fgetc(fd), $feof(fd));
+                    $fclose(fd);
+                end
+            endmodule
+        "#,
+            &[("in.txt", "hello 42\nsecond\n")],
+        );
+        assert_eq!(
+            simulator.output().text(),
+            "9 <hello 42> 9 0\n7 <second> 16 0\n0 1\n0 104 104 0\n"
+        );
+    }
+
+    /// Reading a descriptor that names no readable file is end of file — a
+    /// channel, a write-only file and a closed one alike, which is what
+    /// iverilog answers — while an update mode, which this simulator cannot
+    /// read, is a named error rather than a silent `-1`.
+    #[test]
+    fn test_reading_what_is_not_readable() {
+        let simulator = run_with_files(
+            "unreadable",
+            r#"
+            module top;
+                integer mcd, fd, n, v;
+                initial begin
+                    mcd = $fopen("channel.txt");
+                    fd = $fopen("written.txt", "w");
+                    n = $fscanf(mcd, "%d", v);
+                    $display("%0d", n);
+                    n = $fscanf(fd, "%d", v);
+                    $display("%0d", n);
+                    n = $fgets(v, fd);
+                    $display("%0d", n);
+                end
+            endmodule
+        "#,
+            &[],
+        );
+        assert_eq!(simulator.output().text(), "-1\n-1\n0\n");
+
+        let (_, module) = parse_module_declaration(
+            r#"
+            module top;
+                integer fd, n, v;
+                initial begin
+                    fd = $fopen("update.txt", "w+");
+                    n = $fscanf(fd, "%d", v);
+                end
+            endmodule
+        "#,
+        )
+        .unwrap();
+        let directory = std::env::temp_dir().join("visilog-runner-update");
+        fs::create_dir_all(&directory).expect("scratch directory should be creatable");
+        let mut simulator = Simulator::new(module);
+        simulator.set_output_directory(&directory);
+        // `setup` runs time zero, which is when the `initial` block reads.
+        let error = simulator.setup().expect_err("an update mode is refused");
+        assert!(error.to_string().contains("update mode"), "{}", error);
     }
 
     #[test]
