@@ -393,19 +393,17 @@ enum Outcome {
 ///
 /// * **Trailing whitespace is trimmed per line.** Leading whitespace is *not* —
 ///   column alignment is often exactly what a `$display` test is checking.
-/// * **`VCD info:` lines are dropped from both sides.** iverilog's `$dumpfile`
-///   writes `VCD info: dumpfile … opened for output.` into seven of the gold
-///   files. visilog has no waveform dumper, so it never emits one; keeping the
-///   line would fail those comparisons on an unimplemented side effect rather
-///   than on the output the test is actually about.
 /// * **A trailing newline is not a difference.** `str::lines` yields the same
 ///   sequence for `"a\n"` and `"a"`, so a gold file written either way compares
 ///   equal.
+///
+/// `VCD info: dumpfile … opened for output.` used to be dropped from both
+/// sides, because seven gold files carry it and visilog had no waveform dumper
+/// to emit one. It has one now and writes that line where iverilog writes it,
+/// so the rule is gone: the line is output like any other, and a design that
+/// stopped short of opening its dump file should be *told* that it did.
 fn gold_lines(text: &str) -> Vec<&str> {
-    text.lines()
-        .map(str::trim_end)
-        .filter(|line| !line.starts_with("VCD info:"))
-        .collect()
+    text.lines().map(str::trim_end).collect()
 }
 
 /// The first line at which the output departs from the gold file, rendered for
@@ -459,12 +457,16 @@ fn judge_with(
     let Ok(parsed) = front_end(preprocessor, source) else {
         return Outcome::ParseFailed;
     };
+    let timescale = parsed.timescale;
     let modules = parsed.modules;
     let Some(top) = top_module(&modules) else {
         return Outcome::ParseFailed;
     };
 
     let mut simulator = Simulator::with_modules(modules, top);
+    // The `` `timescale `` belongs to the file, which only the harness read, so
+    // a waveform the design dumps can only state it if the harness says so.
+    simulator.set_timescale(timescale);
     // `$readmemh("foo.txt", mem)` names a file relative to the test directory.
     // A `Simulator` is built from parsed modules and never learns which file
     // they came from, so the harness — which does know — supplies the path.

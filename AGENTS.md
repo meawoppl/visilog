@@ -102,7 +102,8 @@ from the start deliberately: it cannot be reconstructed afterwards.
 Supported: `` `define `` (object-like, function-like, argument defaults, `\` line
 continuations), `` `undef ``/`` `undefineall ``, `` `ifdef ``/`` `ifndef ``/`` `elsif ``/
 `` `else ``/`` `endif `` including nesting, `` `timescale `` (recorded on `Preprocessed`
-and on `ModuleLibrary::timescale`, not discarded — #81 needs a real one), `` `include ``
+and on `ModuleLibrary::timescale`, and handed to `Simulator::set_timescale` for a waveform
+dump's `$timescale`), `` `include ``
 with a search path set by `Preprocessor::with_include_dir`, the `` `" ``/`` `\`" ``/`` `` ``
 escapes, and the `` `__FILE__ ``/`` `__LINE__ `` builtins. `IGNORED_DIRECTIVES` skips
 `` `begin_keywords ``, `` `celldefine ``, `` `default_nettype `` and the rest of the
@@ -413,6 +414,64 @@ the LRM asks. A `$monitoroff` in the *same* timestep as a change suppresses that
 timestep's line, where iverilog still prints it (corpus `monitor4`, which is a
 `vvp` test rather than a scored one).
 
+**A value change dump is the one artifact a design writes for a person, and it lives
+in `vcd.rs`.** `$dumpfile`, `$dumpvars`, `$dumpon`, `$dumpoff`, `$dumpall`,
+`$dumpflush` and `$dumplimit` are all implemented, and every detail of the text was
+measured against iverilog 12.0: identifiers are base 94 over `!`..`~` with the least
+significant digit first (`!`, `"`, … `~`, `!"`), a scalar is `0!`, a vector is
+`b1010 "`, a real is `r1.5 #`, and a vector's leading digits are trimmed the way a
+reader re-extends them — a run of `0`s goes unless an `x` or `z` is under it (then one
+`0` stays), a run of `x`s or `z`s collapses to one, and a leading `1` is never
+touched (`00zzzzzz` is `b0zzzzzz`, `xx01` is `bx01`). `$dumpoff` writes every variable
+as `x` (`bx` for a vector, `rNaN` for a real), and time that passes while it is off
+leaves no section at all.
+
+**A time section is driven by the change journal, not by a scan.** `settle` already
+takes `StateStore::take_changes` once per delta cycle; while a dump is armed it hands
+the same names to `VcdDump::note_changes`, which marks the dumped variables they read
+as dirty — one hash lookup per *written* name. `Simulator::end_of_timestep` is where
+the section is written, because it is the moment the design has stopped moving, and
+only a dirty variable whose value really differs from what the file last said gets a
+line. That is also why `a = 1; a = 0; a = 1;` in one timestep is one line, which is
+what iverilog writes. A design that dumps nothing asks `TaskContext::is_dumping` —
+an `Option` check — once per settle round.
+
+**The file opens at the first `$dumpvars`, and the header waits for the end of that
+timestep.** `$dumpfile` alone writes nothing, which is what iverilog does; `$dumpvars`
+opens it through the store's `FileTable` — the same table and the same
+`set_output_directory` `$fopen` uses, so a corpus run writes into the scratch
+directory — and prints `VCD info: dumpfile <name> opened for output.` at once, where
+iverilog prints it, ahead of whatever the block prints next. The `$scope` tree and the
+opening `$dumpvars` block are written at the end of the timestep, so a second
+`$dumpvars` in the same timestep still adds to them; one in a *later* timestep is
+ignored with iverilog's `VCD warning: $dumpvars ignored, previously called at simtime
+N`. No `$dumpfile` means `dump.vcd`. The final `#<time>` is written when the design
+calls `$finish`, and `advance` flushes the file before it returns, so a waveform read
+after a run is the whole run.
+
+**What a `$dumpvars` argument names is resolved against the flat store.** The top
+module is the store's root and carries no prefix, so `top`, `top.u1` and `u1` resolve
+by stripping it; a name that is a signal dumps that signal, one that prefixes signals
+dumps the scope to the level asked for (`0` is all the way down), and `arr[4]` dumps
+one memory word under iverilog's escaped name `\arr[4]`. A name that is none of these
+is a named `SystemTask` error, never an empty waveform. Memories are not dumped by a
+scope, and neither are events or the hidden `$repeat$` / `$hold$` slots. An instance
+port aliased onto its parent's signal is declared under its own name with the parent's
+identifier, which is how iverilog shows one store entry under two names — so it writes
+no second line.
+
+Where it deliberately differs from iverilog: `$timescale` states the design's *unit*
+rather than its precision, because the clock counts ticks of the unit and nothing
+rescales them (`` `timescale 1ns/1ps `` gives `1ns` and `#5`, where iverilog gives
+`1ps` and `#5000`); `$date` is ISO 8601 UTC; variables are in the store's sorted order
+grouped into one scope tree rather than one tree per `$dumpvars` call; a parameter is a
+store signal like any other and so is dumped as a `reg` in the `$dumpvars` block rather
+than as a `$var parameter` in a `$comment` block; an `integer` is a `reg [31:0]`; and
+an aliased port is declared with its parent's `wire`/`reg` kind, since the alias table
+keeps only the name. `SignalState::is_net` is the one field added for the dump — a net
+flag set at declaration and carried across every write, so `$var wire` and `$var reg`
+come from the declaration rather than from a guess.
+
 **Formatting is per digit, and the case of an unknown one says whether it
 mixes.** `Radix::render` goes through `tasks::digits`, which renders four bits
 at a time for `%h` and three for `%o`, so `12'b0000_0000_00xx` is `00X` rather
@@ -452,9 +511,10 @@ which iverilog 12.0 itself fails).
 fractional digits, then the suffix, right-aligned in `min_width` (twenty by
 default), with an explicit `%12t` overriding `min_width` and `%0t` meaning no
 padding at all. The `units` argument is range-checked and then taken to name the
-unit a tick already *is*: the clock counts ticks and nothing hands `Simulator`
-the `` `timescale `` the preprocessor recorded, so there is no second unit to
-convert between. That is the identity for the `` `timescale 1ns `` plus
+unit a tick already *is*: the clock counts ticks, and although
+`Simulator::set_timescale` now receives the `` `timescale `` the preprocessor recorded,
+only the waveform header reads it — nothing converts between it and `units` (#209).
+That is the identity for the `` `timescale 1ns `` plus
 `$timeformat(-9, …)` pairing that covers nearly every design using either, and
 wrong by a power of ten when they disagree — corpus `timeform1` is the case.
 
@@ -1171,12 +1231,13 @@ telling apart.
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
-| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, and the `$readmemh` / `$writememh` memory file format |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness and declared realness), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills`) a scan writes its arguments through, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills`) a scan writes its arguments through, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
+| `vcd.rs` | `VcdDump` — the value change dump: `add` resolves `$dumpvars` targets into variables, `note_changes` marks the ones the change journal says were written, `flush` writes the header, the opening block and each timestep's section, and `trimmed` / `identifier` are the iverilog-measured vector trimming and identifier alphabet |
 
 ## Measuring progress: the ivtest corpus
 
@@ -1226,14 +1287,17 @@ distinguishable in the report. `gold=` is scanned for across every field past th
 directory, not read from a fixed position, because the optional top-module name comes
 first when an entry has one (`shellho1 normal ivltests top gold=shellho1.gold`).
 
-Three rules make a gold comparison mean something (`gold_lines` / `first_difference`):
+Two rules make a gold comparison mean something (`gold_lines` / `first_difference`):
 
 - **Trailing whitespace is trimmed per line, leading whitespace is not.** Column alignment
   is exactly what a lot of these `$display` tests check.
-- **`VCD info: dumpfile … opened for output.` is dropped from both sides.** Seven gold
-  files carry it; visilog has no waveform dumper, so keeping it would fail those on an
-  unimplemented side effect rather than on the output the test is about.
 - **A trailing newline is not a difference**, which comes free from `str::lines`.
+
+`VCD info: dumpfile … opened for output.` is **compared like any other line.** Seven gold
+files carry it, and the harness used to drop it from both sides because visilog had no
+dumper. It has one now and prints that line where iverilog does, so dropping it would only
+hide a design that stopped before it opened its dump file — removing the rule was worth +1
+on its own (`pr1963962`, whose whole gold file is that line).
 
 **A design that printed nothing is `Silent`, never a gold match** — not even against an
 empty gold file, since "produced exactly the right emptiness" and "never reached its own
@@ -1369,7 +1433,8 @@ tripwire.
   one table. The whole words are matched *first*, and there are six: `$finish` and
   `$timeformat` because `finish`'s `f` is not the prefix, `$monitoroff` because its trailing
   `f` is not one either, `$fflush` because its trailing `h` is not a radix, and `$time` and
-  `$monitoron` alongside them. `$readmem` and
+  `$monitoron` alongside them. The `$dump…` family is matched whole as well — `$dumpflush`
+  ends in an `h` that is not a radix. `$readmem` and
   `$readmemo` are consequently names nothing implements — the radix suffix is the file
   format rather than a default, so only `b` and `h` spell a task. `$sformat` and `$swrite`
   go through the same split although they take no descriptor, which is what gives
