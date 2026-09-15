@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -11,6 +11,7 @@ use rand::{RngCore, SeedableRng};
 
 use crate::parsers::expr::Expression;
 use crate::register::{Register, REAL_WIDTH, X};
+use crate::simulator::exec::ResolvedTarget;
 use crate::simulator::program::FunctionDefinition;
 
 /// What the `$random` stream starts from.
@@ -83,8 +84,112 @@ const STDOUT_DESCRIPTOR: usize = 1;
 #[derive(Clone, Debug, Default)]
 pub struct FileTable(Rc<RefCell<OpenFiles>>);
 
+/// A file open for reading, and the one byte a look-ahead has taken off it.
+///
+/// The pushback slot is the whole of the reading model: `peek` reads a byte and
+/// leaves it here, `bump` consumes it, and `$ungetc` puts one back by hand. A
+/// scan that stops at a character it does not want therefore leaves the stream
+/// positioned *before* it, which is what makes `$ftell` after a `$fscanf`
+/// report what C reports.
+#[derive(Debug)]
+pub struct Reader {
+    file: BufReader<File>,
+    /// The byte `peek` has looked at and `bump` has not yet consumed.
+    pushback: Option<u8>,
+    /// Whether a read has run off the end. Sticky, like C's `feof`: it is set
+    /// by a read that found nothing and cleared only by a seek.
+    eof: bool,
+}
+
+impl Reader {
+    /// The next byte without consuming it. `None` is end of file, and it is
+    /// what sets the `$feof` flag — the same rule C follows, where a read that
+    /// finds nothing is what makes `feof` true rather than merely being at the
+    /// last byte.
+    pub fn peek(&mut self) -> Option<u8> {
+        if self.pushback.is_none() {
+            let mut byte = [0u8; 1];
+            match self.file.read(&mut byte) {
+                Ok(1) => self.pushback = Some(byte[0]),
+                _ => {
+                    self.eof = true;
+                    return None;
+                }
+            }
+        }
+        self.pushback
+    }
+
+    /// Consumes the byte [`peek`](Reader::peek) looked at.
+    pub fn bump(&mut self) {
+        self.pushback = None;
+    }
+
+    /// `$fgetc` — the next byte, consumed. `None` at end of file.
+    pub fn take(&mut self) -> Option<u8> {
+        let byte = self.peek();
+        if byte.is_some() {
+            self.bump();
+        }
+        byte
+    }
+
+    /// `$ungetc` — puts a byte back so the next read finds it. There is room
+    /// for exactly one, which is all C promises; a second in a row fails.
+    pub fn unread(&mut self, byte: u8) -> bool {
+        if self.pushback.is_some() {
+            return false;
+        }
+        self.pushback = Some(byte);
+        self.eof = false;
+        true
+    }
+
+    /// `$feof` — whether a read has run off the end.
+    pub fn at_eof(&mut self) -> bool {
+        self.eof
+    }
+
+    /// `$ftell` — the byte offset of the next character. A byte held in the
+    /// pushback slot has been read off the underlying file but not consumed by
+    /// the design, so it is counted back off.
+    pub fn position(&mut self) -> Option<i64> {
+        let position = self.file.stream_position().ok()?;
+        let held = u64::from(self.pushback.is_some());
+        i64::try_from(position.saturating_sub(held)).ok()
+    }
+
+    /// `$fseek` / `$rewind`. Seeking discards the look-ahead byte and clears
+    /// the end-of-file flag, exactly as C's `fseek` does.
+    pub fn seek(&mut self, to: SeekFrom) -> bool {
+        self.pushback = None;
+        match self.file.seek(to) {
+            Ok(_) => {
+                self.eof = false;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// One open file: the direction it was opened in decides what it can do.
+#[derive(Debug)]
+enum Handle {
+    /// Open for writing. `updates` records a mode with a `+` in it, which asks
+    /// for a file that reads *and* writes — this simulator buffers one
+    /// direction at a time, so a read of one of those is a named error rather
+    /// than a silent end of file.
+    Writing {
+        writer: BufWriter<File>,
+        updates: bool,
+    },
+    /// Open for reading.
+    Reading(Reader),
+}
+
 /// One open file, or the slot a closed one left behind.
-type Channel = Option<BufWriter<File>>;
+type Channel = Option<Handle>;
 
 #[derive(Debug, Default)]
 struct OpenFiles {
@@ -97,6 +202,11 @@ struct OpenFiles {
     /// Where a relative path is resolved. `None` is the process working
     /// directory, which is what a caller that never said otherwise gets.
     directory: Option<PathBuf>,
+    /// Where a relative path is *read* from, after the process working
+    /// directory. The mirror of `directory`, and the same list
+    /// `$readmemh` searches — a design that opens a data file for reading and
+    /// one that loads a memory from it are naming the same file.
+    search_paths: Vec<PathBuf>,
 }
 
 impl OpenFiles {
@@ -116,8 +226,8 @@ impl OpenFiles {
         Some(slots.len() - 1)
     }
 
-    /// Every slot the descriptor names that really is an open file: one for a
-    /// file descriptor, and one per set bit for a channel mask.
+    /// Every slot the descriptor names that really is an open *writable* file:
+    /// one for a file descriptor, and one per set bit for a channel mask.
     fn named(&mut self, descriptor: u32) -> Vec<&mut BufWriter<File>> {
         if descriptor & FILE_DESCRIPTOR != 0 {
             let index = (descriptor & !FILE_DESCRIPTOR) as usize;
@@ -125,6 +235,7 @@ impl OpenFiles {
                 .descriptors
                 .get_mut(index)
                 .and_then(Option::as_mut)
+                .and_then(Handle::writer)
                 .into_iter()
                 .collect();
         }
@@ -132,7 +243,7 @@ impl OpenFiles {
             .iter_mut()
             .enumerate()
             .filter(|(bit, _)| *bit >= 1 && descriptor & (1 << bit) != 0)
-            .filter_map(|(_, slot)| slot.as_mut())
+            .filter_map(|(_, slot)| slot.as_mut().and_then(Handle::writer))
             .collect()
     }
 
@@ -142,9 +253,39 @@ impl OpenFiles {
         self.channels
             .iter_mut()
             .chain(self.descriptors.iter_mut())
-            .filter_map(Option::as_mut)
+            .filter_map(|slot| slot.as_mut().and_then(Handle::writer))
             .collect()
     }
+}
+
+impl Handle {
+    fn writer(&mut self) -> Option<&mut BufWriter<File>> {
+        match self {
+            Handle::Writing { writer, .. } => Some(writer),
+            Handle::Reading(_) => None,
+        }
+    }
+}
+
+/// Why a descriptor cannot be read from.
+///
+/// The distinctions matter because a design *observes* the answer: iverilog
+/// hands a `$fscanf` on a write-only file the same `-1` it hands one at end of
+/// file, and prints a diagnostic for a descriptor that names nothing at all.
+/// There is no diagnostic channel here, so the two that a design can act on are
+/// reported as `-1` and the one that is genuinely unimplemented is a named
+/// error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotReadable {
+    /// A multi-channel descriptor, a descriptor nothing has open, or a file
+    /// opened for writing. Each one reads as end of file, which is what
+    /// iverilog returns for all three.
+    EndOfFile,
+    /// A file opened in an update mode (`r+`, `w+`, `a+`), which asks for a
+    /// handle that reads and writes at once. This simulator buffers one
+    /// direction at a time, so reading one is a named error rather than a
+    /// silent end of file.
+    Update,
 }
 
 /// The declared range of a `real`, which is what a sixty-four bit value's
@@ -598,6 +739,9 @@ pub struct StateStore {
     /// The files `$fopen` has opened, and the directory a relative path is
     /// written into. See [`FileTable`].
     files: FileTable,
+    /// The writes a system *function* owes the design. See
+    /// [`owe_fill`](StateStore::owe_fill).
+    fills: RefCell<Vec<(ResolvedTarget, Register)>>,
 }
 
 impl StateStore {
@@ -649,7 +793,39 @@ impl StateStore {
             // called from a function body, and a file it opened there has to
             // outlive the frame the way a file opened anywhere else does.
             files: self.files.clone(),
+            // Fresh, unlike the file table: a frame's writes are its own, so a
+            // `$sscanf` inside a function body fills the function's variables
+            // and nothing the design can see.
+            fills: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Records a write a system *function* made through its argument list.
+    ///
+    /// `$sscanf` returns how many values it converted **and** writes them into
+    /// the arguments it was handed, so it is the one kind of expression that
+    /// changes the store — and [`eval`](crate::simulator::eval::eval) is given
+    /// a `&StateStore`. The write is therefore queued here and carried out at
+    /// the next instruction boundary by
+    /// [`resume`](crate::simulator::program::resume), which is the first moment
+    /// the statement that evaluated the expression has finished with it. Doing
+    /// it there rather than inside `eval` is what keeps the assignment's own
+    /// target (`code = $sscanf(…)`) written first, and what keeps the queue
+    /// from having to know anything about assignment order.
+    pub fn owe_fill(&self, target: ResolvedTarget, value: Register) {
+        self.fills.borrow_mut().push((target, value));
+    }
+
+    /// Whether any system function has left a write outstanding. Asked once per
+    /// instruction, so it is deliberately a length compare rather than
+    /// anything that allocates.
+    pub fn owes_fills(&self) -> bool {
+        !self.fills.borrow().is_empty()
+    }
+
+    /// Hands the outstanding writes over and starts a fresh list.
+    pub fn take_fills(&mut self) -> Vec<(ResolvedTarget, Register)> {
+        std::mem::take(&mut self.fills.borrow_mut())
     }
 
     /// Where a relative `$fopen` or `$writememh` path is written, which
@@ -662,6 +838,54 @@ impl StateStore {
     /// [`Simulator::add_search_path`](crate::simulator::runner::Simulator::add_search_path).
     pub fn set_output_directory(&mut self, directory: impl Into<PathBuf>) {
         self.files.0.borrow_mut().directory = Some(directory.into());
+    }
+
+    /// Where a relative `$fopen(name, "r")` path is looked for, after the
+    /// process working directory.
+    ///
+    /// This is the read half of [`set_output_directory`](StateStore::set_output_directory)
+    /// and it is the same list `$readmemh` searches — see
+    /// [`Simulator::add_search_path`](crate::simulator::runner::Simulator::add_search_path).
+    /// It lives here rather than on the `TaskContext` because `$fopen` is a
+    /// system *function*, and `eval` is handed the store and nothing else.
+    pub fn set_search_paths(&mut self, directories: Vec<PathBuf>) {
+        self.files.0.borrow_mut().search_paths = directories;
+    }
+
+    /// The path a name denotes when it is being *read*: itself if it is
+    /// absolute, otherwise the first of the process working directory and the
+    /// search paths that has it. `None` names nothing that exists, and the
+    /// caller says what that means.
+    ///
+    /// The output directory is asked first: a design that writes
+    /// `work/temp.txt` and then opens `work/temp.txt` to read it back is naming
+    /// one file, the way it would be under a simulator that runs in a single
+    /// directory. Without that the read would miss the file the design has
+    /// just written and quietly read nothing (corpus `pr1876798`).
+    pub fn resolve_read_path(&self, name: &str) -> Option<PathBuf> {
+        let written = self.resolve_write_path(name);
+        if written.is_file() {
+            return Some(written);
+        }
+        let path = Path::new(name);
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        if path.is_absolute() {
+            return None;
+        }
+        let files = self.files.0.borrow();
+        files
+            .search_paths
+            .iter()
+            .map(|directory| directory.join(path))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Every directory a relative read path is looked for in, which is what an
+    /// error naming a file it could not find lists.
+    pub fn search_paths(&self) -> Vec<PathBuf> {
+        self.files.0.borrow().search_paths.clone()
     }
 
     /// The path a `$fopen` or `$writemem…` name denotes. An absolute one is
@@ -694,7 +918,10 @@ impl StateStore {
         };
         match File::create(&path) {
             Ok(file) => {
-                files.channels[bit] = Some(BufWriter::new(file));
+                files.channels[bit] = Some(Handle::Writing {
+                    writer: BufWriter::new(file),
+                    updates: false,
+                });
                 1 << bit
             }
             Err(_) => 0,
@@ -704,10 +931,21 @@ impl StateStore {
     /// `$fopen(name, mode)` — opens `name` in a C `fopen` mode and returns a
     /// *file* descriptor: bit 31 set, over a number allocated from 3 upwards.
     /// 0 on failure, exactly as [`open_channel`](StateStore::open_channel).
+    /// A relative name in a **reading** mode is resolved against the search
+    /// paths rather than the output directory — a design that opens a data
+    /// file beside itself is naming the same file `$readmemh` would.
     pub fn open_descriptor(&self, name: &str, mode: &str) -> u32 {
-        let path = self.resolve_write_path(name);
         let mut options = OpenOptions::new();
-        match mode.trim_end_matches('b') {
+        let mode = mode.trim_end_matches('b');
+        let (reads, updates) = match mode {
+            "r" => (true, false),
+            "r+" => (true, true),
+            "w" => (false, false),
+            "w+" | "a+" => (false, true),
+            "a" => (false, false),
+            _ => return 0,
+        };
+        match mode {
             "r" => options.read(true),
             "r+" => options.read(true).write(true),
             "w" => options.write(true).create(true).truncate(true),
@@ -715,6 +953,17 @@ impl StateStore {
             "a" => options.append(true).create(true),
             "a+" => options.read(true).append(true).create(true),
             _ => return 0,
+        };
+        // A file being opened to read has to exist already, so the search path
+        // is what finds it; one being opened to write is being created, so
+        // there is nothing to search for and it hangs off the output directory.
+        let path = if reads {
+            match self.resolve_read_path(name) {
+                Some(path) => path,
+                None => return 0,
+            }
+        } else {
+            self.resolve_write_path(name)
         };
         let mut files = self.files.0.borrow_mut();
         let Some(index) = OpenFiles::free_slot(
@@ -726,10 +975,46 @@ impl StateStore {
         };
         match options.open(&path) {
             Ok(file) => {
-                files.descriptors[index] = Some(BufWriter::new(file));
+                files.descriptors[index] = Some(if reads && !updates {
+                    Handle::Reading(Reader {
+                        file: BufReader::new(file),
+                        pushback: None,
+                        eof: false,
+                    })
+                } else {
+                    Handle::Writing {
+                        writer: BufWriter::new(file),
+                        updates,
+                    }
+                });
                 FILE_DESCRIPTOR | index as u32
             }
             Err(_) => 0,
+        }
+    }
+
+    /// Runs `action` against the file the descriptor names, open for reading.
+    ///
+    /// Access is by closure because the handle lives behind the table's
+    /// [`RefCell`]: handing a borrow out would keep the table locked for as
+    /// long as the caller held it, and `$fscanf` writes through the store while
+    /// it reads.
+    pub fn with_reader<T>(
+        &self,
+        descriptor: u32,
+        action: impl FnOnce(&mut Reader) -> T,
+    ) -> Result<T, NotReadable> {
+        let mut files = self.files.0.borrow_mut();
+        if descriptor & FILE_DESCRIPTOR == 0 {
+            // A multi-channel descriptor is a write-only thing by
+            // construction: `$fopen(name)` opens for writing.
+            return Err(NotReadable::EndOfFile);
+        }
+        let index = (descriptor & !FILE_DESCRIPTOR) as usize;
+        match files.descriptors.get_mut(index).and_then(Option::as_mut) {
+            Some(Handle::Reading(reader)) => Ok(action(reader)),
+            Some(Handle::Writing { updates: true, .. }) => Err(NotReadable::Update),
+            Some(Handle::Writing { .. }) | None => Err(NotReadable::EndOfFile),
         }
     }
 

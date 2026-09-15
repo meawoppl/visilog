@@ -6,6 +6,7 @@ pub mod exec;
 pub mod gates;
 pub mod program;
 pub mod runner;
+pub mod scan;
 pub mod signals;
 pub mod state_store;
 pub mod tasks;

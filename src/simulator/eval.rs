@@ -56,9 +56,10 @@ use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, REAL_WIDTH, X, Z, ZERO};
-use crate::simulator::exec::range_width;
+use crate::simulator::exec::{range_width, resolve_target};
 use crate::simulator::runner::SimulationError;
-use crate::simulator::state_store::{StateStore, MAX_CALL_DEPTH};
+use crate::simulator::scan::{self, Slot, END_OF_FILE};
+use crate::simulator::state_store::{NotReadable, StateStore, MAX_CALL_DEPTH};
 use crate::simulator::tasks::ascii;
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
@@ -132,6 +133,11 @@ pub enum EvalError {
         expected: String,
         found: usize,
     },
+    /// A `$sscanf`, `$fscanf` or `$fgets` that could not be carried out: a
+    /// conversion this simulator does not implement, a format asking for more
+    /// arguments than it was given, or an argument that cannot be written.
+    /// Never a quiet count of zero, which a design reads as "did not match".
+    Scan(String),
 }
 
 impl fmt::Display for EvalError {
@@ -192,6 +198,7 @@ impl fmt::Display for EvalError {
                 expected,
                 found,
             } => write!(f, "`${}` takes {}, but was given {}", name, expected, found),
+            EvalError::Scan(reason) => write!(f, "cannot read: {}", reason),
         }
     }
 }
@@ -1021,7 +1028,7 @@ const TIME_WIDTH: usize = 64;
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 22] = [
+pub const SYSTEM_FUNCTIONS: [&str; 31] = [
     "time",
     "stime",
     "realtime",
@@ -1046,6 +1053,18 @@ pub const SYSTEM_FUNCTIONS: [&str; 22] = [
     "ceil",
     "hypot",
     "fabs",
+    // The reading half of file I/O. Every one of these is a system *function*
+    // that writes through its argument list — see
+    // [`StateStore::owe_fill`](crate::simulator::state_store::StateStore::owe_fill).
+    "sscanf",
+    "fscanf",
+    "fgets",
+    "fgetc",
+    "ungetc",
+    "feof",
+    "ftell",
+    "fseek",
+    "rewind",
 ];
 
 /// Evaluates `$name(...)`, the simulator's own functions.
@@ -1146,6 +1165,142 @@ fn eval_system_function_bits(
                 descriptor as u128,
                 SYSTEM_FUNCTION_WIDTH,
             ))
+        }
+        // The reading half. `$sscanf` and `$fscanf` differ in one thing —
+        // where the characters come from — so everything past that point is
+        // the one engine in [`scan`].
+        "sscanf" | "fscanf" => {
+            if arguments.len() < 2 {
+                return Err(EvalError::SystemFunctionArity {
+                    name: name.to_string(),
+                    expected: "a source, a format string, and the arguments to fill".to_string(),
+                    found: arguments.len(),
+                });
+            }
+            // The targets are resolved before anything is read, so an
+            // argument that cannot be written into is reported instead of
+            // being discovered half way through a scan that has already
+            // consumed the input.
+            let slots = scan_slots(&arguments[2..], store)?;
+            // A format string with an unknown bit in it is no format at all:
+            // `$sscanf(s, 'bx, a)` is end of file, which is what corpus
+            // `scanf4` asserts.
+            let Some(format) = known_text(&arguments[1], store)? else {
+                return Ok(scan_count(END_OF_FILE));
+            };
+            let (count, fills) = if name == "sscanf" {
+                let Some(text) = known_text(&arguments[0], store)? else {
+                    return Ok(scan_count(END_OF_FILE));
+                };
+                scan::scan(&mut scan::Text::new(&text), &format, &slots).map_err(EvalError::Scan)?
+            } else {
+                let descriptor = descriptor(&arguments[0], store)?;
+                match store.with_reader(descriptor, |reader| scan::scan(reader, &format, &slots)) {
+                    Ok(scanned) => scanned.map_err(EvalError::Scan)?,
+                    // A descriptor that names no readable file is end of file,
+                    // which is the number iverilog hands back for all three of
+                    // a closed descriptor, a write-only one and a channel.
+                    Err(NotReadable::EndOfFile) => (END_OF_FILE, Vec::new()),
+                    Err(NotReadable::Update) => return Err(update_mode("$fscanf")),
+                }
+            };
+            for (target, value) in fills {
+                store.owe_fill(target, value);
+            }
+            Ok(scan_count(count))
+        }
+        // `$fgets(target, fd)` — one line, up to as many characters as the
+        // target holds, the newline kept. The answer is how many characters
+        // were read; `0` is end of file, and the target is then left alone.
+        "fgets" => {
+            arity("a target and a file descriptor", &[2])?;
+            let slot = scan_slots(&arguments[..1], store)?
+                .pop()
+                .expect("one argument gives one slot");
+            let descriptor = descriptor(&arguments[1], store)?;
+            let line = match store.with_reader(descriptor, |reader| {
+                read_line(reader, slot.width.max(8) / 8)
+            }) {
+                Ok(line) => line,
+                Err(NotReadable::EndOfFile) => Vec::new(),
+                Err(NotReadable::Update) => return Err(update_mode("$fgets")),
+            };
+            if !line.is_empty() {
+                store.owe_fill(slot.target, string_bits_of(&line));
+            }
+            Ok(Register::from_u128(
+                line.len() as u128,
+                SYSTEM_FUNCTION_WIDTH,
+            ))
+        }
+        // `$fgetc` — one character, or `-1` at end of file.
+        "fgetc" => {
+            arity("exactly one file descriptor", &[1])?;
+            let descriptor = descriptor(&arguments[0], store)?;
+            let byte = match store.with_reader(descriptor, |reader| reader.take()) {
+                Ok(byte) => byte,
+                Err(NotReadable::EndOfFile) => None,
+                Err(NotReadable::Update) => return Err(update_mode("$fgetc")),
+            };
+            Ok(signed_result(byte.map_or(END_OF_FILE, i64::from)))
+        }
+        // `$ungetc` — puts one character back, so the next read finds it. `0`
+        // is success and `-1` is failure, which is C's convention rather than
+        // the character itself.
+        "ungetc" => {
+            arity("a character and a file descriptor", &[2])?;
+            let byte = eval(&arguments[0], store)?.to_u128().map(|code| code as u8);
+            let descriptor = descriptor(&arguments[1], store)?;
+            let done = match byte {
+                Some(byte) => store
+                    .with_reader(descriptor, |reader| reader.unread(byte))
+                    .unwrap_or(false),
+                None => false,
+            };
+            Ok(signed_result(if done { 0 } else { END_OF_FILE }))
+        }
+        // `$feof` — whether a read has run off the end. Sticky, like C's, so
+        // reaching the last byte is not yet end of file.
+        "feof" => {
+            arity("exactly one file descriptor", &[1])?;
+            let descriptor = descriptor(&arguments[0], store)?;
+            let done = store
+                .with_reader(descriptor, |reader| reader.at_eof())
+                .unwrap_or(true);
+            Ok(Register::from_u128(u128::from(done), SYSTEM_FUNCTION_WIDTH))
+        }
+        // `$ftell` — the byte offset of the next character, or `-1`.
+        "ftell" => {
+            arity("exactly one file descriptor", &[1])?;
+            let descriptor = descriptor(&arguments[0], store)?;
+            let position = store
+                .with_reader(descriptor, |reader| reader.position())
+                .ok()
+                .flatten();
+            Ok(signed_result(position.unwrap_or(END_OF_FILE)))
+        }
+        // `$fseek(fd, offset, operation)` and `$rewind(fd)` — `0` on success
+        // and `-1` on failure, C's convention again.
+        "fseek" | "rewind" => {
+            let expected = if name == "rewind" {
+                arity("exactly one file descriptor", &[1])?;
+                Some(std::io::SeekFrom::Start(0))
+            } else {
+                arity("a file descriptor, an offset and an operation", &[3])?;
+                let offset = whole_number(&arguments[1], store)?;
+                let operation = whole_number(&arguments[2], store)?;
+                offset
+                    .zip(operation)
+                    .and_then(|(offset, operation)| scan::seek_from(operation, offset))
+            };
+            let descriptor = descriptor(&arguments[0], store)?;
+            let done = match expected {
+                Some(to) => store
+                    .with_reader(descriptor, |reader| reader.seek(to))
+                    .unwrap_or(false),
+                None => false,
+            };
+            Ok(signed_result(if done { 0 } else { END_OF_FILE }))
         }
         // The real math library. Each is its `f64` counterpart, with the
         // argument converted on the way in — `$sqrt(9)` is `3.0`, because an
@@ -1321,6 +1476,100 @@ fn string_width(text: &str) -> usize {
 /// over a bit vector, and eight bits at a time it is the same characters.
 fn file_name(expression: &Expression, store: &StateStore) -> Result<String, EvalError> {
     Ok(ascii(&eval(expression, store)?))
+}
+
+/// The text an expression spells, or `None` if any bit of it is unknown.
+///
+/// A scan's format string and a `$sscanf` source both come through here, and
+/// the `None` is what makes `$sscanf(s, 'bx, a)` end of file: there is nothing
+/// to read *by*, which is a different thing from reading and not matching.
+fn known_text(expression: &Expression, store: &StateStore) -> Result<Option<String>, EvalError> {
+    let value = eval(expression, store)?;
+    if value.has_unknown() {
+        return Ok(None);
+    }
+    Ok(Some(ascii(&value)))
+}
+
+/// A descriptor argument: a `$fopen` answer, which has to be fully known.
+///
+/// An unknown one is an error rather than a plausible number, exactly as it is
+/// for the writing half — a design cannot have got a descriptor with an `x` in
+/// it from anywhere this simulator handed one out.
+fn descriptor(expression: &Expression, store: &StateStore) -> Result<u32, EvalError> {
+    let value = eval(expression, store)?;
+    value
+        .to_u128()
+        .map(|descriptor| descriptor as u32)
+        .ok_or_else(|| {
+            EvalError::Scan(format!(
+                "file descriptor `{}` is not a known value",
+                expression.to_contracted_string()
+            ))
+        })
+}
+
+/// An integer argument that has to be a whole known number — a `$fseek` offset
+/// or operation. `None` is an unknown one, which fails the seek rather than
+/// seeking somewhere arbitrary.
+fn whole_number(expression: &Expression, store: &StateStore) -> Result<Option<i64>, EvalError> {
+    Ok(eval(expression, store)?
+        .to_i128()
+        .and_then(|value| i64::try_from(value).ok()))
+}
+
+/// Turns each argument of a scan into the place its conversion writes.
+fn scan_slots(arguments: &[Expression], store: &StateStore) -> Result<Vec<Slot>, EvalError> {
+    arguments
+        .iter()
+        .map(|argument| {
+            let target = resolve_target(store, argument)
+                .map_err(|error| EvalError::Scan(error.to_string()))?;
+            let width = target.width(store);
+            Ok(Slot { target, width })
+        })
+        .collect()
+}
+
+/// What a scan hands back: an `integer`, so `-1` reads as `-1`.
+fn scan_count(count: i64) -> Register {
+    signed_result(count)
+}
+
+fn signed_result(value: i64) -> Register {
+    Register::from_u128(value as i128 as u128, SYSTEM_FUNCTION_WIDTH).with_signedness(true)
+}
+
+fn update_mode(task: &str) -> EvalError {
+    EvalError::Scan(format!(
+        "`{}` on a file opened in an update mode (`r+`, `w+`, `a+`), which this simulator does not read",
+        task
+    ))
+}
+
+/// One line from a file: up to `bytes` characters, stopping after a newline.
+/// An empty answer is end of file, and is what leaves `$fgets`'s target alone.
+fn read_line(reader: &mut crate::simulator::state_store::Reader, bytes: usize) -> Vec<u8> {
+    let mut line = Vec::new();
+    while line.len() < bytes {
+        let Some(byte) = reader.take() else { break };
+        line.push(byte);
+        if byte == b'\n' {
+            break;
+        }
+    }
+    line
+}
+
+/// A run of bytes as a bit vector, eight bits a character, most significant
+/// character first — the same shape a string literal has.
+fn string_bits_of(bytes: &[u8]) -> Register {
+    Register::from_bits(
+        bytes
+            .iter()
+            .flat_map(|byte| (0..8).rev().map(move |offset| (byte >> offset) & 1))
+            .collect::<Vec<u8>>(),
+    )
 }
 
 pub(crate) fn string_bits(text: &str) -> Register {
@@ -2797,6 +3046,12 @@ mod tests {
                 "fopen" => "$fopen(\"\")".to_string(),
                 // The two-argument members of the real math library.
                 "pow" | "hypot" => format!("${}(a, a)", name),
+                // The reading half, each against a descriptor nothing has
+                // open, which reads as end of file and touches no file.
+                "sscanf" => "$sscanf(\"1\", \"%d\", a)".to_string(),
+                "fscanf" => "$fscanf(32'h8000_0009, \"%d\", a)".to_string(),
+                "fgets" | "ungetc" => format!("${}(a, 32'h8000_0009)", name),
+                "fseek" => "$fseek(32'h8000_0009, 0, 0)".to_string(),
                 other => format!("${}(a)", other),
             };
             eval(&parse(&source), &store)

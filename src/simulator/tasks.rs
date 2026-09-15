@@ -20,7 +20,7 @@
 //! `$fdisplayh` is "to a descriptor, one line, hex by default".
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
@@ -518,9 +518,6 @@ pub struct TaskContext {
     monitor: Option<Monitor>,
     /// How `%t` renders.
     time_format: TimeFormat,
-    /// Directories a relative `$readmemh` path is looked for in, after the
-    /// process working directory. See [`TaskContext::resolve_read_path`].
-    search_paths: Vec<PathBuf>,
 }
 
 impl TaskContext {
@@ -538,15 +535,8 @@ impl TaskContext {
         self.finished
     }
 
-    /// Adds a directory to look in for a relative `$readmemh` / `$readmemb`
-    /// path. See [`TaskContext::resolve_read_path`].
-    pub fn add_search_path(&mut self, directory: impl Into<PathBuf>) {
-        self.search_paths.push(directory.into());
-    }
-
     /// Forgets everything one elaboration produced — the output, the `$finish`
-    /// mark, the deferred queues and the `%t` format — while keeping the search
-    /// path, which belongs to the caller rather than to the design.
+    /// mark, the deferred queues and the `%t` format.
     pub fn reset(&mut self) {
         self.output = Output::default();
         self.finished = false;
@@ -1119,7 +1109,7 @@ impl TaskContext {
             None => last,
         };
 
-        let path = self.resolve_read_path(&name)?;
+        let path = Self::resolve_read_path(store, &name)?;
         let text = fs::read_to_string(&path).map_err(|error| {
             SimulationError::SystemTask(format!(
                 "`$readmem…` could not read `{}`: {}",
@@ -1229,26 +1219,20 @@ impl TaskContext {
     /// uses. Finding nothing is an error naming the file and everywhere it was
     /// looked for — never an empty memory, which would leave a design reading
     /// `x` and looking exactly like one that simply ran.
-    fn resolve_read_path(&self, name: &str) -> Result<PathBuf, SimulationError> {
-        let path = Path::new(name);
-        if path.is_file() {
-            return Ok(path.to_path_buf());
+    ///
+    /// The list lives on the [`StateStore`] because `$fopen(name, "r")` is a
+    /// system *function* and has to search the same directories from `eval`.
+    fn resolve_read_path(store: &StateStore, name: &str) -> Result<PathBuf, SimulationError> {
+        if let Some(path) = store.resolve_read_path(name) {
+            return Ok(path);
         }
-        if !path.is_absolute() {
-            for directory in &self.search_paths {
-                let candidate = directory.join(path);
-                if candidate.is_file() {
-                    return Ok(candidate);
-                }
-            }
-        }
-
         let mut tried = vec![match std::env::current_dir() {
             Ok(directory) => directory.display().to_string(),
             Err(_) => "the working directory".to_string(),
         }];
         tried.extend(
-            self.search_paths
+            store
+                .search_paths()
                 .iter()
                 .map(|directory| directory.display().to_string()),
         );
