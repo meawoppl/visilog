@@ -5240,6 +5240,86 @@ mod tests {
         directory
     }
 
+    /// IEEE 1364-2005's load direction, measured against iverilog 12.0 on a
+    /// three-word file into memories declared *descending*:
+    ///
+    /// - with no range the load starts at the **lowest** address and runs
+    ///   upward, so `down[0]` is the first word — 1364-2001 would have
+    ///   started at `down[7]`;
+    /// - with only a start it still runs upward from there;
+    /// - with both bounds the design's direction wins: `5, 3` fills
+    ///   `both[5]`, `both[4]`, `both[3]`.
+    #[test]
+    fn test_readmemh_follows_the_1364_2005_load_direction() {
+        let directory = scratch_directory("readmem2005");
+        fs::write(directory.join("three.hex"), "11 22 33\n").expect("data file should be writable");
+
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module loader();
+                reg [7:0] down [7:0];
+                reg [7:0] from2 [7:0];
+                reg [7:0] both [7:0];
+                initial begin
+                    $readmemh("three.hex", down);
+                    $readmemh("three.hex", from2, 2);
+                    $readmemh("three.hex", both, 5, 3);
+                    $display("%h %h %h %h", down[0], down[1], down[2], down[7]);
+                    $display("%h %h %h", from2[2], from2[3], from2[4]);
+                    $display("%h %h %h", both[5], both[4], both[3]);
+                end
+            endmodule
+        "#,
+        )
+        .expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = Simulator::new(module);
+        simulator.add_search_path(directory);
+        simulator.setup().expect("design should run");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["11 22 33 xx", "11 22 33", "11 22 33"]
+        );
+    }
+
+    /// `$writememh` follows the same 1364-2005 rule as `$readmemh`: defaulted
+    /// bounds write the lowest address first, a start with no finish writes
+    /// upward, and two explicit bounds write in the direction given. iverilog
+    /// 12.0 writes `00 11 22 33`, `11 22 33` and `33 22 11` for these three —
+    /// after an address comment this does not emit, which a reader skips.
+    #[test]
+    fn test_writememh_follows_the_1364_2005_direction() {
+        let directory = scratch_directory("writemem2005");
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module writer();
+                reg [7:0] down [3:0];
+                integer k;
+                initial begin
+                    for (k = 0; k < 4; k = k + 1) down[k] = 8'h11 * k;
+                    $writememh("defaults.hex", down);
+                    $writememh("from1.hex", down, 1);
+                    $writememh("both.hex", down, 3, 1);
+                end
+            endmodule
+        "#,
+        )
+        .expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = Simulator::new(module);
+        simulator.set_output_directory(directory.clone());
+        simulator.setup().expect("design should run");
+
+        let written =
+            |name: &str| fs::read_to_string(directory.join(name)).expect("file should be written");
+        assert_eq!(written("defaults.hex"), "00\n11\n22\n33\n");
+        assert_eq!(written("from1.hex"), "11\n22\n33\n");
+        assert_eq!(written("both.hex"), "33\n22\n11\n");
+    }
+
     #[test]
     fn test_readmemh_loads_a_memory_including_comments_and_an_address_jump() {
         let directory = scratch_directory("readmemh");

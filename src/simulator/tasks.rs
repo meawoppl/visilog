@@ -1231,10 +1231,15 @@ impl TaskContext {
     /// `$readmemh(file, memory)` / `$readmemb(file, memory[, start[, finish]])`
     /// — fills a memory from a text file of whitespace-separated words.
     ///
-    /// The load runs from `start` towards `finish`, which default to the first
-    /// and last addresses the memory declares, so a `mem [15:0]` loads
-    /// downwards exactly as its declaration reads. An `@<hex>` entry in the
-    /// file moves the load address without ending the load.
+    /// The load runs from `start` towards `finish`. A defaulted `start` is the
+    /// memory's **lowest** address and a defaulted `finish` its **highest**, so
+    /// the load runs upward whichever way round the memory was declared —
+    /// `mem [7:0]` fills `mem[0]` first. That is IEEE 1364-2005, which reversed
+    /// the 1364-2001 rule of following the declaration; iverilog 12.0 warns
+    /// about exactly this and defaults to 2005, and the corpus is a 2005 suite.
+    /// Explicit bounds still set the direction: `$readmemh(f, mem, 5, 3)` loads
+    /// `mem[5]`, `mem[4]`, `mem[3]`. An `@<hex>` entry in the file moves the
+    /// load address without ending the load.
     fn read_memory(
         &mut self,
         call: &TaskCall,
@@ -1255,10 +1260,11 @@ impl TaskContext {
             .memory(&memory_name)
             .ok_or_else(|| not_a_memory(&memory_name))?;
         let (first, last) = memory.addresses();
+        let (lowest, highest) = (first.min(last), first.max(last));
 
         let start = match arguments.get(2) {
             Some(argument) => self.address_argument(argument, store, "start")?,
-            None => first,
+            None => lowest,
         };
         // Whether the design said where to stop decides what a file with more
         // words in it than that means. An explicit finish is an *instruction*
@@ -1267,9 +1273,11 @@ impl TaskContext {
         // that came from the declaration is a *description* of the memory, and
         // a file too big for it is a real mismatch between the two.
         let bounded = arguments.len() > 3;
+        // With a start but no finish the load still runs *upward*, to the
+        // highest address — not towards whichever end was declared last.
         let finish = match arguments.get(3) {
             Some(argument) => self.address_argument(argument, store, "finish")?,
-            None => last,
+            None => highest,
         };
 
         let path = Self::resolve_read_path(store, &name)?;
@@ -1309,6 +1317,12 @@ impl TaskContext {
     /// `$writememh(file, memory[, start[, finish]])` — the reverse of
     /// [`TaskContext::read_memory`], one word per line.
     ///
+    /// Its bounds default by the same IEEE 1364-2005 rule the load follows —
+    /// lowest address first, whichever way round the memory was declared, and
+    /// upward from a `start` given alone — while two explicit bounds write in
+    /// the direction they name. iverilog 12.0 writes a descending `mem [3:0]`
+    /// as `mem[0]` first.
+    ///
     /// The path is taken as written: a file being created cannot be searched
     /// for, so the search path plays no part and a relative name lands under
     /// the process working directory.
@@ -1332,13 +1346,14 @@ impl TaskContext {
             .memory(&memory_name)
             .ok_or_else(|| not_a_memory(&memory_name))?;
         let (first, last) = memory.addresses();
+        let (lowest, highest) = (first.min(last), first.max(last));
         let start = match arguments.get(2) {
             Some(argument) => self.address_argument(argument, store, "start")?,
-            None => first,
+            None => lowest,
         };
         let finish = match arguments.get(3) {
             Some(argument) => self.address_argument(argument, store, "finish")?,
-            None => last,
+            None => highest,
         };
 
         let step: i64 = if start <= finish { 1 } else { -1 };

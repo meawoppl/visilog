@@ -212,11 +212,13 @@ StateStore`.** A system task used to be an output and nothing else; loading a
 memory is the one that is not, and widening the one signature was the whole
 structural change. The file format is whitespace-separated words with `//` and
 `/* */` comments and `@<hex>` address jumps, and the load runs from `start`
-towards `finish` — which default to the memory's *declared* first and last
-addresses, so `mem [7:0]` loads downwards exactly as its declaration reads. **That default
-is wrong against iverilog 12.0**, which takes the 1364-2005 reading — an unranged load
-always runs from the *lowest* address up — and corpus `writememh2` / `writememb2` fail on
-exactly that once they can read back the file they wrote.
+towards `finish`. **A defaulted `start` is the lowest address and a defaulted `finish` the
+highest**, so an unranged load runs *upward* whichever way round the memory was declared —
+`mem [7:0]` fills `mem[0]` first. That is IEEE 1364-2005, which reversed the 1364-2001 rule
+of following the declaration; iverilog 12.0 warns about exactly this and takes the 2005
+reading, and the corpus is a 2005 suite. A `start` with no `finish` also runs upward, while
+two explicit bounds still set the direction — `$readmemh(f, mem, 5, 3)` loads `mem[5]`,
+`mem[4]`, `mem[3]` (all three measured against iverilog).
 Whether the design named a `finish` decides what a file with more words than
 that means: an explicit one is an instruction to stop there (`$readmemh(f, mem,
 0, 3)` against an eight word file loads four and leaves the rest alone, which is
