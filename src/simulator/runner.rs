@@ -119,6 +119,16 @@ pub enum SimulationError {
     /// take: `and (out);` has nothing to read, `bufif1 (out, in);` has no
     /// control.
     GateTerminals { gate: &'static str, found: usize },
+    /// A connection to an arrayed module instance that is neither as wide as
+    /// one element's port — shared by every element — nor exactly `count`
+    /// times that, one slice per element.
+    ArrayConnectionWidth {
+        instance: String,
+        port: String,
+        port_width: usize,
+        count: usize,
+        found: usize,
+    },
     /// A terminal of an *arrayed* gate instance that is neither one bit wide —
     /// shared by every instance — nor one bit per instance.
     GateArrayTerminal {
@@ -245,6 +255,25 @@ impl fmt::Display for SimulationError {
                 f,
                 "gate `{}` cannot be instantiated with {} terminals",
                 gate, found
+            ),
+            SimulationError::ArrayConnectionWidth {
+                instance,
+                port,
+                port_width,
+                count,
+                found,
+            } => write!(
+                f,
+                "port `{}` of instance array `{}` is {} bits wide, so a connection to \
+                 it must be {} bits (shared) or {} bits (one slice for each of {}); \
+                 this one is {}",
+                port,
+                instance,
+                port_width,
+                port_width,
+                port_width * count,
+                count,
+                found
             ),
             SimulationError::GateArrayTerminal {
                 gate,
@@ -2716,6 +2745,51 @@ mod tests {
         simulator.advance(3).expect("time should advance");
 
         assert_eq!(simulator.output().text(), "x x\n");
+    }
+
+    /// An array of instances: a connection as wide as the port reaches every
+    /// element, and one `count` times as wide is sliced — the array's *right*
+    /// index taking the least significant slice. Elements are named `u[0]`,
+    /// `p[1]` and reached that way.
+    ///
+    /// iverilog 12.0 prints `o=0101 y=1101` and `u[0].o=1 p[1].y=11 p[0].a=01`.
+    #[test]
+    fn test_instance_arrays_slice_their_connections() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module inv(output o, input i);
+              assign o = ~i;
+            endmodule
+            module pair(output [1:0] y, input [1:0] a, input en);
+              assign y = en ? a : 2'b00;
+            endmodule
+            module tb;
+              reg [3:0] i;
+              wire [3:0] o;
+              reg [3:0] a;
+              reg en;
+              wire [3:0] y;
+              inv u[3:0] (o, i);
+              pair p[1:0] (.y(y), .a(a), .en(en));
+              initial begin
+                i = 4'b1010; a = 4'b1101; en = 1;
+                #1 $display("o=%b y=%b", o, y);
+                #1 $display("u[0].o=%b p[1].y=%b p[0].a=%b", u[0].o, p[1].y, p[0].a);
+              end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(3).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().text(),
+            "o=0101 y=1101\nu[0].o=1 p[1].y=11 p[0].a=01\n"
+        );
     }
 
     #[test]

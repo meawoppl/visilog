@@ -450,6 +450,9 @@ fn param_block(input: &str) -> IResult<&str, ModuleInitArguments> {
 pub struct ModuleInstantiation {
     pub module_name: Identifier,
     pub instance_name: Identifier,
+    /// `inv u[3:0] (o, i);` — an array of instances, one per index. `None` for
+    /// an ordinary instantiation.
+    pub range: Option<Range>,
     pub parameters: ModuleInitArguments, // NB(meawoppl) parameters have tighter bounds than arguments (we don't check)
     pub arguments: ModuleInitArguments,
 }
@@ -470,6 +473,8 @@ pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, Module
 
     let (input, instance_name) = identifier(input)?;
     let (input, _) = ws_and_comments(input)?;
+    let (input, range) = opt(range)(input)?;
+    let (input, _) = ws_and_comments(input)?;
 
     let (input, arguments) = argument_block(input)?;
 
@@ -480,6 +485,7 @@ pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, Module
         ModuleInstantiation {
             module_name,
             instance_name,
+            range,
             parameters,
             arguments,
         },
@@ -1230,5 +1236,20 @@ mod tests {
             Err(PortReconciliationError::MixedStyles)
         );
         assert!(parse_module_declaration("module m(input a); input a; endmodule").is_err());
+    }
+
+    /// `inv u[3:0] (o, i);` — a range after the instance name makes an array
+    /// of instances; without one it is an ordinary instantiation.
+    #[test]
+    fn test_instance_arrays_parse() {
+        let arrayed = assert_parses(parse_module_instantiation_statement, "inv u[3:0] (o, i);");
+        assert!(arrayed.range.is_some());
+        let spaced = assert_parses(
+            parse_module_instantiation_statement,
+            "prim U [wid-1:0] (Q, D, C);",
+        );
+        assert!(spaced.range.is_some());
+        let single = assert_parses(parse_module_instantiation_statement, "inv u (o, i);");
+        assert!(single.range.is_none());
     }
 }
