@@ -114,10 +114,6 @@ pub enum SimulationError {
     RecursiveTask(String),
     /// An `assign` whose left hand side is not something that can be driven.
     UnsupportedTarget(String),
-    /// An instance of a *sequential* user-defined primitive. Its rows ask
-    /// about the previous value of an input and its output is a register the
-    /// primitive owns, neither of which a continuous driver is handed.
-    SequentialPrimitive(String),
     /// A gate primitive instantiated with a terminal count its type cannot
     /// take: `and (out);` has nothing to read, `bufif1 (out, in);` has no
     /// control.
@@ -174,11 +170,6 @@ impl fmt::Display for SimulationError {
             }
             SimulationError::SystemTask(problem) => write!(f, "{}", problem),
             SimulationError::UnknownModule(name) => write!(f, "no module named `{}`", name),
-            SimulationError::SequentialPrimitive(name) => write!(
-                f,
-                "`{}` is a sequential user-defined primitive, which is not supported",
-                name
-            ),
             SimulationError::UnknownTask(name) => write!(f, "no task named `{}`", name),
             SimulationError::TaskArity {
                 name,
