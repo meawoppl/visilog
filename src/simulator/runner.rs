@@ -568,6 +568,12 @@ impl Simulator {
             }
         }
 
+        // Declaring every signal journalled it, and a declaration is not a
+        // change anything should wake on. Clearing here leaves the journal
+        // holding only what the drivers go on to do to the nets — which *is*
+        // an event, and the first `settle` has to be able to see it.
+        self.state.clear_changes();
+
         // A delayed `assign` is driving from the first instant, and what it is
         // driving before its first transaction lands is `x` — not the `z` of a
         // net nothing drives. One pass puts that on the net and puts the first
@@ -937,6 +943,19 @@ impl Simulator {
         if !self.settled_once {
             self.settled_once = true;
             let _ = self.propagate();
+            // Before simulation starts a *driven* net holds `x`, so its
+            // drivers' first values are events only when they differ from `x`.
+            // A primitive whose `initial` is 0 wakes `always @(q)`; one with no
+            // `initial`, whose output is simply `x`, does not — iverilog puts
+            // that `x` on the net "before the start of simulation". Corpus
+            // `br_ml20190806a` and `br_ml20190806b` pin the two halves. A net
+            // nothing drives is never written, so it still reads `z`.
+            self.state.treat_undriven_start_as_unknown();
+            // The loop below starts every timestamp by clearing the journal,
+            // so without settling here that first change would be dropped
+            // unseen. Its result is dropped for the reason the pass above
+            // drops its own.
+            let _ = self.settle();
         }
 
         let target = self.now + duration;
@@ -2623,6 +2642,80 @@ mod tests {
         simulator.advance(3).expect("time should advance");
 
         assert_eq!(simulator.output().text(), "pass=1 v=0100\n");
+    }
+
+    /// A net taking its first driven value at time zero is an **event**, so an
+    /// edge-triggered block wakes on it. Here the only thing that ever moves is
+    /// a primitive's output settling to its `initial` 0 — `e` and `d` are never
+    /// driven — and `always @(q)` has to see that.
+    ///
+    /// This is corpus `br_ml20190806a`, which iverilog 12.0 passes: `r` is 0 at
+    /// `#1`, where it stayed `x` while the first change was dropped unseen.
+    #[test]
+    fn test_a_nets_first_driven_value_is_an_event() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            primitive latch(q, e, d);
+              output q; input e; input d; reg q;
+              initial q = 1'b0;
+              table
+                1 1 : ? : 1 ;
+                1 0 : ? : 0 ;
+                0 ? : ? : - ;
+              endtable
+            endprimitive
+            module test();
+              wire q;
+              reg e, d, r;
+              latch latch(q, e, d);
+              always @(q) r = q;
+              initial begin #1; $display("q=%b r=%b", q, r); end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "test");
+        simulator.setup().expect("should set up");
+        simulator.advance(3).expect("time should advance");
+
+        assert_eq!(simulator.output().text(), "q=0 r=0\n");
+    }
+
+    /// The other half of the rule: a net whose driver starts at `x` gets that
+    /// `x` silently, before simulation starts, so `always @(q)` does **not**
+    /// wake. Same latch as above with no `initial`; iverilog 12.0 prints
+    /// `x x` (corpus `br_ml20190806b`).
+    #[test]
+    fn test_a_nets_first_value_of_x_is_not_an_event() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            primitive latch(q, e, d);
+              output q; input e; input d; reg q;
+              table
+                1 1 : ? : 1 ;
+                1 0 : ? : 0 ;
+                0 ? : ? : - ;
+              endtable
+            endprimitive
+            module test();
+              wire q;
+              reg e, d, r;
+              latch latch(q, e, d);
+              always @(q) r = 1;
+              initial begin #1; $display("%b %b", q, r); end
+            endmodule
+        "#,
+        )
+        .expect("should parse")
+        .1;
+
+        let mut simulator = Simulator::with_modules(modules, "test");
+        simulator.setup().expect("should set up");
+        simulator.advance(3).expect("time should advance");
+
+        assert_eq!(simulator.output().text(), "x x\n");
     }
 
     #[test]

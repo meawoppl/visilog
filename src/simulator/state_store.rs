@@ -1240,6 +1240,21 @@ impl StateStore {
         changes
     }
 
+    /// Rewrites every journalled starting value that was entirely `z` as `x`.
+    ///
+    /// This is for the one moment before simulation starts, when a *driven*
+    /// net holds `x` rather than the `z` of a net nothing drives. Its drivers'
+    /// first values are then events only when they differ from `x` — which is
+    /// the rule iverilog follows, and which a `z` baseline gets wrong in the
+    /// direction of waking blocks on a value nobody set.
+    pub fn treat_undriven_start_as_unknown(&mut self) {
+        for previous in self.journal.values_mut().flatten() {
+            if *previous == Register::high_impedance(previous.width()) {
+                *previous = Register::unknown(previous.width());
+            }
+        }
+    }
+
     /// Forgets every recorded change, making now the point later changes are
     /// measured against.
     pub fn clear_changes(&mut self) {
