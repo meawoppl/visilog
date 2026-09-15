@@ -1754,11 +1754,171 @@ impl<'m> Elaborator<'m> {
                 });
             }
             ModuleStatement::ModuleInstantiation(instantiation) => {
-                self.instantiate(instantiation, scope)?
+                self.instantiate_each(instantiation, scope)?
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Instantiates one module, or — for `inv u[3:0] (o, i);` — one per index
+    /// of an instance array, named `u[3]`, `u[2]`, … and each handed its own
+    /// slice of any connection wider than one instance's port.
+    ///
+    /// Expanding here, before [`instantiate`](Elaborator::instantiate), is what
+    /// lets an array of modules and an array of UDPs share one path: each
+    /// element is an ordinary instantiation from then on.
+    fn instantiate_each(
+        &mut self,
+        instantiation: &ModuleInstantiation,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        let Some(range) = &instantiation.range else {
+            return self.instantiate(instantiation, scope);
+        };
+        let (left, right) = self.resolve_range(range, scope)?;
+        let count = range_width((left, right));
+        let modules = self.modules;
+        let wanted = &instantiation.module_name.name;
+        let child = modules
+            .iter()
+            .find(|module| &module.identifier.name == wanted)
+            .ok_or_else(|| SimulationError::UnknownModule(wanted.clone()))?;
+        for position in 0..count {
+            // The *right* index takes the least significant slice, which is
+            // what iverilog does: `inv u[3:0] (o, i)` gives `u[0]` bit 0 of `i`,
+            // and `u[0:3]` would give it to `u[3]`.
+            let index = if left >= right {
+                right + position as i64
+            } else {
+                right - position as i64
+            };
+            let arguments = match &instantiation.arguments {
+                ModuleInitArguments::NoArgs => ModuleInitArguments::NoArgs,
+                ModuleInitArguments::Positional(connections) => {
+                    let mut sliced = Vec::with_capacity(connections.len());
+                    for (port, connection) in child.ports.iter().zip(connections) {
+                        sliced.push(match connection {
+                            Some(connection) => Some(self.array_connection(
+                                instantiation,
+                                port,
+                                connection,
+                                position,
+                                count,
+                                scope,
+                            )?),
+                            None => None,
+                        });
+                    }
+                    ModuleInitArguments::Positional(sliced)
+                }
+                ModuleInitArguments::Keyword(connections) => {
+                    let mut sliced = HashMap::with_capacity(connections.len());
+                    for (name, connection) in connections {
+                        // A name no port has is reported by `instantiate`,
+                        // which sees it next; it is passed through unsliced.
+                        let expression = match child
+                            .ports
+                            .iter()
+                            .find(|port| port.identifier.name == name.name)
+                        {
+                            Some(port) => self.array_connection(
+                                instantiation,
+                                port,
+                                connection,
+                                position,
+                                count,
+                                scope,
+                            )?,
+                            None => connection.clone(),
+                        };
+                        sliced.insert(name.clone(), expression);
+                    }
+                    ModuleInitArguments::Keyword(sliced)
+                }
+            };
+            let element = ModuleInstantiation {
+                module_name: instantiation.module_name.clone(),
+                instance_name: Identifier::new(format!(
+                    "{}[{}]",
+                    instantiation.instance_name.name, index
+                )),
+                range: None,
+                parameters: instantiation.parameters.clone(),
+                arguments,
+            };
+            self.instantiate(&element, scope)?;
+        }
+        Ok(())
+    }
+
+    /// One element's share of a connection to an arrayed instance.
+    ///
+    /// A connection exactly as wide as the port reaches every element — which
+    /// is how one clock drives a whole array — and one exactly `count` times as
+    /// wide is sliced, a port's width apiece from the least significant end.
+    /// Anything else is a named error rather than a guessed wiring.
+    ///
+    /// The slice is built on the parent's *local* name, because
+    /// [`instantiate`](Elaborator::instantiate) renames every connection itself
+    /// and a slice of an already-renamed one would be qualified twice. Only
+    /// the width is measured on a renamed copy, since that is what the store
+    /// can answer.
+    fn array_connection(
+        &self,
+        instantiation: &ModuleInstantiation,
+        port: &Port,
+        connection: &Expression,
+        position: usize,
+        count: usize,
+        scope: &Scope,
+    ) -> Result<Expression, SimulationError> {
+        // A port whose width is made of the child's parameters has no width
+        // until the child is being elaborated, which is after this decision.
+        let Range::Constant(port_msb, port_lsb) = port.range else {
+            return Err(SimulationError::Unsupported(
+                "an instance array whose port width depends on a parameter",
+            ));
+        };
+        let port_width = range_width((port_msb, port_lsb));
+        let found = expression_width(&renamed(connection, scope), &self.out.state);
+        if found == port_width {
+            return Ok(connection.clone());
+        }
+        let mismatch = || SimulationError::ArrayConnectionWidth {
+            instance: instantiation.instance_name.name.clone(),
+            port: port.identifier.name.clone(),
+            port_width,
+            count,
+            found,
+        };
+        if found != port_width * count {
+            return Err(mismatch());
+        }
+        // Only a plain signal can be sliced by index: a slice of
+        // `{16'b0, data}` is not something a select can name.
+        let Some(id) = plain_identifier(connection) else {
+            return Err(mismatch());
+        };
+        let Some(signal) = self.out.state.get_signal(&scope.resolve(&id.name)) else {
+            return Err(SimulationError::UnknownSignal(id.name.clone()));
+        };
+        let (msb, lsb) = signal.range();
+        let offset = (position * port_width) as i64;
+        let span = port_width as i64 - 1;
+        // Walked from the least significant end, so which way round the parent
+        // declared its vector cannot matter.
+        let (high, low) = if msb >= lsb {
+            (lsb + offset + span, lsb + offset)
+        } else {
+            (lsb - offset - span, lsb - offset)
+        };
+        let bound = |index: i64| Box::new(Expression::Constant(VerilogConstant::from_int(index)));
+        Ok(if port_width == 1 {
+            Expression::BitSelect(id.clone(), bound(low))
+        } else {
+            Expression::PartSelect(id.clone(), bound(high), bound(low))
+        })
     }
 
     fn instantiate(
