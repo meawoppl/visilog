@@ -19,17 +19,20 @@
 //! no format specifier prints in, and what is left is the task itself. So
 //! `$fdisplayh` is "to a descriptor, one line, hex by default".
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
+use crate::parsers::preprocessor::Timescale;
 use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, string_bits, SYSTEM_FUNCTIONS};
 use crate::simulator::exec::drive;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+use crate::simulator::vcd::{Control, DumpTarget, VcdDump};
 
 /// The descriptor a task outside the `$f…` family writes to: bit 0 of a
 /// multi-channel mask, which is standard output.
@@ -192,6 +195,17 @@ pub enum SystemTask {
     FlushFile,
     /// `$timeformat` — how `%t` renders a time value from here on.
     TimeFormat,
+    /// `$dumpfile` — names the waveform file the dump is written to.
+    DumpFile,
+    /// `$dumpvars` — records what to dump, and how far down a scope to go.
+    DumpVars,
+    /// `$dumpon` / `$dumpoff` / `$dumpall` — suspend, resume, or write a full
+    /// snapshot now.
+    Dump(Control),
+    /// `$dumpflush` — pushes what has been written out to the file.
+    DumpFlush,
+    /// `$dumplimit` — stops the dump once the file reaches this many bytes.
+    DumpLimit,
     /// End the simulation.
     Finish,
     /// The current simulated time. Meaningful as an argument; as a statement of
@@ -334,6 +348,16 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
         // `$fflush` ends in an `h` that is not a radix, the same way
         // `$monitoroff` ends in an `f` that is not the descriptor prefix.
         "fflush" => return Ok(SystemTask::FlushFile),
+        // The waveform family is spelled out rather than split: `$dumpflush`
+        // ends in an `h` that is not a radix and `$dumpvars` in an `s` that is
+        // not one either, so there is nothing for the split to find.
+        "dumpfile" => return Ok(SystemTask::DumpFile),
+        "dumpvars" => return Ok(SystemTask::DumpVars),
+        "dumpon" => return Ok(SystemTask::Dump(Control::On)),
+        "dumpoff" => return Ok(SystemTask::Dump(Control::Off)),
+        "dumpall" => return Ok(SystemTask::Dump(Control::All)),
+        "dumpflush" => return Ok(SystemTask::DumpFlush),
+        "dumplimit" => return Ok(SystemTask::DumpLimit),
         _ => {}
     }
 
@@ -518,6 +542,22 @@ pub struct TaskContext {
     monitor: Option<Monitor>,
     /// How `%t` renders.
     time_format: TimeFormat,
+    /// The design's waveform dump, once `$dumpfile` or `$dumpvars` has asked
+    /// for one. `None` is a design that dumps nothing, which is what keeps the
+    /// dumper off its settle loop entirely.
+    dump: Option<VcdDump>,
+    /// The name of the top module, which is the root scope a `$dumpvars`
+    /// argument is resolved against and the outermost `$scope` in the header.
+    /// The flat store carries no prefix for it, so it has to be told.
+    top: String,
+    /// The `` `timescale `` the front end recorded, which is what `$timescale`
+    /// says. It belongs to the *source* rather than to an elaboration, and
+    /// [`Simulator::setup`](crate::simulator::runner::Simulator::setup) hands
+    /// it over again after every [`TaskContext::reset`].
+    timescale: Option<Timescale>,
+    /// Qualified port name → the store entry it was aliased onto, which is the
+    /// only record that an instance's port has a name of its own.
+    aliases: HashMap<String, String>,
 }
 
 impl TaskContext {
@@ -535,6 +575,51 @@ impl TaskContext {
         self.finished
     }
 
+    /// Records what the design is called and what a tick of its clock is —
+    /// the two things a waveform header states that no task argument carries.
+    pub fn describe_design(&mut self, top: impl Into<String>, timescale: Option<Timescale>) {
+        self.top = top.into();
+        self.timescale = timescale;
+    }
+
+    /// The ports that are another signal under a second name, which a
+    /// waveform declares beside the entry they share. See
+    /// [`VcdDump::add`].
+    pub fn name_aliases(&mut self, aliases: HashMap<String, String>) {
+        self.aliases = aliases;
+    }
+
+    /// Whether anything is being recorded, which is the question the settle
+    /// loop asks before it hands the change journal over.
+    pub fn is_dumping(&self) -> bool {
+        self.dump.as_ref().is_some_and(VcdDump::is_active)
+    }
+
+    /// Hands the names written since the last round to the dump. See
+    /// [`VcdDump::note_changes`].
+    pub fn note_changes<'a>(&mut self, names: impl Iterator<Item = &'a str>) {
+        if let Some(dump) = &mut self.dump {
+            dump.note_changes(names);
+        }
+    }
+
+    /// Pushes what the dump has written out to its file: `$dumpflush`, and
+    /// the end of every [`Simulator::advance`](crate::simulator::runner::Simulator::advance),
+    /// so a caller that reads the waveform after a run reads all of it.
+    pub fn flush_dump_file(&self, store: &StateStore) {
+        if let Some(dump) = &self.dump {
+            dump.flush_file(store);
+        }
+    }
+
+    /// Writes the final `#<time>` and pushes the file out, which is what a
+    /// design reaching `$finish` owes its waveform.
+    pub fn close_dump(&mut self, store: &StateStore, time: i64) {
+        if let Some(dump) = &mut self.dump {
+            dump.close(store, time);
+        }
+    }
+
     /// Forgets everything one elaboration produced — the output, the `$finish`
     /// mark, the deferred queues and the `%t` format.
     pub fn reset(&mut self) {
@@ -543,6 +628,7 @@ impl TaskContext {
         self.strobes.clear();
         self.monitor = None;
         self.time_format = TimeFormat::default();
+        self.dump = None;
     }
 
     /// Whether anything is owed to the end of the current timestep.
@@ -551,7 +637,7 @@ impl TaskContext {
     /// asks once per timestep and `poke` once per call, so this sits on the hot
     /// path: a design that uses neither task pays a load and a branch.
     pub fn has_deferred(&self) -> bool {
-        !self.strobes.is_empty() || self.monitor.is_some()
+        !self.strobes.is_empty() || self.monitor.is_some() || self.dump.is_some()
     }
 
     /// Runs what the current timestep deferred: every `$strobe` made in it, in
@@ -574,6 +660,7 @@ impl TaskContext {
         // Taking the monitor out keeps `self` free to print with; nothing
         // between here and putting it back can arm a different one.
         let Some(mut monitor) = self.monitor.take() else {
+            self.flush_dump(store);
             return Ok(());
         };
         if monitor.enabled {
@@ -592,7 +679,66 @@ impl TaskContext {
             }
         }
         self.monitor = Some(monitor);
+        self.flush_dump(store);
         Ok(())
+    }
+
+    /// Writes the waveform section this timestep owes, and whatever the dump
+    /// itself has to say about doing so.
+    fn flush_dump(&mut self, store: &StateStore) {
+        let Some(mut dump) = self.dump.take() else {
+            return;
+        };
+        let printed = dump.flush(store, store.time());
+        self.dump = Some(dump);
+        self.output.push(&printed);
+    }
+
+    /// The design's dump, started if this is the first task to ask for one.
+    fn dump_state(&mut self) -> &mut VcdDump {
+        let timescale = self.timescale;
+        self.dump.get_or_insert_with(|| VcdDump::new(timescale))
+    }
+
+    /// `$dumpvars`, `$dumpvars(levels)` and `$dumpvars(levels, scope, …)`.
+    ///
+    /// The file is opened here rather than at the end of the timestep, because
+    /// iverilog's `VCD info:` line lands before whatever the rest of the block
+    /// prints. The *header* still waits: a second `$dumpvars` in the same
+    /// timestep may add more variables to declare.
+    fn dump_vars(
+        &mut self,
+        call: &TaskCall,
+        store: &mut StateStore,
+    ) -> Result<(), SimulationError> {
+        let levels = match call.arguments.first() {
+            Some(argument) => self.field_argument(argument, store, "`$dumpvars`'s level")?,
+            None => 0,
+        };
+        let targets = call
+            .arguments
+            .iter()
+            .skip(1)
+            .map(|argument| dump_target(argument, store))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let top = self.top.clone();
+        let aliases = self.aliases.clone();
+        // A `$dumpvars` after the header has been written is too late to add
+        // anything to it, which is what iverilog reports and carries on from.
+        if self.dump_state().is_started() {
+            let time = store.time();
+            self.output.push(&format!(
+                "VCD warning: $dumpvars ignored, previously called at simtime {}\n",
+                time
+            ));
+            return Ok(());
+        }
+        let opened = self.dump_state().open(store);
+        self.output.push(&opened);
+        self.dump_state()
+            .add(levels, &targets, &top, &aliases, store)
+            .map_err(|detail| SimulationError::SystemTask(format!("`$dumpvars`: {}", detail)))
     }
 
     /// Carries out one call, appending whatever it prints to the output.
@@ -641,6 +787,23 @@ impl TaskContext {
             SystemTask::ReadMemory(radix) => self.read_memory(call, radix, store)?,
             SystemTask::WriteMemory(radix) => self.write_memory(call, radix, store)?,
             SystemTask::TimeFormat => self.set_time_format(&call.arguments, store)?,
+            SystemTask::DumpFile => {
+                let argument = call.arguments.first().ok_or_else(|| {
+                    SimulationError::SystemTask("`$dumpfile` needs a file name".to_string())
+                })?;
+                let name = self.text_argument(argument, store)?;
+                self.dump_state().set_file(&name);
+            }
+            SystemTask::DumpVars => self.dump_vars(call, store)?,
+            SystemTask::Dump(control) => self.dump_state().control(control),
+            SystemTask::DumpFlush => self.flush_dump_file(store),
+            SystemTask::DumpLimit => {
+                let argument = call.arguments.first().ok_or_else(|| {
+                    SimulationError::SystemTask("`$dumplimit` needs a size".to_string())
+                })?;
+                let size = self.integer_argument(argument, store, "`$dumplimit`'s size")?;
+                self.dump_state().set_limit(size.max(0) as u64);
+            }
             // `$finish` takes an optional diagnostic level, which says how much
             // the simulator should report about itself on the way out.
             SystemTask::Finish => self.finished = true,
@@ -1342,6 +1505,31 @@ fn integer_value(register: &Register) -> Option<i128> {
         register
             .to_u128()
             .and_then(|value| i128::try_from(value).ok())
+    }
+}
+
+/// What one `$dumpvars` argument names.
+///
+/// It is a *name*, not a value: `$dumpvars(0, top.u1)` names a scope, which no
+/// expression could evaluate to. A memory word is the one argument that
+/// carries an index, and the index is evaluated because it may be a parameter.
+fn dump_target(argument: &TaskArgument, store: &StateStore) -> Result<DumpTarget, SimulationError> {
+    match argument {
+        TaskArgument::Value(Expression::Identifier(identifier)) => {
+            Ok(DumpTarget::Name(identifier.name.clone()))
+        }
+        TaskArgument::Value(Expression::BitSelect(identifier, index)) => {
+            let address = eval(index, store)?;
+            let address = integer_value(&address).ok_or_else(|| {
+                SimulationError::SystemTask(
+                    "`$dumpvars` needs a known address to dump a memory word".to_string(),
+                )
+            })?;
+            Ok(DumpTarget::Word(identifier.name.clone(), address as i64))
+        }
+        _ => Err(SimulationError::SystemTask(
+            "`$dumpvars` takes a level and then the scopes and variables to dump".to_string(),
+        )),
     }
 }
 

@@ -309,13 +309,24 @@ pub const REAL_RANGE: (i64, i64) = (REAL_WIDTH as i64 - 1, 0);
 pub struct SignalState {
     register: Register,
     range: (i64, i64),
+    /// Whether the declaration was a *net* rather than a variable. Nothing in
+    /// the run loop reads it — an undriven net's `z` is already in the value —
+    /// but a waveform dump has to say `$var wire` where a `reg` says `$var
+    /// reg`, and by then the declaration is long gone. It rides here for the
+    /// same reason signedness does: the declaration is the only thing that
+    /// knows, and it is set once and re-stamped rather than re-derived.
+    net: bool,
 }
 
 impl SignalState {
     /// Wraps a value with the implicit range `(width - 1, 0)`.
     pub fn new(register: Register) -> Self {
         let range = (register.width() as i64 - 1, 0);
-        SignalState { register, range }
+        SignalState {
+            register,
+            range,
+            net: false,
+        }
     }
 
     /// Wraps a value with an explicit `(msb, lsb)` range.
@@ -329,7 +340,23 @@ impl SignalState {
             range,
             register.width()
         );
-        SignalState { register, range }
+        SignalState {
+            register,
+            range,
+            net: false,
+        }
+    }
+
+    /// The same signal, declared as a net rather than as a variable.
+    pub fn as_net(mut self, net: bool) -> Self {
+        self.net = net;
+        self
+    }
+
+    /// Whether the signal was declared as a net — a `wire`, a `tri` or a port
+    /// backed by one.
+    pub fn is_net(&self) -> bool {
+        self.net
     }
 
     /// The same signal, declared signed or unsigned.
@@ -1302,7 +1329,7 @@ impl StateStore {
     /// [`declare`](StateStore::declare) for a signal whose declaration carried
     /// a `signed` qualifier.
     pub fn declare_signed(&mut self, name: impl Into<String>, range: (i64, i64), signed: bool) {
-        self.declare_filled(name, range, signed, Register::unknown);
+        self.declare_filled(name, range, signed, false, Register::unknown);
     }
 
     /// Declares a *net* — a `wire`, `tri` or a port backed by one — which
@@ -1314,7 +1341,7 @@ impl StateStore {
     /// undriven bit of `out` reads `z` where an untouched `reg` reads `x` —
     /// which is what iverilog prints, and what a three-state bus depends on.
     pub fn declare_net(&mut self, name: impl Into<String>, range: (i64, i64), signed: bool) {
-        self.declare_filled(name, range, signed, Register::high_impedance);
+        self.declare_filled(name, range, signed, true, Register::high_impedance);
     }
 
     /// Declares a `real`: sixty-four bits read as a double, starting at `0.0`.
@@ -1345,6 +1372,7 @@ impl StateStore {
         name: impl Into<String>,
         range: (i64, i64),
         signed: bool,
+        net: bool,
         fill: fn(usize) -> Register,
     ) {
         let name = name.into();
@@ -1353,7 +1381,9 @@ impl StateStore {
         let register = fill(range_width(range));
         self.name_to_signal.insert(
             name,
-            SignalState::with_range(register, range).with_signedness(signed),
+            SignalState::with_range(register, range)
+                .with_signedness(signed)
+                .as_net(net),
         );
     }
 
@@ -1477,16 +1507,16 @@ impl StateStore {
         let (register, signed) = self.as_declared(&name, register);
         self.any_signed |= signed;
         self.any_real |= register.is_real();
-        let range = self
-            .name_to_signal
-            .get(&name)
+        let declared = self.name_to_signal.get(&name);
+        let net = declared.is_some_and(SignalState::is_net);
+        let range = declared
             .map(|signal| signal.range())
             .filter(|&range| range_width(range) == register.width());
         let signal = match range {
             Some(range) => SignalState::with_range(register, range),
             None => SignalState::new(register),
         };
-        self.name_to_signal.insert(name, signal);
+        self.name_to_signal.insert(name, signal.as_net(net));
     }
 
     /// Sets a signal's value and declared range in one step.
@@ -1496,8 +1526,20 @@ impl StateStore {
         let (register, signed) = self.as_declared(&name, register);
         self.any_signed |= signed;
         self.any_real |= register.is_real();
-        self.name_to_signal
-            .insert(name, SignalState::with_range(register, range));
+        // Every whole-signal write in the simulator lands here, so the entry
+        // is overwritten in place: one lookup finds it, keeps its declared net
+        // flag and replaces the rest, where asking for the flag and then
+        // inserting would hash the name twice.
+        match self.name_to_signal.get_mut(&name) {
+            Some(signal) => {
+                let net = signal.is_net();
+                *signal = SignalState::with_range(register, range).as_net(net);
+            }
+            None => {
+                self.name_to_signal
+                    .insert(name, SignalState::with_range(register, range));
+            }
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&Register> {
