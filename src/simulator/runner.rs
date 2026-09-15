@@ -38,6 +38,7 @@ use crate::parsers::{
     behavior::EventControl,
     gates::{DriveStrength, StrengthLevel},
     modules::VerilogModule,
+    preprocessor::Timescale,
 };
 use crate::register::Register;
 use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
@@ -442,6 +443,11 @@ pub struct Simulator {
     /// after the process working directory. Kept here and handed to each fresh
     /// store for the same reason `output_directory` is.
     search_paths: Vec<PathBuf>,
+    /// The `` `timescale `` the source declared, which a waveform dump states
+    /// in its header. A `Simulator` is built from parsed *modules* and a
+    /// timescale is a property of the *file*, so — like the search path and the
+    /// output directory — only the caller that read the file knows it.
+    timescale: Option<Timescale>,
 }
 
 impl Simulator {
@@ -480,6 +486,7 @@ impl Simulator {
             tasks: TaskContext::new(),
             output_directory: None,
             search_paths: Vec::new(),
+            timescale: None,
         }
     }
 
@@ -510,6 +517,9 @@ impl Simulator {
         self.inputs.clear();
         self.is_setup = false;
         self.tasks.reset();
+        // What the design is called and what one tick of it is: the two things
+        // a waveform header states that no task argument carries.
+        self.tasks.describe_design(self.top.clone(), self.timescale);
 
         let top = self
             .modules
@@ -540,6 +550,11 @@ impl Simulator {
         self.blocks = elaborated.blocks;
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
+        // An aliased port is a *name* the design has and the flat store does
+        // not, so a waveform that left them out would show an instance with no
+        // ports on it. The dump is the only thing that wants the table by
+        // value, and it is built once per elaboration.
+        self.tasks.name_aliases(self.aliases.clone());
 
         self.is_setup = true;
 
@@ -681,12 +696,25 @@ impl Simulator {
             // Taking the changes here, before the blocks run, is what makes the
             // next round's edges exactly what this round moves.
             let changes = self.state.take_changes();
+            // The waveform dump measures a timestep from the same journal the
+            // edges come out of, so it costs the names *written* rather than
+            // the names in the design. A design that dumps nothing asks one
+            // question per round and does nothing else.
+            if self.tasks.is_dumping() {
+                self.tasks
+                    .note_changes(changes.iter().map(|(name, _)| name.as_str()));
+            }
             let mut edges = events::edges_from_changes(changes, &self.state);
             // A memory keeps a journal of its own, since one displaced
             // `Register` per name cannot say which word moved. A design that
             // declares no memory skips it on a flag rather than on a lookup.
             if self.state.any_memory() {
-                edges.extend(events::memory_edges(self.state.take_memory_changes()));
+                let memory_changes = self.state.take_memory_changes();
+                if self.tasks.is_dumping() {
+                    self.tasks
+                        .note_changes(memory_changes.iter().map(|(name, _, _)| name.as_str()));
+                }
+                edges.extend(events::memory_edges(memory_changes));
             }
             // A named event has no value, so it cannot appear in either
             // journal above: a trigger is recorded as the bare fact that it
@@ -813,7 +841,13 @@ impl Simulator {
         if !self.tasks.has_deferred() {
             return Ok(());
         }
-        self.tasks.flush(&self.state)
+        self.tasks.flush(&self.state)?;
+        // A design that has stopped owes its waveform a final `#<time>`: that
+        // is how a viewer knows how long it ran after its last transition.
+        if self.tasks.finished() {
+            self.tasks.close_dump(&self.state, self.now);
+        }
+        Ok(())
     }
 
     /// The current simulated time.
@@ -845,6 +879,19 @@ impl Simulator {
     /// belongs is something only the caller knows.
     pub fn set_output_directory(&mut self, directory: impl Into<PathBuf>) {
         self.output_directory = Some(directory.into());
+    }
+
+    /// The `` `timescale `` the front end recorded, which is what a waveform
+    /// dump's `$timescale` states.
+    ///
+    /// The clock counts *ticks* and nothing rescales them, so this names the
+    /// unit a tick already is — the design's `unit`, not its `precision`. That
+    /// is exactly the reading `$timeformat` takes of the same directive, and it
+    /// is the one that makes `#5` in a `` `timescale 1ns `` design five
+    /// nanoseconds in the waveform. A design that declared none dumps in `1s`,
+    /// which is what iverilog writes for one.
+    pub fn set_timescale(&mut self, timescale: Option<Timescale>) {
+        self.timescale = timescale;
     }
 
     /// Everything the design has printed with `$display` and `$write`.
@@ -990,6 +1037,10 @@ impl Simulator {
 
         self.now = target;
         self.state.set_time(target);
+        // Once per call rather than once per timestep: a waveform read after
+        // `advance` returns is the whole of the run so far, and a design that
+        // dumps nothing pays one branch for it.
+        self.tasks.flush_dump_file(&self.state);
         Ok(())
     }
 
