@@ -15,24 +15,34 @@
 //! iverilog's: a `0` row beats a `1` row and either beats an unmatched
 //! combination, which is `x`.
 //!
-//! # What is not modelled
+//! # A sequential UDP
 //!
-//! A **sequential** UDP is a named error rather than a driver that quietly
-//! does nothing. Its rows ask about the *previous* value of an input — `(01)`
-//! is a question no lookup of the present levels can answer — and its output
-//! is a register the primitive owns rather than a function of what is on its
-//! terminals now. Both are outside what a continuous driver is handed, so a
-//! design that instantiates one stops here, by name.
+//! One whose output is a `reg` keeps a state of its own and has rows that ask
+//! about an **edge** — `(01)`, `p`, `*` — which is a question about what an
+//! input *was*. [`UdpMemory`] answers it: the inputs as they stood at the last
+//! lookup and the output the primitive holds, behind a `RefCell` so the lookup
+//! can still be made through the shared reference `propagate` holds.
+//! Remembering on the instance rather than in the simulator is what keeps a
+//! sequential UDP an ordinary continuous driver — nothing in the settle loop
+//! had to learn that one exists.
+//!
+//! Evaluating one twice with nothing moved in between is harmless: no edge is
+//! seen, so the output holds, which is what lets the fixpoint re-ask it as
+//! often as it likes. The rules themselves are
+//! [`UdpTable::sequential_output`]'s.
+
+use std::cell::RefCell;
 
 use crate::parsers::expr::Expression;
 use crate::parsers::primitive::UdpTable;
+use crate::register::X;
 use crate::simulator::eval::eval;
 use crate::simulator::gates::{as_level, least_significant_bit};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 
-/// One elaborated combinational UDP instance, with its terminals split the way
-/// the declaration split them: the output first, the inputs after.
+/// One elaborated UDP instance, with its terminals split the way the
+/// declaration split them: the output first, the inputs after.
 pub struct Udp {
     /// The primitive's name, so an error about this instance can say which
     /// table it came from.
@@ -42,6 +52,20 @@ pub struct Udp {
     /// The table itself. Owned rather than borrowed: elaboration hands the
     /// simulator a flat model that outlives the modules it was built from.
     pub table: UdpTable,
+    /// What a **sequential** instance remembers between lookups; `None` for a
+    /// combinational one, which remembers nothing.
+    pub memory: Option<RefCell<UdpMemory>>,
+}
+
+/// What a sequential UDP carries from one lookup to the next.
+#[derive(Debug, Clone)]
+pub struct UdpMemory {
+    /// The inputs at the last lookup, which an edge column is measured
+    /// against. `None` until the first one: before that nothing has had a
+    /// chance to move, so no row with an edge in it can match.
+    previous: Option<Vec<u8>>,
+    /// The output the primitive holds.
+    state: u8,
 }
 
 impl Udp {
@@ -54,7 +78,39 @@ impl Udp {
         for input in &self.inputs {
             levels.push(as_level(least_significant_bit(&eval(input, state)?)));
         }
-        Ok(self.table.combinational_output(&levels))
+        let Some(memory) = &self.memory else {
+            return Ok(self.table.combinational_output(&levels));
+        };
+        let mut memory = memory.borrow_mut();
+        let next = self
+            .table
+            .sequential_output(memory.previous.as_deref(), &levels, memory.state);
+        memory.previous = Some(levels);
+        memory.state = next;
+        Ok(next)
+    }
+
+    /// The memory a new instance of `table` starts with, or `None` when the
+    /// table is combinational.
+    ///
+    /// The starting state is the table's `initial` value when it gave one and
+    /// `x` when it did not, which is what iverilog prints for a flip-flop that
+    /// has not yet been clocked.
+    pub fn memory_for(
+        table: &UdpTable,
+        state: &StateStore,
+    ) -> Result<Option<RefCell<UdpMemory>>, SimulationError> {
+        if !table.sequential {
+            return Ok(None);
+        }
+        let initial = match &table.initial {
+            Some(value) => as_level(least_significant_bit(&eval(value, state)?)),
+            None => X,
+        };
+        Ok(Some(RefCell::new(UdpMemory {
+            previous: None,
+            state: initial,
+        })))
     }
 }
 
@@ -147,31 +203,96 @@ mod tests {
         assert_eq!(simulator.get("q").unwrap().to_binary(), "x");
     }
 
-    /// A sequential UDP is a named error at elaboration, never a driver that
-    /// quietly settles on something plausible.
+    /// A sequential UDP keeps its own state and answers edges: a flip-flop,
+    /// whose rows name a clock edge, and a latch, whose rows are level
+    /// sensitive, driven through one stimulus.
+    ///
+    /// Every line is what iverilog 12.0 prints for this design — including
+    /// `t7`, where the clock goes `1 -> x`: no row speaks to that edge, and an
+    /// input change nothing matches drives `x` rather than holding.
     #[test]
-    fn test_a_sequential_primitive_is_a_named_error() {
+    fn test_sequential_primitives_keep_state_and_answer_edges() {
         let source = r#"
-            primitive latch (q, e, d);
-              output q;
-              reg q;
-              input e, d;
+            primitive dff(output reg q, input d, input clk);
               table
-                1 1 : ? : 1 ;
-                1 0 : ? : 0 ;
-                0 ? : ? : - ;
+              // d clk : q : q+
+                 0 (01) : ? : 0;
+                 1 (01) : ? : 1;
+                 ? (?0) : ? : -;
+                 * ?    : ? : -;
               endtable
             endprimitive
-
-            module main(input e, input d, output q);
-              latch u (q, e, d);
+            primitive latch(output reg q, input d, input en);
+              table
+                 1 1 : ? : 1;
+                 0 1 : ? : 0;
+                 ? 0 : ? : -;
+              endtable
+            endprimitive
+            module tb;
+              reg d, clk, en;
+              wire q, l;
+              dff u(q, d, clk);
+              latch v(l, d, en);
+              initial begin
+                d = 0; clk = 0; en = 0;
+                #1 $display("t1 q=%b l=%b", q, l);
+                d = 1; #1 $display("t2 q=%b l=%b", q, l);
+                clk = 1; #1 $display("t3 q=%b l=%b", q, l);
+                d = 0; #1 $display("t4 q=%b l=%b", q, l);
+                en = 1; #1 $display("t5 q=%b l=%b", q, l);
+                d = 1; #1 $display("t6 q=%b l=%b", q, l);
+                clk = 1'bx; #1 $display("t7 q=%b l=%b", q, l);
+              end
             endmodule
         "#;
         let (_, modules) = parse_verilog_source(source).expect("design should parse");
-        let mut simulator = Simulator::with_modules(modules, "main");
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(8).expect("time should advance");
         assert_eq!(
-            simulator.setup().err(),
-            Some(SimulationError::SequentialPrimitive("latch".to_string()))
+            simulator.output().text(),
+            "t1 q=x l=x\nt2 q=x l=x\nt3 q=1 l=x\nt4 q=1 l=x\n\
+             t5 q=1 l=0\nt6 q=1 l=1\nt7 q=x l=1\n"
         );
+    }
+
+    /// Inputs that move together are taken one at a time. A set/reset latch
+    /// whose `initial` is 1 sees `(x, x) -> (0, 0)` at time zero, which passes
+    /// through `(0, x)` — a combination no row covers — so its state goes to
+    /// `x` rather than holding the 1 that `(0, 0)` alone would have kept.
+    ///
+    /// iverilog 12.0 prints `t1 q=x`, `t2 q=0`, `t3 q=0` for this design.
+    #[test]
+    fn test_simultaneous_input_changes_are_taken_one_at_a_time() {
+        let source = r#"
+            primitive srff(q, s, r);
+              output q;
+              reg q;
+              input s, r;
+              initial q = 1'b1;
+              table
+                1 0 : ? : 1;
+                0 1 : ? : 0;
+                0 0 : ? : -;
+              endtable
+            endprimitive
+            module tb;
+              reg s, r;
+              wire q;
+              srff u(q, s, r);
+              initial begin
+                s = 0; r = 0;
+                #1 $display("t1 q=%b", q);
+                r = 1; #1 $display("t2 q=%b", q);
+                r = 0; #1 $display("t3 q=%b", q);
+              end
+            endmodule
+        "#;
+        let (_, modules) = parse_verilog_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(modules, "tb");
+        simulator.setup().expect("should set up");
+        simulator.advance(4).expect("time should advance");
+        assert_eq!(simulator.output().text(), "t1 q=x\nt2 q=0\nt3 q=0\n");
     }
 }

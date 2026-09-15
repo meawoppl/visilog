@@ -1501,14 +1501,10 @@ impl<'m> Elaborator<'m> {
         table: &UdpTable,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
-        // A sequential UDP asks about the previous value of an input and keeps
-        // a register of its own. A continuous driver is handed neither, so it
-        // stops here by name rather than driving something plausible.
-        if table.sequential {
-            return Err(SimulationError::SequentialPrimitive(
-                module.identifier.name.clone(),
-            ));
-        }
+        // A sequential UDP keeps a state and remembers its inputs between
+        // lookups. Both live on the instance, so from here on it is an
+        // ordinary continuous driver like a combinational one.
+        let memory = Udp::memory_for(table, &self.out.state)?;
         let mut terminals = module.ports.iter().map(|port| {
             Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)))
         });
@@ -1525,6 +1521,7 @@ impl<'m> Elaborator<'m> {
             output,
             inputs,
             table: table.clone(),
+            memory,
         });
         Ok(())
     }
