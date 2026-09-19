@@ -362,11 +362,20 @@ fn harness_accepts_known_good_source() {
     assert_eq!(modules.len(), 2);
 }
 
-/// How far simulated time is advanced before a design is judged. Generous
-/// enough for the corpus's self-checking testbenches, which typically finish
-/// within a few hundred time units, and bounded so a free-running design
-/// cannot run the suite forever.
-const TIME_BUDGET: i64 = 10_000;
+/// How far simulated time is advanced before a design is judged.
+///
+/// A design that calls `$finish` stops on its own and costs what it costs; this
+/// bound is only what a design that *never* finishes is given before it is
+/// judged on what it printed so far. So the cost of raising it falls entirely
+/// on the free-running designs — the whole corpus takes about 70 seconds here
+/// against about 30 at ten thousand.
+///
+/// A hundred thousand rather than a round-enough ten thousand because the
+/// corpus really does write testbenches that long: `pr528` and `pr528b` clock
+/// a `` `timescale 1ps `` design every five thousand ticks and finish at
+/// 50001, and cutting them off mid-run scored them as wrong answers rather
+/// than as designs that had not been given time to run.
+const TIME_BUDGET: i64 = 100_000;
 
 /// The module to elaborate: one that nothing else instantiates.
 ///
