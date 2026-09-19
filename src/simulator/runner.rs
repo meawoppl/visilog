@@ -3691,6 +3691,34 @@ mod tests {
         assert_eq!(simulator.get("c").unwrap().to_binary(), "1z1z");
     }
 
+    /// Two continuous assignments on one net are *resolved* against each
+    /// other, not written one after the other.
+    ///
+    /// Writing them in turn does not settle at all — each pass undoes the one
+    /// before it — so a design that does this used to fail as `NoConvergence`
+    /// (corpus `pr1701921`). iverilog 12.0 prints `blend=x agree=1` for this
+    /// design: drivers that disagree give `x` and drivers that agree pass
+    /// their value through.
+    #[test]
+    fn test_two_assignments_on_one_net_resolve_against_each_other() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg foo, bar;
+                wire blend, agree;
+                assign blend = foo;
+                assign blend = bar;
+                assign agree = bar;
+                assign agree = bar;
+                initial bar = 1'b1;
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.get("blend").unwrap().to_binary(), "x");
+        assert_eq!(simulator.get("agree").unwrap().to_binary(), "1");
+    }
+
     #[test]
     fn test_non_blocking_updates_are_visible_across_blocks() {
         // Two flops in series. With `<=` the second captures the *old* `a`, so

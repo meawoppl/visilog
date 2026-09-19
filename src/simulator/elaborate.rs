@@ -248,6 +248,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
     if let Some(path) = elaborator.defparams.keys().next() {
         return Err(SimulationError::UnappliedDefparam(path.clone()));
     }
+    elaborator.resolve_multiply_driven_nets();
     Ok(elaborator.out)
 }
 
@@ -1618,6 +1619,37 @@ impl<'m> Elaborator<'m> {
             }
         }
         self.out.assignments.push(assignment);
+    }
+
+    /// Marks every net that more than one continuous assignment drives, so
+    /// that the drivers are *resolved* against each other rather than written
+    /// one after the other.
+    ///
+    /// Two drivers writing the same net in turn is not merely imprecise, it
+    /// does not settle: `assign blend = foo; assign blend = bar;` for a `foo`
+    /// of `x` and a `bar` of `1` has each pass undo the one before it, so the
+    /// fixpoint runs out of passes and the design fails as
+    /// `NoConvergence` (corpus `pr1701921`, `pr2013758`, `con_tri`,
+    /// `gen_case_opt1`, `drive_strength2`, `pr2219441b`, `pr2715558`).
+    /// Resolution answers instead: the bits the drivers agree on pass through
+    /// and the ones they do not are `x`, which is what iverilog 12.0 gives.
+    ///
+    /// It is counted once here rather than asked per push, because the count
+    /// is only complete when the whole hierarchy has been walked — one
+    /// driver may be an instance's `Binding::Driving` and the other the
+    /// parent's own `assign`.
+    fn resolve_multiply_driven_nets(&mut self) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut twice: HashSet<String> = HashSet::new();
+        for assignment in &self.out.assignments {
+            let Some(name) = assigned_name(assignment.lhs()) else {
+                continue;
+            };
+            if !seen.insert(name) {
+                twice.insert(name.to_string());
+            }
+        }
+        self.out.resolved_nets.extend(twice);
     }
 
     /// Records a net that drives itself — `supply0`/`supply1` at their rail,
