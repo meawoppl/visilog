@@ -422,6 +422,11 @@ pub struct Simulator {
     /// delayed `assign`, so it wants the identical machinery — an empty vector
     /// for a design whose gates name no delay.
     gate_delays: Vec<Option<DelayedDrive>>,
+    /// The same again, one slot per user-defined primitive. A UDP is a
+    /// continuous driver like a gate, so `BUFG #5 bg(out, in);` wants the
+    /// identical machinery — and an empty vector for a design whose primitives
+    /// name no delay.
+    udp_delays: Vec<Option<DelayedDrive>>,
     /// Writes an `a <= #5 b;` scheduled but has not yet made. Each holds the
     /// value its right hand side had when the statement ran, so nothing about
     /// it is re-read when it lands. Empty for a design that writes none.
@@ -514,6 +519,7 @@ impl Simulator {
             assignments: Vec::new(),
             delays: Vec::new(),
             gate_delays: Vec::new(),
+            udp_delays: Vec::new(),
             scheduled: Vec::new(),
             settled_once: false,
             gates: Vec::new(),
@@ -550,6 +556,7 @@ impl Simulator {
         self.assignments.clear();
         self.delays.clear();
         self.gate_delays.clear();
+        self.udp_delays.clear();
         self.gates.clear();
         self.udps.clear();
         self.pass_switches.clear();
@@ -609,6 +616,14 @@ impl Simulator {
             Vec::new()
         };
         self.udps = elaborated.udps;
+        self.udp_delays = if self.udps.iter().any(|udp| udp.delay.is_some()) {
+            self.udps
+                .iter()
+                .map(|udp| udp.delay.as_ref().map(|_| DelayedDrive::default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.pass_switches = elaborated.pass_switches;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
@@ -657,7 +672,7 @@ impl Simulator {
         // already see. It is deliberately conditional: settling unconditionally
         // here would make a module that never converges fail at setup rather
         // than when someone actually asks it to run.
-        if !self.delays.is_empty() || !self.gate_delays.is_empty() {
+        if !self.delays.is_empty() || !self.gate_delays.is_empty() || !self.udp_delays.is_empty() {
             self.propagate()?;
         }
 
@@ -1159,6 +1174,7 @@ impl Simulator {
             .delays
             .iter()
             .chain(self.gate_delays.iter())
+            .chain(self.udp_delays.iter())
             .flatten()
             .filter_map(|drive| drive.pending.as_ref().map(|(time, _)| *time))
             .chain(self.scheduled.iter().map(|(at, _)| *at))
@@ -1226,6 +1242,7 @@ impl Simulator {
             .delays
             .iter_mut()
             .chain(self.gate_delays.iter_mut())
+            .chain(self.udp_delays.iter_mut())
             .flatten()
         {
             let Some((at, _)) = &drive.pending else {
@@ -1677,13 +1694,44 @@ impl Simulator {
             }
             // A user-defined primitive drives its output exactly the way a gate
             // does: one bit, at strong strength, resolved against every other
-            // driver of that net.
-            for udp in &self.udps {
+            // driver of that net — and a `#(...)` on its instantiation is a
+            // delay, which changes only *which* value it drives, through the
+            // same `DelayedDrive` a gate uses.
+            for (index, udp) in self.udps.iter().enumerate() {
                 let code = udp.evaluate(&self.state)?;
+                let value = match self.udp_delays.get(index).and_then(Option::as_ref) {
+                    None => Register::from_bits(vec![code]),
+                    Some(drive) => {
+                        let value = Register::from_bits(vec![code]);
+                        let delay = udp
+                            .delay
+                            .as_ref()
+                            .expect("a delay slot belongs to a delayed primitive");
+                        let ticks =
+                            delay.ticks_between(drive.applied.as_ref(), &value, &self.state)?;
+                        let drive = self.udp_delays[index]
+                            .as_mut()
+                            .expect("the slot was just matched");
+                        if drive.destination() != Some(&value) {
+                            if ticks == 0 {
+                                drive.applied = Some(value);
+                                drive.pending = None;
+                            } else {
+                                drive.pending = Some((self.now + ticks, value));
+                            }
+                        }
+                        match &drive.applied {
+                            Some(applied) => applied.clone(),
+                            // Driving from the first instant, and what it
+                            // drives before its first transaction lands is `x`.
+                            None => Register::unknown(1),
+                        }
+                    }
+                };
                 let target = scalar_output(&self.state, resolve_target(&self.state, &udp.output)?);
                 contributions.push(Contribution {
                     target,
-                    value: Register::from_bits(vec![code]),
+                    value,
                     strength: DriveStrength::STRONG,
                 });
             }
@@ -9285,6 +9333,53 @@ mod tests {
 
         simulator.advance(60).expect("time should advance");
         assert_eq!(simulator.output().text(), "0 o=x\n2 o=0\n26 o=1\n42 o=0\n");
+    }
+
+    /// A **user-defined** primitive is a continuous driver like a gate, so a
+    /// `#(...)` on its instantiation is a delay and goes through the identical
+    /// machinery. `#(6, 2)` on a UDP buffer traces exactly what the same
+    /// delays on a `buf` do — iverilog 12.0 prints
+    /// `0 out=x / 2 out=0 / 26 out=1 / 42 out=0` for both.
+    ///
+    /// The tokens read as a *parameter override* — that is what `#(...)` means
+    /// on a module instantiation — and only the module being instantiated says
+    /// otherwise, which is why the decision is made where the instance is
+    /// created (corpus `udp_bufg2`, which writes the one-delay `BUFG #5`).
+    #[test]
+    fn test_a_primitive_instance_delay_is_simulated() {
+        let source = r#"
+            primitive BUFG (O, I);
+                output O;
+                input I;
+                table
+                    0 : 0 ;
+                    1 : 1 ;
+                endtable
+            endprimitive
+
+            module main();
+                reg in;
+                wire out;
+                BUFG #(6, 2) bg (out, in);
+                initial $monitor("%0t out=%b", $time, out);
+                initial begin
+                    in = 1'b0;
+                    #20 in = 1'b1;
+                    #20 in = 1'b0;
+                end
+            endmodule
+        "#;
+        let (rest, modules) =
+            crate::parsers::source::parse_verilog_source(source).expect("design should parse");
+        assert!(rest.trim().is_empty(), "unparsed input: {}", rest);
+        let mut simulator = Simulator::with_modules(modules, "main");
+        simulator.setup().expect("design should elaborate");
+
+        simulator.advance(60).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "0 out=x\n2 out=0\n26 out=1\n42 out=0\n"
+        );
     }
 
     /// The delay is **inertial**, not transport: a pulse shorter than the

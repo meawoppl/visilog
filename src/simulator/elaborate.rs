@@ -48,7 +48,7 @@ use crate::parsers::{
         TaskDeclaration,
     },
     constants::VerilogConstant,
-    delay::GateDelay,
+    delay::{Delay, GateDelay},
     expr::Expression,
     gates::{DriveStrength, GateInstantiation, GateKind, StrengthLevel},
     generate::{DefparamAssignment, GenerateBlock, GenerateItem, GenerateLoop},
@@ -336,6 +336,11 @@ struct Scope {
     /// root of the flat name space and carries no prefix of its own, so that
     /// leading segment is dropped rather than kept.
     root_name: String,
+    /// The `#(...)` on the instantiation that made this scope, when the module
+    /// it names is a **primitive** — where it is a delay rather than a
+    /// parameter override. `None` for an ordinary module, which reads the same
+    /// tokens as `overrides`.
+    primitive_delay: Option<GateDelay>,
 }
 
 impl Scope {
@@ -348,6 +353,7 @@ impl Scope {
             locals: HashMap::new(),
             genvars: HashMap::new(),
             root_name: format!("{}.", module),
+            primitive_delay: None,
         }
     }
 
@@ -1794,6 +1800,9 @@ impl<'m> Elaborator<'m> {
             inputs,
             table: table.clone(),
             memory,
+            // A UDP is a continuous driver exactly as a gate is, so its delay
+            // is the same `GateDelay` and goes through the same machinery.
+            delay: scope.primitive_delay.clone(),
         });
         Ok(())
     }
@@ -2348,6 +2357,16 @@ impl<'m> Elaborator<'m> {
             scope.hierarchy(&instantiation.instance_name.name),
             child.timescale,
         ));
+        // `BUFG #5 bg(out, in);` reads as a parameter override, because that
+        // is what `#(...)` means on a module instantiation — but a primitive
+        // has no parameters and the tokens are a *delay*. Only the module being
+        // instantiated says which, so the decision is made here and the answer
+        // travels with the scope the way a port binding does.
+        let primitive_delay = if primitive_table(child).is_some() {
+            primitive_delay(&instantiation.parameters)?
+        } else {
+            None
+        };
         let mut inner = Scope {
             module_prefix: prefix.clone(),
             prefix,
@@ -2356,6 +2375,7 @@ impl<'m> Elaborator<'m> {
             locals: HashMap::new(),
             genvars: HashMap::new(),
             root_name: scope.root_name.clone(),
+            primitive_delay,
         };
 
         for (port, connection) in connections(child, &instantiation.arguments)? {
@@ -2731,6 +2751,41 @@ fn primitive_table(module: &VerilogModule) -> Option<&UdpTable> {
             ModuleStatement::PrimitiveTable(table) => Some(table),
             _ => None,
         })
+}
+
+/// The `#(...)` on a **primitive** instantiation, read as the delay it is.
+///
+/// A UDP has no parameters, so the tokens the grammar read as a parameter
+/// override list are a `delay3` — one, two or three delays, meaning rise, fall
+/// and turn-off exactly as a gate's do. `BUFG #5 bg(out, in);` is the common
+/// spelling and is one delay standing for all three.
+///
+/// A *named* override (`#(.x(1))`) names a parameter a primitive cannot have,
+/// and more than three delays is not a `delay3`; both are refused by name
+/// rather than dropped, because a delay a design wrote and the simulator
+/// ignored is a wrong answer at the right values.
+fn primitive_delay(parameters: &ModuleInitArguments) -> Result<Option<GateDelay>, SimulationError> {
+    let values = match parameters {
+        ModuleInitArguments::NoArgs => return Ok(None),
+        ModuleInitArguments::Positional(values) => values,
+        ModuleInitArguments::Keyword(_) => {
+            return Err(SimulationError::Unsupported(
+                "a named parameter override on a primitive, which has no parameters",
+            ))
+        }
+    };
+    let mut delays = values.iter().flatten().cloned().map(Delay::from_expression);
+    let Some(rise) = delays.next() else {
+        return Ok(None);
+    };
+    let fall = delays.next().unwrap_or_else(|| rise.clone());
+    let turn_off = delays.next();
+    if delays.next().is_some() {
+        return Err(SimulationError::Unsupported(
+            "more than three delays on a primitive instantiation",
+        ));
+    }
+    Ok(Some(GateDelay::of(rise, fall, turn_off)))
 }
 
 /// The signal an assignment target writes, or `None` when the target is not

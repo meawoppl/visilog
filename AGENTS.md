@@ -1595,6 +1595,18 @@ a row whose output is `x` say nothing a missing row does not already say, since 
 unmatched combination is `x` anyway. There is no cleverness about an unknown input: `x 0`
 against `0 0 : 1` and `1 0 : 1` is `x` and not `1`, even though both substitutions agree.
 
+**A `#(...)` on a primitive instantiation is a *delay*, not a parameter override.** The
+grammar cannot tell — `#(...)` after a module name is a parameter list and that is what it
+reads — so only the module being instantiated says otherwise, and `Elaborator::instantiate`
+is where the question is asked (`primitive_delay`). The answer travels to `build_udp` on the
+`Scope`, the way a port binding does, and from there it is the same `GateDelay` a gate
+carries and the same `DelayedDrive` slot: `Simulator::udp_delays` sits beside `gate_delays`
+and the propagation arm is the gate's. `BUFG #(6, 2)` therefore traces exactly what
+`buf #(6, 2)` does (corpus `udp_bufg2`, `pr2829776`). A *named* override on a primitive and
+a fourth delay are both named errors — a primitive has no parameters and a `delay3` has
+three terms, and a delay a design wrote and the simulator dropped is a wrong answer at the
+right values.
+
 A **sequential** UDP — one whose output is a `reg`, whose rows carry a current-state field,
 and whose input columns may name an edge (`(01)`, `r`, `*`) — parses and is then
 `SimulationError::SequentialPrimitive`, naming it. Its rows ask about the *previous* value

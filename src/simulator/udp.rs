@@ -33,6 +33,7 @@
 
 use std::cell::RefCell;
 
+use crate::parsers::delay::GateDelay;
 use crate::parsers::expr::Expression;
 use crate::parsers::primitive::UdpTable;
 use crate::register::X;
@@ -55,6 +56,11 @@ pub struct Udp {
     /// What a **sequential** instance remembers between lookups; `None` for a
     /// combinational one, which remembers nothing.
     pub memory: Option<RefCell<UdpMemory>>,
+    /// The `#(...)` the instantiation wrote, which on a primitive is a delay
+    /// rather than a parameter override. A UDP is a continuous driver exactly
+    /// as a gate is, so it is the same [`GateDelay`] and goes through the same
+    /// `DelayedDrive` machinery.
+    pub delay: Option<GateDelay>,
 }
 
 /// What a sequential UDP carries from one lookup to the next.
