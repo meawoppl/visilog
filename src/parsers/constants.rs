@@ -9,7 +9,7 @@ use nom::{
 };
 
 use super::base::RawToken;
-use super::numbers::{based_digits, decimal};
+use super::numbers::{based_digits, unsigned_number};
 use super::simple::ws_and_comments;
 use nom::character::complete::char;
 
@@ -193,8 +193,8 @@ impl RawToken for VerilogConstant {
 }
 
 fn integer_constant(input: &str) -> IResult<&str, VerilogConstant> {
-    map_res(decimal, |content| {
-        let cnst = VerilogConstant::new(None, VerilogBaseType::Decimal, content.to_string());
+    map_res(unsigned_number, |content: &str| {
+        let cnst = VerilogConstant::new(None, VerilogBaseType::Decimal, content.replace('_', ""));
         Ok::<_, nom::Err<nom::error::Error<&str>>>(cnst)
     })(input)
 }
@@ -227,13 +227,13 @@ fn unsized_const(input: &str) -> IResult<&str, VerilogConstant> {
 /// between a `#` and its delay.
 fn sized_const(input: &str) -> IResult<&str, VerilogConstant> {
     let parsed = tuple((
-        decimal,
+        unsigned_number,
         preceded(ws_and_comments, base_designator),
         preceded(ws_and_comments, based_digits),
     ));
 
     map_res(parsed, |(size_str, (signed, base), content)| {
-        let size = size_str.parse::<usize>().unwrap();
+        let size = size_str.replace('_', "").parse::<usize>().unwrap();
         let cnst =
             VerilogConstant::new(Some(size), base, content.to_string()).with_signedness(signed);
         Ok::<_, nom::Err<nom::error::Error<&str>>>(cnst)
@@ -602,6 +602,31 @@ mod tests {
                     .with_base()
             ))
         );
+    }
+
+    /// A size and a plain decimal are both IEEE 1364-2005's `unsigned_number`,
+    /// which carries `_` separators anywhere but at the front. The digits of a
+    /// based literal already did; the size did not, so corpus `pr902`'s
+    /// `2_0'b0` read as the number `2` followed by an identifier.
+    #[test]
+    fn test_a_size_and_a_plain_decimal_carry_underscore_separators() {
+        assert_eq!(
+            verilog_const("2_0'b0"),
+            Ok((
+                "",
+                VerilogConstant::new(Some(20), VerilogBaseType::Binary, "0".to_string())
+            ))
+        );
+        assert_eq!(
+            verilog_const("1_000"),
+            Ok((
+                "",
+                VerilogConstant::new(None, VerilogBaseType::Decimal, "1000".to_string())
+            ))
+        );
+        // A leading `_` is not a number — that is the first character of an
+        // identifier, and claiming it would take `_x` for one.
+        assert!(verilog_const("_5").is_err());
     }
 
     /// The size, the base designator and the digits are three tokens, so
