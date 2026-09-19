@@ -1863,7 +1863,12 @@ tripwire.
   returns from `resume` entirely: the program counter and the `StateStore` are the only
   state a resumption has, so a loop-local counter would be lost. A Verilog identifier
   cannot start with `$`, and `Program::rename` qualifies the name like any other signal, so
-  two instances of one module count separately. An `x` count runs zero iterations.
+  two instances of one module count separately. An `x` count runs zero iterations, and a
+  **real** count is *rounded*, half away from zero, the way a real written into an integer
+  is: `repeat (10.4)` runs ten times, `repeat (10.6)` eleven and `repeat (3.5)` four
+  (iverilog 12.0). Reading the sixty-four bit encoding as a number instead asks for a count
+  in the billions, which is a runaway loop rather than an answer — corpus `br967`
+  failed as `NoConvergence` on a design that runs ten times.
 - **A zero-delay loop is bounded inside `resume`, not by the runner.** `MAX_DELTA_CYCLES`
   and `MAX_RESUMPTIONS_PER_TIME` both count *returns* from `resume`, and `forever a = 1;`
   never returns, so `program.rs::MAX_INSTRUCTIONS` is the bound that sees it and reports
