@@ -829,7 +829,7 @@ impl Simulator {
                 {
                     continue;
                 }
-                if self.blocks[id].fires(&edges) {
+                if self.blocks[id].fires(&edges, &self.state) {
                     let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
                     pending.extend(updates);
                 }
@@ -880,7 +880,7 @@ impl Simulator {
                 Some(watch) => {
                     let mut edges = watch.edges_since(&self.state);
                     edges.extend(triggers.iter().cloned());
-                    events::control_fires(&watch.control, &edges, &implicit)
+                    events::control_fires(&watch.control, &edges, &implicit, &self.state)
                 }
             };
             if wake {
@@ -6477,6 +6477,41 @@ mod tests {
         simulator.setup().expect("design should run");
 
         assert_eq!(simulator.output().lines(), vec!["12 34 56 78"]);
+    }
+
+    /// An edge is a property of the least significant bit of the *triggering
+    /// expression*, so a sensitivity entry that names one bit of a vector has
+    /// to be asked about that bit. `bus` moving `0000 -> 0010` is a `posedge`
+    /// of `bus[1]` and no edge of `bus` at all — reading the whole vector's
+    /// LSB answers for a different bit entirely. A generate loop writing one
+    /// such block per bit is where it shows (corpus `pr1623097`).
+    ///
+    /// iverilog 12.0 prints `hit=1110` for this design: bit 0 never rises,
+    /// bits 1 and 2 do, and bit 3 falls.
+    #[test]
+    fn test_a_sensitivity_list_can_name_one_bit_of_a_vector() {
+        let mut simulator = simulator_for(
+            r#"
+            module selected();
+                reg [3:0] bus;
+                reg [3:0] hit;
+                initial begin
+                    bus = 4'b1000;
+                    hit = 4'b0000;
+                    #1 bus = 4'b0010;
+                    #1 bus = 4'b0110;
+                    #1 $display("hit=%b", hit);
+                end
+                always @(posedge bus[0]) hit[0] = 1'b1;
+                always @(posedge bus[1]) hit[1] = 1'b1;
+                always @(posedge bus[2]) hit[2] = 1'b1;
+                always @(negedge bus[3]) hit[3] = 1'b1;
+            endmodule
+        "#,
+        );
+        simulator.advance(5).expect("time should advance");
+
+        assert_eq!(simulator.output().lines(), vec!["hit=1110"]);
     }
 
     /// `%t` pads to twenty characters until `$timeformat` says otherwise, and

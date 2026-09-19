@@ -41,7 +41,8 @@ use crate::parsers::behavior::{
 };
 use crate::parsers::expr::Expression;
 use crate::register::{Register, ONE, X, Z, ZERO};
-use crate::simulator::state_store::StateStore;
+use crate::simulator::eval::{eval, select_index, MAX_SELECT_WIDTH};
+use crate::simulator::state_store::{bit_position_in, StateStore};
 
 /// One signal's transition across a time step.
 ///
@@ -211,22 +212,23 @@ pub fn control_fires(
     control: &EventControl,
     edges: &[SignalEdge],
     implicit_reads: &BTreeSet<String>,
+    state: &StateStore,
 ) -> bool {
     match control {
         EventControl::None => true,
         EventControl::Implicit => edges.iter().any(|edge| implicit_reads.contains(&edge.name)),
-        EventControl::Events(events) => events.iter().any(|event| event_fires(event, edges)),
+        EventControl::Events(events) => events.iter().any(|event| event_fires(event, edges, state)),
     }
 }
 
 /// [`control_fires`] for a whole `always` block, deriving the `@(*)` read set
 /// from the block's own body.
-pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge]) -> bool {
+pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge], state: &StateStore) -> bool {
     let implicit_reads = match block.event_control {
         EventControl::Implicit => signals_read(&block.statements),
         _ => BTreeSet::new(),
     };
-    control_fires(&block.event_control, edges, &implicit_reads)
+    control_fires(&block.event_control, edges, &implicit_reads, state)
 }
 
 /// Whether one sensitivity-list entry matches an observed edge.
@@ -239,11 +241,84 @@ pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge]) -> bool {
 /// expression reads and fires when any of them shows a matching edge. That
 /// over-approximates — `posedge (a & b)` fires on a `posedge` of either operand
 /// — so a block may be woken more often than it should, never less.
-fn event_fires(event: &Event, edges: &[SignalEdge]) -> bool {
+fn event_fires(event: &Event, edges: &[SignalEdge], state: &StateStore) -> bool {
     let names = event_signals(&event.expression);
-    edges
+    edges.iter().any(|edge| {
+        if !names.contains(&edge.name) {
+            return false;
+        }
+        match narrowed(&event.expression, edge, state) {
+            Some(narrowed) => narrowed.matches(&event.trigger),
+            None => edge.matches(&event.trigger),
+        }
+    })
+}
+
+/// The same edge over just the bits a **select** in the sensitivity list
+/// names, or `None` when the entry is not a select of the signal that moved.
+///
+/// An edge is a property of the least significant bit of the triggering
+/// expression, so `always @(posedge clear[1])` has to be asked about bit 1 and
+/// not about bit 0 of the whole vector: `clear` moving `0000 -> 0010` is a
+/// `posedge` of `clear[1]` and no edge of `clear` at all. A generate loop
+/// writing one such block per bit is where it shows (corpus `pr1623097`).
+///
+/// The index is evaluated against the store, which is what a genvar's
+/// substituted constant and an ordinary parameter both need. Anything else —
+/// `posedge (a & b)`, a select whose index is not a constant — keeps the
+/// over-approximating whole-signal reading `event_fires` documents.
+fn narrowed(expression: &Expression, edge: &SignalEdge, state: &StateStore) -> Option<SignalEdge> {
+    let (name, indices) = match expression {
+        Expression::BitSelect(id, index) => (&id.name, vec![constant_index(index, state)?]),
+        Expression::PartSelect(id, msb, lsb) => {
+            let msb = constant_index(msb, state)?;
+            let lsb = constant_index(lsb, state)?;
+            let step = if msb >= lsb { -1 } else { 1 };
+            let mut indices = Vec::new();
+            let mut at = msb;
+            loop {
+                indices.push(at);
+                if at == lsb || indices.len() > MAX_SELECT_WIDTH {
+                    break;
+                }
+                at += step;
+            }
+            (&id.name, indices)
+        }
+        _ => return None,
+    };
+    if name != &edge.name {
+        return None;
+    }
+    let range = state.get_signal(name)?.range();
+    Some(SignalEdge {
+        name: edge.name.clone(),
+        before: bits_of(&edge.before, range, &indices),
+        after: bits_of(&edge.after, range, &indices),
+    })
+}
+
+/// One select bound worked out against the store, or `None` when it is not a
+/// number there — which is what sends the entry back to the whole-signal
+/// reading rather than to a bit nothing names.
+fn constant_index(expression: &Expression, state: &StateStore) -> Option<i64> {
+    select_index(&eval(expression, state).ok()?).ok()?
+}
+
+/// The declared bits `indices` names out of one value, most significant first.
+/// An index outside the declared range reads `x`, which is what every other
+/// out-of-range select does.
+fn bits_of(value: &Register, range: (i64, i64), indices: &[i64]) -> Register {
+    let width = value.width();
+    let bits: Vec<u8> = indices
         .iter()
-        .any(|edge| names.contains(&edge.name) && edge.matches(&event.trigger))
+        .map(|index| {
+            bit_position_in(range, *index)
+                .and_then(|offset| value.bit_from_lsb(width.checked_sub(offset + 1)?))
+                .unwrap_or(X)
+        })
+        .collect();
+    Register::from_bits(bits)
 }
 
 /// Every signal name an event control is sensitive to.
@@ -489,6 +564,14 @@ fn collect_expression_reads(expression: &Expression, names: &mut BTreeSet<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store with nothing in it. Sensitivity matching only asks the store
+    /// about a *select*'s bounds, so a control naming plain signals needs no
+    /// design behind it.
+    fn no_state() -> StateStore {
+        StateStore::new()
+    }
+
     use crate::parsers::assignment::{ProceduralAssignment, ProceduralAssignmentType};
     use crate::parsers::behavior::{parse_always_block, parse_block, parse_sensitivity_list};
     use crate::parsers::helpers::assert_parses;
@@ -668,11 +751,17 @@ mod tests {
     #[test]
     fn test_control_fires_none_always_fires() {
         let no_reads = BTreeSet::new();
-        assert!(control_fires(&EventControl::None, &[], &no_reads));
+        assert!(control_fires(
+            &EventControl::None,
+            &[],
+            &no_reads,
+            &no_state()
+        ));
         assert!(control_fires(
             &EventControl::None,
             &[named_edge("clk", "0", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
     }
 
@@ -683,14 +772,21 @@ mod tests {
         assert!(control_fires(
             &EventControl::Implicit,
             &[named_edge("b", "0000", "0010")],
-            &reads
+            &reads,
+            &no_state()
         ));
         assert!(!control_fires(
             &EventControl::Implicit,
             &[named_edge("c", "0", "1")],
-            &reads
+            &reads,
+            &no_state()
         ));
-        assert!(!control_fires(&EventControl::Implicit, &[], &reads));
+        assert!(!control_fires(
+            &EventControl::Implicit,
+            &[],
+            &reads,
+            &no_state()
+        ));
     }
 
     #[test]
@@ -702,27 +798,31 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("rst", "1", "0")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         // Only clk moved, in the listed direction.
         assert!(control_fires(
             &control,
             &[named_edge("clk", "0", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         // clk moved the wrong way and rst did not move at all.
         assert!(!control_fires(
             &control,
             &[named_edge("clk", "1", "0")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         // A signal that is not in the list.
         assert!(!control_fires(
             &control,
             &[named_edge("data", "0", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
-        assert!(!control_fires(&control, &[], &no_reads));
+        assert!(!control_fires(&control, &[], &no_reads, &no_state()));
     }
 
     #[test]
@@ -734,13 +834,15 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("rst", "1", "x")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         // x -> 1 is a posedge of clk.
         assert!(control_fires(
             &control,
             &[named_edge("clk", "x", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
     }
 
@@ -753,12 +855,14 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("b", "0101", "0111")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         assert!(!control_fires(
             &control,
             &[named_edge("c", "0", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
     }
 
@@ -771,17 +875,20 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("a", "0", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         assert!(control_fires(
             &control,
             &[named_edge("b", "0", "1")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
         assert!(!control_fires(
             &control,
             &[named_edge("a", "1", "0")],
-            &no_reads
+            &no_reads,
+            &no_state()
         ));
     }
 
@@ -789,11 +896,23 @@ mod tests {
     fn test_always_block_fires_derives_the_implicit_read_set() {
         let block = assert_parses(parse_always_block, "always @(*) begin y = a & b; end");
 
-        assert!(always_block_fires(&block, &[named_edge("a", "0", "1")]));
-        assert!(always_block_fires(&block, &[named_edge("b", "1", "1010")]));
+        assert!(always_block_fires(
+            &block,
+            &[named_edge("a", "0", "1")],
+            &no_state()
+        ));
+        assert!(always_block_fires(
+            &block,
+            &[named_edge("b", "1", "1010")],
+            &no_state()
+        ));
         // `y` is written, not read, so it does not wake its own block.
-        assert!(!always_block_fires(&block, &[named_edge("y", "0", "1")]));
-        assert!(!always_block_fires(&block, &[]));
+        assert!(!always_block_fires(
+            &block,
+            &[named_edge("y", "0", "1")],
+            &no_state()
+        ));
+        assert!(!always_block_fires(&block, &[], &no_state()));
     }
 
     #[test]
@@ -803,9 +922,17 @@ mod tests {
             "always @(posedge clk) begin q <= d; end",
         );
 
-        assert!(always_block_fires(&block, &[named_edge("clk", "0", "1")]));
+        assert!(always_block_fires(
+            &block,
+            &[named_edge("clk", "0", "1")],
+            &no_state()
+        ));
         // `d` is read but the list is explicit, so reading it is not enough.
-        assert!(!always_block_fires(&block, &[named_edge("d", "0", "1")]));
+        assert!(!always_block_fires(
+            &block,
+            &[named_edge("d", "0", "1")],
+            &no_state()
+        ));
     }
 
     /// Every expression form the walker knows about, in one body: parentheses,
