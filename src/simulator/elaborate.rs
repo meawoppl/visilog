@@ -820,8 +820,16 @@ impl<'m> Elaborator<'m> {
         let local = &port.identifier.name;
         match scope.bindings.get(local) {
             // The parent's signal *is* this port. Declaring it again would give
-            // the port a second, immediately stale copy.
-            Some(Binding::Alias(_)) => return Ok(()),
+            // the port a second, immediately stale copy — but a port the child
+            // backs with a `reg` is a *driver* of that signal, so its fill is
+            // the one that stands.
+            Some(Binding::Alias(target)) => {
+                if port_is_variable(port) {
+                    let target = target.clone();
+                    self.out.state.redeclare_as_variable(&target);
+                }
+                return Ok(());
+            }
             Some(Binding::Driven(expression)) => {
                 let name = scope.qualified(local);
                 let range = self.resolve_range(&port.range, scope)?;
@@ -1377,11 +1385,16 @@ impl<'m> Elaborator<'m> {
 
     /// Declares a signal local to this instance.
     ///
-    /// A redeclaration of an aliased port (`output q;` followed by `reg q;`) is
-    /// skipped: the parent's signal is the one the port names, and resetting it
-    /// to `x` at the child's width would clobber it.
+    /// A redeclaration of an aliased port (`output q;` followed by `reg q;`)
+    /// keeps the parent's entry — resetting it to `x` at the *child's* width
+    /// would clobber the width aliasing gave it — but it does say the signal is
+    /// a **variable**, so an undriven one reads `x` rather than the `z` the
+    /// parent's `wire` filled it with. The `reg` is a driver of that net, and
+    /// what a driver has not said is `x` (corpus `pr1792108`, `pr1645518`).
     fn declare_local(&mut self, local: &str, range: (i64, i64), signed: bool, scope: &Scope) {
-        if matches!(scope.bindings.get(local), Some(Binding::Alias(_))) {
+        if let Some(Binding::Alias(target)) = scope.bindings.get(local) {
+            let target = target.clone();
+            self.out.state.redeclare_as_variable(&target);
             return;
         }
         self.out
@@ -3761,6 +3774,45 @@ mod tests {
         // `count` is the same entry as the parent's `out` port.
         assert_eq!(simulator.get("dut.count").unwrap().to_u128(), Some(1));
         assert_eq!(simulator.get("out").unwrap().to_u128(), Some(1));
+    }
+
+    /// A `wire` in the parent bound to an `output reg` in the child reads `x`
+    /// before anything drives it, not `z`: the `reg` *is* the net's driver, and
+    /// what a driver has not said yet is unknown rather than floating. Both
+    /// spellings of the child's declaration say it — `output reg q` in the
+    /// header and `output q; reg q;` in the body.
+    ///
+    /// iverilog 12.0 prints `ansi=x body=x float=z` for this design.
+    #[test]
+    fn test_a_wire_driven_by_a_childs_reg_starts_unknown() {
+        let ansi = r#"
+            module ansi(output reg q);
+            endmodule
+        "#;
+        let body = r#"
+            module body(q);
+                output q;
+                reg q;
+            endmodule
+        "#;
+        let floating = r#"
+            module floating(q);
+                output q;
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                wire a, b, c;
+                ansi u1 (a);
+                body u2 (b);
+                floating u3 (c);
+                initial $display("ansi=%b body=%b float=%b", a, b, c);
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, ansi, body, floating], "top");
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["ansi=x body=x float=z"]);
     }
 
     /// Combinational output flowing back up into a parent expression.
