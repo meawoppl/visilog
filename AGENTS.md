@@ -1050,8 +1050,17 @@ declare, mapped to the store entries they took — and it is what `resolve` asks
 is keyed by the **head** segment of a name, so a reference that reaches into a nested
 block (`inner[0].sig`) is qualified by the block that declares `inner`. The list is
 `declared_names`: the signals and parameters a block declares, the *instances* it
-creates, and the *labels* of the blocks nested in it, because a hierarchical reference
-reaches through all three.
+creates, the *labels* of the generate blocks nested in it, and the *labels* of the named
+`begin : blk` blocks its `initial` and `always` bodies open, because a hierarchical
+reference reaches through all four.
+
+That last one is `block_labels`, and it is load-bearing rather than tidy: `elaborate`
+declares a named block's variables under `scope.qualified`, which inside a generate block
+is the *block's* prefix (`genblk1.a.i`), while a reference to one resolves through
+`Scope::resolve`, which without the label sends it outwards to the module (`a.i`) and
+finds nothing. The walk stops at the first named block on each path, since that label is
+the head segment every name inside it is keyed by — one nested deeper is reached through
+it. Corpus `pr2306259` is exactly this.
 
 **A named block's label is the scope, and a loop indexes it**: `stage[0].u.count` is how
 a testbench reaches inside, and it is literally the store key. An unnamed block still
