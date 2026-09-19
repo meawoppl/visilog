@@ -1556,9 +1556,28 @@ functions, because a loop bound, an `if` condition and a `case` subject are made
 those; and *before* the declaration passes, because what a region unrolls **to** is
 declarations. A `parameter` written inside a block is the one thing evaluated as the
 block unrolls rather than in the pass that follows — a nested loop's bound may be made of
-it. A `function` or a `task` inside a block is a named error rather than a silent
-omission: `walk` compiled the module's subprograms before it got here, so one written
-inside a block would simply be missing from the store a call looks in.
+it.
+
+**A `function` inside a block is compiled in a *second* round, after the unrolling.** It
+belongs to the block, so it has no scope until the block has one — and the module's own
+functions are compiled again alongside it rather than kept from the first round, because
+`close_reads` has to see the whole call graph at once: a block's function may call one of
+the module's, and the outer call's frame has to hold what the inner one reads. The first
+round still happens where it always did, since a generate condition may itself be a call.
+A design with no function in a generate block never reaches the second round and pays one
+`Iterator::any`. The function's own name is then one of `declared_names`, which is what
+makes the bare `funfun(select)` written beside the `endfunction` resolve to `genblk1.funfun`
+rather than outwards to the module (corpus `generate_case2`); the hierarchical
+`blk.f(…)` written outside already resolved, since a block's prefix is the module's plus
+the label.
+
+A **`task`** inside a block is still a named error, and the reason is the `TaskTable`
+rather than the ordering: it is keyed by the name an enable *spells*, which is the bare one
+inside a block and outside it alike, so a task the block declares and one the module
+declares would share a single slot and the enable could not say which it meant. A function
+has no such table — it is stored under its qualified name and a call resolves through the
+scope like any other reference — which is the whole of why that half works and this one
+does not (#186).
 
 **A generate block is a *nested* scope, and that is the whole difference between it and
 an instance.** A module cannot see out of itself, so everything a module names is its
@@ -1568,9 +1587,9 @@ declare, mapped to the store entries they took — and it is what `resolve` asks
 is keyed by the **head** segment of a name, so a reference that reaches into a nested
 block (`inner[0].sig`) is qualified by the block that declares `inner`. The list is
 `declared_names`: the signals and parameters a block declares, the *instances* it
-creates, the *labels* of the generate blocks nested in it, and the *labels* of the named
-`begin : blk` blocks its `initial` and `always` bodies open, because a hierarchical
-reference reaches through all four.
+creates, the *functions* it declares, the *labels* of the generate blocks nested in it,
+and the *labels* of the named `begin : blk` blocks its `initial` and `always` bodies open,
+because a hierarchical reference reaches through all five.
 
 That last one is `block_labels`, and it is load-bearing rather than tidy: `elaborate`
 declares a named block's variables under `scope.qualified`, which inside a generate block
