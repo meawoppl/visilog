@@ -639,7 +639,14 @@ the next instruction boundary like `$sscanf`'s and prints the old one.
 
 **Signedness is modelled.** `reg signed [3:0] a;`,
 `wire signed`, `input signed`, an `integer`, `4'sd12` and a bare decimal like `42` are all
-signed; everything else is unsigned. It rides on the `Register` a lookup produces — a
+signed; everything else is unsigned. **A decimal is signed by having no base designator,
+not by having no size** — `1` is signed and `'d1` is not, which is IEEE 1364-2005's line
+and iverilog 12.0's (`('d1 - 'd2) < 0` is false where `(1 - 2) < 0` is true, and
+`parameter tp = 'd1;` prints in ten `%d` columns where `parameter tp = 1;` prints in
+eleven — corpus `pr812`, `param-extend`). `VerilogConstant::based` is what tells the two
+apart, since both reach the type as an unsized decimal; a *sized* literal always has a
+base, so `VerilogConstant::new` reads it off the size and only an unsized one has to say
+so. It rides on the `Register` a lookup produces — a
 register is bits *plus how to read them* — and `$signed` / `$unsigned` are real casts that
 set that bit and change nothing else. It changes the answer in exactly five places: `/`,
 `%`, `>>>`, the relational operators, and the widening that happens when two operands of

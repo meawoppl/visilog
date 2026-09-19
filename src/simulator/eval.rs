@@ -3392,6 +3392,17 @@ mod tests {
             .is_signed());
         // The `s` changes no bit, only how they read.
         assert_eq!(bits("4'sb1000"), "1000");
+        // It is the *base designator* rather than the size that makes a
+        // decimal unsigned: `'d1` is not signed where `1` is. Measured against
+        // iverilog 12.0 — `parameter tp = 'd1; $display("%d", tp);` prints in
+        // ten columns and `parameter tp = 1;` in eleven (corpus `pr812`), and
+        // `('d1 - 'd2) < 0` is false where `(1 - 2) < 0` is true.
+        assert!(!eval(&parse("'d1"), &StateStore::new()).unwrap().is_signed());
+        assert!(eval(&parse("'sd1"), &StateStore::new())
+            .unwrap()
+            .is_signed());
+        assert_eq!(bits("('d1 - 'd2) < 0"), "0");
+        assert_eq!(bits("(1 - 2) < 0"), "1");
     }
 
     /// `-1 < 0` is true between signed operands and false the moment either
