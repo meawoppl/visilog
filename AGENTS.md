@@ -2077,6 +2077,14 @@ tripwire.
   takes an *identifier*, and `keywords::is_reserved_word` is what stops it: without
   that guard `always @* begin … end` reads `begin` as the event it waits on. This is
   the mirror image of the task-enable trap — the same helper, the other way round.
+- **An `always` or `initial` body is exactly one statement.** Both go through
+  `behavior.rs::statement_body`, the same production a conditional arm uses — a
+  `begin`…`end` block, a null statement, or a single statement. Reading a *run* of
+  statements instead let an unbracketed body swallow whatever followed the block, and
+  every form that is legal both inside a block and at module level is a way for it to do
+  so silently: `always @(posedge clk) d <= ~c;` followed by
+  `assign {e0, f0, g0, h0} = oo;` compiled to one three-instruction block, turning a
+  continuous driver into a procedural `assign` on a net (corpus `initmod`, `pr434`).
 - **A named block keeps its node; an unnamed one does not.** `parse_block` returns a
   `Vec<ProceduralStatements>` either way, so `always`/`initial`/`if` bodies are
   unchanged, but a `begin : name` comes back as a single
