@@ -13,7 +13,7 @@ use super::{
     identifier::hierarchical_identifier,
     simple::{ws, ws_and_comments},
 };
-use crate::register::Register;
+use crate::register::{Register, ONE, Z, ZERO};
 use crate::simulator::eval::{eval, EvalError};
 use crate::simulator::state_store::StateStore;
 
@@ -137,15 +137,110 @@ pub fn parse_delay(input: &str) -> IResult<&str, Delay> {
     Ok((input, delay))
 }
 
-/// `#5`, `#(2, 7)`, `#(2, 7, 9)`, `#(1:2:3, 4:5:6)` — the delay a *gate*
-/// primitive carries.
+/// Up to three delays — rise, fall and turn-off — which is what a gate or a
+/// continuous assignment writes where a statement writes one.
 ///
-/// A gate writes up to three delays rather than one — rise, fall and turn-off —
-/// which is the whole difference from [`parse_delay`]. Only the first is kept:
-/// the simulator settles a gate in zero time along with every other continuous
-/// driver, so nothing downstream can tell one delay from three, and a `Delay`
-/// that pretended to hold all of them would be a shape no caller reads.
-pub fn parse_gate_delay(input: &str) -> IResult<&str, Delay> {
+/// **Which of the three applies is decided by the value being driven to**, not
+/// by the one being left: a bit going to `1` takes `rise`, one going to `0`
+/// takes `fall`, and one going to `z` takes `turn_off`. A bit going to `x`
+/// takes the *shortest* of them, since `x` is "it could already be any of
+/// these". An omitted `turn_off` is the shorter of `rise` and `fall`, and a
+/// single delay stands for all three.
+///
+/// For a value more than one bit wide the transaction is **one** transaction
+/// at the **longest** of the delays the changed bits ask for — the bits that
+/// did not move ask for nothing. That was measured against iverilog 12.0
+/// rather than read off the LRM: `assign #(6, 2) o = i;` on a `[3:0]` carries
+/// `1100 -> 0011` (two bits falling, two rising) in 6, and `1111 -> 1100`
+/// (only falls) in 2, with no intermediate value in between either time.
+#[derive(Debug, PartialEq, Clone)]
+pub struct GateDelay {
+    rise: Delay,
+    fall: Delay,
+    /// `None` when the design wrote fewer than three delays, which means the
+    /// shorter of `rise` and `fall` rather than no delay at all.
+    turn_off: Option<Delay>,
+}
+
+impl GateDelay {
+    /// The three delays as written, for a test that means to name each one.
+    pub fn of(rise: Delay, fall: Delay, turn_off: Option<Delay>) -> Self {
+        GateDelay {
+            rise,
+            fall,
+            turn_off,
+        }
+    }
+
+    /// A single delay, standing for all three.
+    pub fn single(delay: Delay) -> Self {
+        GateDelay {
+            rise: delay.clone(),
+            fall: delay,
+            turn_off: None,
+        }
+    }
+
+    /// The delay a move from `previous` to `next` takes.
+    ///
+    /// `previous` is `None` before the driver has asserted anything, which
+    /// makes every bit a changed one — the first transaction is a move from
+    /// nothing.
+    pub fn ticks_between(
+        &self,
+        previous: Option<&Register>,
+        next: &Register,
+        store: &StateStore,
+    ) -> Result<i64, EvalError> {
+        let rise = self.rise.ticks(store)?;
+        let fall = self.fall.ticks(store)?;
+        let turn_off = match &self.turn_off {
+            Some(delay) => delay.ticks(store)?,
+            None => rise.min(fall),
+        };
+        let codes = next.get_raw();
+        let before = previous.map(|value| value.coerced(next.width()));
+        let mut longest = None;
+        for (position, code) in codes.iter().enumerate() {
+            if let Some(before) = &before {
+                if before.get_raw().get(position) == Some(code) {
+                    continue;
+                }
+            }
+            let ticks = match *code {
+                ONE => rise,
+                ZERO => fall,
+                Z => turn_off,
+                // An `x` is any of the three, so it arrives as soon as the
+                // soonest of them would have.
+                _ => rise.min(fall).min(turn_off),
+            };
+            longest = Some(longest.map_or(ticks, |best: i64| best.max(ticks)));
+        }
+        // Nothing moved, so nothing is scheduled; the caller has already
+        // decided there is a transaction to make.
+        Ok(longest.unwrap_or(0))
+    }
+
+    /// Every delay expression, for the pass that rewrites a flattened
+    /// instance's names.
+    pub fn expressions_mut(&mut self) -> impl Iterator<Item = &mut Expression> {
+        let turn_off = self.turn_off.iter_mut().flat_map(Delay::expressions_mut);
+        self.rise
+            .expressions_mut()
+            .into_iter()
+            .chain(self.fall.expressions_mut())
+            .chain(turn_off)
+    }
+}
+
+/// `#5`, `#(2, 7)`, `#(2, 7, 9)`, `#(1:2:3, 4:5:6)` — the delay a *gate*
+/// primitive or a continuous assignment carries.
+///
+/// Up to three delays rather than one is the whole difference from
+/// [`parse_delay`]; a fourth is not a `delay3` and is left unconsumed rather
+/// than quietly dropped.
+pub fn parse_gate_delay(input: &str) -> IResult<&str, GateDelay> {
     let (input, _) = tag("#")(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, delays) = alt((
@@ -157,12 +252,23 @@ pub fn parse_gate_delay(input: &str) -> IResult<&str, Delay> {
         map(delay_operand, |delay| vec![Delay::from_expression(delay)]),
     ))(input)?;
     let (input, _) = ws_and_comments(input)?;
+    let mut delays = delays.into_iter();
+    let rise = delays.next().expect("a separated list holds at least one");
+    let fall = delays.next().unwrap_or_else(|| rise.clone());
+    let turn_off = delays.next();
+    if delays.next().is_some() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
     Ok((
         input,
-        delays
-            .into_iter()
-            .next()
-            .expect("a separated list holds at least one delay"),
+        GateDelay {
+            rise,
+            fall,
+            turn_off,
+        },
     ))
 }
 

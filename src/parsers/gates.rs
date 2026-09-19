@@ -30,7 +30,7 @@ use nom::{
 };
 
 use super::{
-    delay::{parse_gate_delay, Delay},
+    delay::{parse_gate_delay, Delay, GateDelay},
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
     simple::{range, ws, ws_and_comments, Range},
@@ -210,7 +210,7 @@ pub struct GateInstantiation {
     /// driver — in zero time — so this is parsed but not scheduled. It is kept
     /// rather than discarded because rebuilding it would mean re-reading the
     /// source.
-    pub delay: Option<Delay>,
+    pub delay: Option<GateDelay>,
     pub instance: GateInstance,
 }
 
@@ -408,22 +408,42 @@ mod tests {
         );
         assert_eq!(gates.len(), 2);
         assert!(gates.iter().all(|gate| gate.kind == GateKind::Nand));
-        assert!(gates.iter().all(|gate| gate.delay == Some(Delay::new(3))));
+        assert!(gates
+            .iter()
+            .all(|gate| gate.delay == Some(GateDelay::single(Delay::new(3)))));
         assert_eq!(gates[0].instance.name, Some("n1".into()));
         assert_eq!(gates[1].instance.name, Some("n2".into()));
     }
 
     #[test]
     fn test_delays() {
-        assert_eq!(one("xor #5 g (o, a, b);").delay, Some(Delay::new(5)));
-        assert_eq!(one("xor #(5) (o, a, b);").delay, Some(Delay::new(5)));
-        // A rise/fall pair keeps the rise delay, the way `#(min:typ:max)`
-        // keeps the typical one.
-        assert_eq!(one("buf #(2, 7) (o, i);").delay, Some(Delay::new(2)));
-        assert_eq!(one("buf #(2, 7, 9) (o, i);").delay, Some(Delay::new(2)));
+        assert_eq!(
+            one("xor #5 g (o, a, b);").delay,
+            Some(GateDelay::single(Delay::new(5)))
+        );
+        assert_eq!(
+            one("xor #(5) (o, a, b);").delay,
+            Some(GateDelay::single(Delay::new(5)))
+        );
+        // All three are kept. Which one applies is decided by the value being
+        // driven *to*, so a rise/fall pair that kept only the rise would give
+        // a falling edge the wrong delay.
+        assert_eq!(
+            one("buf #(2, 7) (o, i);").delay,
+            Some(GateDelay::of(Delay::new(2), Delay::new(7), None))
+        );
+        assert_eq!(
+            one("buf #(2, 7, 9) (o, i);").delay,
+            Some(GateDelay::of(
+                Delay::new(2),
+                Delay::new(7),
+                Some(Delay::new(9))
+            ))
+        );
+        // Each of the three may itself be a `min:typ:max` triple.
         assert_eq!(
             one("buf #(1:2:3, 7) (o, i);").delay,
-            Some(Delay::triple(1, 2, 3))
+            Some(GateDelay::of(Delay::triple(1, 2, 3), Delay::new(7), None))
         );
         assert_eq!(one("and (o, a, b);").delay, None);
     }
@@ -458,7 +478,7 @@ mod tests {
         assert_eq!(one("and (o, a, b);").strength, None);
         // With a strength *and* a delay, which is the order the LRM writes.
         let both = one("buf (weak0, weak1) #(1, 1) (o, a);");
-        assert_eq!(both.delay, Some(Delay::new(1)));
+        assert_eq!(both.delay, Some(GateDelay::single(Delay::new(1))));
         assert_eq!(both.strength.map(|s| s.zero), Some(StrengthLevel::Weak));
         assert_eq!(both.instance.terminals.len(), 2);
     }

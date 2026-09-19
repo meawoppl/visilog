@@ -16,7 +16,7 @@ use crate::parsers::identifier::hierarchical_identifier;
 
 use super::{
     behavior::{assignment_timing, EventControl},
-    delay::{parse_gate_delay, Delay},
+    delay::{parse_gate_delay, Delay, GateDelay},
     simple::ws,
 };
 
@@ -29,7 +29,7 @@ pub struct ContinuousAssignment {
     /// expression moves the net follows it. `None` is an assignment that named
     /// none, which settles in the same instant like every other continuous
     /// driver.
-    delay: Option<Delay>,
+    delay: Option<GateDelay>,
 }
 
 impl ContinuousAssignment {
@@ -61,7 +61,7 @@ impl ContinuousAssignment {
         lhs: Expression,
         rhs: Expression,
         strength: Option<DriveStrength>,
-        delay: Option<Delay>,
+        delay: Option<GateDelay>,
     ) -> Self {
         ContinuousAssignment {
             lhs,
@@ -90,13 +90,13 @@ impl ContinuousAssignment {
 
     /// The delay between the driving expression moving and the net following
     /// it, e.g. the `#10` of `assign #10 a = b;`.
-    pub fn delay(&self) -> Option<&Delay> {
+    pub fn delay(&self) -> Option<&GateDelay> {
         self.delay.as_ref()
     }
 
     /// The three expressions of the delay, for a pass that rewrites the names
     /// in them.
-    pub fn delay_mut(&mut self) -> Option<&mut Delay> {
+    pub fn delay_mut(&mut self) -> Option<&mut GateDelay> {
         self.delay.as_mut()
     }
 }
@@ -692,14 +692,30 @@ mod tests {
     /// strength, if it named one) and the first target.
     #[test]
     fn test_continuous_assignment_carries_a_delay() {
-        assert_eq!(only("assign #10 a = b;").delay(), Some(&Delay::new(10)));
         assert_eq!(
-            only("assign (pull1, pull0) #(2) a = b;").delay(),
-            Some(&Delay::new(2))
+            only("assign #10 a = b;").delay(),
+            Some(&GateDelay::single(Delay::new(10)))
         );
         assert_eq!(
+            only("assign (pull1, pull0) #(2) a = b;").delay(),
+            Some(&GateDelay::single(Delay::new(2)))
+        );
+        // All three are kept: which one applies is decided by the transition
+        // being made, so dropping the second and third would leave a fall
+        // taking the rise delay.
+        assert_eq!(
             only("assign #(1, 2, 3) a = b;").delay(),
-            Some(&Delay::new(1))
+            Some(&GateDelay::of(
+                Delay::new(1),
+                Delay::new(2),
+                Some(Delay::new(3))
+            ))
+        );
+        // Two delays leave the turn-off unwritten, which means the shorter of
+        // the two rather than no delay.
+        assert_eq!(
+            only("assign #(4, 2) a = b;").delay(),
+            Some(&GateDelay::of(Delay::new(4), Delay::new(2), None))
         );
         assert_eq!(only("assign a = b;").delay(), None);
     }
@@ -711,8 +727,8 @@ mod tests {
         let (remaining, assignments) =
             parse_continuous_assignment("assign #(LAG) a = 1, b = 0;").unwrap();
         assert!(remaining.is_empty());
-        let expected = Some(Delay::from_expression(Expression::Identifier(
-            Identifier::new("LAG".to_string()),
+        let expected = Some(GateDelay::single(Delay::from_expression(
+            Expression::Identifier(Identifier::new("LAG".to_string())),
         )));
         assert_eq!(assignments[0].delay(), expected.as_ref());
         assert_eq!(assignments[1].delay(), expected.as_ref());

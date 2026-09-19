@@ -417,6 +417,10 @@ pub struct Simulator {
     /// no delay. Empty for a design that names none anywhere, which is what
     /// keeps the question off the propagation hot path.
     delays: Vec<Option<DelayedDrive>>,
+    /// The same, one slot per gate. A gate is a continuous driver like a
+    /// delayed `assign`, so it wants the identical machinery — an empty vector
+    /// for a design whose gates name no delay.
+    gate_delays: Vec<Option<DelayedDrive>>,
     /// Writes an `a <= #5 b;` scheduled but has not yet made. Each holds the
     /// value its right hand side had when the statement ran, so nothing about
     /// it is re-read when it lands. Empty for a design that writes none.
@@ -498,6 +502,7 @@ impl Simulator {
             state: StateStore::new(),
             assignments: Vec::new(),
             delays: Vec::new(),
+            gate_delays: Vec::new(),
             scheduled: Vec::new(),
             settled_once: false,
             gates: Vec::new(),
@@ -531,6 +536,7 @@ impl Simulator {
         self.state = StateStore::new();
         self.assignments.clear();
         self.delays.clear();
+        self.gate_delays.clear();
         self.gates.clear();
         self.udps.clear();
         self.resolved_nets.clear();
@@ -573,6 +579,14 @@ impl Simulator {
             Vec::new()
         };
         self.gates = elaborated.gates;
+        self.gate_delays = if self.gates.iter().any(|gate| gate.delay.is_some()) {
+            self.gates
+                .iter()
+                .map(|gate| gate.delay.as_ref().map(|_| DelayedDrive::default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.udps = elaborated.udps;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
@@ -610,7 +624,7 @@ impl Simulator {
         // already see. It is deliberately conditional: settling unconditionally
         // here would make a module that never converges fail at setup rather
         // than when someone actually asks it to run.
-        if !self.delays.is_empty() {
+        if !self.delays.is_empty() || !self.gate_delays.is_empty() {
             self.propagate()?;
         }
 
@@ -1082,6 +1096,7 @@ impl Simulator {
         let due = self
             .delays
             .iter()
+            .chain(self.gate_delays.iter())
             .flatten()
             .filter_map(|drive| drive.pending.as_ref().map(|(time, _)| *time))
             .chain(self.scheduled.iter().map(|(at, _)| *at))
@@ -1145,7 +1160,12 @@ impl Simulator {
     }
 
     fn land_due_drives(&mut self, time: i64) {
-        for drive in self.delays.iter_mut().flatten() {
+        for drive in self
+            .delays
+            .iter_mut()
+            .chain(self.gate_delays.iter_mut())
+            .flatten()
+        {
             let Some((at, _)) = &drive.pending else {
                 continue;
             };
@@ -1459,10 +1479,19 @@ impl Simulator {
                 let value = match self.delays.get_mut(index).and_then(Option::as_mut) {
                     None => value,
                     Some(_) => {
-                        let ticks = assignment
+                        let delay = assignment
                             .delay()
-                            .expect("a delay slot belongs to a delayed assignment")
-                            .ticks(&self.state)?;
+                            .expect("a delay slot belongs to a delayed assignment");
+                        // Which of the rise, fall and turn-off delays applies
+                        // is decided by the move being made, so it is measured
+                        // from what the driver is asserting *now* rather than
+                        // from where it is headed.
+                        let applied = self.delays[index]
+                            .as_ref()
+                            .expect("the slot was just matched")
+                            .applied
+                            .clone();
+                        let ticks = delay.ticks_between(applied.as_ref(), &value, &self.state)?;
                         let drive = self.delays[index]
                             .as_mut()
                             .expect("the slot was just matched");
@@ -1508,13 +1537,48 @@ impl Simulator {
                     "a `$sscanf`, `$fscanf` or `$fgets` in a continuous assignment",
                 ));
             }
-            for gate in &self.gates {
+            for (index, gate) in self.gates.iter().enumerate() {
                 let code = gate.evaluate(&self.state)?;
+                // A delay does not stop a gate being a continuous driver — it
+                // only changes which value it drives, exactly as it does for
+                // an `assign`. The fresh value goes into flight; what comes
+                // out here is the one that has already landed.
+                let value = match self.gate_delays.get(index).and_then(Option::as_ref) {
+                    None => Register::from_bits(vec![code]),
+                    Some(drive) => {
+                        let value = Register::from_bits(vec![code]);
+                        let delay = gate
+                            .delay
+                            .as_ref()
+                            .expect("a delay slot belongs to a delayed gate");
+                        let ticks =
+                            delay.ticks_between(drive.applied.as_ref(), &value, &self.state)?;
+                        let drive = self.gate_delays[index]
+                            .as_mut()
+                            .expect("the slot was just matched");
+                        if drive.destination() != Some(&value) {
+                            if ticks == 0 {
+                                drive.applied = Some(value);
+                                drive.pending = None;
+                            } else {
+                                drive.pending = Some((self.now + ticks, value));
+                            }
+                        }
+                        match &drive.applied {
+                            Some(applied) => applied.clone(),
+                            // A delayed gate is driving from the first
+                            // instant; what it drives before its first
+                            // transaction lands is `x`, not the `z` of a
+                            // terminal nothing drives.
+                            None => Register::unknown(1),
+                        }
+                    }
+                };
                 for output in &gate.outputs {
                     let target = scalar_output(&self.state, resolve_target(&self.state, output)?);
                     contributions.push(Contribution {
                         target,
-                        value: Register::from_bits(vec![code]),
+                        value: value.clone(),
                         strength: gate.strength,
                     });
                 }
@@ -7620,6 +7684,99 @@ mod tests {
 
         simulator.advance(50).expect("time should advance");
         assert_eq!(simulator.output().text(), "0 a=x\n5 a=x\n15 a=1\n");
+    }
+
+    /// `#(rise, fall)` — which of the three delays applies is decided by the
+    /// value being driven **to**, not by the one being left.
+    ///
+    /// An omitted turn-off delay is the *shorter* of the two, which is why the
+    /// move to `z` takes 2 rather than 6. iverilog 12.0 prints
+    /// `0 a=x / 2 a=0 / 26 a=1 / 42 a=0 / 62 a=z` for this design.
+    #[test]
+    fn test_a_delay3_picks_its_delay_from_the_value_driven_to() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg b;
+                wire a;
+                assign #(6, 2) a = b;
+                initial begin
+                    b = 1'b0;
+                    #20 b = 1'b1;
+                    #20 b = 1'b0;
+                    #20 b = 1'bz;
+                end
+                initial $monitor("%0t a=%b", $time, a);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(80).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "0 a=x\n2 a=0\n26 a=1\n42 a=0\n62 a=z\n"
+        );
+    }
+
+    /// A value more than one bit wide is **one** transaction at the
+    /// **longest** of the delays its changed bits ask for — the bits that did
+    /// not move ask for nothing, and there is no intermediate value.
+    ///
+    /// iverilog 12.0, for `assign #(6, 2) o = i;` on a `[3:0]`: `1100 -> 0011`
+    /// (two bits falling, two rising) lands at 6, and `1111 -> 1100` (only
+    /// falls) lands at 2.
+    #[test]
+    fn test_a_wide_delayed_assignment_lands_once_at_the_longest_delay() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] i;
+                wire [3:0] o;
+                assign #(6, 2) o = i;
+                initial begin
+                    i = 4'b1111;
+                    #20 i = 4'b1100;
+                    #20 i = 4'b0011;
+                end
+                initial $monitor("%0t o=%b", $time, o);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(60).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "0 o=xxxx\n6 o=1111\n22 o=1100\n46 o=0011\n"
+        );
+    }
+
+    /// A **gate** delay is simulated, on the same machinery a delayed
+    /// `assign` uses: the delay changes which value the gate asserts rather
+    /// than whether it asserts one, so nothing about strength resolution or
+    /// the change journal had to learn about it.
+    ///
+    /// iverilog 12.0 prints `0 o=x / 2 o=0 / 26 o=1 / 42 o=0` for this design
+    /// (corpus `rise_fall_delay2`, `rise_fall_decay2`).
+    #[test]
+    fn test_a_gate_delay_is_simulated() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg i;
+                wire o;
+                buf #(6, 2) g (o, i);
+                initial begin
+                    i = 1'b0;
+                    #20 i = 1'b1;
+                    #20 i = 1'b0;
+                end
+                initial $monitor("%0t o=%b", $time, o);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(60).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 o=x\n2 o=0\n26 o=1\n42 o=0\n");
     }
 
     /// The delay is **inertial**, not transport: a pulse shorter than the

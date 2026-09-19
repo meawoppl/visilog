@@ -987,6 +987,21 @@ rather than assumed (iverilog 12.0): a new value *replaces* what is in flight in
 queueing behind it, so a pulse shorter than the delay never reaches the net. `assign #10`
 against a five-unit pulse produces no transition whatsoever.
 
+**A `delay3` keeps all three of its delays, and which one applies is decided by the value
+being driven *to*.** `#(rise, fall, turn_off)` is `parsers::delay::GateDelay`: a bit going
+to `1` takes `rise`, to `0` takes `fall`, to `z` takes `turn_off`, and to `x` takes the
+*shortest* of the three, since `x` is "it could already be any of these". An omitted
+`turn_off` is the shorter of `rise` and `fall` rather than no delay at all. Keeping only
+the first — which is what the parser used to do — gives every falling edge the rise delay,
+which is a wrong answer wearing a working simulator's clothes.
+
+For a value more than one bit wide the transaction is **one** transaction at the
+**longest** of the delays the changed bits ask for, with the unchanged bits asking for
+nothing and no intermediate value in between. That was measured rather than reasoned:
+`assign #(6, 2) o = i;` on a `[3:0]` carries `1100 -> 0011` — two bits falling, two
+rising — in 6, and `1111 -> 1100` in 2. `GateDelay::ticks_between` is the one place the
+rule lives, and both the assignment and the gate loop read it, so the two cannot disagree.
+
 Two seams make it work. `Simulator::next_time` is the time wheel: it is the earlier of the
 `EventQueue`'s next cursor and the earliest pending transaction, so a timestamp at which
 *only* a net changes still gets a turn. `Simulator::land_due_drives` runs at the top of
@@ -1020,14 +1035,15 @@ terminal that is neither — or one that is wide but not a plain signal, like
 misconnection. Both the array and the terminal are walked from their least significant end,
 so which way round either range was declared cannot matter.
 
-Not modelled, each by name where it can be: **a gate delay is parsed and ignored** — the
-gate settles in zero time along with every other continuous driver, and `#(rise, fall)`
-keeps only the first value. That is now the *only* continuous driver whose delay is
-ignored: `assign #10 a = b;` is simulated (see below), so the machinery a gate needs is
-already there and the gap is that nothing hands `Gate` a delay to schedule. It is what
-corpus `rise_fall_delay1`, `rise_fall_delay2`, `rise_fall_decay1` and `rise_fall_decay2`
-fail on, and they fail *honestly* — they run and print `FAILED` rather than looking like
-missing syntax. The **bidirectional** switches (`tran`, `tranif0`, `rtranif1`, …)
+**A gate delay is simulated, on the machinery a delayed `assign` already had.** `Gate`
+carries the `#(rise, fall, turn_off)` it was written with and `Simulator::gate_delays`
+holds one `DelayedDrive` per gate beside the one per assignment, so the delay changes
+*which* value the gate asserts rather than whether it asserts one — and nothing about
+strength resolution, three-state buses or the change journal had to learn about it. A
+design whose gates name no delay keeps an empty vector and the loop asks nothing per
+pass, the same shape the assignment delays use.
+
+Not modelled, each by name where it can be: the **bidirectional** switches (`tran`, `tranif0`, `rtranif1`, …)
 conduct both ways and have no output terminal, so `Gate::new` refuses them by name. The
 `r`-prefixed switches pass the same values as their non-resistive counterparts because the
 strength *reduction* is not modelled, and neither is strength *propagation* through a switch
@@ -1500,10 +1516,10 @@ tripwire.
   hierarchical identifier, and an expression is legal only inside parentheses — which is
   exactly what the LRM says. `#(2:10:17)` is the `min:typ:max` triple, tried first inside
   those parentheses because the single-value branch would match `2` and choke on the `:`.
-- **A `#delay` on an `assign` is simulated; a `#delay` on a gate is not.** A **gate** writes
-  up to three delays rather than one — `#(rise, fall, turn_off)` — which is what
-  `parse_gate_delay` is for; it keeps the first and drops the rest. The same production is
-  what an `assign` uses, and there the first value is *scheduled*: see below.
+- **A `#delay` on an `assign` and a `#delay` on a gate are both simulated, through one
+  production.** `parse_gate_delay` reads the `delay3` — up to three delays rather than one,
+  `#(rise, fall, turn_off)` — into a `GateDelay`, and both an `assign` and a gate schedule
+  it. A fourth delay is not a `delay3` and is left unconsumed rather than quietly dropped.
 - **System task names are decomposed, not enumerated.** `split_task_name` peels an optional
   `f` prefix (takes a descriptor) and an optional `b`/`h`/`o` suffix (the default radix), so
   `$display`, `$writeh`, `$fdisplayb`, `$strobeh`, `$fmonitor` and `$readmemb` all come from
