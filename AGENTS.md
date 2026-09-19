@@ -1767,8 +1767,16 @@ tripwire.
   distinct — don't collapse `@(*)` into an empty `Events` list.
 - **`case`, `casez` and `casex` differ only in the comparison.** One `CaseKind`
   (`behavior.rs`) rides on `CaseStatement` and on every `Instruction::JumpIfMatch`, and
-  `program.rs`'s `case_matches` switches on it: `Exact` keeps `==` semantics, where an
-  `x`/`z` on either side is never a match, while the wildcard forms compare for *identity*
+  `program.rs`'s `case_matches` switches on it: `Exact` is **case equality** — `===`, not
+  `==` — so an `x` matches an `x` and a `z` matches a `z` while still being told apart from
+  each other and from a known bit, which is IEEE 1364-2005 §9.5 and what iverilog 12.0
+  does (`case (3'bx11)` takes the `3'bx11` arm; `case (3'bz11)` takes the `3'bz11` arm and
+  not the `3'bx11` one; `case (3'bx11)` against a lone `3'bz11` arm takes the default).
+  Reading it as `==` instead — an unknown on either side never matching — is what a `case`
+  whose arms enumerate `x` and `z` states catches, and it is silent everywhere else:
+  corpus `case3.8D` and `always3.1.6D` were exactly that. The four-state `Register`
+  comparison already answers it, so the whole of the rule is comparing at the wider of the
+  two widths. The wildcard forms instead compare for *identity*
   with the don't-care bits masked out — `Register::matches_ignoring_z` / `_xz`, which read
   the don't-care mask straight off the `unknown` bit plane. A wildcard counts on **either
   side**, so a `z` in the subject is as much a don't-care as one in the label; testing only
