@@ -430,6 +430,14 @@ struct ForkJoin {
     /// `fork` field — which outer join *it* is a branch of. That chain is what
     /// makes a `fork` nested inside a branch work with no second mechanism.
     parent: ExecutionCursor,
+    /// The `Instruction::Fork` this record was opened at.
+    ///
+    /// A labelled `fork`'s scope runs from that instruction up to — but not
+    /// including — the join, so asking "is this fork inside the scope?" of the
+    /// parent cursor, which sits *at* the join, answers `no` for the fork's
+    /// own label. The site answers `yes`, which is what tells a `disable` of
+    /// the label from a `disable` of something inside one branch.
+    site: usize,
     /// Branches that have not reached their `join` yet.
     outstanding: usize,
 }
@@ -1476,7 +1484,17 @@ impl Simulator {
                 return Ok((carried, halted));
             };
             carried.extend(pending);
-            self.cancel_scope(&scope)?;
+            // A `disable` that named a scope *this* thread is inside cancels
+            // this activation too — `cancel_scope` has already re-queued the
+            // block at the scope's end, so carrying on from `pc + 1` would
+            // give the design two threads of one block. That is the `disable`
+            // written inside a `fork` branch naming the scope around the
+            // `fork`: the jump a local one compiles to cannot reach the
+            // siblings, so it comes here instead.
+            if self.cancel_scope(&scope, id)? {
+                let carried = self.hold_scheduled(carried);
+                return Ok((carried, true));
+            }
             pc = next;
         }
     }
@@ -1539,7 +1557,7 @@ impl Simulator {
     /// scope that exists but is not running anywhere is a no-op, which is what
     /// the LRM asks for — `always #6 disable foo;` cancels the enable of `foo`
     /// that happens to be in flight and says nothing about the times it is not.
-    fn cancel_scope(&mut self, scope: &str) -> Result<(), SimulationError> {
+    fn cancel_scope(&mut self, scope: &str, running: usize) -> Result<bool, SimulationError> {
         let known = self
             .blocks
             .iter()
@@ -1596,7 +1614,7 @@ impl Simulator {
         }
 
         if whole.is_empty() && threads.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let doomed: Vec<usize> = whole.iter().map(|(block, _)| *block).collect();
         // A block whose whole activation is going takes its branch threads
@@ -1632,7 +1650,7 @@ impl Simulator {
                 },
             );
         }
-        Ok(())
+        Ok(doomed.contains(&running))
     }
 
     /// Whether `cursor` is a `fork` branch whose own `fork` sits *outside*
@@ -1650,10 +1668,13 @@ impl Simulator {
         let Some(Some(record)) = self.forks.get(fork) else {
             return false;
         };
-        let parent = record.parent;
-        self.blocks[parent.block]
+        // Asked of the `Fork` instruction rather than of the parent cursor:
+        // a labelled `fork`'s own scope ends *at* the join the parent sits on,
+        // so the parent is outside it either way and only the site tells
+        // `disable fork_label` from a `disable` of something in one branch.
+        self.blocks[record.parent.block]
             .program
-            .scope_end_containing(scope, parent.pc)
+            .scope_end_containing(scope, record.site)
             .is_none()
     }
 
@@ -1720,6 +1741,7 @@ impl Simulator {
             // the last branch arrives.
             Resume::Forked {
                 branches,
+                site,
                 pc,
                 pending,
             } => {
@@ -1728,6 +1750,7 @@ impl Simulator {
                 }
                 let fork = self.open_fork(ForkJoin {
                     parent: ExecutionCursor { pc, ..cursor },
+                    site,
                     outstanding: branches.len(),
                 });
                 for branch in branches {
@@ -9296,31 +9319,72 @@ mod tests {
     }
 
     /// A `disable` written inside a branch, naming a scope the `fork` itself
-    /// sits in, would stop only the one thread that ran it and leave the join
-    /// waiting for an arrival that can never come. It is named rather than
-    /// approximated.
+    /// sits in, stops *every* branch and the block parked at the join — so it
+    /// cannot be the jump a local `disable` compiles to, which would stop the
+    /// one thread that ran it and leave the join waiting for ever.
+    ///
+    /// Execution continues where the named scope ends, which here is past the
+    /// statement after the `join` — that statement is inside `blk` too.
+    /// iverilog 12.0:
+    ///
+    /// ```text
+    /// 5 disabling
+    /// 20 done a=x
+    /// ```
     #[test]
-    fn test_a_disable_escaping_its_own_fork_is_a_named_error() {
-        let error = setup_error(
+    fn test_a_disable_of_the_scope_around_a_fork_stops_every_branch() {
+        let mut simulator = simulator_for(
             r#"
             module main();
                 integer a;
                 initial begin : blk
                     fork
-                        begin #5 disable blk; end
-                        begin #10 a = 1; end
+                        begin
+                            #5 $display("%0t disabling", $time);
+                            disable blk;
+                            $display("%0t not reached", $time);
+                        end
+                        begin #10 a = 1; $display("%0t branch two", $time); end
                     join
+                    $display("%0t after join", $time);
+                end
+                initial #20 $display("%0t done a=%0d", $time, a);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(50).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["5 disabling", "20 done a=x"]
+        );
+    }
+
+    /// A `fork` may carry the label itself, and `disable` of it ends at the
+    /// `join` rather than at the end of the block around it — so the statement
+    /// after the `join` *does* run. iverilog 12.0 prints `5 PASSED` and then
+    /// `30 FAILED`, the second `initial` being untouched by the `disable`.
+    #[test]
+    fn test_a_disable_of_a_forks_own_label_carries_on_after_the_join() {
+        let mut simulator = simulator_for(
+            r#"
+            module test();
+                initial begin
+                    fork : F
+                        forever #10;
+                        #5 disable F;
+                    join
+                    $display("%0t PASSED", $time);
+                end
+                initial begin
+                    #30; $display("%0t FAILED", $time);
                 end
             endmodule
         "#,
         );
 
-        assert_eq!(
-            error,
-            SimulationError::Unsupported(
-                "a `disable` inside a `fork` branch naming a scope around the `fork`"
-            )
-        );
+        simulator.advance(50).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["5 PASSED", "30 FAILED"]);
     }
 
     /// A branch that never arrives holds the join for ever, which is what the

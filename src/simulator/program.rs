@@ -226,7 +226,14 @@ pub enum Instruction {
     /// program counter is already inside it this is a jump to where that range
     /// ends. When it is not, the scope belongs to some other block and only
     /// the driver can reach it, which is what [`Resume::Disabled`] is for.
-    Disable(String),
+    ///
+    /// `escapes_fork` is the one case where the scope *does* contain the
+    /// program counter and the jump is still wrong: the `disable` sits in a
+    /// `fork` branch and names a scope the `fork` itself is inside. Jumping
+    /// would stop this one thread and leave its siblings running and the join
+    /// waiting for an arrival that can never come, so it goes to the driver
+    /// like a non-local one. [`Program::mark_fork_disables`] is what sets it.
+    Disable { scope: String, escapes_fork: bool },
     /// `fork … join` whose branches consume time — start one thread of
     /// execution per branch and suspend until every one of them has finished.
     ///
@@ -313,8 +320,15 @@ pub enum Resume {
     /// Hit a `fork` whose branches consume time. Start one thread at each of
     /// `branches` and hold this one at `pc` — the `join` — until the last of
     /// them arrives.
+    ///
+    /// `site` is the `Fork` instruction itself, which is the one point of the
+    /// layout that is inside a labelled `fork`'s own scope — the join is its
+    /// end and so is not. A `disable` of that label has to tell "the scope
+    /// contains this fork" from "this fork contains the scope", and only the
+    /// site answers both spellings the same way.
     Forked {
         branches: Vec<usize>,
+        site: usize,
         pc: usize,
         pending: Vec<PendingUpdate>,
     },
@@ -374,7 +388,7 @@ fn instruction_expressions(instruction: &Instruction) -> Vec<&Expression> {
         Instruction::Delay(delay) => delay.expressions().to_vec(),
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
-        | Instruction::Disable(_)
+        | Instruction::Disable { .. }
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => Vec::new(),
@@ -472,7 +486,7 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
         // beside the scope table it points into — see
         // [`Program::rename_scopes`] — and never through a map of variables.
         Instruction::Jump(_)
-        | Instruction::Disable(_)
+        | Instruction::Disable { .. }
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => {}
@@ -528,7 +542,7 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
         }
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
-        | Instruction::Disable(_)
+        | Instruction::Disable { .. }
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => {}
@@ -543,41 +557,46 @@ impl Program {
     ) -> Result<Program, SimulationError> {
         let mut program = Program::compile_body(statements, tasks, "")?;
         program.emit(Instruction::Halt);
-        program.check_fork_disables()?;
+        program.mark_fork_disables();
         Ok(program)
     }
 
-    /// Rejects a `disable` written inside a `fork` branch that names a scope
-    /// the `fork` itself is inside.
+    /// Marks every `disable` written inside a `fork` branch that names a scope
+    /// the `fork` itself is inside, so that it goes to the driver rather than
+    /// compiling to a jump.
     ///
     /// Terminating such a scope has to stop *every* branch and the block parked
-    /// at the join, and the jump a local `disable` compiles to would stop only
-    /// the one thread that ran it — leaving its siblings running and the join
-    /// waiting for an arrival that can never come. That is a wrong answer with
-    /// no symptom, so it is named here instead. The check is a post-pass rather
-    /// than part of `compile_fork` because the enclosing block's own range is
-    /// not recorded until the block around the `fork` has finished compiling.
-    fn check_fork_disables(&self) -> Result<(), SimulationError> {
+    /// at the join, and a jump would stop only the one thread that ran it —
+    /// leaving its siblings running and the join waiting for an arrival that
+    /// can never come. Only [`Simulator::cancel_scope`](super::runner::Simulator)
+    /// can reach the other threads, so the instruction is flagged here and
+    /// answered there. The pass is a post-pass rather than part of
+    /// `compile_fork` because the enclosing block's own range is not recorded
+    /// until the block around the `fork` has finished compiling.
+    fn mark_fork_disables(&mut self) {
+        let mut escaping = Vec::new();
         for (site, instruction) in self.instructions.iter().enumerate() {
             let Instruction::Fork { join, .. } = instruction else {
                 continue;
             };
-            for (pc, inner) in self.instructions[site + 1..*join].iter().enumerate() {
-                let Instruction::Disable(scope) = inner else {
+            for (offset, inner) in self.instructions[site + 1..*join].iter().enumerate() {
+                let Instruction::Disable { scope, .. } = inner else {
                     continue;
                 };
-                let pc = site + 1 + pc;
+                let pc = site + 1 + offset;
                 if self
                     .scope_end_containing(scope, pc)
                     .is_some_and(|end| end >= *join)
                 {
-                    return Err(SimulationError::Unsupported(
-                        "a `disable` inside a `fork` branch naming a scope around the `fork`",
-                    ));
+                    escaping.push(pc);
                 }
             }
         }
-        Ok(())
+        for pc in escaping {
+            if let Instruction::Disable { escapes_fork, .. } = &mut self.instructions[pc] {
+                *escapes_fork = true;
+            }
+        }
     }
 
     /// The same, without the trailing [`Instruction::Halt`] — a task's body,
@@ -661,8 +680,8 @@ impl Program {
             scope.name = resolve(&scope.name);
         }
         for instruction in &mut self.instructions {
-            if let Instruction::Disable(name) = instruction {
-                *name = resolve(name);
+            if let Instruction::Disable { scope, .. } = instruction {
+                *scope = resolve(scope);
             }
         }
     }
@@ -697,7 +716,10 @@ impl Program {
             .iter()
             .enumerate()
             .find_map(|(pc, instruction)| match instruction {
-                Instruction::Disable(scope) if self.scope_end_containing(scope, pc).is_none() => {
+                Instruction::Disable {
+                    scope,
+                    escapes_fork,
+                } if *escapes_fork || self.scope_end_containing(scope, pc).is_none() => {
                     Some(scope.as_str())
                 }
                 _ => None,
@@ -955,7 +977,10 @@ impl Program {
                 // matches none of them is left as it stands, to be found among
                 // the module's own scopes when it runs.
                 ProceduralStatements::Disable(name) => {
-                    self.emit(Instruction::Disable(enclosing_scope(scope, &name.name)));
+                    self.emit(Instruction::Disable {
+                        scope: enclosing_scope(scope, &name.name),
+                        escapes_fork: false,
+                    });
                 }
                 // Which `$name`s exist is settled here rather than while the
                 // design runs, so an unrecognised one fails before it can look
@@ -1934,9 +1959,12 @@ pub fn resume(
             // with the statement following the block". Terminating one it is
             // not inside can only be done by whoever holds the other block's
             // resume point, so it goes back to the driver.
-            Instruction::Disable(scope) => match program.scope_end_containing(scope, pc) {
-                Some(end) => pc = end,
-                None => {
+            Instruction::Disable {
+                scope,
+                escapes_fork,
+            } => match program.scope_end_containing(scope, pc) {
+                Some(end) if !escapes_fork => pc = end,
+                _ => {
                     return Ok(Resume::Disabled {
                         scope: scope.clone(),
                         pc: pc + 1,
@@ -1950,6 +1978,7 @@ pub fn resume(
             Instruction::Fork { branches, join } => {
                 return Ok(Resume::Forked {
                     branches: branches.clone(),
+                    site: pc,
                     pc: *join,
                     pending,
                 })
