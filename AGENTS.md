@@ -1826,6 +1826,14 @@ the first draft of the closure metric read `0%`, and only a control distinguishe
 a real result. A comparator stuck on "match" would invent 357 passes; one stuck on
 "mismatch" would look exactly like 357 genuine wrong answers.
 
+**`TIME_BUDGET` is what a design that never finishes is given**, and nothing else — one
+that calls `$finish` stops on its own. So the cost of raising it falls entirely on the
+free-running designs, and it is real: the whole corpus takes about 70 seconds at a
+hundred thousand ticks against about 30 at ten thousand. It is a hundred thousand because
+the corpus writes testbenches that long — `pr528` and `pr528b` clock a `` `timescale 1ps ``
+design every five thousand ticks and finish at 50001 — and a design cut off mid-run scores
+as a wrong answer rather than as one that was not given time.
+
 The harness runs the corpus through `front_end`, which is `Preprocessor` + `parse_expanded`
 rather than `parse_source`, because the corpus files `` `include `` one another by paths
 relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
