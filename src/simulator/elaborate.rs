@@ -66,7 +66,7 @@ use crate::register::{Register, ONE, ZERO};
 use crate::simulator::eval::{eval, expression_width};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
-use crate::simulator::gates::{Gate, PassSwitch};
+use crate::simulator::gates::{Gate, PassSwitch, WiredKind};
 use crate::simulator::program::{
     block_scope, FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition,
     TaskParameter, TaskTable, FUNCTION_DELAY_UNSUPPORTED, FUNCTION_EVENT_UNSUPPORTED,
@@ -193,6 +193,12 @@ pub struct Elaborated {
     /// it is what lets `resolve_bit` decide between them and everything else
     /// without a second rule.
     pub pulled_nets: Vec<PulledNet>,
+    /// The `wand`/`triand` and `wor`/`trior` nets, whose drivers combine by a
+    /// logic function rather than by strength.
+    ///
+    /// Empty for a design that declares none, which is what keeps the question
+    /// off the resolution hot path.
+    pub wired_nets: HashMap<String, WiredKind>,
     pub blocks: Vec<TimedBlock>,
     /// The *top* module's input ports, the only ones a testbench may drive.
     pub inputs: Vec<String>,
@@ -232,6 +238,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
+            wired_nets: HashMap::new(),
             blocks: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
@@ -1659,6 +1666,15 @@ impl<'m> Elaborator<'m> {
     /// rather than written: `tri0 c; assign c = d;` is `0` when `d` is `z` and
     /// `1` when `d` is `1`, which only `resolve_bit` can say.
     fn record_pull(&mut self, local: &str, net_type: WireKind, scope: &Scope) {
+        // A `wand`/`wor` net drives nothing of its own, but it does change how
+        // its drivers combine, and both questions are about the same
+        // declaration.
+        if let Some(wired) = wired_kind(net_type) {
+            let name = self.net_entry(local, scope);
+            self.out.resolved_nets.insert(name.clone());
+            self.out.wired_nets.insert(name, wired);
+            return;
+        }
         let (code, strength) = match net_type {
             WireKind::Supply0 => (ZERO, StrengthLevel::Supply),
             WireKind::Supply1 => (ONE, StrengthLevel::Supply),
@@ -1666,19 +1682,25 @@ impl<'m> Elaborator<'m> {
             WireKind::Tri1 => (ONE, StrengthLevel::Pull),
             _ => return,
         };
-        // A net that is also a port bound to a parent signal has no entry of
-        // its own, so the pull belongs on the entry it aliases — otherwise it
-        // names a signal the store does not have and setup fails.
-        let name = match scope.bindings.get(local) {
-            Some(Binding::Alias(target)) => target.clone(),
-            _ => scope.qualified(local),
-        };
+        let name = self.net_entry(local, scope);
         self.out.resolved_nets.insert(name.clone());
         self.out.pulled_nets.push(PulledNet {
             name,
             code,
             strength,
         });
+    }
+
+    /// The store entry a net declaration takes.
+    ///
+    /// A net that is also a port bound to a parent signal has no entry of its
+    /// own, so what is recorded against it belongs on the entry it aliases —
+    /// otherwise it names a signal the store does not have and setup fails.
+    fn net_entry(&self, local: &str, scope: &Scope) -> String {
+        match scope.bindings.get(local) {
+            Some(Binding::Alias(target)) => target.clone(),
+            _ => scope.qualified(local),
+        }
     }
 
     /// Elaborates one user-defined primitive instance into the flat driver
@@ -2460,6 +2482,16 @@ fn analyse_function_body(
 /// then fail at the first propagation. A concatenation qualifies because #212
 /// made one a writable target — every part is resolved on its own and the
 /// value is split across them.
+/// The wired resolution a net type asks for, or `None` for the kinds that
+/// resolve by strength like every other net.
+fn wired_kind(net_type: WireKind) -> Option<WiredKind> {
+    match net_type {
+        WireKind::WireAnd | WireKind::TriAnd => Some(WiredKind::And),
+        WireKind::WireOr | WireKind::TriOr => Some(WiredKind::Or),
+        _ => None,
+    }
+}
+
 fn is_drivable(expression: &Expression) -> bool {
     match expression {
         Expression::Identifier(_)
