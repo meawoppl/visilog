@@ -1183,9 +1183,28 @@ design can name one, so journalling it would only manufacture edges. The `repeat
 the ordinary `repeat` loop with the wait as its whole body, so a count of zero writes
 immediately.
 
-A **non-blocking** assignment with one of these is a named error, not an approximation:
-`a <= #5 b;` schedules its write and lets the block carry straight on, where everything
-here suspends the block — running it would hold up statements that have already run.
+A **non-blocking** assignment with one of these is not one of them: `a <= #5 b;`
+schedules its write and lets the block carry straight on, where everything above suspends
+the block. `Instruction::ScheduleWrite` is that shape, and `Simulator::scheduled` holds the
+write until its time.
+
+**A scheduled write lands at the *end* of the timestamp it is due at, not at the top of
+it**, which is the one thing that tells it from a delayed `assign`'s transaction. It is a
+*non-blocking* write, so it belongs in the same place in a timestep as an ordinary `<=` —
+`Simulator::land_due_writes` therefore sits beside `commit_updates`, after every block that
+runs at that instant, where `land_due_drives` stays at the top because a continuous driver
+really has changed the net by then. Measured: iverilog 12.0 prints `00` for **both**
+`$display`s at time 2 of
+
+```verilog
+initial begin a = 0; a <= #2 8'haa; #2; $display("%h", a); end
+initial begin #2; $display("%h", a); end
+```
+
+and `aa` only at time 3 (corpus `patch1268`). Landing it first instead lets a block read a
+value that has not been written yet. It goes ahead of the timestamp's own non-blocking
+updates because it was scheduled earlier, which is the order IEEE 1364-2005 §11.4 puts two
+updates in.
 
 **`@*` in front of a statement is not the same list as `@*` in front of a block.** It is
 sensitive to what *that statement* reads, so `@* a = c;` is `@(c)` even inside an
