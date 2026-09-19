@@ -2078,6 +2078,21 @@ tripwire.
   once and comes out 5% *faster* than the arrangement without the widening at all. It
   therefore sits **after** the selects in `operand_no_ws`, since it answers for any name
   at all and would otherwise leave their `[` behind.
+- **An unsized literal fills the width it is written against, and only if its leading
+  digit is unknown.** `'hx` compared with a 64 bit register is sixty-four `x`s and `'hz`
+  sixty-four `z`s — IEEE 1364-2005 3.5.1's rule that a literal extends by its most
+  significant digit — while `'h1` zero pads and `-1` sign extends like any other value.
+  A **sized** literal is *not* one of these: `4'bx` was extended to its own four bits
+  where it was written and is an ordinary value from then on, so `reg [63:0] p; p = 4'bx;`
+  is `...000x` (measured against iverilog 12.0). `VerilogConstant::extends_with_unknown`
+  is the one place the question is asked, and it asks about the **size** first, which is
+  what keeps the digit scan off the path nearly every literal takes.
+  It is also the one *leaf* `eval::sized_within` has to answer `true` for: widening it
+  before it is evaluated is not the same as padding the value afterwards, so a comparison
+  against one measures its operands where `state == 3'b010` measures nothing. Getting that
+  half wrong leaves `period !== 'hx` *true* for an untouched 64 bit register (corpus
+  `pr673`).
+
 - **A based literal is three tokens.** The size, the base designator and the digits are
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a

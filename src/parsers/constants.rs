@@ -129,6 +129,27 @@ impl VerilogConstant {
     pub fn digits(&self) -> &str {
         &self.value
     }
+
+    /// Whether widening this literal fills with `x`/`z` rather than with `0`.
+    ///
+    /// An **unsized** literal takes the width of whatever it is written
+    /// against, and IEEE 1364-2005 3.5.1 extends one whose most significant
+    /// digit is `x` or `z` with that digit — so `'hx` against a 64 bit
+    /// register is sixty-four `x`s. A **sized** literal was already extended
+    /// to its own width where it was written and is an ordinary value from
+    /// then on, which is why the size is asked about first: it is the cheap
+    /// half of the question and answers for nearly every literal a design
+    /// contains.
+    pub fn extends_with_unknown(&self) -> bool {
+        self.size.is_none()
+            && matches!(
+                self.value
+                    .chars()
+                    .find(|c| *c != '_')
+                    .map(|c| c.to_ascii_lowercase()),
+                Some('x') | Some('z') | Some('?')
+            )
+    }
 }
 
 impl RawToken for VerilogConstant {
@@ -615,5 +636,23 @@ mod tests {
                 VerilogConstant::new(None, VerilogBaseType::Binary, "1?0z".to_string())
             ))
         );
+    }
+
+    /// Only an *unsized* literal whose most significant digit is `x`, `z` or
+    /// `?` fills a wider context with that digit; everything else pads with
+    /// zeros. A sized literal is answered by the size alone, which is what
+    /// keeps the digit scan off the path nearly every literal takes.
+    #[test]
+    fn test_which_literals_extend_with_unknown() {
+        let extends = |source: &str| verilog_const(source).unwrap().1.extends_with_unknown();
+        assert!(extends("'hx"));
+        assert!(extends("'hz"));
+        assert!(extends("'bx1"));
+        assert!(extends("'b?"));
+        assert!(extends("'h_x1"));
+        assert!(!extends("4'bx"));
+        assert!(!extends("'h1x"));
+        assert!(!extends("'h1"));
+        assert!(!extends("42"));
     }
 }
