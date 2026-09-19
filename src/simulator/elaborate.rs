@@ -462,6 +462,17 @@ impl<'m> Elaborator<'m> {
         for (statement, inner) in &generated {
             self.declare(statement, inner)?;
         }
+        // An undeclared name wired to an instance, to a gate or to the left of
+        // an `assign` is an *implicit net*, which is a declaration and not a
+        // mistake. It runs after everything explicit, because it is only the
+        // names nothing declared that it creates, and before the build pass,
+        // because that is what looks them up.
+        for statement in &module.statements {
+            self.declare_implicit_nets(statement, scope);
+        }
+        for (statement, inner) in &generated {
+            self.declare_implicit_nets(statement, inner);
+        }
         for statement in &module.statements {
             self.build(statement, scope, &tasks)?;
         }
@@ -1342,6 +1353,72 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .declare_net(scope.qualified(local), range, signed);
+    }
+
+    /// Declares the implicit nets one module item asks for.
+    ///
+    /// IEEE 1364-2005 §4.5: a name nothing declares becomes a *scalar* net of
+    /// the default type where it is wired to a module instance's port, to a
+    /// gate or primitive terminal, or to the left of a continuous assignment.
+    /// `assign w = 1'b1;` with no `wire w;` above it is a design and not a
+    /// mistake, and iverilog 12.0 reads all three that way — a connection
+    /// expression too, so `.a(yy + 1)` for an undeclared `yy` reads `z` rather
+    /// than refusing to elaborate.
+    ///
+    /// The width is one bit even when the port it feeds is wider, which is what
+    /// iverilog does: `sub u(w, d);` against a four bit port warns and pads.
+    ///
+    /// The name is declared under exactly what [`Scope::resolve`] answers for
+    /// it, which is what the build pass asks for a moment later — declaring it
+    /// any other way could disagree with the lookup that follows.
+    fn declare_implicit_nets(&mut self, statement: &ModuleStatement, scope: &Scope) {
+        let mut names: Vec<&str> = Vec::new();
+        match statement {
+            ModuleStatement::Assignment(assignments) => {
+                for assignment in assignments {
+                    if let Expression::Identifier(id) = assignment.lhs() {
+                        names.push(&id.name);
+                    }
+                }
+            }
+            ModuleStatement::GateInstantiation(instances) => {
+                for instance in instances {
+                    for terminal in &instance.instance.terminals {
+                        operand_names(terminal, &mut names);
+                    }
+                }
+            }
+            ModuleStatement::ModuleInstantiation(instantiation) => match &instantiation.arguments {
+                ModuleInitArguments::NoArgs => {}
+                ModuleInitArguments::Positional(connections) => {
+                    for connection in connections.iter().flatten() {
+                        operand_names(connection, &mut names);
+                    }
+                }
+                ModuleInitArguments::Keyword(connections) => {
+                    for connection in connections.values() {
+                        operand_names(connection, &mut names);
+                    }
+                }
+            },
+            _ => {}
+        }
+        for local in names {
+            // A hierarchical name reaches something another scope declares, so
+            // there is nothing here to declare for it; a genvar is an
+            // elaboration-time integer and never reaches the store at all.
+            if local.contains('.') || scope.genvars.contains_key(local) {
+                continue;
+            }
+            let name = scope.resolve(local);
+            if self.out.state.contains(&name)
+                || self.out.state.memory(&name).is_some()
+                || self.out.state.is_event(&name)
+            {
+                continue;
+            }
+            self.out.state.declare_net(name, (0, 0), false);
+        }
     }
 
     /// Declares a memory local to this instance: `reg [7:0] mem [0:255];`.
@@ -2671,6 +2748,53 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
     }
 }
 
+/// The plain identifiers an expression uses as whole operands.
+///
+/// What it leaves out is the point: a *select*'s name, a called function's name
+/// and a `$name` are all names an implicit net could never be. An implicit net
+/// is one bit wide, so a name something indexes was meant to be declared, and
+/// declaring a scalar for it would turn a missing `wire [7:0]` into a silent
+/// out-of-range read.
+fn operand_names<'e>(expression: &'e Expression, names: &mut Vec<&'e str>) {
+    match expression {
+        Expression::Identifier(id) => names.push(&id.name),
+        Expression::Unary(_, inner) | Expression::Parenthetical(inner) => {
+            operand_names(inner, names)
+        }
+        Expression::Binary(lhs, _, rhs) => {
+            operand_names(lhs, names);
+            operand_names(rhs, names);
+        }
+        Expression::Conditional(condition, when_true, when_false) => {
+            operand_names(condition, names);
+            operand_names(when_true, names);
+            operand_names(when_false, names);
+        }
+        Expression::Concatenation(parts) => {
+            for part in parts {
+                operand_names(part, names);
+            }
+        }
+        Expression::Replication(count, parts) => {
+            operand_names(count, names);
+            for part in parts {
+                operand_names(part, names);
+            }
+        }
+        Expression::FunctionCall(_, arguments) | Expression::SystemFunctionCall(_, arguments) => {
+            for argument in arguments {
+                operand_names(argument, names);
+            }
+        }
+        Expression::Constant(_)
+        | Expression::RealLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BitSelect(..)
+        | Expression::PartSelect(..)
+        | Expression::IndexedPartSelect { .. } => {}
+    }
+}
+
 /// Rewrites every name an expression uses through `resolve`.
 ///
 /// That includes the name of a function it calls, which is qualified exactly as
@@ -3909,8 +4033,12 @@ mod tests {
         );
     }
 
+    /// A name nothing declares that is wired to an instance is an implicit
+    /// net, not an error: IEEE 1364-2005 §4.5, and what iverilog 12.0 does —
+    /// it warns that the four bit port got one bit and pads the rest, where
+    /// refusing would be a design it cannot compile at all.
     #[test]
-    fn test_connecting_a_signal_the_parent_never_declared() {
+    fn test_connecting_a_signal_the_parent_never_declared_is_an_implicit_net() {
         let top = r#"
             module top(
                 input clk,
@@ -3920,9 +4048,89 @@ mod tests {
             endmodule
         "#;
 
-        assert_eq!(
-            setup_error(&[top, COUNTER], "top"),
-            SimulationError::UnknownSignal("nowhere".to_string())
+        let simulator = simulator_for(&[top, COUNTER], "top");
+        // Scalar whatever the port's width is, which is the LRM's rule and
+        // iverilog's: `w=0 width=1` for a four bit port.
+        assert_eq!(simulator.get("nowhere").unwrap().width(), 1);
+    }
+
+    /// `assign w = 1'b1;` with no `wire w;` above it declares `w`, which is
+    /// what corpus `pr1693890` is about — its own comment says so, and it
+    /// checks `w !== 1'b1` at time 1.
+    #[test]
+    fn test_a_continuous_assignment_declares_its_undeclared_target() {
+        let top = r#"
+            module top;
+                assign w = 1'b1;
+                initial #1 if (w === 1'b1) $display("PASSED");
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "PASSED\n");
+    }
+
+    /// A gate terminal declares one too, which is how a netlist written
+    /// without `wire` declarations between its gates simulates at all
+    /// (corpus `pr1587669`, `pr1645518`).
+    #[test]
+    fn test_a_gate_terminal_declares_an_implicit_net() {
+        let top = r#"
+            module top;
+                reg a;
+                not g1 (mid, a);
+                not g2 (out, mid);
+                initial begin
+                    a = 1'b0;
+                    #1 $display("mid=%b out=%b", mid, out);
+                end
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "mid=1 out=0\n");
+    }
+
+    /// An implicit net is created for a name used *inside* a connection
+    /// expression as well, and an undriven one reads `z` — measured against
+    /// iverilog 12.0, which prints `yy=z` for `.a(yy + 1)`.
+    #[test]
+    fn test_an_undeclared_name_inside_a_connection_is_an_implicit_net() {
+        let top = r#"
+            module top;
+                sub u (.a(yy + 1));
+                initial #1 $display("yy=%b", yy);
+            endmodule
+        "#;
+        let sub = r#"
+            module sub(a);
+                input a;
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, sub], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "yy=z\n");
+    }
+
+    /// A name something *indexes* is not implicitly declared: an implicit net
+    /// is one bit, so a scalar standing in for a missing `wire [7:0]` would
+    /// turn a declaration the design forgot into a silent out-of-range read.
+    #[test]
+    fn test_a_selected_name_is_not_implicitly_declared() {
+        let top = r#"
+            module top;
+                reg a;
+                not g1 (bus[0], a);
+            endmodule
+        "#;
+
+        let simulator = simulator_for(&[top], "top");
+        assert!(
+            simulator.get("bus").is_err(),
+            "a name under a select should not have been declared"
         );
     }
 
