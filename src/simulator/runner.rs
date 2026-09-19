@@ -3017,7 +3017,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// A strength-bearing `assign` is resolved even when it is the net's only
     /// driver and the design has no gate in it at all.
     ///
@@ -6032,6 +6031,52 @@ mod tests {
         // The forced bit does not.
         simulator.advance(5).expect("time should advance");
         assert_eq!(simulator.get("r").unwrap().to_binary(), "1111");
+    }
+
+    /// Two forces may hold different parts of one vector at once, and a
+    /// `release` of one leaves the other standing.
+    ///
+    /// A drive used to be recorded per *signal name*, so `force bus[3:2]`
+    /// evicted `force bus[0]` and `release bus[0]` then took the `[3:2]` force
+    /// away with it — both silently. iverilog 12.0 prints
+    /// `0001 1101 110z 110z` for this design (corpus `force_release_reg_pv`,
+    /// `force_release_wire_pv`, `force_release_wire8_pv`,
+    /// `assign_deassign_pv`).
+    #[test]
+    fn test_two_forces_hold_separate_parts_of_one_vector() {
+        let mut simulator = simulator_for(
+            r#"
+            module held();
+                reg [3:0] bus;
+                initial begin
+                    bus = 4'b0000;
+                    force bus[0] = 1'b1;
+                    #5 force bus[3:2] = 2'b11;
+                    #5 release bus[0];
+                    bus = 4'b000z;
+                    #5 release bus[3:2];
+                end
+            endmodule
+        "#,
+        );
+
+        // The first force alone.
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.get("bus").unwrap().to_binary(), "0001");
+
+        // The second force does not displace the first.
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.get("bus").unwrap().to_binary(), "1101");
+
+        // Releasing bit 0 leaves `[3:2]` held, so the whole-signal write that
+        // follows it is masked rather than landing everywhere.
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("bus").unwrap().to_binary(), "110z");
+
+        // A released `reg` keeps what the force left it holding — nothing is
+        // put back — so the `11` stays even once the force is gone.
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("bus").unwrap().to_binary(), "110z");
     }
 
     /// A force is a *continuous* drive: it is re-evaluated whenever an operand

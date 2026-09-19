@@ -673,9 +673,25 @@ expression when an operand moves. `propagate` holds them through `StateStore::dr
 `assign` underneath a `force` has to be able to see the force to know its own write goes
 nowhere.
 
+**A drive is recorded per *target*, not per signal name.** `force bus[0] = 1;` and
+`force bus[3:2] = 2'b11;` hold different parts of one vector and both stand at once, and
+`release bus[0];` leaves the `[3:2]` force standing — which is the same per-bit rule
+`held_bits` already answered writes with, applied to the drive list itself. Keying the
+list by signal name instead made the second `force` silently evict the first and the
+first `release` take both away (corpus `force_release_reg_pv`, `force_release_wire_pv`,
+`force_release_wire8_pv`, `assign_deassign_pv`). A new drive goes on the **end**, so
+where two do overlap the later one is applied last and wins, which falls out of the order
+rather than needing a rule of its own. `exec::remove_drives_over` is the release half: it
+resolves each drive's target and drops the ones whose bits the release names, which is
+why the decision is made in `exec` and applied by `StateStore::retain_drives` — resolving
+a target needs the evaluator, and the store has no evaluator.
+
 **A `release` puts nothing back**, and the asymmetry that follows is the whole rule: a
 **net** reverts because its continuous drivers reach it again on the next pass, while a
-**variable** has no driver and so keeps the value the force left it holding. A releasing
+**variable** has no driver and so keeps the value the force left it holding. "On the next
+pass" is load-bearing and is a known gap (#235): iverilog re-resolves the net at the
+`release` itself, so a design that reads the net in the *same* timestep sees the driver's
+value where this reads the value the force left (corpus `pr1832097a`). A releasing
 `reg` forced to `1010` stays `1010`; a releasing `wire` returns to its assignment. That
 is what iverilog does, and it is why there is no "displaced value" recorded anywhere — a
 `release` simply removes the drive, unless a procedural `assign` is still installed
@@ -1336,6 +1352,26 @@ rather than `parse_source`, because the corpus files `` `include `` one another 
 relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
 `judge(source: &str)` signature so the control tests exercise exactly the corpus
 path; `judge_with` is the one that takes the configured preprocessor and the gold text.
+
+**`VISILOG_ONLY=<name>` runs one design and shows what it printed.** The closure report
+names the files that got a wrong answer but cannot say *what* they got — printing 1514
+designs' output would bury the number the report exists for — so triage used to mean
+hand-rolling a throwaway unit test around one design, which is slow and easy to get
+subtly wrong (a corpus file with a backtick directive has to go through `Preprocessor`,
+not `parse_verilog_source`). `ivtest_probe` is that probe, kept: it runs exactly the
+entry named through the same `judge_with` every other entry goes through, and prints the
+outcome, the output, and — for a `gold=` entry — the two side by side with the first
+differing line marked.
+
+```bash
+VISILOG_ONLY=pr2835632b cargo test --test ivtest_corpus ivtest_probe -- --ignored --nocapture
+```
+
+**iverilog 12.0 is installed on this machine** (`/usr/bin/iverilog`, `/usr/bin/vvp`), so
+a disputed answer is a measurement rather than a guess — write the smallest design that
+isolates the question, `iverilog -o x x.v && vvp x`, and record what it printed in the
+test's doc comment. Nearly every rule in this file was settled that way, and the ones
+that were reasoned from the LRM instead are the ones that turned out wrong.
 
 The blocker tables in `ivtest_corpus_parse_rate` are text heuristics, not parser
 diagnostics. **They go stale as features land** — a row counting files that *contain* a
