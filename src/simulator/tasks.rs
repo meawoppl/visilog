@@ -3334,6 +3334,89 @@ mod tests {
         );
     }
 
+    /// Every three-character spelling `%v` has, driven straight off the
+    /// interval so the rendering is tested apart from the resolution.
+    ///
+    /// Each is a line of corpus `pr544`'s gold file, which iverilog 12.0
+    /// produces for two `bufif1`s on one net at `(pull0, pull1)` and
+    /// `(strong0, strong1)`: `HiZ`, `PuL`, `StL`, `PuH`, `StH`, `Pu0`, `St0`,
+    /// `Pu1`, `St1`, `PuX`, `StX`, `650`, `65X`, `651`, `56X`.
+    #[test]
+    fn test_every_strength_spelling() {
+        for (low, high, expected) in [
+            (0, 0, "HiZ"),
+            (-5, 0, "PuL"),
+            (-6, 0, "StL"),
+            (0, 5, "PuH"),
+            (0, 6, "StH"),
+            (-5, -5, "Pu0"),
+            (-6, -6, "St0"),
+            (5, 5, "Pu1"),
+            (6, 6, "St1"),
+            (-5, 5, "PuX"),
+            (-6, 6, "StX"),
+            (-6, -5, "650"),
+            (-6, 5, "65X"),
+            (5, 6, "651"),
+            (-5, 6, "56X"),
+            (-7, 7, "SuX"),
+            (-7, -6, "760"),
+            (6, 7, "761"),
+        ] {
+            assert_eq!(
+                render_strength(Strength::span(low, high)),
+                expected,
+                "[{}, {}]",
+                low,
+                high
+            );
+        }
+    }
+
+    /// A `%v` of a net whose drivers were *resolved* reports the level they
+    /// settled on, where one of a plain register reports `strong`.
+    ///
+    /// Measured against iverilog 12.0: `assign (pull1, strong0) net = 4'b0110;`
+    /// with `$display("%v", net)` prints `St0_Pu1_Pu1_St0` (corpus
+    /// `multi_bit_strength`, whose whole point is that the two halves differ).
+    #[test]
+    fn test_a_resolved_net_reports_the_level_it_settled_at() {
+        let mut store = store_with(&[("net", "0110")]);
+        store.set_strengths(
+            "net",
+            vec![
+                Strength::span(-6, -6),
+                Strength::span(5, 5),
+                Strength::span(5, 5),
+                Strength::span(-6, -6),
+            ],
+        );
+        assert_eq!(
+            printed(r#"$display("[%v]", net);"#, &store),
+            "[St0_Pu1_Pu1_St0]\n"
+        );
+        // A bit select of one reads the same levels, picked by index.
+        assert_eq!(printed(r#"$display("[%v]", net[2]);"#, &store), "[Pu1]\n");
+        assert_eq!(
+            printed(r#"$display("[%v]", net[2:1]);"#, &store),
+            "[Pu1_Pu1]\n"
+        );
+    }
+
+    /// A level a later write left behind is **not** printed. A `force` or a
+    /// procedural write lands on a net after the resolution that recorded its
+    /// strength, so a stale level would name a strength for a value the net no
+    /// longer holds — `St1` beside a `0` is not something any driver produces.
+    #[test]
+    fn test_a_strength_that_no_longer_matches_the_value_is_dropped() {
+        let mut store = store_with(&[("net", "0000")]);
+        store.set_strengths("net", vec![Strength::span(5, 5); 4]);
+        assert_eq!(
+            printed(r#"$display("[%v]", net);"#, &store),
+            "[St0_St0_St0_St0]\n"
+        );
+    }
+
     /// A string is a value — eight bits a character — so a numeric format
     /// takes one: `$display("%d", "A")` is 65, right-aligned in the three
     /// columns eight bits ask for (iverilog 12.0).
