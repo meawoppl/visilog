@@ -649,6 +649,35 @@ impl Program {
         }
     }
 
+    /// Makes this program's hidden slots unique to the block it belongs to.
+    ///
+    /// A `repeat` counter and an intra-assignment hold both live in the
+    /// [`StateStore`] under a name derived from the index of the instruction
+    /// that created them — unique *within* one program, and not between two of
+    /// them. Two `initial` blocks in one module each start at instruction
+    /// zero, so without a tag of the block's own their `repeat (10)` loops
+    /// count each other down and run five iterations apiece (corpus `pr923`).
+    ///
+    /// The tag goes in **front**, where [`splice`](Program::splice)'s offset
+    /// goes behind: `$repeat$0$5` is a task's loop inside block 0 and
+    /// `$b5$repeat$0` is block 5's own, and a shared separator at one end
+    /// would let the two spell the same name. A spliced body is deliberately
+    /// *not* skipped — its loops belong to this block as much as the rest.
+    pub fn tag_slots(&mut self, tag: usize) {
+        for instruction in &mut self.instructions {
+            match instruction {
+                Instruction::RepeatInit { counter, .. }
+                | Instruction::RepeatNext { counter, .. } => {
+                    *counter = format!("$b{}{}", tag, counter)
+                }
+                Instruction::Hold { slot, .. } | Instruction::WriteHeld { slot, .. } => {
+                    *slot = format!("$b{}{}", tag, slot)
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Rewrites the names this program's *own* statements use, leaving the
     /// instructions spliced in from a task's body untouched.
     ///
@@ -2518,6 +2547,32 @@ mod tests {
             })
             .collect();
         assert_eq!(counters, vec!["dut.$repeat$0", "dut.$repeat$0"]);
+    }
+
+    /// Two blocks in one module each start at instruction zero, so their
+    /// counters have the same name until the block tags them. Sharing one is
+    /// what made corpus `pr923`'s two `repeat (10)` loops run five iterations
+    /// apiece and stop halfway through the design's output.
+    #[test]
+    fn test_a_block_tag_keeps_two_repeat_counters_apart() {
+        let counters = |program: &Program| -> Vec<String> {
+            program
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match instruction {
+                    Instruction::RepeatInit { counter, .. } => Some(counter.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut first = compile("begin repeat (2) a = 1'b1; end");
+        let mut second = compile("begin repeat (2) b = 1'b1; end");
+        assert_eq!(counters(&first), counters(&second));
+
+        first.tag_slots(0);
+        second.tag_slots(1);
+        assert_eq!(counters(&first), vec!["$b0$repeat$0"]);
+        assert_eq!(counters(&second), vec!["$b1$repeat$0"]);
     }
 
     /// A loop body is compiled inline, so a `#delay` in one suspends and

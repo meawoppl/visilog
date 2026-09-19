@@ -8595,6 +8595,34 @@ mod tests {
         assert_eq!(simulator.get("value").expect("declared").to_u128(), Some(5));
     }
 
+    /// Two blocks that each `repeat` count independently: the hidden counter
+    /// is named by an instruction index, and both blocks start at zero, so a
+    /// shared name would let them count each other down. Measured against
+    /// iverilog 12.0, which prints `a=5 b=5` (corpus `pr923`, whose two
+    /// `repeat (10)` loops stopped halfway).
+    #[test]
+    fn test_two_blocks_repeat_their_own_number_of_times() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                integer a, b;
+                initial begin
+                    a = 0;
+                    repeat (5) #1 a = a + 1;
+                end
+                initial begin
+                    b = 0;
+                    repeat (5) #1 b = b + 1;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(20).expect("time should advance");
+        assert_eq!(simulator.get("a").expect("declared").to_u128(), Some(5));
+        assert_eq!(simulator.get("b").expect("declared").to_u128(), Some(5));
+    }
+
     /// A function is evaluated at one instant, so a wait inside one is a named
     /// error rather than a call that quietly returns whatever it found.
     #[test]
