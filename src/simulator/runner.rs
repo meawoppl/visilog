@@ -1068,9 +1068,6 @@ impl Simulator {
             // its new value before anything runs, so a block scheduled for
             // this instant reads the net as it is at this instant.
             self.land_due_drives(time);
-            // A write scheduled for this instant lands before anything runs,
-            // for the same reason: a block resuming now must read it.
-            self.land_due_writes(time)?;
             let mut pending = Vec::new();
             let mut resumptions = 0;
 
@@ -1117,6 +1114,23 @@ impl Simulator {
                 let _ = self.propagate();
             }
 
+            // A write an `a <= #2 b;` scheduled for this instant is a
+            // *non-blocking* write like any other, so it lands here — after
+            // every block that runs at this timestamp — rather than at the top
+            // of it. Landing it first instead lets a `#2` in another block
+            // read a value that has not been written yet: iverilog 12.0 prints
+            // `00` for both `$display`s at time 2 of
+            //
+            // ```verilog
+            // initial begin a = 0; a <= #2 8'haa; #2; $display("%h", a); end
+            // initial begin #2; $display("%h", a); end
+            // ```
+            //
+            // and `aa` only at time 3 (corpus `patch1268`). It goes ahead of
+            // this timestamp's own non-blocking updates because it was
+            // scheduled earlier, which is the order IEEE 1364-2005 §11.4 puts
+            // two updates in.
+            self.land_due_writes(time)?;
             commit_updates(pending, &mut self.state)?;
             self.propagate()?;
             self.settle()?;
@@ -3021,6 +3035,50 @@ mod tests {
 
         simulator.advance(30).expect("time should advance");
         assert_eq!(simulator.output().text(), "t=23 a=10 b=99\n");
+    }
+
+    /// A write an `a <= #2 b;` scheduled is a *non-blocking* write, so it
+    /// lands at the **end** of the timestamp it is due at — after every block
+    /// that runs there — rather than at the top of it.
+    ///
+    /// iverilog 12.0 prints
+    ///
+    /// ```text
+    /// at 2 (same timestamp as the landing): 00
+    /// other block at 2: 00
+    /// at 3: aa
+    /// ```
+    ///
+    /// for the design below. Landing it at the top of the timestamp instead
+    /// gives `aa` on all three lines, which is a block reading a value that
+    /// has not been written yet (corpus `patch1268`).
+    #[test]
+    fn test_a_scheduled_write_lands_after_the_blocks_at_its_timestamp() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [7:0] a;
+                initial begin
+                    a = 8'h00;
+                    a <= #2 8'haa;
+                    #2;
+                    $display("at 2: %h", a);
+                    #1;
+                    $display("at 3: %h", a);
+                end
+                initial begin
+                    #2;
+                    $display("other block at 2: %h", a);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "at 2: 00\nother block at 2: 00\nat 3: aa\n"
+        );
     }
 
     /// `{a, b, c} = v;` splits the value across the parts, most significant
