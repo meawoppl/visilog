@@ -611,11 +611,31 @@ not pure functions of their arguments reach the simulation *through the store*:
 `StateStore::set_time` carries the clock `$time` reads — `Simulator::advance` moves it
 with `now`, and it is the only clock, which is why `TaskContext` no longer holds one —
 `StateStore::open_channel` / `open_descriptor` own the files `$fopen` opens, and
-`StateStore::next_random` / `seed_random` own the `$random` stream. The stream is a
-`RefCell<StdRng>` seeded from a fixed constant (`DEFAULT_RANDOM_SEED`, 0), so a design
-that draws random stimulus draws the *same* stimulus on every run and a self-checking
-test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
-write the seed back the way a real simulator's `inout` argument does.
+`StateStore::next_random` owns the `$random` stream.
+
+**`$random` is IEEE 1364-2005 17.9.3's generator, transcribed rather than chosen.** The
+point of that algorithm is that every simulator draws the *same* numbers from the same
+seed, so `state_store::random_from_seed` is the standard's reference C line for line —
+its `69069 * seed + 1` step, its `float`-flavoured scaling through `uniform`, and its
+truncation toward zero. The whole of the stream's state is one 32 bit seed
+(`DEFAULT_RANDOM_SEED`, 0, which `uniform` maps to a stream of its own), so a design that
+draws random stimulus draws the same stimulus on every run *and* the stimulus iverilog
+draws — corpus `pr556` prints 256 unseeded draws and `pr995` 93 seeded seed/value pairs,
+and either one catches any departure at all.
+
+**The two forms differ only in where the state is kept.** A bare `$random` advances the
+store's seed; `$random(seed)` reads the *design's* variable and writes the next seed back
+through it, because the argument is an `inout` — which is what makes `for (…) r =
+$random(s);` a sequence rather than one number repeated. The write-back goes on
+`StateStore::owe_fill`, the queue `$sscanf` already used, so it lands at the next
+instruction boundary and the statement after the call reads the new seed. A seed that is
+not a writable target is `EvalError::RandomSeed` naming it, never a stream that cannot
+move; an unknown bit of one reads as `0`, which is what iverilog takes from a four-state
+value asked for as an integer. A **second** draw in the same statement reads the seed out
+of that queue rather than out of the signal — `StateStore::pending_fill`, the same
+question a second call to a function with a side effect already asked — so
+`{$random(s), $random(s), $random(s), $random(s)}` is four different numbers (corpus
+`concat3`).
 
 **The plus-args are the one thing a design learns about its own invocation, and only a
 caller knows them.** `$test$plusargs("opt")` is a *prefix* match over the whole `+name=value`
@@ -1528,7 +1548,7 @@ telling apart.
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, and `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
