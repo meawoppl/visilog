@@ -30,6 +30,7 @@
 //! terminal at all; they are a **named error** at elaboration rather than a
 //! driver that quietly does nothing.
 
+use crate::parsers::delay::GateDelay;
 use crate::parsers::expr::Expression;
 use crate::parsers::gates::{DriveStrength, GateKind, StrengthLevel};
 use crate::register::{Register, ONE, X, Z, ZERO};
@@ -56,6 +57,10 @@ pub struct Gate {
     /// The terminals it reads, in the order the truth table wants them:
     /// the data first, then any control.
     pub inputs: Vec<Expression>,
+    /// `#(rise, fall, turn_off)`, when the instantiation named one. A gate is
+    /// a continuous driver like a delayed `assign`, so the delay changes
+    /// *which* value it asserts rather than whether it asserts one.
+    pub delay: Option<GateDelay>,
 }
 
 impl Gate {
@@ -68,6 +73,7 @@ impl Gate {
         kind: GateKind,
         strength: DriveStrength,
         mut terminals: Vec<Expression>,
+        delay: Option<GateDelay>,
     ) -> Result<Gate, SimulationError> {
         let found = terminals.len();
         let too_few = || SimulationError::GateTerminals {
@@ -133,6 +139,7 @@ impl Gate {
             strength,
             outputs,
             inputs,
+            delay,
         })
     }
 
@@ -537,6 +544,7 @@ mod tests {
             GateKind::And,
             DriveStrength::STRONG,
             terminals(&["out", "a", "b"]),
+            None,
         )
         .unwrap();
         assert_eq!(gate.outputs, terminals(&["out"]));
@@ -546,6 +554,7 @@ mod tests {
             GateKind::Buf,
             DriveStrength::STRONG,
             terminals(&["o1", "o2", "in"]),
+            None,
         )
         .unwrap();
         assert_eq!(gate.outputs, terminals(&["o1", "o2"]));
@@ -555,6 +564,7 @@ mod tests {
             GateKind::Pullup,
             DriveStrength::PULL,
             terminals(&["net_a", "net_b"]),
+            None,
         )
         .unwrap();
         assert_eq!(gate.outputs, terminals(&["net_a", "net_b"]));
@@ -566,7 +576,13 @@ mod tests {
     #[test]
     fn test_terminal_count_is_checked() {
         assert_eq!(
-            Gate::new(GateKind::And, DriveStrength::STRONG, terminals(&["out"])).err(),
+            Gate::new(
+                GateKind::And,
+                DriveStrength::STRONG,
+                terminals(&["out"]),
+                None
+            )
+            .err(),
             Some(SimulationError::GateTerminals {
                 gate: "and",
                 found: 1
@@ -576,7 +592,8 @@ mod tests {
             Gate::new(
                 GateKind::Bufif1,
                 DriveStrength::STRONG,
-                terminals(&["out", "in"])
+                terminals(&["out", "in"]),
+                None
             )
             .err(),
             Some(SimulationError::GateTerminals {
@@ -588,7 +605,8 @@ mod tests {
             Gate::new(
                 GateKind::Cmos,
                 DriveStrength::STRONG,
-                terminals(&["out", "in", "n"])
+                terminals(&["out", "in", "n"]),
+                None
             )
             .err(),
             Some(SimulationError::GateTerminals {
@@ -612,7 +630,13 @@ mod tests {
             GateKind::Rtranif1,
         ] {
             assert_eq!(
-                Gate::new(kind, DriveStrength::STRONG, terminals(&["a", "b", "c"])).err(),
+                Gate::new(
+                    kind,
+                    DriveStrength::STRONG,
+                    terminals(&["a", "b", "c"]),
+                    None
+                )
+                .err(),
                 Some(BIDIRECTIONAL_UNSUPPORTED)
             );
         }

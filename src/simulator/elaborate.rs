@@ -1499,8 +1499,17 @@ impl<'m> Elaborator<'m> {
             .iter()
             .map(|terminal| renamed(terminal, scope))
             .collect();
+        // `#(PERIOD)` on a gate names a parameter, which belongs to the
+        // instance that declared it like every other name the gate holds.
+        let delay = gate.delay.as_ref().map(|delay| {
+            let mut delay = delay.clone();
+            for expression in delay.expressions_mut() {
+                *expression = renamed(expression, scope);
+            }
+            delay
+        });
         let Some(range) = &gate.instance.range else {
-            let gate = Gate::new(gate.kind, strength, terminals)?;
+            let gate = Gate::new(gate.kind, strength, terminals, delay)?;
             self.push_gate(gate);
             return Ok(());
         };
@@ -1512,7 +1521,7 @@ impl<'m> Elaborator<'m> {
                 .iter()
                 .map(|terminal| self.array_terminal(gate.kind, terminal, position, count))
                 .collect::<Result<Vec<Expression>, SimulationError>>()?;
-            let gate = Gate::new(gate.kind, strength, sliced)?;
+            let gate = Gate::new(gate.kind, strength, sliced, delay.clone())?;
             self.push_gate(gate);
         }
         Ok(())
