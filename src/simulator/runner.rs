@@ -2377,6 +2377,35 @@ mod tests {
 
     /// An undriven **net** reads `z` while an untouched **variable** reads
     /// `x`. The difference is not cosmetic: a variable with no assignment is
+    /// A port's default value is applied where a body declaration's is, so a
+    /// `reg` in the body naming the same port cannot overwrite it — and a
+    /// value given to an output reaches the parent's net through the alias.
+    #[test]
+    fn test_a_ports_default_value_reaches_the_parent() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module child (a, b, c);
+              output a;
+              reg a = 1'b0;
+              output reg b = 1'b1;
+              output integer c = 7;
+            endmodule
+            module top;
+              wire out1, out2;
+              wire [31:0] out3;
+              child dut(out1, out2, out3);
+              initial #1 $display("%b %b %0d", out1, out2, out3);
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("advance should succeed");
+        assert_eq!(simulator.output().lines(), vec!["0 1 7"]);
+    }
+
     /// unknown because nothing has said what it is, while a net with no driver
     /// is high-impedance because nothing is driving it.
     ///

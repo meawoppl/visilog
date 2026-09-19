@@ -615,6 +615,66 @@ mod tests {
     }
 
     #[test]
+    /// `output integer d;` and `output time e;` — a port whose keyword *is*
+    /// its width, the same fixed widths an ordinary declaration gives them.
+    #[test]
+    fn test_a_port_may_name_a_data_type() {
+        assert_parses_to(
+            parse_port,
+            "output integer d",
+            Port {
+                direction: PortDirection::Output,
+                net_type: Some(NetType::Reg),
+                range: Range::Constant(31, 0),
+                identifier: "d".into(),
+                signed: true,
+                init: None,
+            },
+        );
+        assert_parses_to(
+            parse_port,
+            "output time e",
+            Port {
+                direction: PortDirection::Output,
+                net_type: Some(NetType::Reg),
+                range: Range::Constant(63, 0),
+                identifier: "e".into(),
+                signed: false,
+                init: None,
+            },
+        );
+        // And in the Verilog-1995 body spelling, where one declaration may
+        // name several ports and they share the type.
+        let ports = assert_parses(parse_port_declaration, "output integer d, f;");
+        assert_eq!(ports.len(), 2);
+        for port in &ports {
+            assert_eq!(port.range, Range::Constant(31, 0));
+            assert!(port.signed);
+        }
+    }
+
+    /// A default value belongs to the *name*, so `output reg x = 1, y = 2;`
+    /// gives the two ports different starting values — and a bare name after
+    /// one inherits the qualifiers but not the value.
+    #[test]
+    fn test_a_port_may_carry_a_default_value() {
+        let ports = assert_parses(parse_port_declaration, "output reg [31:0] x = 1, y = 2;");
+        assert_eq!(ports.len(), 2);
+        assert!(ports[0].init.is_some());
+        assert!(ports[1].init.is_some());
+        assert_ne!(ports[0].init, ports[1].init);
+
+        let module = assert_parses(
+            parse_module_declaration,
+            "module m(output reg [31:0] x = 1, y = 2); endmodule",
+        );
+        assert_eq!(module.ports.len(), 2);
+        assert_eq!(module.ports[1].range, Range::Constant(31, 0));
+        assert!(module.ports[0].init.is_some());
+        assert!(module.ports[1].init.is_some());
+    }
+
+    #[test]
     fn test_parse_port() {
         assert_parses_to(
             parse_port,
