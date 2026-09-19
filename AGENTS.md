@@ -1455,9 +1455,10 @@ is `0` rather than `x` — an unknown input that cannot change the answer does n
 answer unknown — and `or(1, z)` is `1`. A `z` reaching a *logic* gate is read as an `x`,
 which is the one place the switch family differs: `nmos` conducting a `z` passes a `z`,
 where `bufif1` enabled on a `z` gives an `x`. A three-state buffer whose control is unknown
-drives `x`, where the LRM allows the weaker `L`/`H`. `cmos` is deliberately **not** two
-resolved switches — `cmos(0, 1, x)` is `0`, where resolving a strong `0` against the `x` a
-half-open `pmos` reports would give `x` — so it asks whether *either* half conducts instead.
+drives `x` as a *value*; the LRM's weaker `L`/`H` is a **strength** and is `Gate::driving`'s.
+`cmos` is deliberately **not** two resolved switches — `cmos(0, 1, x)` is `0`, where
+resolving a strong `0` against the `x` a half-open `pmos` reports would give `x` — so it
+asks whether *either* half conducts instead, which is the same question its strength asks.
 
 An **array of instances** (`bufif1 drv [7:0] (bus, data, enable);`) is expanded at
 elaboration into one gate per index, because nothing downstream has a notion of an instance
@@ -1528,18 +1529,20 @@ Three things about a switch are **not** modelled, and each is measured rather th
 - **A control that is `x` or `z` is taken not to conduct.** iverilog conducts at an
   *ambiguous* strength instead, which gives the far side an `x` while leaving the driven
   side alone: `assign p = a; tranif1 (p, q, en);` with `a` at 1 and `en` unknown is
-  `p=1 q=x` there and `p=1 q=z` here. Saying "unknown" needs a strength that is a *range*
-  rather than a level, which `resolve_bit` has no shape for.
+  `p=1 q=x` there and `p=1 q=z` here. `Strength` now has the range shape that would take —
+  it is the pooling in `bond_nodes` that has nowhere to put a *directional* answer, since a
+  node is symmetric by construction (corpus `switch_primitives`).
 - **A switch delay changes nothing.** `tranif0 #(100) sw(gnd, net1, gnd);` delays the moment
   the switch opens or closes rather than a value, which is not the `DelayedDrive` machinery
   an `assign` or a gate uses. Corpus `pr3499807` is exactly that and fails honestly.
-- **Strength reduction and strength propagation are still absent.** The `r`-prefixed forms
-  pass the same values as their non-resistive counterparts, and nothing carries a strength
-  *through* a switch: corpus `resolv1` needs a `pmos` to carry a `pullup`'s `pull` strength
-  to its output, which — like `%v` printing `Pu1` rather than `St1` — would mean the store
-  carrying a strength per bit beside its value. That is what the seven `%v` gold files
-  (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`, `switch_primitives`) are
-  blocked on; they run and mismatch rather than failing to elaborate.
+- **Strength reduction across a bidirectional switch is still absent.** A *unidirectional*
+  one carries its input's strength through and the `r`-prefixed forms weaken it (see
+  `Gate::driving`), but `bond_nodes` pools the driver lists of a node and a pool is
+  symmetric, where a reduction is directional: a `tran` therefore passes a `supply` on
+  unchanged where iverilog drops it to `strong`, and an `rtran` chain does not weaken by a
+  level per switch. That is what the seven `%v` gold files (`tran`, `tranif0`, `tranif1`,
+  `rtran`, `rtranif0`, `rtranif1`, `switch_primitives`) are blocked on; they run and
+  mismatch rather than failing to elaborate.
 
 **A `generate` region is unrolled at elaboration, which is the same thing
 flattening an instance is, one level down.** `parsers/generate.rs` captures the
@@ -1891,13 +1894,47 @@ or a procedural write lands on the net after the resolution that recorded it —
 would print a strength for a value it no longer describes. A **memory word** has no slot at
 all: a name is in the signal map or the memory map and never both.
 
-Still missing from the picture, and both are one gap rather than two: a switch or a
-three-state buffer whose **control is unknown** drives a hard `x` where iverilog drives the
-ambiguous `StL`/`StH` (corpus `pr544`, `pr1787394a`/`b`), and **nothing reduces or
-propagates a strength through a switch** — `tran` should drop a `supply` to `strong` and the
-`r`-prefixed forms reduce every level, which is what the seven `%v` gold files of the switch
-family (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`,
-`switch_primitives`) and corpus `resolv1` are waiting on.
+**A driver that is not sure what it is driving is what the interval is *for*, and there are
+two of them.** `gates::Gate::driving` answers both, and everything else still drives at the
+`(strength0, strength1)` it declared:
+
+- **A control that is unknown makes the strength ambiguous, not the value.** A `bufif1`
+  whose enable is `x` is either driving its data or turned off, and `Strength::or_floating`
+  is that — the interval stretched to high impedance. The *value* is the `x` it always was;
+  what changes is that it prints `StL` rather than `StX` (corpus `pr544`, `pr1787394a`/`b`,
+  measured against iverilog 12.0). A `cmos` is the exception and stays the question
+  `complementary_switch` already asked: a half that is **definitely** open settles the
+  matter whatever the other half's control is doing, so `cmos(0, 1, x)` is a definite `St0`
+  where a lone `pmos` with an unknown gate is `StL`.
+- **A MOS switch passes the strength on its *input*** rather than declaring one, which is
+  what makes a `pullup` reach the far side of one still recognisably a `pull`:
+  `pullup (w); pmos (q, w, 1'b0);` beside `bufif0 (q, 1'b0, g);` answers `q = 0`, because
+  the switch carries `Pu1` and loses to the buffer's `St0` — driving at `strong` ties and
+  gives `x` (corpus `resolv1`, `br_gh99t`/`u`). `reduced` is IEEE 1364-2005 Table 7-8 on
+  top of it: a non-resistive switch drops `supply` to `strong`, an `r`-prefixed one weakens
+  every level.
+
+`Driven` is the seam that carries the two shapes — `Declared(DriveStrength)`, where each
+bit's strength follows from that bit's own value, against `Bit(Strength)`, one bit's
+strength worked out by the driver itself. A primitive terminal is one bit, which is why the
+second needs nothing per-bit.
+
+**A strength that moved counts as a change** in the propagation fixpoint, beside a value
+that moved. It has to: `pullup (w); bufif1 (w, 1'b1, g);` leaves `w` at `1` whether `g` is
+on or not and only the *level* moves, so a `pmos` downstream of it would carry the stale one
+for the rest of the run.
+
+Still missing: a **delayed** gate drives at its declared strength rather than at the one its
+inputs say this instant, because the value in hand is the one that landed `#n` ago and the
+two would otherwise be out of step — a `bufif1` whose enable has just gone away would let go
+of the net at once and keep its turn-off delay for nothing (corpus `rise_fall_decay2`), and
+a delayed *switch* consequently drives at `strong`. And nothing reduces a strength across a
+**bidirectional** switch: `bond_nodes` pools driver lists, which is symmetric, where a
+reduction is directional — so a `tran` carries a `supply` through where iverilog drops it to
+`strong`, and the `r`-prefixed forms do not weaken at all. That is what the seven `%v` gold
+files of the switch family (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`,
+`switch_primitives`) are still waiting on, together with a `tranif` whose control is unknown
+conducting at an ambiguous strength rather than not at all.
 
 **A string is a value wherever a number is wanted.** `$display("%d", "A")` is 65:
 `TaskArgument::Text` reaches a numeric format as its own bytes, eight bits a character.
