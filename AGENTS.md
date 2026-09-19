@@ -2039,6 +2039,27 @@ tripwire.
   does for a write out of range. `ResolvedTarget::Nowhere` is that write.
   `indexed_part_select` is tried before `part_select`, which would otherwise read the `:`
   of `+:` as its own separator.
+- **A word select is two brackets and must be tried before every one-bracket select.**
+  `mem[i][3:0]`, `mem[i][2]` and `mem[i][b +: 4]` are `Expression::WordSelect`, whose
+  `WordSelectKind` is the same three shapes a plain select has — held without a name of
+  their own, because the name belongs to the word in front of them. `expr.rs`'s
+  `word_select` sits ahead of `bit_select` in both `operand_no_ws` and
+  `assignment_lhs`: put it after and `bit_select` matches the *first* bracket on its own
+  and leaves the second for whatever comes next, which is a parse failure somewhere that
+  says nothing about the select. Inside the second bracket the ordering rules are
+  `bit_select`'s, for `bit_select`'s reasons — the bit before the part so a conditional
+  index wins, the indexed part before the plain one so the `:` of `+:` is not read as a
+  separator — and each of the three carries its own brackets so the `alt` gets a second
+  chance at a whole one.
+  **Only a memory has a second dimension**, and nothing in the grammar can tell
+  `mem[i][2]` from a second select on a vector, so `a[0][1:0]` for a plain `a` is
+  `EvalError::NotAMemory` naming it rather than bits of the wrong thing — a packed
+  dimension (`reg [3:0][7:0] v;`) is still not modelled. A word is a bare `Register` with
+  no declared range, so the declared indices are mapped through the *memory's* range:
+  that is `state_store::bit_position_in`, the one copy of the mapping, which
+  `SignalState::bit_position` and `Memory::bit_of` / `with_bit_of` both go through.
+  `indexed_select_indices` asks the memory map for its "which end is most significant"
+  question only on a miss of the signal map, so an ordinary vector pays nothing.
 - **`resolve_target` guards its part-select width, and must keep doing so.** A range like
   `a[1000000:0]` names more bits than any register has; the evaluator always refused it,
   and the *write* path did not, so once enough designs elaborated to reach it one asked

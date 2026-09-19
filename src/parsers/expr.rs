@@ -72,6 +72,78 @@ pub enum Expression {
     SystemFunctionCall(String, Vec<Expression>),
     BitSelect(Identifier, Box<Expression>),
     PartSelect(Identifier, Box<Expression>, Box<Expression>),
+    /// `mem[i][3:0]` — a select *within one word of a memory*, written as two
+    /// brackets.
+    ///
+    /// Only a memory has a second dimension to select from, and only the
+    /// declaration says which bracket is which: the first is the word address
+    /// and the second is the bit, part or indexed part select of that word.
+    /// It is its own node rather than a select whose base is an expression,
+    /// because the one shape Verilog allows here is exactly this one — a
+    /// select of a select of anything else is not legal — so a general base
+    /// would be a hole nothing fills.
+    WordSelect {
+        id: Identifier,
+        index: Box<Expression>,
+        select: WordSelectKind,
+    },
+}
+
+/// Which of the three selects the *second* bracket of `mem[i][…]` writes.
+///
+/// The same three shapes [`Expression::BitSelect`], [`Expression::PartSelect`]
+/// and [`Expression::IndexedPartSelect`] carry, held here without a name of
+/// their own: the name belongs to the word in front of them.
+#[derive(Debug, PartialEq, Clone)]
+pub enum WordSelectKind {
+    Bit(Box<Expression>),
+    Part(Box<Expression>, Box<Expression>),
+    Indexed {
+        base: Box<Expression>,
+        width: Box<Expression>,
+        upward: bool,
+    },
+}
+
+impl WordSelectKind {
+    /// The expressions inside the bracket, for a pass that rewrites them.
+    pub fn expressions_mut(&mut self) -> Vec<&mut Expression> {
+        match self {
+            WordSelectKind::Bit(index) => vec![index],
+            WordSelectKind::Part(first, second) => vec![first, second],
+            WordSelectKind::Indexed { base, width, .. } => vec![base, width],
+        }
+    }
+
+    /// The expressions inside the bracket, for a pass that only reads them.
+    pub fn expressions(&self) -> Vec<&Expression> {
+        match self {
+            WordSelectKind::Bit(index) => vec![index],
+            WordSelectKind::Part(first, second) => vec![first, second],
+            WordSelectKind::Indexed { base, width, .. } => vec![base, width],
+        }
+    }
+
+    fn to_contracted_string(&self) -> String {
+        match self {
+            WordSelectKind::Bit(index) => index.to_contracted_string(),
+            WordSelectKind::Part(first, second) => format!(
+                "{}:{}",
+                first.to_contracted_string(),
+                second.to_contracted_string()
+            ),
+            WordSelectKind::Indexed {
+                base,
+                width,
+                upward,
+            } => format!(
+                "{} {}: {}",
+                base.to_contracted_string(),
+                if *upward { "+" } else { "-" },
+                width.to_contracted_string()
+            ),
+        }
+    }
 }
 
 impl Expression {
@@ -153,6 +225,12 @@ impl Expression {
                 base.to_contracted_string(),
                 if *upward { "+" } else { "-" },
                 width.to_contracted_string()
+            ),
+            Expression::WordSelect { id, index, select } => format!(
+                "{}[{}][{}]",
+                id.name,
+                index.to_contracted_string(),
+                select.to_contracted_string()
             ),
         }
     }
@@ -266,6 +344,15 @@ impl Expression {
                 id.name,
                 base.to_ast_string(indent + 1),
                 width.to_ast_string(indent + 1)
+            ),
+            Expression::WordSelect { id, index, select } => format!(
+                "{}WordSelect(\n{}{}[{}],\n{}{})",
+                indent_str,
+                indent_str,
+                id.name,
+                index.to_contracted_string(),
+                indent_str,
+                select.to_contracted_string()
             ),
         }
     }
@@ -401,6 +488,9 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
         // A `$name` can start nothing else, so it is unambiguous first.
         system_function_call,
         fn_call,
+        // Before every single-bracket select, which would match the first
+        // bracket of `mem[i][3:0]` and stop there.
+        word_select,
         bit_select,
         indexed_part_select,
         part_select,
@@ -472,6 +562,74 @@ pub fn indexed_part_select(input: &str) -> IResult<&str, Expression> {
             base: Box::new(base),
             width: Box::new(width),
             upward,
+        },
+    ))
+}
+
+/// `mem[i][3:0]`, `mem[i][2]`, `mem[i][b +: 4]` — a select inside one word of
+/// a memory.
+///
+/// Two brackets, and the declaration is what says the first is a word address:
+/// nothing in the grammar can tell `mem[i][2]` from a second select on a
+/// vector, which is not legal Verilog and is a named error at evaluation.
+///
+/// It must be tried **before** [`bit_select`], which would otherwise match the
+/// first bracket on its own and leave the second for whatever comes next. The
+/// three inner forms keep [`bit_select`]'s ordering rules — the bit before the
+/// part, so a conditional index wins, and the indexed part before the plain
+/// one, so the `:` of `+:` is not read as a separator — and each carries its
+/// own brackets so the `alt` gets a second chance at the whole of one.
+pub fn word_select(input: &str) -> IResult<&str, Expression> {
+    let (input, id) = hierarchical_identifier(input)?;
+    let (input, index) = preceded(
+        ws_and_comments,
+        delimited(tag("["), ws(verilog_expression), tag("]")),
+    )(input)?;
+    let (input, select) = preceded(
+        ws_and_comments,
+        alt((
+            delimited(
+                tag("["),
+                map(ws(verilog_expression), |bit| {
+                    WordSelectKind::Bit(Box::new(bit))
+                }),
+                tag("]"),
+            ),
+            delimited(
+                tag("["),
+                map(
+                    tuple((
+                        ws(verilog_expression),
+                        alt((value(true, tag("+:")), value(false, tag("-:")))),
+                        ws(verilog_expression),
+                    )),
+                    |(base, upward, width)| WordSelectKind::Indexed {
+                        base: Box::new(base),
+                        width: Box::new(width),
+                        upward,
+                    },
+                ),
+                tag("]"),
+            ),
+            delimited(
+                tag("["),
+                map(
+                    pair(
+                        ws(verilog_expression),
+                        preceded(tag(":"), ws(verilog_expression)),
+                    ),
+                    |(first, second)| WordSelectKind::Part(Box::new(first), Box::new(second)),
+                ),
+                tag("]"),
+            ),
+        )),
+    )(input)?;
+    Ok((
+        input,
+        Expression::WordSelect {
+            id,
+            index: Box::new(index),
+            select,
         },
     ))
 }

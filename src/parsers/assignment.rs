@@ -9,7 +9,7 @@ use nom::{
 };
 
 use crate::parsers::expr::{
-    bit_select, indexed_part_select, part_select, verilog_expression, Expression,
+    bit_select, indexed_part_select, part_select, verilog_expression, word_select, Expression,
 };
 use crate::parsers::gates::{drive_strength, DriveStrength};
 use crate::parsers::identifier::hierarchical_identifier;
@@ -240,6 +240,9 @@ pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
 /// expressions, so `q[n:m]` and `q[i]` work as well as literal indices.
 pub fn assignment_lhs(input: &str) -> IResult<&str, Expression> {
     alt((
+        // `mem[i][3:0] = d;` — before every single-bracket select, which would
+        // match the first bracket and leave the second unconsumed.
+        word_select,
         bit_select,
         indexed_part_select,
         part_select,
