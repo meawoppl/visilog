@@ -649,6 +649,14 @@ and resolves down a different path. A `$name` nothing implements is
 `EvalError::UnknownSystemFunction`, never a zero, and a wrong argument count is
 `EvalError::SystemFunctionArity`.
 
+**`$stime` is unsigned, like the `$time` beside it**, because `time` is an unsigned type
+— and that is the field `%d` gives it: iverilog 12.0 prints `$display($stime)` in ten
+columns where an `integer` takes eleven (corpus `pr2842621`). iverilog is inconsistent
+about it in the other direction — `($stime - 2) < 0` is *true* there, so it reads the
+same call as signed in arithmetic while printing it at the unsigned width, and `$clog2`
+has the same split (`$bits` is unsigned in both). No one flag gives both answers, and
+the unsigned reading is the one that matches the type.
+
 `eval` is handed a `&StateStore` and nothing else, so the system functions that are
 not pure functions of their arguments reach the simulation *through the store*:
 `StateStore::set_time` carries the clock `$time` reads — `Simulator::advance` moves it
