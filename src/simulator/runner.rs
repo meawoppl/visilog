@@ -6480,7 +6480,16 @@ mod tests {
     }
 
     /// `%t` pads to twenty characters until `$timeformat` says otherwise, and
-    /// then renders exactly what it was asked for.
+    /// then renders exactly what it was asked for — scaled from the tick this
+    /// design counts to the unit it asked for. A design with no `` `timescale ``
+    /// is at `1s / 1s`, so a tick is a second and `$timeformat(-9, …)` asks for
+    /// it in nanoseconds. iverilog 12.0 prints the same three lines:
+    ///
+    /// ```text
+    /// default[                   7]
+    /// set[7000000000.00 ns]
+    /// narrow[7000000000.00 ns]
+    /// ```
     #[test]
     fn test_timeformat_configures_how_percent_t_renders() {
         let mut simulator = simulator_for(
@@ -6501,8 +6510,51 @@ mod tests {
             simulator.output().lines(),
             vec![
                 "default[                   7]",
-                "set[   7.00 ns]",
-                "narrow[7.00 ns]",
+                "set[7000000000.00 ns]",
+                "narrow[7000000000.00 ns]",
+            ]
+        );
+    }
+
+    /// `%t` scales from the tick the clock counts — the design's
+    /// `` `timescale `` unit — to the unit `$timeformat` names, and a design
+    /// that never called `$timeformat` prints in the finest *precision* its
+    /// directives declared. Measured against iverilog 12.0 for
+    /// `` `timescale 1ns/100ps ``, which prints:
+    ///
+    /// ```text
+    /// default[                  50]
+    /// us[   0.005000 us]
+    /// ps[5000 ps]
+    /// ```
+    #[test]
+    fn test_percent_t_scales_by_the_designs_timescale() {
+        let source = r#"
+            module scaled();
+                initial begin
+                    #5 $display("default[%t]", $time);
+                    $timeformat(-6, 6, " us", 14);
+                    $display("us[%t]", $time);
+                    $timeformat(-12, 0, " ps", 0);
+                    $display("ps[%0t]", $time);
+                end
+            endmodule
+        "#;
+        let (remaining, module) = parse_module_declaration(source).expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.set_timescale(Some(
+            Timescale::parse("1ns/100ps").expect("a legal timescale"),
+        ));
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(10).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "default[                  50]",
+                "us[   0.005000 us]",
+                "ps[5000 ps]",
             ]
         );
     }

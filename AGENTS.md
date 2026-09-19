@@ -570,16 +570,32 @@ is a compiler diagnostic visilog has no channel for, which is the whole of why c
 `pr1403406b` is a gold mismatch while `pr1403406`, `pr1403406a`, `pr1701855` and
 `pr1701855b` match.
 
-**`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
-fractional digits, then the suffix, right-aligned in `min_width` (twenty by
-default), with an explicit `%12t` overriding `min_width` and `%0t` meaning no
-padding at all. The `units` argument is range-checked and then taken to name the
-unit a tick already *is*: the clock counts ticks, and although
-`Simulator::set_timescale` now receives the `` `timescale `` the preprocessor recorded,
-only the waveform header reads it — nothing converts between it and `units` (#209).
-That is the identity for the `` `timescale 1ns `` plus
-`$timeformat(-9, …)` pairing that covers nearly every design using either, and
-wrong by a power of ten when they disagree — corpus `timeform1` is the case.
+**`$timeformat`'s `units` is a scale factor, and `%t` is the one place the
+`` `timescale `` reaches the output.** The clock counts ticks of the **unit** of the
+module a call was written in — `TaskContext::tick_fs`, which asks the same `scale_of`
+`$printtimescale` does — and `%t` restates one of those in the power of ten the design
+named, so `` `timescale 1ns `` with `$timeformat(-6, …)` prints `10` as `0` and with
+`$timeformat(-12, …)` prints it as `10000`. Both ends are held in **femtoseconds**,
+because a `` `timescale `` term is `1`, `10` or `100` of a unit and only the finest unit
+makes every ratio an exact integer.
+
+A design that never called `$timeformat` prints in the **finest precision** any
+`` `timescale `` in it declared (`TaskContext::default_time_units`), which is what the
+LRM asks for: `` `timescale 1ns/100ps `` renders `$time` of 5 as `50`. That is also why
+a design with no directive at all is unchanged — a module with no `` `timescale `` is at
+`1s / 1s`, so the tick and the display unit are both a second and the ratio is one.
+
+The scaling of an **integer** time is exact and **truncated** — 1500 ticks of `1ns` at
+`$timeformat(-6, 0, …)` is `1`, not `2`, and at `$timeformat(-6, 1, …)` is `1.5` — while
+a **real** one (`$realtime`, or a literal) is scaled as a double and rounded by the field
+width, since it carries a fraction of a tick. Both were measured against iverilog 12.0,
+which takes the two paths as well. `precision` fractional digits, then the suffix,
+right-aligned in `min_width` (twenty by default), with an explicit `%12t` overriding
+`min_width` and `%0t` meaning no padding at all.
+
+What is still not rescaled is *time itself*: `#5` advances five ticks whatever the
+module's unit is, so a design mixing `` `timescale 1ns `` and `` `timescale 1us ``
+modules runs both at the same rate where iverilog would not (#209).
 
 **A system *function* is an expression operand, and `eval` implements it.** `$time`,
 `$stime`, `$signed`, `$unsigned`, `$random`, `$fopen`, `$bits` and `$clog2` parse anywhere an
