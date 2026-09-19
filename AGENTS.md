@@ -1254,12 +1254,24 @@ suspends inside an enabled task's body count — the body is already spliced in 
 Three seams keep it consistent with what was already there. `Program::splice` offsets a
 `Fork`'s branch targets like any other jump, so a `fork` inside a task works. `settle` skips
 a block that `is_forking`, for the same reason it skips one part way through a `wait` — it
-has not finished the run it is on. And `Simulator::cancel_scope` is **block oriented**: a
-`disable` naming a scope with a running `fork` in it has to cancel every branch and the
-block parked at the join, so it collects the *blocks* with a thread inside the scope, drops
-every cursor of each — queued, waiting, and the fork records, which are the only thing
-holding a parent at a join — and re-queues one cursor at the scope's end. A block has one
-activation at a time, which is what makes "every cursor of that block" the right set.
+has not finished the run it is on. And `Simulator::cancel_scope` is **block oriented when
+the scope contains the `fork` and thread oriented when the `fork` contains the scope**,
+which is the whole of the difference between the two cases and is decided per cursor by
+`is_branch_of_outside_fork`. A `disable` naming a scope with a running `fork` in it has to
+cancel every branch and the block parked at the join, so it collects the *blocks* with a
+thread inside the scope, drops every cursor of each — queued, in the round, waiting, and
+the fork records, which are the only thing holding a parent at a join — and re-queues one
+cursor at the scope's end. A block has one activation at a time, which is what makes "every
+cursor of that block" the right set. A `disable` naming a scope inside a **sibling branch**
+is the other case: only the cursor inside that scope stops, and it is re-queued **keeping
+its `fork` field**, so it still reaches its `JoinBranch` and the `fork` completes. Building
+a fresh `ExecutionCursor::new` for it instead gives it `fork: None`, which reaches
+`JoinBranch` as "the compiled layout and the scheduler have parted company" and is reported
+as `FORK_TIMING_UNSUPPORTED` — naming the wrong thing entirely. The question "is this fork
+inside the scope?" is asked of the fork record's *parent* cursor, which is the instruction
+the join sits at (corpus `disable3.6B`; measured against iverilog 12.0, which resumes the
+join at the instant of the `disable` rather than at the instant the cancelled branch would
+have finished).
 
 `join_any` and `join_none` are not implemented, and `block_between` closing on a
 word-boundary `keyword` rather than a bare `tag` is what keeps them out: without it,

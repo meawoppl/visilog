@@ -1424,59 +1424,113 @@ impl Simulator {
             return Err(SimulationError::UnknownScope(scope.to_string()));
         }
 
-        // Which blocks have a thread inside the scope, and where each of them
-        // carries on. A block has one activation at a time, so a `fork` inside
-        // the scope contributes several cursors and they all belong to the one
-        // activation being cancelled — which is why what is collected here is a
-        // *block*, and why every one of that block's cursors then goes.
-        // A block parked at a `join` is on neither the queue nor the waiting
-        // list — the fork record is the only thing holding it — so a `disable`
-        // naming the scope the fork sits in has to look there as well or the
-        // block would simply be lost.
+        // Which threads are inside the scope, and where each of them carries
+        // on. A block parked at a `join` is on neither the queue nor the
+        // waiting list — the fork record is the only thing holding it — so a
+        // `disable` naming the scope the fork sits in has to look there as well
+        // or the block would simply be lost.
         // `round` is the fourth place a live cursor can be: `advance` takes
         // every cursor due at this timestamp off the queue before it resumes
         // any of them, so a block that is due *now* and has not run yet is on
         // neither the queue nor the waiting list (corpus `sdw_dsbl`, where the
         // `disable` and the block it names are both due at time 15).
-        let live = self
+        let scheduled = self
             .queue
             .cursors()
             .copied()
             .chain(self.round.iter().copied())
-            .chain(self.waiting.iter().map(|waiting| waiting.cursor))
-            .chain(self.forks.iter().flatten().map(|record| record.parent));
-        let mut cancelled: Vec<(usize, usize)> = Vec::new();
-        for cursor in live {
+            .chain(self.waiting.iter().map(|waiting| waiting.cursor));
+        let mut whole: Vec<(usize, usize)> = Vec::new();
+        let mut threads: Vec<(ExecutionCursor, usize)> = Vec::new();
+        for cursor in scheduled {
             let Some(end) = self.blocks[cursor.block]
                 .program
                 .scope_end_containing(scope, cursor.pc)
             else {
                 continue;
             };
-            if !cancelled.iter().any(|(id, _)| *id == cursor.block) {
-                cancelled.push((cursor.block, end));
+            if self.is_branch_of_outside_fork(cursor, scope) {
+                threads.push((cursor, end));
+            } else if !whole.iter().any(|(id, _)| *id == cursor.block) {
+                whole.push((cursor.block, end));
+            }
+        }
+        // A `fork` whose *parent* is inside the scope is a fork the scope
+        // contains, so the whole activation goes: every branch, and the block
+        // held at the join.
+        for record in self.forks.iter().flatten() {
+            let cursor = record.parent;
+            let Some(end) = self.blocks[cursor.block]
+                .program
+                .scope_end_containing(scope, cursor.pc)
+            else {
+                continue;
+            };
+            if !whole.iter().any(|(id, _)| *id == cursor.block) {
+                whole.push((cursor.block, end));
             }
         }
 
-        if cancelled.is_empty() {
+        if whole.is_empty() && threads.is_empty() {
             return Ok(());
         }
-        let doomed: Vec<usize> = cancelled.iter().map(|(block, _)| *block).collect();
-        self.queue.retain(|cursor| doomed.contains(&cursor.block));
-        self.round.retain(|cursor| !doomed.contains(&cursor.block));
-        self.waiting
-            .retain(|waiting| !doomed.contains(&waiting.cursor.block));
+        let doomed: Vec<usize> = whole.iter().map(|(block, _)| *block).collect();
+        // A block whose whole activation is going takes its branch threads
+        // with it, so a thread of one is not re-queued a second time.
+        threads.retain(|(cursor, _)| !doomed.contains(&cursor.block));
+        let cancelled: Vec<ExecutionCursor> = threads.iter().map(|(cursor, _)| *cursor).collect();
+        self.queue
+            .retain(|cursor| doomed.contains(&cursor.block) || cancelled.contains(cursor));
+        self.round
+            .retain(|cursor| !doomed.contains(&cursor.block) && !cancelled.contains(cursor));
+        self.waiting.retain(|waiting| {
+            !doomed.contains(&waiting.cursor.block) && !cancelled.contains(&waiting.cursor)
+        });
         for record in self.forks.iter_mut() {
             if record.is_some_and(|it| doomed.contains(&it.parent.block)) {
                 *record = None;
             }
         }
 
-        for (block, end) in cancelled {
+        for (block, end) in whole {
             self.queue
                 .insert(self.now, ExecutionCursor::new(block, end));
         }
+        // A cancelled branch keeps its `fork`, so it still reaches its
+        // `JoinBranch` and the join it belongs to still completes.
+        for (cursor, end) in threads {
+            self.queue.insert(
+                self.now,
+                ExecutionCursor {
+                    block: cursor.block,
+                    pc: end,
+                    fork: cursor.fork,
+                },
+            );
+        }
         Ok(())
+    }
+
+    /// Whether `cursor` is a `fork` branch whose own `fork` sits *outside*
+    /// `scope` — which is what tells a `disable` of a sibling branch's scope
+    /// from a `disable` of a scope the whole `fork` is inside.
+    ///
+    /// In the first case only that one thread stops, and it still has to arrive
+    /// at its `join` or the block would wait for an arrival that can never
+    /// come. In the second the `fork` itself is being cancelled, so every
+    /// branch and the block parked at the join go together.
+    fn is_branch_of_outside_fork(&self, cursor: ExecutionCursor, scope: &str) -> bool {
+        let Some(fork) = cursor.fork else {
+            return false;
+        };
+        let Some(Some(record)) = self.forks.get(fork) else {
+            return false;
+        };
+        let parent = record.parent;
+        self.blocks[parent.block]
+            .program
+            .scope_end_containing(scope, parent.pc)
+            .is_none()
     }
 
     /// What the driver does with a [`Resume`] that is not a
@@ -8751,6 +8805,59 @@ mod tests {
 
         simulator.advance(100).expect("time should advance");
         assert_eq!(simulator.output().text(), "disabled at 5\n");
+    }
+
+    /// A `disable` naming a scope inside a **sibling** branch stops that one
+    /// thread and nothing else — and the thread still arrives at the `join`,
+    /// so the `fork` completes.
+    ///
+    /// iverilog 12.0 on the same design:
+    ///
+    /// ```text
+    /// 1 disabled
+    /// 1 joined q=00
+    /// 6 done q=00
+    /// ```
+    ///
+    /// The join resumes at 1 rather than waiting for the `#2` the cancelled
+    /// task would have taken, and `q` never takes the write past the
+    /// `disable`. Cancelling the whole block instead loses the `fork` the
+    /// cancelled branch belonged to.
+    #[test]
+    fn test_disable_of_a_sibling_branchs_scope_still_reaches_the_join() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [7:0] q;
+                task slow;
+                    begin
+                        #2;
+                        q = 8'hAA;
+                        $display("%0t task finished", $time);
+                    end
+                endtask
+                initial begin
+                    q = 0;
+                    fork
+                        slow;
+                        begin
+                            #1;
+                            disable slow;
+                            $display("%0t disabled", $time);
+                        end
+                    join
+                    $display("%0t joined q=%h", $time, q);
+                    #5 $display("%0t done q=%h", $time, q);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(100).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "1 disabled\n1 joined q=00\n6 done q=00\n"
+        );
     }
 
     /// A `fork` whose branches consume no time cannot tell concurrent from
