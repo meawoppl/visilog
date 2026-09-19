@@ -113,11 +113,13 @@ pub fn parse_expanded(expanded: Preprocessed) -> Result<ParsedSource, SourceErro
     // A `` `timescale `` applies to the modules that follow it, so a module's
     // scale is decided by where it sits. The grammar cannot see a directive at
     // all — the preprocessor took them out — which is why the two halves only
-    // meet here.
+    // meet here. `` `unconnected_drive `` is positional in exactly the same way
+    // and is stamped beside it.
     let modules = located
         .into_iter()
         .map(|(at, mut module)| {
             module.timescale = expanded.timescale_at(at);
+            module.unconnected_drive = expanded.unconnected_drive_at(at);
             module
         })
         .collect();

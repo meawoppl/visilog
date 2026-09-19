@@ -20,11 +20,10 @@ use std::path::{Path, PathBuf};
 /// line instead swallows whatever the design wrote after it on the same line —
 /// `` module test `protect ( `` loses its parenthesis — and, when that rest
 /// opens a block comment, swallows only the opening half of it.
-const IGNORED_DIRECTIVES: [&str; 15] = [
+const IGNORED_DIRECTIVES: [&str; 14] = [
     "end_keywords",
     "celldefine",
     "endcelldefine",
-    "nounconnected_drive",
     "protect",
     "endprotect",
     "suppress_faults",
@@ -41,10 +40,9 @@ const IGNORED_DIRECTIVES: [&str; 15] = [
 /// Ignored directives that take exactly one argument, which is consumed with
 /// them. The argument need not be on the directive's own line: a comment may
 /// sit between the two and a block comment may run across a newline.
-const IGNORED_DIRECTIVES_WITH_ARGUMENT: [&str; 5] = [
+const IGNORED_DIRECTIVES_WITH_ARGUMENT: [&str; 4] = [
     "begin_keywords",
     "default_nettype",
-    "unconnected_drive",
     "default_decay_time",
     "default_trireg_strength",
 ];
@@ -330,6 +328,10 @@ pub struct Preprocessed {
     /// are into the **expanded** text, which is what the grammar sees, so a
     /// module's own offset indexes straight into this list.
     pub timescales: Vec<(usize, Option<Timescale>)>,
+    /// The `` `unconnected_drive `` regions, recorded the same way and for the
+    /// same reason. `Some(true)` is `pull1`, `Some(false)` is `pull0`, and
+    /// `None` is `` `nounconnected_drive `` — the default.
+    pub unconnected_drives: Vec<(usize, Option<bool>)>,
 }
 
 impl Preprocessed {
@@ -341,6 +343,16 @@ impl Preprocessed {
             .take_while(|(at, _)| *at <= offset)
             .last()
             .and_then(|(_, timescale)| *timescale)
+    }
+
+    /// The `` `unconnected_drive `` in force at `offset`, which is `None` when
+    /// nothing had said one — the default, where an unconnected input is `z`.
+    pub fn unconnected_drive_at(&self, offset: usize) -> Option<bool> {
+        self.unconnected_drives
+            .iter()
+            .take_while(|(at, _)| *at <= offset)
+            .last()
+            .and_then(|(_, pull)| *pull)
     }
 }
 
@@ -421,6 +433,7 @@ impl Preprocessor {
                 Some(timescale) => vec![(0, Some(timescale))],
                 None => Vec::new(),
             },
+            unconnected_drives: Vec::new(),
         };
         let file = run.intern(name);
         run.scan(source, Origin::File(file))?;
@@ -449,6 +462,7 @@ impl Preprocessor {
             },
             timescale: run.timescale,
             timescales: run.timescales,
+            unconnected_drives: run.unconnected_drives,
         })
     }
 }
@@ -522,6 +536,7 @@ struct Run<'a> {
     open_includes: Vec<PathBuf>,
     timescale: Option<Timescale>,
     timescales: Vec<(usize, Option<Timescale>)>,
+    unconnected_drives: Vec<(usize, Option<bool>)>,
 }
 
 impl Run<'_> {
@@ -541,6 +556,20 @@ impl Run<'_> {
             }
         }
         self.timescales.push((at, timescale));
+    }
+
+    /// Records that every module declared from here on has `pull` for an
+    /// unconnected input port. The same one-entry-per-position rule as
+    /// [`Run::note_timescale`], for the same reason.
+    fn note_unconnected_drive(&mut self, pull: Option<bool>) {
+        let at = self.out.text.len();
+        if let Some((last, entry)) = self.unconnected_drives.last_mut() {
+            if *last == at {
+                *entry = pull;
+                return;
+            }
+        }
+        self.unconnected_drives.push((at, pull));
     }
 
     fn intern(&mut self, name: &str) -> usize {
@@ -794,11 +823,41 @@ impl Run<'_> {
             // is at `1s / 1s` however the file started (corpus `pr1403406`).
             // It takes no argument, so like every other argumentless directive
             // it consumes its own name and nothing else.
+            // `` `unconnected_drive pull0 `` / `pull1` says what an
+            // unconnected *input port* of every module declared from here on
+            // reads, and `` `nounconnected_drive `` puts the `z` back. It is
+            // positional exactly as a `` `timescale `` is, which is why the two
+            // are recorded the same way — the grammar never sees either.
+            "unconnected_drive" => {
+                let argument = self.skip_directive_argument(text, i, line, origin)?;
+                if emitting {
+                    let pull = match argument.as_str() {
+                        "pull0" => false,
+                        "pull1" => true,
+                        other => {
+                            return Err(self.malformed(
+                                loc,
+                                "unconnected_drive",
+                                format!("expected `pull0` or `pull1`, found `{}`", other),
+                            ))
+                        }
+                    };
+                    self.note_unconnected_drive(Some(pull));
+                }
+            }
+            "nounconnected_drive" => {
+                if emitting {
+                    self.note_unconnected_drive(None);
+                }
+            }
             "resetall" => {
                 if emitting {
                     let default = self.config.default_timescale;
                     self.timescale = default;
                     self.note_timescale(default);
+                    // `` `resetall `` puts *every* directive back to its
+                    // default, and an unconnected drive is one of them.
+                    self.note_unconnected_drive(None);
                 }
             }
             "include" => {
@@ -866,7 +925,7 @@ impl Run<'_> {
         i: &mut usize,
         line: &mut usize,
         origin: Origin,
-    ) -> Result<(), PreprocessError> {
+    ) -> Result<String, PreprocessError> {
         let bytes = text.as_bytes();
         loop {
             let loc = origin.loc(*line);
@@ -909,6 +968,7 @@ impl Run<'_> {
 
         // The argument is a quoted string (`` `begin_keywords "1364-2005" ``)
         // or a bare word — a net type, a pull direction or a number.
+        let start = *i;
         if bytes.get(*i) == Some(&b'"') {
             *i = string_end(bytes, *i);
         } else {
@@ -918,7 +978,10 @@ impl Run<'_> {
                 *i += 1;
             }
         }
-        Ok(())
+        // Handed back rather than only skipped: `` `unconnected_drive `` reads
+        // its argument, and it wants the same whitespace and comment skipping
+        // every other one-argument directive gets.
+        Ok(text[start..*i].to_string())
     }
 
     /// Expand a fragment into a buffer of its own rather than into the output.
@@ -1665,6 +1728,43 @@ mod tests {
         // The last one seen is still the design's, which is what a waveform
         // header states.
         assert_eq!(result.timescale, None);
+    }
+
+    /// `` `unconnected_drive `` is positional exactly as a `` `timescale `` is,
+    /// and `` `nounconnected_drive `` — and `` `resetall `` — put the default
+    /// back. Comments may sit anywhere inside it, including between the
+    /// directive and its argument, which is what corpus `br_gh782c` writes.
+    #[test]
+    fn test_every_unconnected_drive_is_recorded_with_where_it_takes_effect() {
+        let source = "module a; endmodule\n\
+                      `unconnected_drive pull0\nmodule b; endmodule\n\
+                      `nounconnected_drive\nmodule c; endmodule\n\
+                      /* c */`unconnected_drive/*\n c */\n/* c */pull1/*\n c */\n\
+                      module d; endmodule\n\
+                      `resetall\nmodule e; endmodule\n";
+        let result = Preprocessor::new().preprocess(source, "test.v").unwrap();
+        let pull = |name: &str| {
+            result.unconnected_drive_at(result.text.find(name).expect("module should be there"))
+        };
+        assert_eq!(pull("module a"), None);
+        assert_eq!(pull("module b"), Some(false));
+        assert_eq!(pull("module c"), None);
+        assert_eq!(pull("module d"), Some(true));
+        assert_eq!(pull("module e"), None);
+    }
+
+    /// The argument is read rather than skipped, so a word that is neither
+    /// `pull0` nor `pull1` is a named error and not a silent `z`.
+    #[test]
+    fn test_a_malformed_unconnected_drive_is_an_error() {
+        let error = Preprocessor::new()
+            .preprocess("`unconnected_drive pull2\nmodule a; endmodule\n", "test.v")
+            .expect_err("should be rejected");
+        assert!(
+            error.to_string().contains("pull2"),
+            "error should name the argument: {}",
+            error
+        );
     }
 
     /// `with_default_timescale` is iverilog's `+timescale+1ns/1ps`: the scale a

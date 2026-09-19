@@ -104,13 +104,29 @@ continuations), `` `undef ``/`` `undefineall ``, `` `ifdef ``/`` `ifndef ``/`` `
 `` `else ``/`` `endif `` including nesting, `` `timescale `` (recorded on `Preprocessed`
 and on `ModuleLibrary::timescale`, and handed to `Simulator::set_timescale` for a waveform
 dump's `$timescale`, *and* positionally in `Preprocessed::timescales` so each module knows
-the one it was written at), `` `resetall `` (which restores
-`Preprocessor::with_default_timescale`), `` `include ``
+the one it was written at), `` `unconnected_drive ``/`` `nounconnected_drive `` (recorded
+positionally the same way, in `Preprocessed::unconnected_drives`), `` `resetall `` (which
+restores `Preprocessor::with_default_timescale` and clears the unconnected drive),
+`` `include ``
 with a search path set by `Preprocessor::with_include_dir`, the `` `" ``/`` `\`" ``/`` `` ``
 escapes, and the `` `__FILE__ ``/`` `__LINE__ `` builtins. `IGNORED_DIRECTIVES` skips
 `` `begin_keywords ``, `` `celldefine ``, `` `default_nettype `` and the rest of the
-pragma-like set together with the rest of their line — `` `resetall `` is no longer one of
-them, because it puts the default timescale back.
+pragma-like set together with the rest of their line — `` `resetall `` and
+`` `unconnected_drive `` are no longer among them, because both change what the design
+means.
+
+**A positional directive is recorded, not acted on, and the two halves meet in
+`parse_expanded`.** `` `timescale `` and `` `unconnected_drive `` both apply to *what
+follows them* and the grammar never sees either, so the preprocessor records a list of
+`(offset, value)` pairs into the **expanded** text and `parse_verilog_source_located` pairs
+each module with the offset it started at. Anything else positional wants exactly that
+shape: a `Vec` on `Preprocessed`, a `…_at(offset)` accessor, a field on `VerilogModule`
+that is `None` for a module built by a test, and one line in `parse_expanded`.
+`skip_directive_argument` hands its argument back rather than only skipping it, which is
+how `` `unconnected_drive `` reads `pull0`/`pull1` while getting the same whitespace and
+comment skipping every other one-argument directive gets — corpus `br_gh782c` writes block
+comments between the directive and its argument and across the newline after it. An
+argument that is neither is a **named error**, never a silent `z`.
 
 Gotchas that are load-bearing:
 
@@ -278,7 +294,12 @@ identifier is *aliased*: it and the parent's signal are one store entry, resolve
 statically, so there is no propagation step between them and no value can go stale. A port
 bound to a general expression (`.a(x + 1)`) cannot be aliased; an input gets its own signal
 plus a continuous assignment from the parent, and an output reports `UndrivablePort`. An
-unconnected input is declared `z`. `Simulator::with_modules(modules, top)` is how a design
+unconnected input is declared `z` — unless the module was *declared* inside an
+`` `unconnected_drive pull0 `` / `pull1` region, which is what
+`VerilogModule::unconnected_drive` carries to `declare_port` (IEEE 1364-2005 §19.9, corpus
+`uncon_drive`, `br_gh782c`). The directive belongs to the module's declaration and not to
+the instantiation, which is why it travels with the port rather than with the connection.
+`Simulator::with_modules(modules, top)` is how a design
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 

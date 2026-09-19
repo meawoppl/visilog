@@ -459,7 +459,7 @@ impl<'m> Elaborator<'m> {
         // the passes below have anything to walk.
         if let Some(table) = primitive_table(module) {
             for port in &module.ports {
-                self.declare_port(port, scope)?;
+                self.declare_port(port, scope, module.unconnected_drive)?;
             }
             self.build_udp(module, table, scope)?;
             self.stack.pop();
@@ -494,7 +494,7 @@ impl<'m> Elaborator<'m> {
             self.declare(statement, scope)?;
         }
         for port in &module.ports {
-            self.declare_port(port, scope)?;
+            self.declare_port(port, scope, module.unconnected_drive)?;
         }
         // A `defparam` overrides a parameter of an instance this module has yet
         // to create, so it is collected before the build pass reaches that
@@ -861,7 +861,12 @@ impl<'m> Elaborator<'m> {
 
     /// Declares one port, unless it was aliased onto a signal that already
     /// exists.
-    fn declare_port(&mut self, port: &Port, scope: &Scope) -> Result<(), SimulationError> {
+    fn declare_port(
+        &mut self,
+        port: &Port,
+        scope: &Scope,
+        unconnected: Option<bool>,
+    ) -> Result<(), SimulationError> {
         let local = &port.identifier.name;
         match scope.bindings.get(local) {
             // The parent's signal *is* this port. Declaring it again would give
@@ -936,8 +941,19 @@ impl<'m> Elaborator<'m> {
         if scope.is_root() {
             self.out.inputs.push(name);
         } else {
-            // Nothing at all is driving this input, which is what `z` means.
-            let floating = Register::high_impedance(range_width(range));
+            // Nothing at all is driving this input, which is what `z` means —
+            // unless the module was declared inside an
+            // `` `unconnected_drive pull0 `` / `pull1` region, which says an
+            // unconnected input of it reads that level instead (IEEE
+            // 1364-2005 §19.9, corpus `uncon_drive`, `br_gh782c`). The
+            // directive belongs to the module's *declaration*, not to the
+            // instantiation, which is why it arrives with the port.
+            let width = range_width(range);
+            let floating = match unconnected {
+                None => Register::high_impedance(width),
+                Some(false) => Register::from_u128(0, width),
+                Some(true) => Register::from_u128(u128::MAX, width),
+            };
             self.out.state.set_ranged(name, floating, range);
         }
         Ok(())
@@ -4241,6 +4257,43 @@ mod tests {
         // And the floating value propagates the way any other would.
         simulator.run().unwrap();
         assert_eq!(simulator.get("out").unwrap().to_binary(), "zzzz");
+    }
+
+    /// Unless the module was *declared* inside an `` `unconnected_drive ``
+    /// region, in which case an unconnected input of it reads that level.
+    /// IEEE 1364-2005 §19.9, and corpus `uncon_drive` and `br_gh782c`, which
+    /// iverilog 12.0 answers `PASSED`.
+    ///
+    /// The directive belongs to the module's declaration rather than to the
+    /// instantiation, so it is carried on [`VerilogModule::unconnected_drive`]
+    /// and reaches `declare_port` with the port.
+    #[test]
+    fn test_an_unconnected_drive_region_pulls_an_unconnected_input() {
+        let source = "\
+            module top(output [3:0] hi, output [3:0] lo, output [3:0] floating);\n\
+              pullhigh a (.out(hi));\n\
+              pulllow  b (.out(lo));\n\
+              plain    c (.out(floating));\n\
+            endmodule\n\
+            module plain(input [3:0] in, output [3:0] out); assign out = in; endmodule\n\
+            `unconnected_drive pull1\n\
+            module pullhigh(input [3:0] in, output [3:0] out); assign out = in; endmodule\n\
+            `nounconnected_drive\n\
+            `unconnected_drive pull0\n\
+            module pulllow(input [3:0] in, output [3:0] out); assign out = in; endmodule\n\
+            `nounconnected_drive\n";
+
+        let expanded = crate::parsers::preprocessor::Preprocessor::new()
+            .preprocess(source, "test.v")
+            .expect("should preprocess");
+        let parsed = crate::parsers::source::parse_expanded(expanded).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.run().expect("design should settle");
+
+        assert_eq!(simulator.get("hi").unwrap().to_binary(), "1111");
+        assert_eq!(simulator.get("lo").unwrap().to_binary(), "0000");
+        assert_eq!(simulator.get("floating").unwrap().to_binary(), "zzzz");
     }
 
     /// **A range is what decides a parameter's signedness**, failing a
