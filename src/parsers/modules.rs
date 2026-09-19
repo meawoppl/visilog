@@ -46,6 +46,14 @@ pub struct Port {
     /// Whether the declaration carried a `signed` qualifier —
     /// `input signed [3:0] a`.
     pub signed: bool,
+    /// The default value of `output reg [31:0] x = 1;`.
+    ///
+    /// It belongs to the *name* rather than to the declaration, exactly as a
+    /// `reg` or `wire` initialiser does, so `output reg x = 1, y = 2;` gives
+    /// the two ports different starting values. A variable port takes it once,
+    /// at elaboration; a net port takes it as a continuous assignment — the
+    /// same split `reg a = e;` and `wire a = e;` already make.
+    pub init: Option<Expression>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -78,34 +86,74 @@ fn parse_port_direction(input: &str) -> IResult<&str, PortDirection> {
     )(input)
 }
 
-fn parse_net_type(input: &str) -> IResult<&str, NetType> {
+/// The type a port declaration may name, and the width that comes with it.
+///
+/// `wire` and `reg` bring no width of their own — the declaration's own range
+/// says it — while `integer` and `time` *are* a width, the same fixed widths
+/// they carry as ordinary declarations: thirty-two bits signed and sixty-four
+/// unsigned. An `output integer d;` is a variable, so all three of the latter
+/// come back as [`NetType::Reg`].
+fn parse_net_type(input: &str) -> IResult<&str, (NetType, Option<PortType>)> {
     terminated(
         alt((
-            map(tag("wire"), |_| NetType::Wire),
-            map(tag("reg"), |_| NetType::Reg),
+            map(tag("wire"), |_| (NetType::Wire, None)),
+            map(tag("reg"), |_| (NetType::Reg, None)),
+            map(tag("integer"), |_| (NetType::Reg, Some(PortType::Integer))),
+            map(tag("time"), |_| (NetType::Reg, Some(PortType::Time))),
         )),
         not(satisfy(identifier_char)),
     )(input)
 }
 
+/// A port's keyword-led data type, which fixes its width and its signedness.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum PortType {
+    /// Thirty-two bits, signed.
+    Integer,
+    /// Sixty-four bits, unsigned.
+    Time,
+}
+
+impl PortType {
+    fn range(self) -> Range {
+        match self {
+            PortType::Integer => Range::Constant(31, 0),
+            PortType::Time => Range::Constant(63, 0),
+        }
+    }
+
+    fn signed(self) -> bool {
+        matches!(self, PortType::Integer)
+    }
+}
+
 fn parse_port(input: &str) -> IResult<&str, Port> {
     let (input, direction) = parse_port_direction(input)?;
     let (input, _) = ws_and_comments(input)?;
-    let (input, net_type) = opt(parse_net_type)(input)?;
+    let (input, declared) = opt(parse_net_type)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, signed) = signedness(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, range) = opt(range)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, identifier) = identifier(input)?;
+    let (input, init) = opt(preceded(ws(char('=')), verilog_expression))(input)?;
+    let (net_type, declared_type) = match declared {
+        Some((net_type, declared_type)) => (Some(net_type), declared_type),
+        None => (None, None),
+    };
     Ok((
         input,
         Port {
             direction,
             net_type,
-            range: range.unwrap_or(Range::SINGLE_BIT),
+            range: declared_type
+                .map(PortType::range)
+                .or(range)
+                .unwrap_or(Range::SINGLE_BIT),
             identifier,
-            signed,
+            signed: signed || declared_type.is_some_and(PortType::signed),
+            init,
         },
     ))
 }
@@ -121,8 +169,11 @@ struct PortQualifiers {
 }
 
 /// One entry of an ANSI header after the first: either a fresh declaration, or
-/// a bare name that inherits the one before it.
-fn parse_port_item(input: &str) -> IResult<&str, (Option<PortQualifiers>, Identifier)> {
+/// a bare name that inherits the one before it. A default value belongs to the
+/// name, so it is never inherited.
+fn parse_port_item(
+    input: &str,
+) -> IResult<&str, (Option<PortQualifiers>, Identifier, Option<Expression>)> {
     if let Ok((rest, port)) = parse_port(input) {
         let qualifiers = PortQualifiers {
             direction: port.direction,
@@ -130,10 +181,11 @@ fn parse_port_item(input: &str) -> IResult<&str, (Option<PortQualifiers>, Identi
             range: port.range,
             signed: port.signed,
         };
-        return Ok((rest, (Some(qualifiers), port.identifier)));
+        return Ok((rest, (Some(qualifiers), port.identifier, port.init)));
     }
     let (input, name) = ws(identifier)(input)?;
-    Ok((input, (None, name)))
+    let (input, init) = opt(preceded(ws(char('=')), verilog_expression))(input)?;
+    Ok((input, (None, name, init)))
 }
 
 /// An ANSI header. The **first** entry must carry a direction — that is what
@@ -167,8 +219,9 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
         range: carried.range.clone(),
         identifier: first.identifier,
         signed: carried.signed,
+        init: first.init,
     });
-    for (qualifiers, identifier) in rest {
+    for (qualifiers, identifier, init) in rest {
         if let Some(qualifiers) = qualifiers {
             carried = qualifiers;
         }
@@ -178,6 +231,7 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
             range: carried.range.clone(),
             identifier,
             signed: carried.signed,
+            init,
         });
     }
     Ok((input, ports))
@@ -213,26 +267,42 @@ pub(crate) fn parse_port_header(input: &str) -> IResult<&str, PortHeader> {
 pub fn parse_port_declaration(input: &str) -> IResult<&str, Vec<Port>> {
     let (input, direction) = parse_port_direction(input)?;
     let (input, _) = ws_and_comments(input)?;
-    let (input, net_type) = opt(parse_net_type)(input)?;
+    let (input, declared) = opt(parse_net_type)(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, signed) = signedness(input)?;
     let (input, _) = ws_and_comments(input)?;
     let (input, port_range) = opt(range)(input)?;
-    let (input, names) = identifier_list(input)?;
+    let (input, names) = separated_list1(ws(char(',')), ws(declared_port))(input)?;
     let (input, _) = ws(char(';'))(input)?;
+    let (net_type, declared_type) = match declared {
+        Some((net_type, declared_type)) => (Some(net_type), declared_type),
+        None => (None, None),
+    };
+    // The width and the signedness of an `integer` or a `time` are the type's,
+    // not the declaration's, exactly as they are for an ordinary one.
+    let port_range = declared_type.map(PortType::range).or(port_range);
+    let signed = signed || declared_type.is_some_and(PortType::signed);
     Ok((
         input,
         names
             .into_iter()
-            .map(|identifier| Port {
+            .map(|(identifier, init)| Port {
                 direction,
                 net_type,
                 range: port_range.clone().unwrap_or(Range::SINGLE_BIT),
                 identifier,
                 signed,
+                init,
             })
             .collect(),
     ))
+}
+
+/// One declared port name plus the default value that belongs to it.
+fn declared_port(input: &str) -> IResult<&str, (Identifier, Option<Expression>)> {
+    let (input, name) = identifier(input)?;
+    let (input, init) = opt(preceded(ws(char('=')), verilog_expression))(input)?;
+    Ok((input, (name, init)))
 }
 
 /// Why a module's header and its body port declarations do not agree.
@@ -534,8 +604,14 @@ mod tests {
 
     #[test]
     fn test_parse_net_type() {
-        assert_parses_to(parse_net_type, "wire", NetType::Wire);
-        assert_parses_to(parse_net_type, "reg", NetType::Reg);
+        assert_parses_to(parse_net_type, "wire", (NetType::Wire, None));
+        assert_parses_to(parse_net_type, "reg", (NetType::Reg, None));
+        assert_parses_to(
+            parse_net_type,
+            "integer",
+            (NetType::Reg, Some(PortType::Integer)),
+        );
+        assert_parses_to(parse_net_type, "time", (NetType::Reg, Some(PortType::Time)));
     }
 
     #[test]
@@ -549,6 +625,7 @@ mod tests {
                 range: Range::Constant(0, 0),
                 identifier: "a".into(),
                 signed: false,
+                init: None,
             },
         );
         assert_parses_to(
@@ -560,6 +637,7 @@ mod tests {
                 range: Range::Constant(0, 0),
                 identifier: "b".into(),
                 signed: false,
+                init: None,
             },
         );
         assert_parses_to(
@@ -571,6 +649,7 @@ mod tests {
                 range: Range::Constant(0, 0),
                 identifier: "c".into(),
                 signed: false,
+                init: None,
             },
         );
     }
@@ -587,6 +666,7 @@ mod tests {
                     range: Range::Constant(0, 0),
                     identifier: "a".into(),
                     signed: false,
+                    init: None,
                 },
                 Port {
                     direction: PortDirection::Output,
@@ -594,6 +674,7 @@ mod tests {
                     range: Range::Constant(0, 0),
                     identifier: "b".into(),
                     signed: false,
+                    init: None,
                 },
                 Port {
                     direction: PortDirection::InOut,
@@ -601,6 +682,7 @@ mod tests {
                     range: Range::Constant(0, 0),
                     identifier: "c".into(),
                     signed: false,
+                    init: None,
                 },
             ],
         );
@@ -1093,6 +1175,7 @@ mod tests {
             range: Range::Constant(0, 0),
             identifier: name.into(),
             signed: false,
+            init: None,
         }
     }
 
@@ -1122,6 +1205,7 @@ mod tests {
                     range: Range::Constant(11, 0),
                     identifier: "h".into(),
                     signed: false,
+                    init: None,
                 },
             ]
         );
@@ -1162,6 +1246,7 @@ mod tests {
                 range: Range::Constant(3, 0),
                 identifier: "a".into(),
                 signed: true,
+                init: None,
             },
         );
 
@@ -1175,6 +1260,7 @@ mod tests {
                     range: Range::Constant(11, 0),
                     identifier: "h".into(),
                     signed: true,
+                    init: None,
                 },
                 Port {
                     direction: PortDirection::Output,
@@ -1182,6 +1268,7 @@ mod tests {
                     range: Range::Constant(11, 0),
                     identifier: "g".into(),
                     signed: true,
+                    init: None,
                 },
             ],
         );
@@ -1196,6 +1283,7 @@ mod tests {
                 range: Range::Constant(0, 0),
                 identifier: "signedness".into(),
                 signed: false,
+                init: None,
             },
         );
     }
@@ -1212,6 +1300,7 @@ mod tests {
                     range: Range::Constant(11, 0),
                     identifier: "h".into(),
                     signed: false,
+                    init: None,
                 },
                 Port {
                     direction: PortDirection::Output,
@@ -1219,6 +1308,7 @@ mod tests {
                     range: Range::Constant(11, 0),
                     identifier: "g".into(),
                     signed: false,
+                    init: None,
                 },
             ],
         );

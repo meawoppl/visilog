@@ -484,6 +484,25 @@ impl<'m> Elaborator<'m> {
         for (statement, inner) in &generated {
             self.declare_implicit_nets(statement, inner);
         }
+        // A port's default value — `output reg [31:0] x = 1;` — is applied
+        // here rather than in `declare_port`, because a `reg` in the body
+        // naming the same port is a second declaration that runs in between
+        // and would overwrite it with the `x` an undriven variable starts at.
+        // The split is the one a body declaration already makes: a variable
+        // port takes the value once, a net port takes it as a continuous
+        // assignment and follows its operands for the whole run.
+        for port in &module.ports {
+            let Some(init) = &port.init else { continue };
+            if port_is_variable(port) {
+                self.initialise(&port.identifier.name, init, scope)?;
+            } else {
+                let target =
+                    Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)));
+                self.out
+                    .assignments
+                    .push(ContinuousAssignment::new(target, renamed(init, scope)));
+            }
+        }
         for statement in &module.statements {
             self.build(statement, scope, &tasks)?;
         }
