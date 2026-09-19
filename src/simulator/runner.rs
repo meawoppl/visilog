@@ -1098,16 +1098,15 @@ impl Simulator {
                     });
                 }
 
+                // A `$finish` stops the block that ran it and nothing else in
+                // this timestep: iverilog runs everything already scheduled at
+                // this instant and reports the end-of-timestep `$monitor`
+                // before it stops. Measured — an `always #10` beside an
+                // `initial #30 $finish` still runs at 30, and the monitor
+                // still prints that step's line.
                 for cursor in round {
                     let (updates, _) = self.resume_block(cursor)?;
                     pending.extend(updates);
-
-                    if self.finished() {
-                        break;
-                    }
-                }
-                if self.finished() {
-                    break;
                 }
                 // Whatever this reports is dropped, for the same reason the
                 // pre-pass in front of the loop drops its result: a design
@@ -1391,6 +1390,15 @@ impl Simulator {
         outcome: Resume,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
         let id = cursor.block;
+        // A `$finish` ends the simulation at the end of *this* timestep, so
+        // nothing is scheduled past one: a free-running block that halts does
+        // not restart, a `#delay` has no later instant to resume at, and a
+        // `wait` will never be offered another edge. Whatever is already
+        // queued at this instant still runs, which is where the finishing
+        // timestep's `$monitor` line comes from. Without the guard a
+        // free-running block whose body ends in `$finish` restarts at the same
+        // instant and never stops (corpus `always3.1.6D`).
+        let finished = self.finished();
         match outcome {
             // A free-running `always` restarts the moment it finishes, which
             // is how `always begin #50 … end` keeps going forever — and how
@@ -1400,7 +1408,7 @@ impl Simulator {
             Resume::Halted { pending } => {
                 match cursor.fork {
                     Some(fork) => self.branch_arrived(fork),
-                    None if self.blocks[id].free_running => {
+                    None if self.blocks[id].free_running && !finished => {
                         self.queue.insert(self.now, ExecutionCursor::new(id, 0));
                     }
                     None => {}
@@ -1408,13 +1416,18 @@ impl Simulator {
                 Ok((pending, true))
             }
             Resume::Suspended { pc, delay, pending } => {
-                self.queue
-                    .insert(self.now + delay, ExecutionCursor { pc, ..cursor });
+                if !finished {
+                    self.queue
+                        .insert(self.now + delay, ExecutionCursor { pc, ..cursor });
+                }
                 Ok((pending, false))
             }
             // Nothing schedules this one: it goes on the waiting list and
             // `settle` offers it every round of edges until one satisfies it.
             Resume::Waiting { pc, wait, pending } => {
+                if finished {
+                    return Ok((pending, false));
+                }
                 let watch = match wait {
                     WaitReason::Condition => None,
                     WaitReason::Event(control) => Some(EventWatch::arm(control, &self.state)),
@@ -1434,6 +1447,9 @@ impl Simulator {
                 pc,
                 pending,
             } => {
+                if finished {
+                    return Ok((pending, false));
+                }
                 let fork = self.open_fork(ForkJoin {
                     parent: ExecutionCursor { pc, ..cursor },
                     outstanding: branches.len(),
@@ -4426,6 +4442,65 @@ mod tests {
         simulator.advance(1000).unwrap();
         assert!(simulator.finished());
         assert_eq!(simulator.now(), 25);
+    }
+
+    /// `$finish` ends the simulation at the end of the timestep it ran in, not
+    /// the instant it ran: everything already scheduled at that instant still
+    /// runs, and the deferred `$monitor` still reports. Measured against
+    /// iverilog 12.0, which prints
+    ///
+    /// ```text
+    /// mon 0 a=0
+    /// always at 10 a=9
+    /// mon 10 a=9
+    /// always at 20 a=10
+    /// mon 20 a=10
+    /// finish at 30 a=10
+    /// always at 30 a=2
+    /// mon 30 a=2
+    /// ```
+    ///
+    /// Stopping at the `$finish` instead drops the last two lines, which is
+    /// what corpus `pr243` was missing.
+    #[test]
+    fn test_finish_ends_the_timestep_rather_than_the_instant() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] a;
+                initial begin
+                    $monitor("mon %0t a=%0d", $time, a);
+                    a = 0;
+                    #10 a = 1;
+                    #10 a = 2;
+                    #10 $display("finish at %0t a=%0d", $time, a);
+                    $finish;
+                    $display("after finish");
+                end
+                always #10 begin
+                    a = a + 8;
+                    $display("always at %0t a=%0d", $time, a);
+                end
+                initial #35 $display("never reached");
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1000).unwrap();
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "mon 0 a=0",
+                "always at 10 a=9",
+                "mon 10 a=9",
+                "always at 20 a=10",
+                "mon 20 a=10",
+                "finish at 30 a=10",
+                "always at 30 a=2",
+                "mon 30 a=2",
+            ]
+        );
+        assert_eq!(simulator.now(), 30);
     }
 
     #[test]
