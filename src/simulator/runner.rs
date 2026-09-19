@@ -2128,6 +2128,33 @@ mod tests {
         assert_eq!(simulator.get("out").unwrap().to_binary(), "0110");
     }
 
+    /// A vector declared `[base+15:base]` for a negative `base` really does
+    /// have negative bit indices, so an indexed part select whose base is a
+    /// *signed* value has to read it as the negative number it is. Reading
+    /// `-2` as `4294967294` selects nothing at all and answers `xxxx`, where
+    /// iverilog 12.0 straddles the bottom of the vector and prints
+    /// `011x x001` for this design (corpus `pr2835632b`).
+    #[test]
+    fn test_an_indexed_part_select_reads_a_signed_base_as_negative() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                parameter base = -1;
+                reg [base+15:base] big = 16'h0123;
+                reg [base:base+15] ltl = 16'h3210;
+                integer a;
+                initial begin
+                    a = base - 1;
+                    $displayb(big[a+:4], " ", ltl[a+:4]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "011x x001\n");
+    }
+
     /// An undriven **net** reads `z` while an untouched **variable** reads
     /// `x`. The difference is not cosmetic: a variable with no assignment is
     /// unknown because nothing has said what it is, while a net with no driver
