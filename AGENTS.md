@@ -669,6 +669,17 @@ and resolves down a different path. A `$name` nothing implements is
 `EvalError::UnknownSystemFunction`, never a zero, and a wrong argument count is
 `EvalError::SystemFunctionArity`.
 
+**`$bits` takes a data *type* as well as a value, and the type table is asked second.**
+`$bits(integer)` is 32, `$bits(time)` 64 and `$bits(reg)` 1 — the three spellings
+iverilog 12.0 accepts, where `$bits(real)` is "Invalid data type for $bits()" and
+`$bits(wire)` is a syntax error, so both of those stay names nothing declares rather than
+widths invented for them. `eval::type_width` is only consulted once the ordinary lookup
+has come back `UnknownIdentifier`, so anything the design declares always answers for
+itself; a type keyword is reserved and no plain identifier can be spelled one. That is
+how a design asks whether a non-ANSI port really took the data type declared beside it —
+`if ($bits(x) == $bits(integer))`, which is corpus `module_nonansi_integer1`,
+`task_nonansi_time1` and their four siblings.
+
 **`$stime` is unsigned, like the `$time` beside it**, because `time` is an unsigned type
 — and that is the field `%d` gives it: iverilog 12.0 prints `$display($stime)` in ten
 columns where an `integer` takes eleven (corpus `pr2842621`). iverilog is inconsistent
