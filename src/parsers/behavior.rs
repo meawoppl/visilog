@@ -560,12 +560,11 @@ pub fn parse_if_statement(input: &str) -> IResult<&str, IfStatement> {
 
 fn parse_case_label(input: &str) -> IResult<&str, CaseLabel> {
     alt((
-        // The peek keeps an identifier like `default_state` from being read as
-        // the `default` keyword, which alt() could not back out of.
-        value(
-            CaseLabel::Default,
-            terminated(ws(tag("default")), peek(char(':'))),
-        ),
+        // The word boundary keeps an identifier like `default_state` from
+        // being read as the `default` keyword, which alt() could not back out
+        // of. It cannot be the `:` instead, because `default` is the one label
+        // the LRM lets a design write without one.
+        value(CaseLabel::Default, |i| keyword(i, "default")),
         map(
             separated_list1(ws(char(',')), verilog_expression),
             CaseLabel::Expressions,
@@ -573,9 +572,22 @@ fn parse_case_label(input: &str) -> IResult<&str, CaseLabel> {
     ))(input)
 }
 
+/// One arm of a `case`.
+///
+/// **The `:` is optional after `default` and required after anything else.**
+/// IEEE 1364-2005's `case_item` spells it `default [ : ] statement_or_null`,
+/// and corpus `casex3.9E` writes `default result = 3;`. Making it optional
+/// everywhere instead would let a label run straight into the statement after
+/// it, which is a wrong parse tree rather than an error.
 fn parse_case_item(input: &str) -> IResult<&str, CaseItem> {
     let (input, label) = parse_case_label(input)?;
-    let (input, _) = ws(char(':'))(input)?;
+    let (input, separator) = opt(ws(char(':')))(input)?;
+    if separator.is_none() && label != CaseLabel::Default {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Char,
+        )));
+    }
     let (input, statements) = statement_body(input)?;
 
     Ok((input, CaseItem { label, statements }))
@@ -1750,6 +1762,29 @@ mod tests {
             statement.items[0].label,
             CaseLabel::Expressions(vec![identifier_expression("default_state")])
         );
+    }
+
+    /// IEEE 1364-2005's `case_item` is `default [ : ] statement_or_null`, so
+    /// the colon after `default` — and only after `default` — is optional.
+    /// Corpus `casex3.9E` writes `default result = 3;`.
+    #[test]
+    fn test_a_default_arm_may_omit_its_colon() {
+        for source in [
+            "case (s) 1: a = 1; default b = 2; endcase",
+            "case (s) 1: a = 1; default: b = 2; endcase",
+        ] {
+            let statement = assert_parses(parse_case_statement, source);
+            assert_eq!(statement.items[1].label, CaseLabel::Default);
+            assert_eq!(statement.items[1].statements.len(), 1);
+        }
+    }
+
+    /// Every other label still needs its colon: without one a label would run
+    /// straight into the statement after it, which is a wrong parse tree
+    /// rather than an error.
+    #[test]
+    fn test_a_non_default_arm_still_needs_its_colon() {
+        assert!(parse_case_statement("case (s) 1 a = 1; endcase").is_err());
     }
 
     #[test]
