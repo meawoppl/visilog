@@ -353,8 +353,15 @@ fn parse_event_trigger(input: &str) -> IResult<&str, ProceduralStatements> {
 /// It is tried after every other statement form because a bare identifier
 /// followed by `;` is the loosest shape a statement has: everything else is
 /// led by a keyword, by a `$name`, or by an assignment's `=`.
+///
+/// The name is **hierarchical**, because a task belongs to the module that
+/// declares it and a design reaches one across the hierarchy — `n.incr(1);`,
+/// `top.main.test1;`, `gen.foo_task;`. Elaboration does not resolve one of
+/// those yet and answers `UnknownTask` by name (#173), which is still a better
+/// place to stop than the grammar: a design that could not be read at all says
+/// nothing about which feature it needed.
 fn parse_task_enable(input: &str) -> IResult<&str, ProceduralStatements> {
-    let (input, name) = ws(identifier)(input)?;
+    let (input, name) = ws(hierarchical_identifier)(input)?;
     // `wait (a);` has exactly this shape, and so does every statement form the
     // grammar has yet to learn. A task's name is an identifier, and a reserved
     // word is not one.
@@ -2362,6 +2369,30 @@ mod tests {
             "my_task;",
             ProceduralStatements::TaskEnable {
                 name: "my_task".into(),
+                arguments: Vec::new(),
+            },
+        );
+    }
+
+    /// A task belongs to the module that declares it, so a design reaches one
+    /// across the hierarchy: `n.incr(1);` (corpus `task-scope`),
+    /// `top.main.test1;` (`pr2001162`), `gen.foo_task;` (`pr1988310`).
+    #[test]
+    fn test_a_task_enable_names_a_task_by_its_hierarchical_path() {
+        assert_parses_to(
+            procedural_statement,
+            "n.incr(1);",
+            ProceduralStatements::TaskEnable {
+                name: "n.incr".into(),
+                arguments: vec![Expression::Constant(VerilogConstant::from_int(1))],
+            },
+        );
+
+        assert_parses_to(
+            procedural_statement,
+            "top.main.test1;",
+            ProceduralStatements::TaskEnable {
+                name: "top.main.test1".into(),
                 arguments: Vec::new(),
             },
         );
