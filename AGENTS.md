@@ -704,6 +704,18 @@ reach a shift's right operand, a `?:` condition, or anything inside a concatenat
 `c = { a**b };` is the four bit power, `c = a**b;` is the sixteen bit one (corpus
 `pr2823711`).
 
+**An unknown bit makes `==` unknown only when it could still change the answer.** A pair
+of *known* bits that disagrees settles the question whatever the unknown ones hold — the
+two values cannot be equal — so `4'bxxx0 != 4'b0001` is `1` and `4'bxxx0 == 4'b0001` is
+`0`, where `4'bxxx1 != 4'b0001` is `x`. That is measured against iverilog 12.0; the LRM's
+flat "`x` if either operand contains an `x` or `z`" is the coarser reading, and taking it
+turns a determinable comparison into an `x` that then poisons everything built on it —
+corpus `comp1000` and `comp1001`, two thousand-line expression torture tests, each came
+apart at one such comparison. `eval::known_bits_differ` is the walk and it is `#[cold]`:
+it is asked only when one side already has an unknown bit, so an ordinary comparison
+never touches it. The **relational** operators deliberately keep the coarse rule —
+`4'b1xxx > 4'b0111` is `x` in iverilog too, even though it is determinable.
+
 **A comparison is the exception that needs measuring.** Its answer is one unsigned bit
 whatever the context, but its two operands are context-determined *with respect to each
 other*: sized to the wider of the two and read signed only when both are. `assign wide =
