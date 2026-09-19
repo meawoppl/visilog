@@ -2327,6 +2327,30 @@ mod tests {
         assert_eq!(simulator.output().text(), "011x x001\n");
     }
 
+    /// A plain part select reads a negative bound as the number it is, the
+    /// way an indexed one reads its base. `x[0:-1]` straddles the bottom of a
+    /// `reg [3:0]`, so it is the bit at 0 and an out-of-range `x` beside it —
+    /// where reading `-1` as four billion makes the span four billion wide and
+    /// stops the design (corpus `pv_wr_vec4`).
+    #[test]
+    fn test_a_select_bound_may_be_negative() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [3:0] x;
+                initial begin
+                    x = 4'hx;
+                    x[0:-1] = 2'b10;
+                    $displayb(x, " ", x[0:-1], " ", x[4:-1]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "xxx1 1x xxxx1x\n");
+    }
+
     /// An undriven **net** reads `z` while an untouched **variable** reads
     /// `x`. The difference is not cosmetic: a variable with no assignment is
     /// unknown because nothing has said what it is, while a net with no driver

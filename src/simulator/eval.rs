@@ -1556,21 +1556,12 @@ pub fn indexed_select_indices(
     upward: bool,
     store: &StateStore,
 ) -> Result<Option<Vec<i64>>, EvalError> {
-    let value = eval(base, store)?;
-    let Some(bits) = numeric(&value)? else {
-        return Ok(None);
-    };
     // A base is a *position* in a vector rather than a quantity, and a vector
     // declared `[base+15:base]` for a negative `base` really does have negative
     // indices — so a signed base has to be read as the negative number it is.
     // Reading `-2` as `4294967294` selects nothing and answers `xxxx`, where
     // iverilog straddles the bottom of the vector.
-    let base = if value.is_signed() {
-        i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
-    } else {
-        i64::try_from(bits).ok()
-    };
-    let Some(base) = base else {
+    let Some(base) = select_index(base, store)? else {
         return Ok(None);
     };
     let span = span as i64;
@@ -1718,11 +1709,33 @@ pub(crate) fn string_bits(text: &str) -> Register {
     Register::from_bits(bits)
 }
 
+/// The number a select's index or bound denotes, or `None` when it is not a
+/// plain number at all.
+///
+/// A **signed** value is read as the negative number it is, which is the one
+/// place this is not a plain `to_u128`. A vector may be declared over negative
+/// indices (`reg [0:-1]`), and a bound that straddles the bottom of one is
+/// ordinary Verilog — `a[0:-1]` names the bit at 0 and nothing else, where
+/// reading `-1` as four billion makes the span four billion wide and stops the
+/// design with `WidthOverflow`. `indexed_select_indices` already reads its
+/// base this way; this is the same rule for the other two select shapes, and
+/// it is shared with `exec::resolve_target` so reading and writing a select
+/// cannot disagree about which bits it names.
+pub fn select_index(expr: &Expression, store: &StateStore) -> Result<Option<i64>, EvalError> {
+    let value = eval(expr, store)?;
+    let Some(bits) = numeric(&value)? else {
+        return Ok(None);
+    };
+    Ok(if value.is_signed() {
+        i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
+    } else {
+        i64::try_from(bits).ok()
+    })
+}
+
 fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError> {
-    let value = numeric(&eval(expr, store)?)?
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| EvalError::NonConstantSelectBound(expr.to_contracted_string()))?;
-    Ok(value)
+    select_index(expr, store)?
+        .ok_or_else(|| EvalError::NonConstantSelectBound(expr.to_contracted_string()))
 }
 
 // ---------------------------------------------------------------------------
