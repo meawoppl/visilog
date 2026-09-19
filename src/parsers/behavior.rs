@@ -778,28 +778,33 @@ pub fn parse_sensitivity_list(input: &str) -> IResult<&str, EventControl> {
     ))(input)
 }
 
+/// `initial <statement>` — **one** statement, which is what makes a
+/// `begin`…`end` around two of them necessary.
+///
+/// It shares `statement_body` with a conditional arm rather than reading a run
+/// of statements: a run would let an unbracketed body swallow whatever followed
+/// the block, and every statement form that is legal both inside a block and at
+/// module level — a continuous `assign` above all — is a way for it to do so
+/// silently. `always @(posedge clk) d <= ~c;` followed by
+/// `assign {e0, f0, g0, h0} = oo;` used to compile to one three-instruction
+/// block, turning a module-level driver into a procedural one (corpus
+/// `initmod`).
 pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
     let (input, _) = ws(tag("initial"))(input)?;
-    let (input, assignments) = alt((
-        parse_block,
-        map(null_statement, |_| Vec::new()),
-        many1(procedural_statement),
-    ))(input)?;
+    let (input, assignments) = statement_body(input)?;
     let initial_block = InitialBlock::new(assignments);
     Ok((input, initial_block))
 }
 
+/// `always [@(…)] <statement>` — one statement, for the reason
+/// [`parse_initial_block`] takes one.
 pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
     let (input, _) = ws(tag("always"))(input)?;
     let (input, event_control) = map(opt(parse_sensitivity_list), |control| {
         control.unwrap_or(EventControl::None)
     })(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, assignments) = alt((
-        parse_block,
-        map(null_statement, |_| Vec::new()),
-        many1(procedural_statement),
-    ))(input)?;
+    let (input, assignments) = statement_body(input)?;
 
     let block = AlwaysBlock::new(event_control, assignments);
 
@@ -2631,5 +2636,27 @@ mod tests {
             statement,
             ProceduralStatements::Disable(Identifier::new("t".to_string()))
         );
+    }
+
+    /// An unbracketed `always` or `initial` body is **one** statement, so what
+    /// follows the block is left for the module.
+    ///
+    /// Reading a *run* of statements let a block swallow every module-level
+    /// statement after it that also happens to be legal inside one — a
+    /// continuous `assign` above all, which then installed a procedural drive
+    /// on a net instead of driving it. Corpus `initmod` is exactly that, and
+    /// iverilog 12.0's gold file for it needs `assign {e0, f0, g0, h0} = oo;`
+    /// to be a continuous driver.
+    #[test]
+    fn test_a_bare_block_body_is_one_statement() {
+        let (rest, block) = parse_always_block("always @(posedge clk) d <= ~c;\n assign ii = 1;")
+            .expect("the always block parses");
+        assert_eq!(block.statements.len(), 1);
+        assert_eq!(rest.trim_start(), "assign ii = 1;");
+
+        let (rest, block) =
+            parse_initial_block("initial a = 0;\n assign b = a;").expect("the initial parses");
+        assert_eq!(block.statements.len(), 1);
+        assert_eq!(rest.trim_start(), "assign b = a;");
     }
 }
