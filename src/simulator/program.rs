@@ -229,6 +229,23 @@ pub enum Instruction {
     /// The end of one `fork` branch. It ends *that thread*, not the block, and
     /// the last one to arrive is what lets the block past its `join`.
     JoinBranch,
+    /// `j.set(1'b1);` — an enable of a task belonging to **another instance**,
+    /// left standing until the whole hierarchy has been walked.
+    ///
+    /// A local enable is spliced where it is written, because the table of the
+    /// module's own tasks is in hand when the block is compiled. An instance's
+    /// task is not: the child may be instantiated further down the parent's own
+    /// source, so it has no compiled body yet — and when it does, that body is
+    /// resolved into the **child's** names rather than the caller's. So the
+    /// enable is left as this marker, with the path already run through
+    /// [`Scope::resolve`](super::elaborate) and the arguments already the
+    /// caller's names, and
+    /// [`link_hierarchical_enables`](Program::link_hierarchical_enables)
+    /// expands it once elaboration has walked everything.
+    HierarchicalEnable {
+        path: String,
+        arguments: Vec<Expression>,
+    },
     /// The end of the block.
     Halt,
 }
@@ -384,6 +401,15 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
                 rename_expression(expression, resolve);
             }
         }
+        // The arguments of a hierarchical enable are the *caller's*
+        // expressions, so they are renamed here like any others. Its path is
+        // not: it names a task rather than a signal, and travels with the
+        // scope table — see [`Program::rename_scopes`].
+        Instruction::HierarchicalEnable { arguments, .. } => {
+            for argument in arguments {
+                rename_expression(argument, resolve);
+            }
+        }
         // A `disable` names a scope rather than a signal, so it is renamed
         // beside the scope table it points into — see
         // [`Program::rename_scopes`] — and never through a map of variables.
@@ -392,6 +418,22 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => {}
+    }
+}
+
+/// [`Program::tag_slots`] over a run of instructions, which is what a body
+/// linked in after the block was tagged needs.
+fn tag_slots_in(instructions: &mut [Instruction], tag: usize) {
+    for instruction in instructions {
+        match instruction {
+            Instruction::RepeatInit { counter, .. } | Instruction::RepeatNext { counter, .. } => {
+                *counter = format!("$b{}{}", tag, counter)
+            }
+            Instruction::Hold { slot, .. } | Instruction::WriteHeld { slot, .. } => {
+                *slot = format!("$b{}{}", tag, slot)
+            }
+            _ => {}
+        }
     }
 }
 
@@ -440,6 +482,13 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
         Instruction::Delay(delay) => {
             for expression in delay.expressions_mut() {
                 replace(expression);
+            }
+        }
+        // A generate loop may index the argument of an enable it writes:
+        // `u[i].load(data[i]);`.
+        Instruction::HierarchicalEnable { arguments, .. } => {
+            for argument in arguments {
+                replace(argument);
             }
         }
         Instruction::Jump(_)
@@ -562,8 +611,15 @@ impl Program {
             scope.name = resolve(&scope.name);
         }
         for instruction in &mut self.instructions {
-            if let Instruction::Disable(name) = instruction {
-                *name = resolve(name);
+            match instruction {
+                Instruction::Disable(name) => *name = resolve(name),
+                // A hierarchical enable's path names a task rather than a
+                // signal, and it is resolved exactly the way a reference to an
+                // instance's signal is: `top.main.test1` written inside `trig1`
+                // is the store's `main.test1`, because the top module is the
+                // root of the flat name space and carries no prefix.
+                Instruction::HierarchicalEnable { path, .. } => *path = resolve(path),
+                _ => {}
             }
         }
     }
@@ -664,18 +720,7 @@ impl Program {
     /// would let the two spell the same name. A spliced body is deliberately
     /// *not* skipped — its loops belong to this block as much as the rest.
     pub fn tag_slots(&mut self, tag: usize) {
-        for instruction in &mut self.instructions {
-            match instruction {
-                Instruction::RepeatInit { counter, .. }
-                | Instruction::RepeatNext { counter, .. } => {
-                    *counter = format!("$b{}{}", tag, counter)
-                }
-                Instruction::Hold { slot, .. } | Instruction::WriteHeld { slot, .. } => {
-                    *slot = format!("$b{}{}", tag, slot)
-                }
-                _ => {}
-            }
-        }
+        tag_slots_in(&mut self.instructions, tag);
     }
 
     /// Rewrites the names this program's *own* statements use, leaving the
@@ -1330,9 +1375,21 @@ impl Program {
         arguments: &[Expression],
         tasks: &TaskTable,
     ) -> Result<(), SimulationError> {
-        let definition = tasks
-            .get(&name.name)
-            .ok_or_else(|| SimulationError::UnknownTask(name.name.clone()))?;
+        let Some(definition) = tasks.get(&name.name) else {
+            // A dotted name is a task of some *other* instance, which this
+            // module's own table cannot answer for and which nothing can
+            // answer for until the hierarchy has been walked. It is left as a
+            // marker rather than refused — see
+            // [`Instruction::HierarchicalEnable`].
+            if name.name.contains('.') {
+                self.emit(Instruction::HierarchicalEnable {
+                    path: name.name.clone(),
+                    arguments: arguments.to_vec(),
+                });
+                return Ok(());
+            }
+            return Err(SimulationError::UnknownTask(name.name.clone()));
+        };
         if arguments.len() != definition.arguments.len() {
             return Err(SimulationError::TaskArity {
                 name: name.name.clone(),
@@ -1373,6 +1430,98 @@ impl Program {
             end,
         });
         Ok(())
+    }
+
+    /// Expands every [`Instruction::HierarchicalEnable`] this program holds,
+    /// reporting whether it expanded any.
+    ///
+    /// `tasks` is every task in the design under the flat path a reference to
+    /// it resolves to — `j.set`, `main.test1` — each already renamed into the
+    /// names of the instance that declares it. So the expansion is **not**
+    /// renamed again, which is the whole reason it happens here rather than at
+    /// compile time: the block around it was resolved into the *caller's*
+    /// names long before this runs.
+    ///
+    /// The body goes on the **end** of the instruction list and the enable
+    /// becomes a jump into it, with a jump back at the far end. Splicing it in
+    /// place would move every jump target past the enable, and those targets
+    /// are what the caller's own control flow is made of; appending costs one
+    /// jump each way and moves nothing. A body that itself holds an enable of a
+    /// third instance is left for the next round, which is why this reports
+    /// whether it did anything.
+    pub fn link_hierarchical_enables(
+        &mut self,
+        tasks: &HashMap<String, TaskDefinition>,
+        tag: usize,
+    ) -> Result<bool, SimulationError> {
+        let sites: Vec<usize> = self
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, instruction)| {
+                matches!(instruction, Instruction::HierarchicalEnable { .. })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if sites.is_empty() {
+            return Ok(false);
+        }
+        for site in sites {
+            let Instruction::HierarchicalEnable { path, arguments } =
+                self.instructions[site].clone()
+            else {
+                unreachable!("the site was chosen by matching on it")
+            };
+            let definition = tasks
+                .get(&path)
+                .ok_or_else(|| SimulationError::UnknownTask(path.clone()))?
+                .clone();
+            if arguments.len() != definition.arguments.len() {
+                return Err(SimulationError::TaskArity {
+                    name: path,
+                    expected: definition.arguments.len(),
+                    found: arguments.len(),
+                });
+            }
+
+            let start = self.next();
+            for (argument, connection) in definition.arguments.iter().zip(&arguments) {
+                if argument.direction.copies_in() {
+                    self.emit(Instruction::Blocking {
+                        target: argument.variable(),
+                        value: connection.clone(),
+                    });
+                }
+            }
+            let body = self.next();
+            self.splice(&definition.program);
+            // A `repeat` counter inside the body is named after the instruction
+            // that created it, which `splice` has already made unique within
+            // this program. The block's own tag is what makes it unique
+            // *between* programs — two blocks enabling one task would otherwise
+            // count each other down.
+            tag_slots_in(&mut self.instructions[body..], tag);
+            for (argument, connection) in definition.arguments.iter().zip(&arguments) {
+                if argument.direction.copies_back() {
+                    self.emit(Instruction::Blocking {
+                        target: connection.clone(),
+                        value: argument.variable(),
+                    });
+                }
+            }
+            self.emit(Instruction::Jump(site + 1));
+            let end = self.next();
+            self.instructions[site] = Instruction::Jump(start);
+            // The scope a `disable` of this enable names covers the copies as
+            // well as the body, exactly as a local enable's does — and the
+            // name is already the flat path a `disable` was resolved to.
+            self.scopes.push(ScopeRange {
+                name: path,
+                start,
+                end,
+            });
+        }
+        Ok(true)
     }
 
     /// Everything a compilation step appends to, so that a step can be
@@ -1841,6 +1990,12 @@ pub fn resume(
                 })
             }
             Instruction::JoinBranch => return Ok(Resume::BranchDone { pending }),
+            // Elaboration links every one of these before the design runs, so
+            // reaching one means the task it names was never found — which is
+            // the same thing a local enable of a name nothing declares is.
+            Instruction::HierarchicalEnable { path, .. } => {
+                return Err(SimulationError::UnknownTask(path.clone()))
+            }
             Instruction::Halt => return Ok(Resume::Halted { pending }),
         }
     }

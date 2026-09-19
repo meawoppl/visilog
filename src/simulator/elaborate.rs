@@ -108,6 +108,12 @@ const FUNCTION_DRIVE_UNSUPPORTED: SimulationError =
 const FUNCTION_RANDOM_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("`$random` inside a function");
 
+/// What a function body that enables another instance's task reports. A task
+/// may consume time and a function may not, so a function that enables one is
+/// illegal Verilog — and a frame has no driver behind it to suspend on.
+const FUNCTION_ENABLE_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a task enable inside a function");
+
 /// How wide a `time` variable is. A `time` counts simulated time and is
 /// defined to be 64 bits, unsigned — the one fixed width beside an `integer`'s
 /// 32.
@@ -283,8 +289,14 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
         walked: 0,
         defparams: BTreeMap::new(),
         blocks_generated: 0,
+        hierarchical_tasks: HashMap::new(),
     };
     elaborator.walk(top, &mut Scope::root(&modules[top].identifier.name))?;
+    // An enable of another instance's task could not be spliced where it was
+    // written, because the instance may be created further down the caller's
+    // own source. Every one of them is linked here, where the whole hierarchy
+    // is in hand.
+    elaborator.link_hierarchical_enables()?;
     // A `defparam` is consumed by the instantiation it names. One that is
     // still here named nothing, and an override that quietly did not happen
     // leaves the design running at a width it was told not to use.
@@ -457,6 +469,16 @@ struct Elaborator<'m> {
     /// A block with no label still needs a scope — two iterations of an
     /// unnamed loop body would otherwise declare the same names twice.
     blocks_generated: usize,
+    /// Every task in the design under the flat path a hierarchical enable
+    /// resolves to — `j.set`, `main.test1` — with its body already renamed
+    /// into the names of the instance that declares it.
+    ///
+    /// A task's own table is keyed by the bare name an enable inside its module
+    /// spells, and its body is left unresolved so the block it is spliced into
+    /// can resolve the whole thing at once. Neither works across instances, so
+    /// this is the second copy: qualified where it is declared, and spliced
+    /// without renaming by [`Elaborator::link_hierarchical_enables`].
+    hierarchical_tasks: HashMap<String, TaskDefinition>,
 }
 
 impl<'m> Elaborator<'m> {
@@ -1171,7 +1193,81 @@ impl<'m> Elaborator<'m> {
             }
         }
 
+        // The second copy: the same bodies, resolved into *this* instance's
+        // names, under the flat path a hierarchical enable of one resolves to.
+        // It has to be taken here because this is the only moment the task and
+        // the scope it belongs to are both in hand; a block that enables one
+        // reaches it long afterwards, with a scope of its own.
+        for (name, definition) in &tasks {
+            let mut qualified = definition.clone();
+            if scope.needs_renaming() {
+                qualified.program.rename(&|local| scope.resolve(local));
+            }
+            for argument in &mut qualified.arguments {
+                argument.name = scope.resolve(&argument.name);
+            }
+            self.hierarchical_tasks
+                .insert(scope.qualified(name), qualified);
+        }
+
         Ok(tasks)
+    }
+
+    /// Splices in every enable of another instance's task, repeating until
+    /// nothing is left to splice.
+    ///
+    /// A body linked in may itself enable a third instance's task, which is
+    /// what the loop is for — and what makes a *cycle* of them non-terminating,
+    /// since every round of it is a real copy of every body in the cycle. The
+    /// cycle is therefore found in the enable graph first, by name, exactly as
+    /// `declare_tasks` finds a cycle among a module's own enables: after that
+    /// the chain is finite and the loop ends on its own.
+    fn link_hierarchical_enables(&mut self) -> Result<(), SimulationError> {
+        if self
+            .out
+            .blocks
+            .iter()
+            .all(|block| first_hierarchical_enable(&block.program).is_none())
+        {
+            return Ok(());
+        }
+        if let Some(name) = recursive_enable(&self.hierarchical_tasks) {
+            return Err(SimulationError::RecursiveTask(name));
+        }
+        for block in 0..self.out.blocks.len() {
+            let mut linked = false;
+            while self.out.blocks[block]
+                .program
+                .link_hierarchical_enables(&self.hierarchical_tasks, block)?
+            {
+                linked = true;
+            }
+            if linked {
+                self.relist_block_names(block);
+            }
+        }
+        Ok(())
+    }
+
+    /// Recomputes what a block reads and writes after a body was linked into
+    /// it.
+    ///
+    /// Both sets were taken where the block was built, when the enable was
+    /// still a marker holding nothing but a path — so an `@(*)` block that
+    /// enables another instance's task would not wake on what that body reads,
+    /// and an edge-triggered one would wake on what it writes. This is the same
+    /// question `build` asks of a *local* enable, asked again now that the body
+    /// is really there.
+    fn relist_block_names(&mut self, block: usize) {
+        let names = BodyNames::of(&self.out.blocks[block].program);
+        let timed = &mut self.out.blocks[block];
+        match timed.control {
+            EventControl::Implicit => timed.implicit_reads.extend(names.reads),
+            EventControl::Events(_) => {
+                timed.writes = written_names(&timed.program);
+            }
+            EventControl::None => {}
+        }
     }
 
     /// Declares the variables every named block inside a procedural body
@@ -2796,6 +2892,13 @@ fn analyse_function_body(
             // frame throws away.
             Instruction::Task(call) if !call.prints_now() => return Err(FUNCTION_TASK_UNSUPPORTED),
             Instruction::Delay(_) => return Err(FUNCTION_DELAY_UNSUPPORTED),
+            // A task may consume time and a function may not, so a function
+            // that enables one is illegal Verilog. A *local* enable is spliced
+            // into the body before this walk sees it and is caught by whatever
+            // the body then does; one naming another instance is still standing
+            // here, and naming it is better than the "assigning a signal
+            // outside itself" the linked body would have reported.
+            Instruction::HierarchicalEnable { .. } => return Err(FUNCTION_ENABLE_UNSUPPORTED),
             // A `wait` and an event control are both suspensions, and a call
             // happens at one instant: there is no later for the body to come
             // back at. `Hold` and `WriteHeld` are the halves of one, so they
@@ -3055,6 +3158,13 @@ impl BodyNames {
                     self.expression(expression);
                 }
             }
+            // The arguments of an enable of another instance's task are read
+            // where the enable is written, which is inside this body.
+            Instruction::HierarchicalEnable { arguments, .. } => {
+                for argument in arguments {
+                    self.expression(argument);
+                }
+            }
             // A `disable` names a scope rather than a signal, so there is
             // nothing in one for a frame to copy in.
             Instruction::Jump(_)
@@ -3170,6 +3280,58 @@ impl BodyNames {
 /// function's frame variables take.
 fn task_variable(task: &str, variable: &str) -> String {
     format!("{}.{}", task, variable)
+}
+
+/// The path of the first enable of another instance's task a program holds.
+fn first_hierarchical_enable(program: &Program) -> Option<&str> {
+    program
+        .instructions()
+        .iter()
+        .find_map(|instruction| match instruction {
+            Instruction::HierarchicalEnable { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+}
+
+/// A task that reaches itself through a chain of hierarchical enables, if the
+/// design has one.
+///
+/// Inlining does not terminate on a cycle, and a static task's storage means
+/// real Verilog cannot recurse either — so this is the same answer
+/// `declare_tasks` gives for a cycle among one module's own enables, over the
+/// graph the whole design's tasks make between them.
+fn recursive_enable(tasks: &HashMap<String, TaskDefinition>) -> Option<String> {
+    fn walk<'a>(
+        path: &'a str,
+        tasks: &'a HashMap<String, TaskDefinition>,
+        open: &mut BTreeSet<&'a str>,
+        settled: &mut BTreeSet<&'a str>,
+    ) -> Option<String> {
+        if settled.contains(path) {
+            return None;
+        }
+        if !open.insert(path) {
+            return Some(path.to_string());
+        }
+        if let Some(definition) = tasks.get(path) {
+            for instruction in definition.program.instructions() {
+                if let Instruction::HierarchicalEnable { path: next, .. } = instruction {
+                    if let Some(cycle) = walk(next, tasks, open, settled) {
+                        return Some(cycle);
+                    }
+                }
+            }
+        }
+        open.remove(path);
+        settled.insert(path);
+        None
+    }
+
+    let mut open = BTreeSet::new();
+    let mut settled = BTreeSet::new();
+    tasks
+        .keys()
+        .find_map(|path| walk(path, tasks, &mut open, &mut settled))
 }
 
 /// Compiles one task body into the shape an enable splices in.
@@ -3871,6 +4033,161 @@ mod tests {
         assert!(matches!(
             setup_error(&[source], "top"),
             SimulationError::Unsupported("a task declared inside a generate block")
+        ));
+    }
+
+    /// An enable of another instance's task runs that instance's body against
+    /// that instance's signals, and a `#delay` inside one suspends the caller
+    /// exactly as a local enable's does. The enable written *inside a task* of
+    /// the caller is the same thing one level down, and `top.nudge` names the
+    /// top module by its own name — the root of the flat name space.
+    ///
+    /// iverilog 12.0 prints `q=7` then `q=9`.
+    #[test]
+    fn test_an_enable_of_another_instances_task() {
+        let top = r#"
+            module top;
+                wire [7:0] q;
+                child c (q);
+                task nudge;
+                    begin
+                        c.load(8'd7);
+                    end
+                endtask
+                initial begin
+                    top.nudge;
+                    #2 $display("q=%0d", q);
+                    c.load(8'd9);
+                    #2 $display("q=%0d", q);
+                end
+            endmodule
+        "#;
+        let child = r#"
+            module child (out);
+                output [7:0] out;
+                reg [7:0] out;
+                task load;
+                    input [7:0] v;
+                    begin
+                        #1 out = v;
+                    end
+                endtask
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[top, child], "top");
+        simulator.advance(10).expect("the design should run");
+        assert_eq!(simulator.output().text(), "q=7\nq=9\n");
+    }
+
+    /// An `output` argument is copied back into the caller's own variable after
+    /// the body has run, the same way a local enable's is. iverilog 12.0 prints
+    /// `r=6`.
+    #[test]
+    fn test_an_enable_of_another_instances_task_copies_its_output_back() {
+        let top = r#"
+            module top;
+                reg [7:0] r;
+                child c ();
+                initial begin
+                    c.bump(8'd5, r);
+                    $display("r=%0d", r);
+                end
+            endmodule
+        "#;
+        let child = r#"
+            module child;
+                task bump;
+                    input [7:0] v;
+                    output [7:0] w;
+                    begin
+                        w = v + 1;
+                    end
+                endtask
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[top, child], "top");
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "r=6\n");
+    }
+
+    /// A path naming a task nothing declares is still `UnknownTask`, because a
+    /// dotted name only defers the question until the hierarchy is walked.
+    #[test]
+    fn test_an_enable_of_a_task_no_instance_declares_is_named() {
+        let top = r#"
+            module top;
+                child c ();
+                initial c.missing;
+            endmodule
+        "#;
+        let child = "module child; endmodule";
+        assert!(
+            matches!(setup_error(&[top, child], "top"), SimulationError::UnknownTask(name) if name == "c.missing")
+        );
+    }
+
+    /// Two tasks that enable each other across instances never finish being
+    /// inlined — every round is a real copy of both bodies — so the cycle is
+    /// found by name in the enable graph before any of it is spliced.
+    #[test]
+    fn test_a_cycle_of_hierarchical_enables_is_reported() {
+        let top = r#"
+            module top;
+                a ua ();
+                b ub ();
+                initial ua.ping;
+            endmodule
+        "#;
+        let a = r#"
+            module a;
+                task ping;
+                    top.ub.pong;
+                endtask
+            endmodule
+        "#;
+        let b = r#"
+            module b;
+                task pong;
+                    top.ua.ping;
+                endtask
+            endmodule
+        "#;
+        assert!(matches!(
+            setup_error(&[top, a, b], "top"),
+            SimulationError::RecursiveTask(_)
+        ));
+    }
+
+    /// A function may not enable a task — it cannot consume time, and a frame
+    /// has no driver behind it — and the refusal names *that* rather than the
+    /// "assigning a signal outside itself" the inlined body would report.
+    #[test]
+    fn test_a_task_enable_inside_a_function_is_named() {
+        let top = r#"
+            module top;
+                child c ();
+                function [7:0] f;
+                    input [7:0] a;
+                    begin
+                        c.load(a);
+                        f = a;
+                    end
+                endfunction
+                initial $display("%0d", f(1));
+            endmodule
+        "#;
+        let child = r#"
+            module child;
+                reg [7:0] held;
+                task load;
+                    input [7:0] v;
+                    held = v;
+                endtask
+            endmodule
+        "#;
+        assert!(matches!(
+            setup_error(&[top, child], "top"),
+            SimulationError::Unsupported("a task enable inside a function")
         ));
     }
 
