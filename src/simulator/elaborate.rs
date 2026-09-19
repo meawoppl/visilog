@@ -303,6 +303,10 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
     if let Some(path) = elaborator.defparams.keys().next() {
         return Err(SimulationError::UnappliedDefparam(path.clone()));
     }
+    // A reference the design wrote to an *aliased port* names an entry the
+    // store does not have, and it could not be answered while the hierarchy
+    // was being walked — see `resolve_aliased_references`.
+    elaborator.resolve_aliased_references();
     elaborator.resolve_multiply_driven_nets();
     Ok(elaborator.out)
 }
@@ -1935,6 +1939,106 @@ impl<'m> Elaborator<'m> {
     /// is only complete when the whole hierarchy has been walked — one
     /// driver may be an instance's `Binding::Driving` and the other the
     /// parent's own `assign`.
+    /// Re-points every reference the design wrote to an *aliased port* at the
+    /// entry that port aliases.
+    ///
+    /// A port bound to a plain identifier is one store entry with the parent's
+    /// signal, so the port's own qualified name — `u_bar.x`, `l.p` — has no
+    /// entry of its own at all. `Scope::resolve` cannot answer for it while the
+    /// hierarchy is being walked: `instantiate` records the alias from the
+    /// **build** pass, in source order, so a block written above the
+    /// instantiation is compiled and renamed before the table has ever heard of
+    /// the name. Asking again here, once everything has been walked, is what
+    /// makes `if (x !== u_bar.x)` read one signal twice rather than one signal
+    /// and a name nothing declares.
+    ///
+    /// It is a rewrite rather than a lookup the store falls back on, because
+    /// everything else about a name here is settled statically and a run-time
+    /// indirection would be the odd one out. One pass settles every reference:
+    /// an alias *target* is never itself an alias key, since `Binding::Alias`
+    /// collapses a chain of connections to the signal at the top of it where
+    /// the entry is recorded.
+    ///
+    /// Every collection the elaboration produces goes through it, because a
+    /// hierarchical reference is legal wherever a name is and one left out
+    /// would be silent.
+    fn resolve_aliased_references(&mut self) {
+        if self.out.aliases.is_empty() {
+            return;
+        }
+        let aliases = self.out.aliases.clone();
+        let resolve = |name: &str| match aliases.get(name) {
+            Some(entry) => entry.clone(),
+            None => name.to_string(),
+        };
+        let rename = |expression: &mut Expression| rename_expression(expression, &resolve);
+        let rename_names = |names: &mut BTreeSet<String>| {
+            *names = std::mem::take(names)
+                .into_iter()
+                .map(|name| resolve(&name))
+                .collect();
+        };
+
+        for assignment in &mut self.out.assignments {
+            let mut lhs = assignment.lhs().clone();
+            let mut rhs = assignment.rhs().clone();
+            rename(&mut lhs);
+            rename(&mut rhs);
+            *assignment = ContinuousAssignment::with_timing(
+                lhs,
+                rhs,
+                assignment.strength(),
+                assignment.delay().cloned(),
+            );
+        }
+        for gate in &mut self.out.gates {
+            for terminal in gate.outputs.iter_mut().chain(&mut gate.inputs) {
+                rename(terminal);
+            }
+        }
+        for udp in &mut self.out.udps {
+            rename(&mut udp.output);
+            for input in &mut udp.inputs {
+                rename(input);
+            }
+        }
+        for switch in &mut self.out.pass_switches {
+            for terminal in &mut switch.terminals {
+                rename(terminal);
+            }
+            if let Some((control, _)) = &mut switch.control {
+                rename(control);
+            }
+        }
+        for net in &mut self.out.pulled_nets {
+            net.name = resolve(&net.name);
+        }
+        self.out.resolved_nets = std::mem::take(&mut self.out.resolved_nets)
+            .into_iter()
+            .map(|name| resolve(&name))
+            .collect();
+        for input in &mut self.out.inputs {
+            *input = resolve(input);
+        }
+        for block in &mut self.out.blocks {
+            block.program.rename(&resolve);
+            if let EventControl::Events(events) = &mut block.control {
+                for event in events {
+                    rename(&mut event.expression);
+                }
+            }
+            rename_names(&mut block.implicit_reads);
+            rename_names(&mut block.writes);
+        }
+        // A function body may name an instance's port as readily as a block
+        // can, and its read set is what a call copies into its frame.
+        for definition in self.out.state.functions_mut().values_mut() {
+            definition.program.rename(&resolve);
+            rename_names(&mut definition.reads);
+            rename_names(&mut definition.writes);
+        }
+    }
+
     fn resolve_multiply_driven_nets(&mut self) {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut twice: HashSet<String> = HashSet::new();
@@ -4411,6 +4515,65 @@ mod tests {
             Some(0),
             "a name starting at the top module reaches the third"
         );
+    }
+
+    /// A reference to an *aliased port* names an entry the store does not have,
+    /// because the port and the parent's signal are one entry under the
+    /// parent's name. It resolves anyway, and it resolves even when the
+    /// instantiation is written *below* the block that reads it — the alias is
+    /// recorded in the build pass, long after that block was renamed.
+    ///
+    /// iverilog 12.0 prints `x=1010 u.p=1010 same=1`.
+    #[test]
+    fn test_a_reference_to_an_aliased_port_reads_the_signal_it_aliases() {
+        let top = r#"
+            module top;
+                reg [3:0] x;
+                initial begin
+                    x = 4'b1010;
+                    #1 $display("x=%b u.p=%b same=%b", x, u.p, x === u.p);
+                end
+                child u (.p(x));
+            endmodule
+        "#;
+        let child = r#"
+            module child (p);
+                input [3:0] p;
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[top, child], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "x=1010 u.p=1010 same=1\n");
+    }
+
+    /// A *function body* may name one as readily as a block can, and its read
+    /// set is what a call copies into its frame — so the definitions on the
+    /// store go through the alias pass beside the blocks. iverilog 12.0 prints
+    /// `through=1010`.
+    #[test]
+    fn test_a_function_reads_through_an_aliased_port() {
+        let top = r#"
+            module top;
+                reg [3:0] x;
+                function [3:0] through;
+                    input dummy;
+                    through = u.p;
+                endfunction
+                initial begin
+                    x = 4'b1010;
+                    #1 $display("through=%b", through(0));
+                end
+                child u (.p(x));
+            endmodule
+        "#;
+        let child = r#"
+            module child (p);
+                input [3:0] p;
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[top, child], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "through=1010\n");
     }
 
     /// An output bound to a bit select is the alias run backwards: the port
