@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
-use crate::parsers::preprocessor::Timescale;
+use crate::parsers::preprocessor::{TimeSpec, TimeUnit, Timescale};
 use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, string_bits, SYSTEM_FUNCTIONS};
@@ -519,18 +519,26 @@ fn split_task_name(name: &str) -> (bool, &str, Radix) {
 
 /// How `%t` renders a time value.
 ///
-/// `$timeformat(units, precision, suffix, min_width)` sets all four. The
-/// simulator's clock counts *ticks* and carries no timescale — nothing hands
-/// `Simulator` the `` `timescale `` the front end recorded — so `units` is
-/// range-checked and then taken to name the unit a tick already is. That is
-/// the identity for the `` `timescale 1ns `` plus `$timeformat(-9, …)` pairing
-/// that covers nearly every design using either, and it is why `units` is not
-/// stored: with no second unit to convert between there is nothing to scale by.
+/// `$timeformat(units, precision, suffix, min_width)` sets all four, and
+/// `units` is the one that does arithmetic: the clock counts ticks of the
+/// design's `` `timescale `` unit, and `%t` reports them in units of
+/// `10**units` seconds. So `` `timescale 1ns `` at time 3 with
+/// `$timeformat(-6, 6, "ns", 12)` prints `  0.003000ns` — three nanoseconds is
+/// 0.003 microseconds, and the suffix is a label the design chose rather than
+/// anything the number was converted to.
 ///
-/// What is left is real formatting: `precision` fractional digits after the
-/// tick count, then `suffix`, right-aligned in `min_width`.
+/// **`units` of `None` is the default format, and it is the design's own
+/// *precision*.** `$timeformat` has not been called, so `%t` reports what the
+/// simulation measures in — which for `` `timescale 1ns/1ps `` is picoseconds
+/// and so a thousand ticks to the unit, the way iverilog reports it.
+///
+/// What is left is formatting: `precision` fractional digits, then `suffix`,
+/// right-aligned in `min_width`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimeFormat {
+    /// The power of ten of a second `%t` reports in, or `None` for the
+    /// design's own precision.
+    units: Option<i32>,
     precision: usize,
     suffix: String,
     min_width: usize,
@@ -546,6 +554,7 @@ const TIME_UNIT_BOUNDS: (i128, i128) = (-15, 2);
 impl Default for TimeFormat {
     fn default() -> Self {
         TimeFormat {
+            units: None,
             precision: 0,
             suffix: String::new(),
             min_width: DEFAULT_TIME_WIDTH,
@@ -557,13 +566,12 @@ impl TimeFormat {
     /// One time value as this format asks for it — without the field padding,
     /// which `%t` applies itself so an explicit `%12t` can override
     /// `min_width`.
-    fn render(&self, value: &Register) -> String {
+    fn render(&self, value: &Register, timescale: Option<Timescale>) -> String {
         if value.has_unknown() {
             return unknown(value);
         }
         // `%t` counts ticks, so a real time — `$realtime` — is rounded to one
-        // before it is rendered. Nothing rescales either form; see the type's
-        // own documentation.
+        // before it is rendered.
         let rounded;
         let value = if value.is_real() {
             rounded = Register::integer_from_f64(value.to_f64().round(), REAL_WIDTH);
@@ -571,16 +579,76 @@ impl TimeFormat {
         } else {
             value
         };
-        let mut text = decimal(value);
-        if self.precision > 0 {
-            text.push('.');
-            for _ in 0..self.precision {
-                text.push('0');
-            }
-        }
+        let scale = timescale.unwrap_or(DEFAULT_TIMESCALE);
+        let tick = u128::from(scale.unit.femtoseconds());
+        let reported = match self.units {
+            Some(units) => femtoseconds_of(units),
+            None => u128::from(scale.precision.femtoseconds()),
+        };
+        let ticks = value.to_u128().unwrap_or(0);
+        let mut text = scaled_decimal(ticks.saturating_mul(tick), reported, self.precision);
         text.push_str(&self.suffix);
         text
     }
+}
+
+/// `10**units` seconds, in femtoseconds. `units` is range-checked against
+/// [`TIME_UNIT_BOUNDS`] before it is stored, so the shift is always in range.
+fn femtoseconds_of(units: i32) -> u128 {
+    10u128.pow((units + 15) as u32)
+}
+
+/// The `` `timescale `` a design that wrote none runs at, which is what the LRM
+/// gives it.
+const DEFAULT_TIMESCALE: Timescale = Timescale {
+    unit: TimeSpec {
+        value: 1,
+        unit: TimeUnit::Seconds,
+    },
+    precision: TimeSpec {
+        value: 1,
+        unit: TimeUnit::Seconds,
+    },
+};
+
+/// `femtoseconds / divisor` as a decimal with exactly `precision` fractional
+/// digits, rounded half up.
+///
+/// The division is done a digit at a time out of the remainder rather than by
+/// scaling the numerator: `precision` is bounded only by [`MAX_TIME_FIELD`],
+/// and `10**1024` is not a number a machine integer holds. The remainder is
+/// always under the divisor, so multiplying it by ten cannot overflow.
+fn scaled_decimal(femtoseconds: u128, divisor: u128, precision: usize) -> String {
+    let mut whole = femtoseconds / divisor;
+    let mut remainder = femtoseconds % divisor;
+    let mut digits = Vec::with_capacity(precision);
+    for _ in 0..precision {
+        remainder *= 10;
+        digits.push((remainder / divisor) as u8);
+        remainder %= divisor;
+    }
+    // Round half up, carrying into the whole part when every digit is a nine.
+    if remainder * 2 >= divisor {
+        let mut index = digits.len();
+        loop {
+            if index == 0 {
+                whole += 1;
+                break;
+            }
+            index -= 1;
+            if digits[index] < 9 {
+                digits[index] += 1;
+                break;
+            }
+            digits[index] = 0;
+        }
+    }
+    let mut text = whole.to_string();
+    if precision > 0 {
+        text.push('.');
+        text.extend(digits.iter().map(|digit| (b'0' + digit) as char));
+    }
+    text
 }
 
 /// The one standing `$monitor`.
@@ -1423,7 +1491,7 @@ impl TaskContext {
             // over the one `$timeformat` set, so `%0t` never pads.
             if specifier.eq_ignore_ascii_case(&'t') {
                 let value = self.value_of(argument, store)?;
-                let rendered = self.time_format.render(&value);
+                let rendered = self.time_format.render(&value, self.timescale);
                 text.push_str(&pad(
                     rendered,
                     width.unwrap_or(self.time_format.min_width),
@@ -1471,8 +1539,6 @@ impl TaskContext {
             )));
         }
 
-        // The units are checked even though nothing scales by them: a design
-        // that names a unit this simulator could not mean should hear so.
         let units = self.integer_argument(&arguments[0], store, "`$timeformat` units")?;
         if units < TIME_UNIT_BOUNDS.0 || units > TIME_UNIT_BOUNDS.1 {
             return Err(SimulationError::SystemTask(format!(
@@ -1485,6 +1551,7 @@ impl TaskContext {
         let min_width = self.field_argument(&arguments[3], store, "`$timeformat` minimum width")?;
 
         self.time_format = TimeFormat {
+            units: Some(units as i32),
             precision,
             suffix,
             min_width,
@@ -3333,12 +3400,55 @@ mod tests {
         );
     }
 
+    /// `%t` reports the clock in the unit `$timeformat` named, scaling by the
+    /// design's own `` `timescale ``. Measured against iverilog 12.0 for a
+    /// `` `timescale 1ns/1ps `` design at time 3:
+    ///
+    /// ```text
+    /// default[                3000]
+    /// ns[       3.000ns]
+    /// us[       0.003us]
+    /// ```
+    ///
+    /// The default format is the design's **precision**, which is why the
+    /// first line is a thousand ticks to the nanosecond.
+    #[test]
+    fn test_percent_t_scales_by_the_timescale() {
+        let mut store = store_with(&[]);
+        store.set_time(3);
+        let mut context = TaskContext::new();
+        context.describe_design("m", Timescale::parse("1ns/1ps").ok());
+        run_in(
+            &mut context,
+            r#"$display("default[%t]", $time);"#,
+            &mut store,
+        );
+        run_in(&mut context, r#"$timeformat(-9, 3, "ns", 14);"#, &mut store);
+        run_in(&mut context, r#"$display("ns[%t]", $time);"#, &mut store);
+        run_in(&mut context, r#"$timeformat(-6, 3, "us", 14);"#, &mut store);
+        run_in(&mut context, r#"$display("us[%t]", $time);"#, &mut store);
+
+        assert_eq!(
+            context.output().lines(),
+            vec![
+                "default[                3000]",
+                "ns[       3.000ns]",
+                "us[       0.003us]",
+            ]
+        );
+    }
+
     /// `$timeformat` with no arguments puts `%t` back where it started.
+    ///
+    /// The design runs at `` `timescale 1ns ``, so a tick is a nanosecond and
+    /// `$timeformat(-9, …)` reports it as one; the default format reports the
+    /// design's own *precision*, which here is the same nanosecond.
     #[test]
     fn test_timeformat_with_no_arguments_restores_the_default() {
         let mut store = store_with(&[]);
         store.set_time(5);
         let mut context = TaskContext::new();
+        context.describe_design("main", Timescale::parse("1ns/1ns").ok());
         run_in(&mut context, r#"$timeformat(-9, 1, "ns", 6);"#, &mut store);
         run_in(&mut context, r#"$display("[%t]", $time);"#, &mut store);
         run_in(&mut context, "$timeformat;", &mut store);

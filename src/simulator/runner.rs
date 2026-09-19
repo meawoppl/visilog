@@ -2142,6 +2142,20 @@ mod tests {
         simulator
     }
 
+    /// [`simulator_for`] for a design that runs at a `` `timescale ``, which
+    /// `%t` reports in: the scale has to reach the `TaskContext`, and that
+    /// happens in `setup`.
+    fn simulator_with_timescale(scale: &str, source: &str) -> Simulator {
+        let (remaining, module) = parse_module_declaration(source).unwrap();
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.set_timescale(Some(
+            crate::parsers::preprocessor::Timescale::parse(scale).expect("a legal timescale"),
+        ));
+        simulator.setup().unwrap();
+        simulator
+    }
+
     fn one() -> Register {
         Register::from_u128(1, 1)
     }
@@ -6480,10 +6494,16 @@ mod tests {
     }
 
     /// `%t` pads to twenty characters until `$timeformat` says otherwise, and
-    /// then renders exactly what it was asked for.
+    /// then renders exactly what it was asked for — in the unit it was asked
+    /// for. The design runs at `` `timescale 1ns ``, so a tick *is* a
+    /// nanosecond and `$timeformat(-9, …)` is the identity; the third case is
+    /// the one that scales.
+    ///
+    /// iverilog 12.0 prints exactly these three lines for the same design.
     #[test]
     fn test_timeformat_configures_how_percent_t_renders() {
-        let mut simulator = simulator_for(
+        let mut simulator = simulator_with_timescale(
+            "1ns/1ns",
             r#"
             module clocked();
                 initial begin
@@ -6491,6 +6511,8 @@ mod tests {
                     $timeformat(-9, 2, " ns", 10);
                     $display("set[%t]", $time);
                     $display("narrow[%0t]", $time);
+                    $timeformat(-6, 3, " us", 10);
+                    $display("micro[%t]", $time);
                 end
             endmodule
         "#,
@@ -6503,6 +6525,7 @@ mod tests {
                 "default[                   7]",
                 "set[   7.00 ns]",
                 "narrow[7.00 ns]",
+                "micro[  0.007 us]",
             ]
         );
     }

@@ -570,16 +570,33 @@ is a compiler diagnostic visilog has no channel for, which is the whole of why c
 `pr1403406b` is a gold mismatch while `pr1403406`, `pr1403406a`, `pr1701855` and
 `pr1701855b` match.
 
-**`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
-fractional digits, then the suffix, right-aligned in `min_width` (twenty by
-default), with an explicit `%12t` overriding `min_width` and `%0t` meaning no
-padding at all. The `units` argument is range-checked and then taken to name the
-unit a tick already *is*: the clock counts ticks, and although
-`Simulator::set_timescale` now receives the `` `timescale `` the preprocessor recorded,
-only the waveform header reads it — nothing converts between it and `units` (#209).
-That is the identity for the `` `timescale 1ns `` plus
-`$timeformat(-9, …)` pairing that covers nearly every design using either, and
-wrong by a power of ten when they disagree — corpus `timeform1` is the case.
+**`$timeformat` sets how `%t` renders, and `units` is the one argument that does
+arithmetic.** The clock counts ticks of the design's `` `timescale `` **unit**, and `%t`
+reports them in units of `10**units` seconds — so `` `timescale 1ns `` at time 3 with
+`$timeformat(-6, 6, "ns", 12)` prints `  0.003000ns`. Three nanoseconds really is 0.003
+microseconds; the suffix is a label the design chose rather than anything the number was
+converted to. `precision` fractional digits, then that suffix, right-aligned in
+`min_width` (twenty by default), with an explicit `%12t` overriding `min_width` and `%0t`
+meaning no padding at all.
+
+**The default format — no `$timeformat` at all — is the design's own *precision*.** That
+is what the simulation measures in, so `` `timescale 1ns/1ps `` at time 3 prints `3000`,
+which is what iverilog prints. `TimeFormat::units` is therefore an `Option`: `None` is
+"the precision", and it is why `$timeformat;` with no arguments puts the scaling back as
+well as the field.
+
+The scale reaches `%t` through `TaskContext::timescale`, which
+`Simulator::set_timescale` fills at `setup` — the same one `$printtimescale` and the
+waveform header read. `TimeSpec::femtoseconds` makes both ends exact integers, and
+`tasks::scaled_decimal` divides a digit at a time out of the remainder rather than
+scaling the numerator, because `precision` is bounded only by `MAX_TIME_FIELD` and
+`10**1024` is not a number a machine integer holds. It rounds half up, carrying into the
+whole part when every digit is a nine.
+
+What is still **not** rescaled is the clock itself: `#5` is five ticks of the unit
+whatever the precision says, so a design whose modules run at *different* timescales has
+one tick length rather than one per module (#209). `%t` reads the design-level scale for
+the same reason.
 
 **A system *function* is an expression operand, and `eval` implements it.** `$time`,
 `$stime`, `$signed`, `$unsigned`, `$random`, `$fopen`, `$bits` and `$clog2` parse anywhere an
