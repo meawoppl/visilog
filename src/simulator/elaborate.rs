@@ -1853,6 +1853,10 @@ impl<'m> Elaborator<'m> {
             ModuleStatement::AlwaysBlock(block) => {
                 self.declare_block_locals(&block.statements, scope, "")?;
                 let mut program = Program::compile(&block.statements, tasks)?;
+                // A hidden `repeat` counter or intra-assignment hold is named
+                // by an instruction index, which two blocks share; the block's
+                // position in the flat list is what makes one its own.
+                program.tag_slots(self.out.blocks.len());
                 program.qualify_scopes(&|block| scope.hierarchy(block));
                 if !scope.genvars.is_empty() {
                     program
@@ -1910,6 +1914,7 @@ impl<'m> Elaborator<'m> {
             ModuleStatement::InitialBlock(block) => {
                 self.declare_block_locals(&block.statements, scope, "")?;
                 let mut program = Program::compile(&block.statements, tasks)?;
+                program.tag_slots(self.out.blocks.len());
                 program.qualify_scopes(&|block| scope.hierarchy(block));
                 if !scope.genvars.is_empty() {
                     program
