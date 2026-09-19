@@ -1353,6 +1353,18 @@ name — `main.dut.count` — and the top module is the root of the flat name sp
 carries no prefix, so `Scope::resolve` drops that leading segment. A scope of its own
 shadows it, which is why the `locals` lookup is asked first.
 
+**An escaped identifier keeps its backslash unless a simple identifier could have spelled
+it**, and that is what keeps it one *segment* of that dotted name space. IEEE 1364 §3.7.1
+says the backslash and the terminating whitespace are not part of the name, so `\a ` and
+`a` really are one object (corpus `escape3` asserts it of `\cpu3 `, `cpu3`, `top.\cpu3 `
+and `\top .cpu3` alike) — but dropping it unconditionally gives `reg \bot.r ;` in the top
+module and `reg r;` inside an instance called `bot` the *same* store key, and iverilog 12.0
+keeps them apart (corpus `escape4`, `escape4b`). `identifier::is_simple_identifier` is the
+question, spelled out beside `simple_identifier` so the two cannot disagree, and a name
+that answers yes still collapses — so nothing downstream sees a backslash it did not see
+before, and a name like `odd*name$` that has no unescaped spelling at all loses nothing by
+keeping one.
+
 **An output bound to a select is the alias run backwards.** `.y(bus[i])` — how a generate
 loop wires an instance per bit — cannot be aliased, because the port and `bus[i]` are not
 one store entry. The port keeps a signal of its own and a continuous assignment carries
