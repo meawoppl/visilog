@@ -1565,6 +1565,11 @@ impl Simulator {
     /// reaches keeps what it held, so a driver of `bus[0]` says nothing about
     /// `bus[1]`. The whole net is then written once, which is what keeps a
     /// three-state bus out of the change journal while it is not moving.
+    ///
+    /// One **word of an array of nets** is a net in its own right, so it is
+    /// grouped by its address as well as by its name: `wire [1:0] foo [0:1];`
+    /// with two strength-bearing drivers on `foo[0]` and two more on `foo[1]`
+    /// has four drivers and two driver *lists*, and they must not be pooled.
     fn resolve_contributions(
         &mut self,
         contributions: Vec<Contribution>,
@@ -1574,35 +1579,57 @@ impl Simulator {
         }
         // Grouped by net, in the order the drivers were written, so a design
         // resolves the same way twice.
-        let mut names: Vec<&str> = Vec::new();
+        let mut nets: Vec<(&str, Option<i64>)> = Vec::new();
         for contribution in &contributions {
-            let name = contribution.target.name();
-            if !names.contains(&name) {
-                names.push(name);
+            let net = (
+                contribution.target.name(),
+                word_address(&contribution.target),
+            );
+            if !nets.contains(&net) {
+                nets.push(net);
             }
         }
-        let mut settled: Vec<(String, Register)> = Vec::new();
-        for name in names {
-            let signal = self
-                .state
-                .get_signal(name)
-                .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
-            let width = signal.width();
+        let mut settled: Vec<(ResolvedTarget, Register)> = Vec::new();
+        for (name, address) in nets {
+            // A memory word's width and held value come from the memory map,
+            // and a signal's from the signal map — a name is in one or the
+            // other, never both, so the address is what says which to ask.
+            let (width, mut bits) = match address {
+                Some(index) => {
+                    let memory = self
+                        .state
+                        .memory(name)
+                        .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
+                    (memory.width(), memory.word(Some(index)).get_raw().to_vec())
+                }
+                None => {
+                    let signal = self
+                        .state
+                        .get_signal(name)
+                        .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
+                    (signal.width(), signal.register().get_raw().to_vec())
+                }
+            };
             // Bits run most significant first, the way a `Register` is written.
             let mut driven: Vec<Vec<(u8, StrengthLevel)>> = vec![Vec::new(); width];
             for contribution in &contributions {
-                if contribution.target.name() != name {
+                if contribution.target.name() != name
+                    || word_address(&contribution.target) != address
+                {
                     continue;
                 }
                 match &contribution.target {
-                    ResolvedTarget::Whole(_) => {
-                        let value = contribution.value.coerced(width);
-                        for (offset, slot) in driven.iter_mut().enumerate() {
-                            let code = value.get_raw()[offset];
-                            slot.push((code, contribution.strength.of(code)));
-                        }
+                    // A word is driven whole: `foo[0][1]` is a bit of a word,
+                    // which the target grammar has no shape for, so a word's
+                    // only driver form is the whole of it.
+                    ResolvedTarget::Whole(_) | ResolvedTarget::Word { .. } => {
+                        contribute_whole(&mut driven, &contribution.value, contribution.strength)
                     }
                     ResolvedTarget::Bits { indices, .. } => {
+                        let signal = self
+                            .state
+                            .get_signal(name)
+                            .expect("a bit select's signal was just looked up");
                         let value = contribution.value.coerced(indices.len());
                         for (offset, index) in indices.iter().enumerate() {
                             let Some(position) = signal.bit_position(*index) else {
@@ -1612,29 +1639,58 @@ impl Simulator {
                             driven[position].push((code, contribution.strength.of(code)));
                         }
                     }
-                    // Neither a memory word nor an event is a net, so neither
-                    // can have a second driver to be resolved against, and a
-                    // concatenation never reaches here — `is_resolved` reports
-                    // it unresolved so it goes down the plain write path.
-                    ResolvedTarget::Word { .. }
-                    | ResolvedTarget::Event(_)
+                    // An event holds no value to resolve, and a concatenation
+                    // never reaches here — `target_is_resolved` reports it
+                    // unresolved so it goes down the plain write path.
+                    ResolvedTarget::Event(_)
                     | ResolvedTarget::Parts(_)
                     | ResolvedTarget::Nowhere => {}
                 }
             }
-            let mut bits: Vec<u8> = signal.register().get_raw().to_vec();
             for (position, drivers) in driven.iter().enumerate() {
                 if !drivers.is_empty() {
                     bits[position] = resolve_bit(drivers);
                 }
             }
-            settled.push((name.to_string(), Register::from_bits(bits)));
+            let target = match address {
+                Some(index) => ResolvedTarget::Word {
+                    name: name.to_string(),
+                    index,
+                },
+                None => ResolvedTarget::Whole(name.to_string()),
+            };
+            settled.push((target, Register::from_bits(bits)));
         }
         let mut changed = false;
-        for (name, value) in settled {
-            changed |= drive_resolved(&mut self.state, &ResolvedTarget::Whole(name), &value)?;
+        for (target, value) in settled {
+            changed |= drive_resolved(&mut self.state, &target, &value)?;
         }
         Ok(changed)
+    }
+}
+
+/// The memory address a target names, if it is a word of one.
+///
+/// It is the second half of a driver list's identity: two drivers of `foo[0]`
+/// resolve against each other, and neither says anything about `foo[1]`.
+fn word_address(target: &ResolvedTarget) -> Option<i64> {
+    match target {
+        ResolvedTarget::Word { index, .. } => Some(*index),
+        _ => None,
+    }
+}
+
+/// Adds one driver's claim on a whole net — or a whole memory word — to the
+/// per-bit driver lists.
+fn contribute_whole(
+    driven: &mut [Vec<(u8, StrengthLevel)>],
+    value: &Register,
+    strength: DriveStrength,
+) {
+    let value = value.coerced(driven.len());
+    for (offset, slot) in driven.iter_mut().enumerate() {
+        let code = value.get_raw()[offset];
+        slot.push((code, strength.of(code)));
     }
 }
 
@@ -3102,6 +3158,58 @@ mod tests {
 
         simulator.poke("clk", zero()).unwrap();
         assert_eq!(simulator.get("d").unwrap().to_binary(), "1xx0");
+    }
+
+    /// A word of an **array of nets** is a net in its own right, so two
+    /// strength-bearing drivers of `foo[0]` resolve against each other and say
+    /// nothing about `foo[1]`. Corpus `pr1703346` is exactly this and iverilog
+    /// 12.0 prints `foo[0] = 01, foo[1] = 10`.
+    #[test]
+    fn test_an_array_of_nets_resolves_a_word_at_a_time() {
+        let mut simulator = simulator_for(
+            r#"
+            module main;
+                wire [1:0] foo [0:1];
+
+                assign (highz0, strong1) foo[0] = 2'b01;
+                assign (strong0, highz1) foo[0] = 2'b01;
+
+                assign (highz0, strong1) foo[1] = 2'b10;
+                assign (strong0, highz1) foo[1] = 2'b10;
+
+                initial #1 $display("foo[0] = %b, foo[1] = %b", foo[0], foo[1]);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(2).unwrap();
+        assert_eq!(simulator.output().text(), "foo[0] = 01, foo[1] = 10\n");
+    }
+
+    /// The same shape with drivers that *disagree*, which is what tells real
+    /// per-bit resolution from writing the last value: iverilog 12.0 prints
+    /// `foo[0] = 0x, foo[1] = 1z`. Pooling the two words' drivers into one
+    /// list, or writing each word as it came, both get this wrong.
+    #[test]
+    fn test_array_of_net_words_resolve_bit_by_bit() {
+        let mut simulator = simulator_for(
+            r#"
+            module main;
+                wire [1:0] foo [0:1];
+
+                assign (highz0, strong1) foo[0] = 2'b01;
+                assign (strong0, highz1) foo[0] = 2'b00;
+
+                assign (highz0, strong1) foo[1] = 2'b10;
+                assign (strong0, highz1) foo[1] = 2'b11;
+
+                initial #1 $display("foo[0] = %b, foo[1] = %b", foo[0], foo[1]);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(2).unwrap();
+        assert_eq!(simulator.output().text(), "foo[0] = 0x, foo[1] = 1z\n");
     }
 
     /// One `assign` may name several targets, and they share its strength.

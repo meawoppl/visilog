@@ -934,6 +934,17 @@ strongest level either agree or the bit is `x`. A bit no driver reaches keeps wh
 so a driver of `bus[0]` says nothing about `bus[1]`. A design with no gates in it pays a
 `HashSet::is_empty` for the question, the same shape `any_signed` and `any_memory` use.
 
+**A driver list is keyed by the net, and a word of an array of nets *is* a net.**
+`wire [1:0] foo [0:1];` with two strength-bearing drivers on `foo[0]` and two more on
+`foo[1]` has four drivers and two driver lists, so `resolve_contributions` groups by the
+name **and** `word_address` — `Some(index)` for a `ResolvedTarget::Word`, `None` for
+everything else. Pooling the words into one list resolves `foo[0]` against `foo[1]`, and
+skipping the word targets entirely leaves the design asking the *signal* map for a name
+only the memory map has, which is `UnknownSignal` naming the array (corpus `pr1703346`).
+Writing each word as it came is the third wrong answer and the quietest: iverilog gives
+`0x` and `1z` for two drivers that disagree under `highz` halves, where the last write
+gives `00` and `11`.
+
 Strength is what makes a `pullup` mean anything: it drives at `pull` where a gate drives at
 `strong`, so it holds a net every buffer has let go of and loses the moment one drives.
 `(strong0, pull1)` parses and reaches the same rule, and because the two halves are
