@@ -299,7 +299,18 @@ are compiled to an `Instruction::Task` and carried out by
 everything the design printed, so "did this design print `PASSED`?" is a plain assertion —
 which is exactly what a self-checking corpus test needs. `$finish` sets a flag rather than
 exiting the process; `advance` and `poke` become no-ops once it is set, and `now` stops
-where it stopped. Which `$name`s exist is decided at *compile* time by `TaskCall::compile`,
+where it stopped.
+
+**`$finish` ends the simulation at the end of the timestep it ran in, not at the instant
+it ran.** It stops the block that called it — `resume` returns the moment one lands — and
+nothing more is *scheduled*: `settled_resume` queues no free-running restart, no `#delay`
+resumption, no `wait` and no `fork` branch once the flag is set. But everything already
+queued at that instant still runs, and the deferred tasks still report, so an
+`always #10` beside an `initial #30 $finish` still runs at 30 and the `$monitor` still
+prints that step's line (measured against iverilog 12.0; corpus `pr243`, whose last line
+is exactly that). Skipping the rest of the round instead loses both. The scheduling guard
+is what makes it terminate: without it a free-running block whose body ends in `$finish`
+restarts at the same instant for ever (corpus `always3.1.6D`). Which `$name`s exist is decided at *compile* time by `TaskCall::compile`,
 so an unrecognised task is an error naming it rather than a silent no-op — a design that
 quietly printed nothing would look just like one that passed. The buffer is an `Output`,
 whose text sits behind an `Rc<RefCell<String>>` so that a *handle* to it can be given to
