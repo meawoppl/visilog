@@ -54,7 +54,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
 | `simple.rs` | whitespace, comments, `raw_pos_int`, `Range` and the `range` parser, `signedness`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
-| `numbers.rs` | raw binary / decimal / hex digit runs, and `real_number` — the one place a real number is spelled out |
+| `numbers.rs` | raw binary / hex digit runs, `unsigned_number` — a decimal run with `_` separators, which is a literal's size, a plain decimal and an unparenthesised delay — and `real_number`, the one place a real number is spelled out |
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
 | `string.rs` | double-quoted string literals |
 | `identifier.rs` | `Identifier`, identifier lists, bit/part select |
@@ -1101,9 +1101,11 @@ terminate on one, and a static task's storage means real Verilog cannot recurse 
 `declare_tasks` compiles in dependency order by repeating until a pass compiles nothing
 new, so a task may enable one declared further down the file.
 
-Still unsupported: a hierarchical enable (`instance.task(…)`); a task enabled from inside a
-`function`, which is rejected by the function body analysis rather than by a check of its
-own. `signals.rs` is built but still unwired.
+Still unsupported: a hierarchical enable (`instance.task(…)`), which **parses** — the name
+is a hierarchical identifier like any other — and is then `UnknownTask` naming the whole
+path, because `declare_tasks` keys the definitions by the enabling module's own names
+(#173); a task enabled from inside a `function`, which is rejected by the function body
+analysis rather than by a check of its own. `signals.rs` is built but still unwired.
 
 **A `disable` is a jump when it can be, and a cancellation when it cannot.** A named block
 and an inlined task body each occupy a *range* of the compiled instruction list, and
@@ -2073,12 +2075,18 @@ tripwire.
   #n …;` wait 3 and then 7. A delay that evaluates to `x` is zero, which is what iverilog
   does with one. `Delay::ticks(&store)` is still the single place a delay *mode* is chosen,
   so `+mindelays`/`+maxdelays` is still a one-function change; it just takes a store now.
-- **The unparenthesised form is a number or a name, and nothing more.** A delay prefixes a
-  statement with only whitespace between, so a full expression parser would read `#5 a = 1;`
-  as `5 a` and `#2 -> ev;` as `2 - >`. `delay_operand` is therefore a constant or a
-  hierarchical identifier, and an expression is legal only inside parentheses — which is
-  exactly what the LRM says. `#(2:10:17)` is the `min:typ:max` triple, tried first inside
-  those parentheses because the single-value branch would match `2` and choke on the `:`.
+- **The unparenthesised form is an `unsigned_number`, a real number or a name, and nothing
+  more.** A delay prefixes a statement with only whitespace between, so a full expression
+  parser would read `#5 a = 1;` as `5 a` and `#2 -> ev;` as `2 - >`. That is only half of
+  it: a **based** literal's size, base designator and digits may themselves be separated by
+  whitespace, so a general *constant* parser here reads the whole of `#1 'h00010203` as one
+  sized value and leaves the statement nothing to assign. `delay_operand` is therefore
+  `numbers::unsigned_number`, `real_literal` or a hierarchical identifier — exactly IEEE
+  1364-2005's `delay_value` — and a based literal is legal only inside parentheses, where a
+  closing `)` says where it ends. Corpus `const4` calls these the "potential ambiguities":
+  `i = # 9_7 'D 3;` waits 97 and assigns `'d3`, while `#(5 'D 3)` is a delay of 3.
+  `#(2:10:17)` is the `min:typ:max` triple, tried first inside those parentheses because
+  the single-value branch would match `2` and choke on the `:`.
 - **A `#delay` on an `assign` and a `#delay` on a gate are both simulated, through one
   production.** `parse_gate_delay` reads the `delay3` — up to three delays rather than one,
   `#(rise, fall, turn_off)` — into a `GateDelay`, and both an `assign` and a gate schedule
@@ -2134,6 +2142,12 @@ tripwire.
   side**, so a `z` in the subject is as much a don't-care as one in the label; testing only
   the label half is the easy mistake. `casez` still tells an `x` apart from a `0`.
   The `case` tag is a prefix of both keywords, so `parse_case_keyword` tries it last.
+  **The colon after `default` — and only after `default` — is optional**, which is IEEE
+  1364-2005's `case_item` (`default [ : ] statement_or_null`) and what corpus `casex3.9E`
+  writes. So what tells `default` from an identifier like `default_state` is the *word
+  boundary* rather than the colon that used to follow it; every other label still needs its
+  colon, since a label without one would run straight into the statement after it, which is
+  a wrong parse tree rather than an error.
   **A subject and its labels are not yet sized against each other**, which is the same
   mutual context a comparison already gets: they should be widened to the widest of *all*
   of them, read signed only when every one of them is, and compared as reals when any one
@@ -2190,11 +2204,30 @@ tripwire.
   one definition of what a `$name` looks like. A format string is a
   `SystemTaskArgument::String`, not an `Expression` — the expression grammar has no string
   operand. A *bare* `$name` argument (`$display("%0d", $time)`) is still a
-  `SystemTaskArgument::SystemFunction`, but only because `bare_system_function` refuses one
-  followed by `(`: `$display("%0d", $signed(a))` is an ordinary expression argument.
-  `TaskCall::compile` turns the bare form into an `Expression::SystemFunctionCall` after
-  checking it against `eval::SYSTEM_FUNCTIONS`, so a name nothing implements is still
+  `SystemTaskArgument::SystemFunction`, but only because `bare_system_function` insists the
+  **next token ends an argument** — a `,` or a `)`. Refusing only a following `(` is not
+  enough: `$display("%d", $time - base)` is a subtraction, and stopping at the `$time`
+  leaves a remainder the argument list cannot get past, which is a parse failure at the
+  end of the call rather than at the operator (corpus `sdf_del_max`, `pr1701889`,
+  `verify_two_var_delays`). `$display("%0d", $signed(a))` is an ordinary expression
+  argument. A system function may also be **separated from its argument list** —
+  `$fopen ("f", "r")`, corpus `pr1687193` — for the reason a call to one of the design's
+  own may: in an operand position a name followed by a parenthesised list can only be a
+  call. `TaskCall::compile` turns the bare form into an `Expression::SystemFunctionCall`
+  after checking it against `eval::SYSTEM_FUNCTIONS`, so a name nothing implements is still
   rejected at compile time and `$time` has exactly one implementation.
+- **The assignment operator is read longest-first, and `<=` is the trap.** `a op= b` stands
+  for `a = a op b` and `a++` for `a = a + 1`, folded into the right hand side by
+  `assignment::assignment_body` so nothing downstream learns the spelling. A non-blocking
+  assignment and the shift-assign `<<=` begin alike, so reading `<=` first gives `a <<= 1;`
+  a non-blocking assignment of `= 1` — a parse error somewhere that says nothing about the
+  operator. `assignment_operator` dispatches on the **first byte** rather than on a
+  fourteen-arm `alt`, because every assignment in a design comes through it and nearly all
+  are a plain `=`: the `alt` spelling measured 6–8% on `bench parse/*`. The increment is
+  tried **second**, only once the operator has failed outright, so an ordinary assignment
+  pays no second whitespace skip. `for_assignment` goes through the same production — the
+  `;` is the whole of the difference — so a `for` header cannot fall behind a statement on
+  what an assignment may be.
 - **A `#delay` is a statement *prefix*, not a field on an assignment.**
   `#5 a = 1;`, `#5 $display(…);`, `#5 begin … end`, `#5 if (…) …` and
   `#5 case (…) … endcase` all parse to `ProceduralStatements::Delayed { delay,
@@ -2363,7 +2396,21 @@ tripwire.
 - **A based literal is three tokens.** The size, the base designator and the digits are
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
-  literal — which is also what the LRM says.
+  literal — which is also what the LRM says. That whitespace is what makes an
+  unparenthesised delay an `unsigned_number` rather than a constant; see above.
+- **A size and a plain decimal are both `numbers::unsigned_number`**, which carries the `_`
+  separator anywhere but at the front. The *digits* of a based literal already did, which
+  is why `2_0'b0` (corpus `pr902`) read as the number `2` followed by an identifier and
+  `1_000` read as `1`. The leading-digit rule is load-bearing: `_5` is not a number but is
+  the start of an identifier, and a parser that claimed it would take `_x` for one.
+- **A `:` inside parentheses is a `min:typ:max` triple, and it is asked about *after* the
+  expression has been read.** A conditional has a `:` of its own and `conditional_layer`
+  has already taken it by the time `parenthetical` looks, so `(c ? a : b)` is unchanged and
+  an ordinary parenthesised expression pays one character comparison. The **typical** value
+  is the one kept — the same choice `Delay::ticks` makes, and what iverilog 12.0 does
+  (`parameter value = (1:2:3);` prints `2` with a `warning: Choosing typ expression.`).
+  The min and the max are dropped, because `Expression` has nowhere to keep them, so
+  `+mindelays` would not reach a triple written outside a delay.
 - **A backslash before a newline inside a string literal is a line continuation, and it
   contributes nothing.** IEEE 1364-2005 §3.6; iverilog 12.0 prints `ab` for a literal
   spelled `"a\<newline>b"`. It is `string.rs::line_continuation`, deliberately *not* one of
@@ -2415,7 +2462,17 @@ tripwire.
   last in `procedural_statement`'s `alt` *and* rejects anything `keywords::is_reserved_word`
   knows, so `wait (1);` is still a parse error rather than a task nothing declared. Without
   that guard five corpus files stop being parse failures and become `UnknownTask` failures
-  instead, which is a worse answer wearing a better one's clothes.
+  instead, which is a worse answer wearing a better one's clothes. The name it reads is
+  **hierarchical**, because a task belongs to the module that declares it and a design
+  reaches one across the hierarchy (`n.incr(1);`, `top.main.test1;`, `gen.foo_task;`). The
+  reserved-word guard still tests the path's *head* segment, which is all it ever had to.
+  Elaboration does not resolve one of those yet (#173), so those ten designs stop at
+  `UnknownTask` naming the path — which is the right place for them to stop.
+- **An event is reached by its hierarchical name too, in both the places one is named.**
+  `-> et1.m1.e2;` (corpus `event3`) and `@top.toplevel_event` (`pr572`) both read the whole
+  dotted path, which is the flat store key the trigger namespace is keyed by. The bare
+  `@name` form keeps its reserved-word guard on the head segment, so `always @* begin … end`
+  still reads `begin` as a statement rather than as an event.
 - **A `time` variable inside a `function` or `task` is 64 bits by being a `time`**, the way
   an `integer` is 32 by being an `integer`. `behavior.rs::declared_type` reads the keyword
   rather than treating it as a bare storage class, so `output time stamp;` is a 64-bit
@@ -2443,6 +2500,12 @@ tripwire.
   tree rather than an error. `specify.rs::terminal` is a name with an optional bit or part
   select and nothing else. The delay on the right of the `=` *is* an expression, which is
   how `= (tRise, tFall)` names two `specparam`s.
+- **A `specparam` is legal at module level as well as inside a `specify` block**, which is
+  IEEE 1364-2005's `module_or_generate_item_declaration` (corpus `br_gh732`). It comes back
+  from `specify.rs::parse_module_specparam` as a `SpecifyBlock` holding nothing else,
+  because a `specparam` is a constant the whole module may name either way and that is
+  already the only thing `elaborate` reads out of one — a second declaration form could
+  only disagree with the first about what a `specparam` means.
 - **A real number is parsed in exactly one place.** `numbers.rs::real_number` reads both of
   IEEE 1364's spellings — fixed point (`0.9`, `0.500`) and exponent (`1e3`, `1.5e-3`) — and
   three productions come to it: `expr.rs::real_literal`, a `specify` path delay and a
