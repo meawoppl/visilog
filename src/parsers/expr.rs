@@ -461,9 +461,9 @@ pub fn system_name(input: &str) -> IResult<&str, String> {
 fn system_function_call(input: &str) -> IResult<&str, Expression> {
     let (input, name) = system_name(input)?;
     let (input, args) = opt(delimited(
-        tag("("),
-        separated_list0(tag(","), ws(verilog_expression)),
-        tag(")"),
+        ws(char('(')),
+        separated_list0(char(','), ws(verilog_expression)),
+        ws(char(')')),
     ))(input)?;
     Ok((
         input,
@@ -2069,6 +2069,25 @@ mod tests {
     fn test_a_bare_system_function_is_an_operand() {
         assert_parses_to(verilog_expression, "$time", system_call("time", vec![]));
         assert_parses_to(verilog_expression, "$random", system_call("random", vec![]));
+    }
+
+    /// A system function may be separated from its argument list, for the same
+    /// reason a call to one of the design's own may: in an operand position a
+    /// `$name` followed by a parenthesised list can only be a call. Corpus
+    /// `pr1687193` writes `$fopen ("…", "r")`, which without this reads as a
+    /// bare `$fopen` and leaves the list behind.
+    #[test]
+    fn test_a_system_function_may_be_separated_from_its_arguments() {
+        assert_parses_to(
+            verilog_expression,
+            "$signed ( b )",
+            system_call("signed", vec![ident("b")]),
+        );
+        assert_parses_to(
+            verilog_expression,
+            "$fopen /* mode */ (name)",
+            system_call("fopen", vec![ident("name")]),
+        );
     }
 
     #[test]
