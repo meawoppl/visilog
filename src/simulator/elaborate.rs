@@ -32,10 +32,12 @@
 //! output is a real signal the child drives that simply nobody reads, so it
 //! starts `x` like any other.
 //!
-//! Aliasing means an aliased port takes the *parent* signal's declared width
-//! and range rather than its own: there is only one entry, and it is the
-//! parent's. That is the price of never having to reconcile the two, and it
-//! only differs from Verilog when a connection is deliberately mismatched.
+//! Aliasing is only sound when the two really are one signal, so a port whose
+//! declared width is **not** the width of what it was bound to is not aliased
+//! at all: [`Elaborator::reconcile_port_widths`] turns it back into a port with
+//! an entry of its own plus a continuous assignment in the port's own
+//! direction, which is the shape a port bound to an *expression* already had.
+//! The extension, the truncation and the signedness are then an assignment's.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -241,7 +243,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
         defparams: BTreeMap::new(),
         blocks_generated: 0,
     };
-    elaborator.walk(top, &Scope::root(&modules[top].identifier.name))?;
+    elaborator.walk(top, &mut Scope::root(&modules[top].identifier.name))?;
     // A `defparam` is consumed by the instantiation it names. One that is
     // still here named nothing, and an override that quietly did not happen
     // leaves the design running at a width it was told not to use.
@@ -398,7 +400,7 @@ struct Elaborator<'m> {
 }
 
 impl<'m> Elaborator<'m> {
-    fn walk(&mut self, index: usize, scope: &Scope) -> Result<(), SimulationError> {
+    fn walk(&mut self, index: usize, scope: &mut Scope) -> Result<(), SimulationError> {
         let modules = self.modules;
         let module = &modules[index];
 
@@ -448,6 +450,10 @@ impl<'m> Elaborator<'m> {
         for statement in deferred {
             self.declare(statement, scope)?;
         }
+        // A port whose width does not match what the parent bound it to cannot
+        // be aliased, so this runs where both widths are first known: the
+        // parameters above are what give the port's range a value.
+        self.reconcile_port_widths(module, scope)?;
         for port in &module.ports {
             self.declare_port(port, scope)?;
         }
@@ -812,6 +818,74 @@ impl<'m> Elaborator<'m> {
         };
         wide.and_then(|value| i64::try_from(value).ok())
             .ok_or_else(|| unresolved("it does not evaluate to an integer".to_string()))
+    }
+
+    /// Turns an alias whose two halves are **not the same number of bits**
+    /// back into an ordinary connection, which is what makes the conversion
+    /// between them happen.
+    ///
+    /// Aliasing is only sound when the port and the signal it is bound to are
+    /// the same signal, and two different widths are not: `slower slwr(sres,
+    /// sin);` for an `output signed [31:0] lrtn` bound to a
+    /// `wire signed [63:0] sres` has to sign extend the port's thirty-two bits
+    /// outwards, and one store entry has nowhere to do that. The port keeps an
+    /// entry of its own and a continuous assignment carries the value across in
+    /// the port's own direction — exactly what a port bound to an *expression*
+    /// already does — so the sign, the padding and the truncation are the ones
+    /// an assignment gives (corpus `pr2121536`, `pr2121536b`).
+    ///
+    /// It has to run here rather than where the binding is made, because a
+    /// port's range is made of the child's parameters and they have only just
+    /// been declared. An `inout` is left aliased whatever its width: it is read
+    /// as well as written, and one assignment only runs one way.
+    fn reconcile_port_widths(
+        &mut self,
+        module: &VerilogModule,
+        scope: &mut Scope,
+    ) -> Result<(), SimulationError> {
+        for port in &module.ports {
+            let local = &port.identifier.name;
+            let Some(Binding::Alias(outer)) = scope.bindings.get(local) else {
+                continue;
+            };
+            if matches!(port.direction, PortDirection::InOut) {
+                continue;
+            }
+            let outer = outer.clone();
+            let Some(signal) = self.out.state.get_signal(&outer) else {
+                continue;
+            };
+            let outer_width = signal.width();
+            let range = self.resolve_range(&port.range, scope)?;
+            if range_width(range) == outer_width {
+                continue;
+            }
+            // The assignment this becomes is a driver the *design* did not
+            // write, and it is the only driver the elaborator adds on its own
+            // account — so it cannot know whether the net it lands on is driven
+            // already. A design that miswires a port's direction drives both
+            // ends (iverilog coerces the port to `inout` and warns), and two
+            // plain drivers of one net overwrite each other every pass and
+            // never settle. Naming the net resolved is what sends both through
+            // `resolve_contributions` instead, where an undriven `z`
+            // contributes nothing and the real driver wins outright (corpus
+            // `br_gh127c`, `br_gh127f`).
+            let binding = match port.direction {
+                PortDirection::Input => {
+                    self.out.resolved_nets.insert(scope.qualified(local));
+                    Binding::Driven(Expression::Identifier(Identifier::new(outer)))
+                }
+                _ => {
+                    self.out.resolved_nets.insert(outer.clone());
+                    Binding::Driving(Expression::Identifier(Identifier::new(outer)))
+                }
+            };
+            scope.bindings.insert(local.clone(), binding);
+            self.out
+                .aliases
+                .remove(&format!("{}{}", scope.prefix, local));
+        }
+        Ok(())
     }
 
     /// Declares one port, unless it was aliased onto a signal that already
@@ -2188,7 +2262,7 @@ impl<'m> Elaborator<'m> {
             }
         }
 
-        self.walk(index, &inner)
+        self.walk(index, &mut inner)
     }
 
     /// Evaluates a `#(...)` block in the *parent's* scope, keyed by the child's
@@ -3761,6 +3835,84 @@ mod tests {
         // `count` is the same entry as the parent's `out` port.
         assert_eq!(simulator.get("dut.count").unwrap().to_u128(), Some(1));
         assert_eq!(simulator.get("out").unwrap().to_u128(), Some(1));
+    }
+
+    /// A port that is **not the same number of bits** as the signal it is bound
+    /// to cannot be aliased: one store entry has nowhere to extend or truncate.
+    /// It keeps an entry of its own and a continuous assignment carries the
+    /// value across, so the conversion is the one an assignment gives — a
+    /// signed port sign extends, an unsigned one zero extends, and a target
+    /// narrower than the port truncates.
+    ///
+    /// Measured against iverilog 12.0, which warns about each connection and
+    /// then prints:
+    ///
+    /// ```text
+    /// signed out   11111101
+    /// unsigned out 00001101
+    /// narrow out   01
+    /// signed in    11111101
+    /// unsigned in  00001101
+    /// ```
+    ///
+    /// Aliasing gives the *parent's* width in both directions instead, which
+    /// is what made corpus `pr2121536` and `pr2121536b` zero extend a signed
+    /// output.
+    #[test]
+    fn test_a_port_of_a_different_width_is_converted_rather_than_aliased() {
+        let top = r#"
+            module top;
+              reg signed [3:0] s = -3;
+              reg [3:0] u = 4'b1101;
+              wire signed [7:0] so;
+              wire [7:0] uo;
+              wire [1:0] narrow;
+
+              widen w1(so, s);
+              widenu w2(uo, u);
+              narrowd n1(narrow, u);
+
+              initial #1 begin
+                $display("signed out   %b", so);
+                $display("unsigned out %b", uo);
+                $display("narrow out   %b", narrow);
+                $display("signed in    %b", w1.lin);
+                $display("unsigned in  %b", w2.lin);
+              end
+            endmodule
+        "#;
+        let widen = r#"
+            module widen(lrtn, lin);
+              output signed [3:0] lrtn;
+              input signed [7:0] lin;
+              assign lrtn = lin[3:0];
+            endmodule
+        "#;
+        let widenu = r#"
+            module widenu(lrtn, lin);
+              output [3:0] lrtn;
+              input [7:0] lin;
+              assign lrtn = lin[3:0];
+            endmodule
+        "#;
+        let narrowd = r#"
+            module narrowd(lrtn, lin);
+              output [3:0] lrtn;
+              input [7:0] lin;
+              assign lrtn = lin[3:0];
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, widen, widenu, narrowd], "top");
+        simulator.advance(20).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "signed out   11111101\n\
+             unsigned out 00001101\n\
+             narrow out   01\n\
+             signed in    11111101\n\
+             unsigned in  00001101\n"
+        );
     }
 
     /// Combinational output flowing back up into a parent expression.
