@@ -2683,8 +2683,9 @@ pub fn rename_event_control(control: &mut EventControl, resolve: &dyn Fn(&str) -
 /// A generate block is a *scope*, so only what it declares is renamed into it
 /// and everything else belongs to the module around it. Which makes this the
 /// list of what "inside" means: the signals and parameters the block declares,
-/// the instances it creates, and the labels of the blocks nested in it — a
-/// hierarchical reference reaches through all three.
+/// the instances it creates, the labels of the generate blocks nested in it,
+/// and the labels of the *named blocks* its `initial` and `always` bodies open
+/// — a hierarchical reference reaches through all four.
 fn declared_names(items: &[GenerateItem]) -> Vec<String> {
     let mut names = Vec::new();
     let mut label = |block: &GenerateBlock| {
@@ -2744,6 +2745,12 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
         ModuleStatement::ModuleInstantiation(instantiation) => {
             names.push(instantiation.instance_name.name.clone())
         }
+        // A named block is a scope, and one opened inside a generate block
+        // belongs to that block: `elaborate` declares its variables under the
+        // block's prefix, so the label has to be here or a reference to one of
+        // them resolves outwards to the module and finds nothing.
+        ModuleStatement::InitialBlock(block) => block_labels(&block.statements, names),
+        ModuleStatement::AlwaysBlock(block) => block_labels(&block.statements, names),
         _ => {}
     }
 }
@@ -2792,6 +2799,46 @@ fn operand_names<'e>(expression: &'e Expression, names: &mut Vec<&'e str>) {
         | Expression::BitSelect(..)
         | Expression::PartSelect(..)
         | Expression::IndexedPartSelect { .. } => {}
+    }
+}
+
+/// The labels of the named blocks a procedural body opens *directly*.
+///
+/// The walk stops at the first named block on each path, because that label is
+/// the head segment of every name inside it — a block nested deeper is reached
+/// through it (`outer.inner.tmp`) and needs no entry of its own. An unnamed
+/// block is grouping and nothing else, so it is walked through.
+fn block_labels(statements: &[ProceduralStatements], names: &mut Vec<String>) {
+    for statement in statements {
+        match statement {
+            ProceduralStatements::Block(block) | ProceduralStatements::Fork(block) => {
+                match &block.name {
+                    Some(name) => names.push(name.name.clone()),
+                    None => block_labels(&block.statements, names),
+                }
+            }
+            ProceduralStatements::If(conditional) => {
+                block_labels(&conditional.then_statements, names);
+                if let Some(otherwise) = &conditional.else_statements {
+                    block_labels(otherwise, names);
+                }
+            }
+            ProceduralStatements::Case(case) => {
+                for item in &case.items {
+                    block_labels(&item.statements, names);
+                }
+            }
+            ProceduralStatements::For(loop_) => block_labels(&loop_.statements, names),
+            ProceduralStatements::While(loop_) => block_labels(&loop_.statements, names),
+            ProceduralStatements::Repeat(loop_) => block_labels(&loop_.statements, names),
+            ProceduralStatements::Wait(statement) => block_labels(&statement.statements, names),
+            ProceduralStatements::Forever(statements)
+            | ProceduralStatements::Delayed { statements, .. }
+            | ProceduralStatements::EventControlled { statements, .. } => {
+                block_labels(statements, names)
+            }
+            _ => {}
+        }
     }
 }
 
@@ -3067,6 +3114,34 @@ mod tests {
             simulator.get("narrow.chosen").is_err(),
             "the arm not taken contributes nothing"
         );
+    }
+
+    /// A named block opened inside a generate block is a scope of *that*
+    /// block, so its local is `genblk1.a.i` in the flat store. Declaring it
+    /// there while a reference to it resolved outwards to a bare `a.i` is
+    /// what corpus `pr2306259` hit, where iverilog 12.0 prints `PASSED`.
+    #[test]
+    fn test_a_named_block_inside_a_generate_block_takes_its_scope() {
+        let source = r#"
+            module top;
+                generate
+                    if (1) begin
+                        initial begin : a
+                            integer i;
+                            i = 7;
+                            $display("i=%0d", i);
+                        end
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        assert!(
+            simulator.get("genblk1.a.i").is_ok(),
+            "the block's local belongs to the generate block's scope"
+        );
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "i=7\n");
     }
 
     /// A generate `case` picks its arm by identity, and falls through to
