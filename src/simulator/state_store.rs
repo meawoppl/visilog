@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::parsers::expr::Expression;
+use crate::parsers::gates::DriveStrength;
 use crate::register::{Register, REAL_WIDTH, X};
 use crate::simulator::exec::ResolvedTarget;
+use crate::simulator::gates::Strength;
 use crate::simulator::program::FunctionDefinition;
 use crate::simulator::tasks::Output;
 
@@ -368,6 +370,15 @@ pub struct SignalState {
     /// same reason signedness does: the declaration is the only thing that
     /// knows, and it is set once and re-stamped rather than re-derived.
     net: bool,
+    /// The strength each bit was last *resolved* at, most significant first.
+    ///
+    /// `None` for everything but a net that goes through
+    /// `Simulator::resolve_contributions`, which is the only thing that knows
+    /// one — an ordinary `assign` or a procedural write drives at `strong` and
+    /// needs nothing recorded. So a design with no gate, no `tran` and no
+    /// strength-bearing `assign` in it never allocates here, and `%v` answers
+    /// from the value the way it always did.
+    strengths: Option<Vec<Strength>>,
 }
 
 impl SignalState {
@@ -378,6 +389,7 @@ impl SignalState {
             register,
             range,
             net: false,
+            strengths: None,
         }
     }
 
@@ -396,6 +408,7 @@ impl SignalState {
             register,
             range,
             net: false,
+            strengths: None,
         }
     }
 
@@ -409,6 +422,12 @@ impl SignalState {
     /// backed by one.
     pub fn is_net(&self) -> bool {
         self.net
+    }
+
+    /// The strength each bit was last resolved at, or `None` for a signal
+    /// nothing resolves.
+    pub fn strengths(&self) -> Option<&[Strength]> {
+        self.strengths.as_deref()
     }
 
     /// The same signal, declared signed or unsigned.
@@ -1773,6 +1792,40 @@ impl StateStore {
 
     pub fn get_signal(&self, name: &str) -> Option<&SignalState> {
         self.name_to_signal.get(name)
+    }
+
+    /// The strength every bit of a signal was last resolved at, `width` of
+    /// them, most significant first.
+    ///
+    /// A signal nothing has resolved yet answers from its *value*, which is
+    /// what an ordinary driver would have given it anyway: a `z` bit is driven
+    /// by nothing and every other bit is `strong`. That is what makes the
+    /// first pass over a net agree with every pass after it.
+    pub fn strengths_of(&self, name: &str, width: usize) -> Vec<Strength> {
+        match self.name_to_signal.get(name) {
+            Some(signal) => match signal.strengths() {
+                Some(levels) if levels.len() == width => levels.to_vec(),
+                _ => signal
+                    .register()
+                    .get_raw()
+                    .iter()
+                    .take(width)
+                    .map(|code| Strength::driven(*code, DriveStrength::STRONG))
+                    .chain(std::iter::repeat(Strength::HIGHZ))
+                    .take(width)
+                    .collect(),
+            },
+            None => vec![Strength::HIGHZ; width],
+        }
+    }
+
+    /// Records what each bit of a net resolved to. Only
+    /// `Simulator::resolve_contributions` calls this, which is why every other
+    /// signal's slot stays `None`.
+    pub fn set_strengths(&mut self, name: &str, levels: Vec<Strength>) {
+        if let Some(signal) = self.name_to_signal.get_mut(name) {
+            signal.strengths = Some(levels);
+        }
     }
 
     /// A signal for in-place modification. What it holds now is journalled

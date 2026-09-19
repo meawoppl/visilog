@@ -385,32 +385,163 @@ fn invert_output(code: u8) -> u8 {
     }
 }
 
-/// What a net carries when several drivers reach it.
+/// The IEEE 1364-2005 strength level a [`StrengthLevel`] names, on the
+/// standard's own `0..=7` scale.
+///
+/// The grammar only spells the five *drive* strengths, so `Small`, `Medium`
+/// and `Large` — the charge strengths a `trireg` declares — have no keyword
+/// reaching here. The numbering still has to be the standard's, because `%v`
+/// prints the **digits** when a bit's two halves disagree: `65X` is a `strong`
+/// `0` against a `pull` `1`, and nothing but 6 and 5 spells that.
+pub fn strength_level(level: StrengthLevel) -> i8 {
+    match level {
+        StrengthLevel::Highz => 0,
+        StrengthLevel::Weak => 3,
+        StrengthLevel::Pull => 5,
+        StrengthLevel::Strong => 6,
+        StrengthLevel::Supply => 7,
+    }
+}
+
+/// The strength of one bit of a net: a **signed interval** over the eight
+/// strength levels.
+///
+/// A negative number is a level driving toward `0`, a positive one toward `1`,
+/// and `0` is high impedance — so `St0` is `[-6, -6]`, `Pu1` is `[5, 5]` and a
+/// floating bit is `[0, 0]`. A driver that is certain what it drives is a
+/// *point*; one that is not is a *range*, and that range is the whole reason a
+/// strength cannot be a level. A `bufif1` whose control is unknown drives its
+/// data or nothing at all, which is `[-6, 0]` — the `StL` iverilog prints where
+/// a level alone could only say `StX`.
+///
+/// The value follows from the interval rather than riding beside it: a bit is
+/// `0` when every level in the range drives toward `0`, `1` when every one
+/// drives toward `1`, `z` when the range is only high impedance, and `x` for
+/// anything else. `StL` is therefore an `x` as a *value* and a `0`-or-`z` as a
+/// strength, which is exactly what `$display("%b,%v", y, y)` prints in corpus
+/// `pr544`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strength {
+    lo: i8,
+    hi: i8,
+}
+
+impl Strength {
+    /// A bit nothing is driving.
+    pub const HIGHZ: Strength = Strength { lo: 0, hi: 0 };
+
+    /// Both halves of an ordinary gate or `assign`, which drives `strong`.
+    pub const STRONG_ZERO: Strength = Strength { lo: -6, hi: -6 };
+    pub const STRONG_ONE: Strength = Strength { lo: 6, hi: 6 };
+    /// A bit driven `strong` toward both levels at once — a plain `x`.
+    pub const STRONG_UNKNOWN: Strength = Strength { lo: -6, hi: 6 };
+
+    /// An interval over the eight levels, in either order.
+    pub fn span(first: i8, second: i8) -> Strength {
+        let lo = first.min(second).clamp(-7, 7);
+        let hi = first.max(second).clamp(-7, 7);
+        Strength { lo, hi }
+    }
+
+    /// What one driver of a bit contributes, given the code it is driving and
+    /// the `(strength0, strength1)` it was declared with.
+    ///
+    /// An `x` is driven toward **both** levels at once, which is what makes it
+    /// the one code whose strength is a range rather than a point; a `z` drives
+    /// nothing whatever the declaration says, and a `0` driven by a `highz0`
+    /// half is the open drain that floats instead.
+    pub fn driven(code: u8, strength: DriveStrength) -> Strength {
+        match code {
+            ZERO => Strength::span(
+                -strength_level(strength.zero),
+                -strength_level(strength.zero),
+            ),
+            ONE => Strength::span(strength_level(strength.one), strength_level(strength.one)),
+            X => Strength::span(-strength_level(strength.zero), strength_level(strength.one)),
+            _ => Strength::HIGHZ,
+        }
+    }
+
+    /// The four-state code this strength stands for.
+    pub fn value(&self) -> u8 {
+        if self.lo == 0 && self.hi == 0 {
+            Z
+        } else if self.hi < 0 {
+            ZERO
+        } else if self.lo > 0 {
+            ONE
+        } else {
+            X
+        }
+    }
+
+    /// The lowest and highest signed levels in the range, weakest-toward-`0`
+    /// first.
+    pub fn bounds(&self) -> (i8, i8) {
+        (self.lo, self.hi)
+    }
+}
+
+/// What one bit of a node carries when two drivers reach it.
+///
+/// Each driver is a *set* of possible signed levels, so the answer is the set
+/// of what every pair of them resolves to — kept as the interval that spans it,
+/// which is all `%v` can print and all the next fold needs. Two unambiguous
+/// drivers are the overwhelmingly common case and take the first branch: the
+/// stronger wins outright, and two that are tied and disagree give an `x` *at
+/// that level*, which is the interval `[-s, s]`.
+fn resolve_pair(a: Strength, b: Strength) -> Strength {
+    if a.lo == a.hi && b.lo == b.hi {
+        return resolve_levels(a.lo, b.lo);
+    }
+    let mut lo = i8::MAX;
+    let mut hi = i8::MIN;
+    for x in a.lo..=a.hi {
+        for y in b.lo..=b.hi {
+            let combined = resolve_levels(x, y);
+            lo = lo.min(combined.lo);
+            hi = hi.max(combined.hi);
+        }
+    }
+    Strength { lo, hi }
+}
+
+/// Two *unambiguous* drivers, resolved. The larger magnitude wins; equal
+/// magnitudes agree, or the bit is unknown at that level.
+fn resolve_levels(x: i8, y: i8) -> Strength {
+    let (magnitude_x, magnitude_y) = (x.abs(), y.abs());
+    if magnitude_x > magnitude_y {
+        Strength { lo: x, hi: x }
+    } else if magnitude_y > magnitude_x {
+        Strength { lo: y, hi: y }
+    } else if x == y {
+        Strength { lo: x, hi: x }
+    } else {
+        Strength {
+            lo: -magnitude_x,
+            hi: magnitude_x,
+        }
+    }
+}
+
+/// What a net carries when several drivers reach it, as a strength.
 ///
 /// A driver contributes nothing when it is floating — either because it is
 /// driving `z` or because that half of its strength is `highz`. Of the rest,
 /// the strongest wins outright; drivers tied at the strongest level agree on a
 /// value or the net is `x`. A net every driver has let go of is `z`.
-pub fn resolve_bit(drivers: &[(u8, StrengthLevel)]) -> u8 {
-    let mut winner = Z;
-    let mut level = StrengthLevel::Highz;
-    for &(code, strength) in drivers {
-        let strength = if code == Z {
-            StrengthLevel::Highz
-        } else {
-            strength
-        };
-        if strength == StrengthLevel::Highz {
-            continue;
-        }
-        if winner == Z || strength > level {
-            winner = code;
-            level = strength;
-        } else if strength == level && winner != code {
-            winner = X;
-        }
+pub fn resolve_strength(drivers: &[Strength]) -> Strength {
+    let mut resolved = Strength::HIGHZ;
+    for &driver in drivers {
+        resolved = resolve_pair(resolved, driver);
     }
-    winner
+    resolved
+}
+
+/// The four-state bit several drivers settle on — [`resolve_strength`] read as
+/// a value.
+pub fn resolve_bit(drivers: &[Strength]) -> u8 {
+    resolve_strength(drivers).value()
 }
 
 #[cfg(test)]
@@ -561,21 +692,32 @@ mod tests {
         assert_eq!(gate_output(GateKind::Pulldown, &[]), ZERO);
     }
 
+    /// One driver at an ordinary `(strong0, strong1)`.
+    fn at(code: u8, level: StrengthLevel) -> Strength {
+        Strength::driven(
+            code,
+            DriveStrength {
+                zero: level,
+                one: level,
+            },
+        )
+    }
+
     #[test]
     fn test_resolution_of_several_drivers() {
         let strong = StrengthLevel::Strong;
         // A net nothing drives is floating.
         assert_eq!(resolve_bit(&[]), Z);
-        assert_eq!(resolve_bit(&[(Z, strong), (Z, strong)]), Z);
+        assert_eq!(resolve_bit(&[at(Z, strong), at(Z, strong)]), Z);
         // One driver holding it, the rest let go.
         assert_eq!(
-            resolve_bit(&[(Z, strong), (ZERO, strong), (Z, strong)]),
+            resolve_bit(&[at(Z, strong), at(ZERO, strong), at(Z, strong)]),
             ZERO
         );
         // Two drivers that agree, and two that do not.
-        assert_eq!(resolve_bit(&[(ONE, strong), (ONE, strong)]), ONE);
-        assert_eq!(resolve_bit(&[(ZERO, strong), (ONE, strong)]), X);
-        assert_eq!(resolve_bit(&[(ZERO, strong), (X, strong)]), X);
+        assert_eq!(resolve_bit(&[at(ONE, strong), at(ONE, strong)]), ONE);
+        assert_eq!(resolve_bit(&[at(ZERO, strong), at(ONE, strong)]), X);
+        assert_eq!(resolve_bit(&[at(ZERO, strong), at(X, strong)]), X);
     }
 
     /// The point of strength: a `pullup` loses to anything actually driving
@@ -584,22 +726,86 @@ mod tests {
     fn test_strength_decides() {
         let pull = StrengthLevel::Pull;
         let strong = StrengthLevel::Strong;
-        assert_eq!(resolve_bit(&[(ONE, pull), (Z, strong)]), ONE);
-        assert_eq!(resolve_bit(&[(ONE, pull), (ZERO, strong)]), ZERO);
+        assert_eq!(resolve_bit(&[at(ONE, pull), at(Z, strong)]), ONE);
+        assert_eq!(resolve_bit(&[at(ONE, pull), at(ZERO, strong)]), ZERO);
         // Order does not matter: the strongest wins whichever way round.
-        assert_eq!(resolve_bit(&[(ZERO, strong), (ONE, pull)]), ZERO);
+        assert_eq!(resolve_bit(&[at(ZERO, strong), at(ONE, pull)]), ZERO);
         // Two pulls that disagree are as unresolved as two strong drivers.
-        assert_eq!(resolve_bit(&[(ZERO, pull), (ONE, pull)]), X);
+        assert_eq!(resolve_bit(&[at(ZERO, pull), at(ONE, pull)]), X);
         // A `highz` half drives nothing, which is what an open drain is.
-        assert_eq!(resolve_bit(&[(ZERO, StrengthLevel::Highz)]), Z);
+        assert_eq!(resolve_bit(&[at(ZERO, StrengthLevel::Highz)]), Z);
         assert_eq!(
-            resolve_bit(&[(ZERO, StrengthLevel::Highz), (ONE, pull)]),
+            resolve_bit(&[at(ZERO, StrengthLevel::Highz), at(ONE, pull)]),
             ONE
         );
         assert_eq!(
-            resolve_bit(&[(ONE, StrengthLevel::Supply), (ZERO, strong)]),
+            resolve_bit(&[at(ONE, StrengthLevel::Supply), at(ZERO, strong)]),
             ONE
         );
+    }
+
+    /// A resolved bit keeps the **level** it was driven at, which is what `%v`
+    /// prints and what a level-only rule could not say.
+    ///
+    /// Measured against iverilog 12.0: `assign (pull1, strong0) net = 4'b0110;`
+    /// with `$display("%v", net)` prints `St0_Pu1_Pu1_St0` (corpus
+    /// `multi_bit_strength`).
+    #[test]
+    fn test_a_resolved_bit_keeps_its_level() {
+        let open_drain = DriveStrength {
+            zero: StrengthLevel::Strong,
+            one: StrengthLevel::Pull,
+        };
+        assert_eq!(
+            resolve_strength(&[Strength::driven(ONE, open_drain)]).bounds(),
+            (5, 5)
+        );
+        assert_eq!(
+            resolve_strength(&[Strength::driven(ZERO, open_drain)]).bounds(),
+            (-6, -6)
+        );
+        // A `pullup` under a driven `strong` keeps the strong level, and holds
+        // the net at `pull` once that driver lets go.
+        let pull_up = Strength::driven(ONE, DriveStrength::PULL);
+        assert_eq!(
+            resolve_strength(&[pull_up, Strength::STRONG_ZERO]).bounds(),
+            (-6, -6)
+        );
+        assert_eq!(
+            resolve_strength(&[pull_up, Strength::HIGHZ]).bounds(),
+            (5, 5)
+        );
+    }
+
+    /// An **ambiguous** driver is a range, and resolving it against another
+    /// driver spans what the two could settle on.
+    ///
+    /// Every case here is a line of corpus `pr544`'s gold file, which is two
+    /// `bufif1`s on one net at `(pull0, pull1)` and `(strong0, strong1)`:
+    /// a `pull` `0`-or-`z` beside a disabled strong driver is `PuL`, and a
+    /// `pull` `x` beside a strong `0`-or-`z` is `65X`.
+    #[test]
+    fn test_an_ambiguous_driver_spans_what_it_could_be() {
+        // A buffer at `pull` whose control is unknown: it drives 0, or floats.
+        let maybe_pull_zero = Strength::span(-5, 0);
+        assert_eq!(
+            resolve_strength(&[maybe_pull_zero, Strength::HIGHZ]).bounds(),
+            (-5, 0)
+        );
+        assert_eq!(resolve_strength(&[maybe_pull_zero]).value(), X);
+        // `65X`: a strong 0-or-z beside a pull x.
+        let maybe_strong_zero = Strength::span(-6, 0);
+        let pull_unknown = Strength::span(-5, 5);
+        assert_eq!(
+            resolve_strength(&[pull_unknown, maybe_strong_zero]).bounds(),
+            (-6, 5)
+        );
+        // `650`: a strong 0-or-z beside a definite pull 0 is a definite 0,
+        // somewhere between the two levels.
+        let pull_zero = Strength::span(-5, -5);
+        let resolved = resolve_strength(&[pull_zero, maybe_strong_zero]);
+        assert_eq!(resolved.bounds(), (-6, -5));
+        assert_eq!(resolved.value(), ZERO);
     }
 
     fn terminal(name: &str) -> Expression {

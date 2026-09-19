@@ -27,11 +27,13 @@ use std::rc::Rc;
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
+use crate::parsers::gates::DriveStrength;
 use crate::parsers::preprocessor::Timescale;
 use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, string_bits, SYSTEM_FUNCTIONS};
-use crate::simulator::exec::drive;
+use crate::simulator::exec::{drive, resolve_target, ResolvedTarget};
+use crate::simulator::gates::Strength;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 use crate::simulator::vcd::{Control, DumpTarget, VcdDump};
@@ -1492,7 +1494,15 @@ impl TaskContext {
             // `%v` is the *strength* of each bit, `_` between them.
             if specifier.eq_ignore_ascii_case(&'v') {
                 let value = self.value_of(argument, store)?;
-                text.push_str(&pad(strengths(&value), width.unwrap_or(0), fill));
+                let rendered = match argument {
+                    TaskArgument::Value(expression) => {
+                        strengths(&value, resolved(expression, store))
+                    }
+                    // A string literal names no net, so its bits are read as
+                    // an ordinary driver's.
+                    TaskArgument::Text(_) => strengths(&value, None),
+                };
+                text.push_str(&pad(rendered, width.unwrap_or(0), fill));
                 continue;
             }
 
@@ -2095,29 +2105,104 @@ fn pad(text: String, width: usize, fill: char) -> String {
     padded
 }
 
-/// The strength of every bit of `value`, most significant first, `_` between
-/// them: `St0_Pu1_Pu1_St0`.
+/// The strengths a `%v` argument names, when it names a *net* whose drivers
+/// were resolved.
 ///
-/// **Only the two strengths a value alone can tell are reported.** A bit that
-/// is `z` is driven by nothing, which is `HiZ`; every other bit is reported as
-/// `St`, because an ordinary continuous assignment and a gate both drive at
-/// `strong` and that is what almost every design has. A `pullup`, a
-/// `tri0`/`tri1` or an `assign (pull1, strong0)` really is weaker, and this
-/// prints `St1` where iverilog prints `Pu1` — the store keeps a *value* per
-/// signal and not a strength, so there is nothing here to read the difference
-/// from. Corpus `multi_bit_strength` is that gap.
-fn strengths(value: &Register) -> String {
-    let bit = |code: u8| match code {
-        ZERO => "St0",
-        ONE => "St1",
-        X => "StX",
-        _ => "HiZ",
-    };
-    (0..value.width())
+/// Only a net that goes through `Simulator::resolve_contributions` has one
+/// recorded, so anything else — a `reg`, a bit of one, an expression — answers
+/// `None` and is rendered from its value. The bits come back most significant
+/// first, the order `strengths` walks them in.
+fn resolved(expression: &Expression, store: &StateStore) -> Option<Vec<Strength>> {
+    match expression {
+        Expression::Identifier(id) => {
+            let signal = store.get_signal(&id.name)?;
+            Some(signal.strengths()?.to_vec())
+        }
+        Expression::BitSelect(..) | Expression::PartSelect(..) => {
+            let ResolvedTarget::Bits { name, indices } = resolve_target(store, expression).ok()?
+            else {
+                return None;
+            };
+            let signal = store.get_signal(&name)?;
+            let levels = signal.strengths()?;
+            Some(
+                indices
+                    .iter()
+                    .map(|index| {
+                        signal
+                            .bit_position(*index)
+                            .and_then(|position| levels.get(position).copied())
+                            .unwrap_or(Strength::HIGHZ)
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The strength of every bit, most significant first, `_` between them:
+/// `St0_Pu1_Pu1_St0`.
+///
+/// A net whose drivers were resolved carries the levels they settled on
+/// (`levels`); anything else is read off the *value*, which is what an
+/// ordinary continuous assignment or a procedural write would have given it —
+/// a `z` bit is driven by nothing, which is `HiZ`, and every other bit is
+/// `strong`.
+fn strengths(value: &Register, levels: Option<Vec<Strength>>) -> String {
+    let width = value.width();
+    (0..width)
         .rev()
-        .map(|index| bit(value.bit_from_lsb(index).unwrap_or(X)))
+        .map(|index| {
+            let code = value.bit_from_lsb(index).unwrap_or(X);
+            let strength = levels
+                .as_ref()
+                .and_then(|levels| levels.get(width - 1 - index).copied())
+                // A recorded strength and the value must agree: a `force` or a
+                // procedural write lands on the net *after* the resolution
+                // that recorded one, so a stale level would print a strength
+                // for a value it no longer describes.
+                .filter(|strength| strength.value() == code)
+                .unwrap_or_else(|| Strength::driven(code, DriveStrength::STRONG));
+            render_strength(strength)
+        })
         .collect::<Vec<_>>()
         .join("_")
+}
+
+/// The two-letter mnemonic of one strength level, IEEE 1364-2005 Table 7-5.
+const STRENGTH_NAMES: [&str; 8] = ["Hi", "Sm", "Me", "We", "La", "Pu", "St", "Su"];
+
+/// One bit's strength as the three characters `%v` prints.
+///
+/// The interval is what makes the rendering: a range that drives one way only
+/// has a *value* and prints the level's mnemonic beside it (`St0`, `Pu1`), one
+/// that reaches high impedance is that value "or `z`" and prints `L` or `H`
+/// (`StL`, `SuH`), and one that straddles zero is unknown and prints `X`.
+/// Where the two ends disagree about the **level**, the mnemonic has nowhere
+/// to put both, so the two digits are printed instead — `65X` is a `strong`
+/// `0` against a `pull` `1`, and `650` a definite `0` somewhere between the
+/// two. Every one of those spellings is a line of corpus `pr544`'s gold file.
+fn render_strength(strength: Strength) -> String {
+    let (low, high) = strength.bounds();
+    if low == 0 && high == 0 {
+        return "HiZ".to_string();
+    }
+    // The two levels the range runs between, strongest first, and the value
+    // they leave. `L` and `H` are the ranges that reach high impedance, and
+    // their weak end is that `0` rather than a level to print.
+    let (strongest, weakest, value) = if low < 0 && high > 0 {
+        (-low, high, 'X')
+    } else if high <= 0 {
+        (-low, -high, if high == 0 { 'L' } else { '0' })
+    } else {
+        (high, low, if low == 0 { 'H' } else { '1' })
+    };
+    if value == 'L' || value == 'H' || strongest == weakest {
+        format!("{}{}", STRENGTH_NAMES[strongest as usize], value)
+    } else {
+        format!("{}{}{}", strongest, weakest, value)
+    }
 }
 
 /// The real conversion a `%` specifier asks for, or `None` if it is not one.

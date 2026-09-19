@@ -35,13 +35,10 @@ use std::path::PathBuf;
 
 use crate::parsers::expr::Expression;
 use crate::parsers::{
-    assignment::ContinuousAssignment,
-    behavior::EventControl,
-    gates::{DriveStrength, StrengthLevel},
-    modules::VerilogModule,
-    preprocessor::Timescale,
+    assignment::ContinuousAssignment, behavior::EventControl, gates::DriveStrength,
+    modules::VerilogModule, preprocessor::Timescale,
 };
-use crate::register::{Register, Z};
+use crate::register::Register;
 use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
 use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
@@ -49,7 +46,7 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_bit, Gate, PassSwitch};
+use crate::simulator::gates::{resolve_strength, Gate, PassSwitch, Strength};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::{bit_position_in, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
@@ -1983,7 +1980,7 @@ impl Simulator {
                 }
             };
             // Bits run most significant first, the way a `Register` is written.
-            let mut driven: Vec<Vec<(u8, StrengthLevel)>> = vec![Vec::new(); width];
+            let mut driven: Vec<Vec<Strength>> = vec![Vec::new(); width];
             for contribution in &contributions {
                 if contribution.target.name() != name
                     || contribution.target.word_address() != address
@@ -2005,8 +2002,10 @@ impl Simulator {
                             let Some(position) = signal.bit_position(*index) else {
                                 continue;
                             };
-                            let code = value.get_raw()[offset];
-                            driven[position].push((code, contribution.strength.of(code)));
+                            driven[position].push(Strength::driven(
+                                value.get_raw()[offset],
+                                contribution.strength,
+                            ));
                         }
                     }
                     // Bits of a word are grouped by the same address a whole
@@ -2023,8 +2022,10 @@ impl Simulator {
                             let Some(position) = bit_position_in(memory.range(), *index) else {
                                 continue;
                             };
-                            let code = value.get_raw()[offset];
-                            driven[position].push((code, contribution.strength.of(code)));
+                            driven[position].push(Strength::driven(
+                                value.get_raw()[offset],
+                                contribution.strength,
+                            ));
                         }
                     }
                     // An event holds no value to resolve, and a concatenation
@@ -2049,9 +2050,16 @@ impl Simulator {
         let mut changed = false;
         for net in resolving {
             let mut bits = net.bits;
+            // The strength of every bit, beside the value — which is what `%v`
+            // prints and what a value alone cannot say. A bit no driver reaches
+            // keeps the strength it was last resolved at, exactly as it keeps
+            // its value.
+            let mut levels = self.state.strengths_of(&net.name, bits.len());
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
-                    bits[position] = resolve_bit(drivers);
+                    let resolved = resolve_strength(drivers);
+                    bits[position] = resolved.value();
+                    levels[position] = resolved;
                 }
             }
             let target = match net.address {
@@ -2061,6 +2069,12 @@ impl Simulator {
                 },
                 None => ResolvedTarget::Whole(net.name),
             };
+            // A memory word has no strength recorded: a name is in the signal
+            // map or the memory map and never both, and only the signal map
+            // has somewhere to keep one.
+            if let ResolvedTarget::Whole(name) = &target {
+                self.state.set_strengths(name, levels);
+            }
             changed |= drive_resolved(&mut self.state, &target, &Register::from_bits(bits))?;
         }
         Ok(changed)
@@ -2151,7 +2165,7 @@ struct NetDrivers {
     /// What the net holds now. A bit no driver reaches keeps its value.
     bits: Vec<u8>,
     /// The drivers of each bit, most significant first.
-    driven: Vec<Vec<(u8, StrengthLevel)>>,
+    driven: Vec<Vec<Strength>>,
 }
 
 /// Pools the driver lists of every bit a conducting pass switch joins.
@@ -2201,7 +2215,7 @@ fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
     for ends in cells.iter().flatten() {
         for (net, position) in ends {
             if let Some(drivers) = nets[*net].driven.get_mut(*position) {
-                drivers.push((Z, StrengthLevel::Highz));
+                drivers.push(Strength::HIGHZ);
             }
         }
     }
@@ -2215,7 +2229,7 @@ fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
         let second = node.cell(ends[1]);
         node.join(first, second);
     }
-    let mut pooled: HashMap<usize, Vec<(u8, StrengthLevel)>> = HashMap::new();
+    let mut pooled: HashMap<usize, Vec<Strength>> = HashMap::new();
     for id in 0..node.cells.len() {
         let (net, position) = node.cells[id];
         let root = node.root(id);
@@ -2270,15 +2284,10 @@ impl Nodes {
 
 /// Adds one driver's claim on a whole net — or a whole memory word — to the
 /// per-bit driver lists.
-fn contribute_whole(
-    driven: &mut [Vec<(u8, StrengthLevel)>],
-    value: &Register,
-    strength: DriveStrength,
-) {
+fn contribute_whole(driven: &mut [Vec<Strength>], value: &Register, strength: DriveStrength) {
     let value = value.coerced(driven.len());
     for (offset, slot) in driven.iter_mut().enumerate() {
-        let code = value.get_raw()[offset];
-        slot.push((code, strength.of(code)));
+        slot.push(Strength::driven(value.get_raw()[offset], strength));
     }
 }
 
