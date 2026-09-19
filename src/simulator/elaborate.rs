@@ -159,8 +159,8 @@ pub struct TimedBlock {
 
 impl TimedBlock {
     /// Whether the edges observed this delta cycle wake this block.
-    pub fn fires(&self, edges: &[SignalEdge]) -> bool {
-        control_fires(&self.control, edges, &self.implicit_reads)
+    pub fn fires(&self, edges: &[SignalEdge], state: &StateStore) -> bool {
+        control_fires(&self.control, edges, &self.implicit_reads, state)
     }
 }
 
