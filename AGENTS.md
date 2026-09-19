@@ -1761,6 +1761,16 @@ tripwire.
 - **`clock_divider.v`'s threshold is 50,000,000**, which no test can reach by simulation.
   The nested-`if` divider pattern it uses is covered instead by
   `test_divider_pattern_toggles_at_its_threshold`, a divide-by-4 of the same shape.
+- **An `always` or `initial` body that is not a `begin`…`end` block is *one* statement.**
+  `always_construct ::= always statement` is what the LRM says, and reading a *run* of
+  them instead reaches past the block: `always @(posedge clk) q <= d;` followed by a
+  module-level `assign` reads the `assign` as a **procedural** continuous assignment
+  inside the block, which takes the design's continuous driver away and leaves the net
+  reading `z` for the whole run. It is a wrong answer with no diagnostic anywhere — the
+  file parses, elaborates and simulates. `statement_body` is the shared production, and
+  the test that pins it asserts on the **remainder**: the second statement has to be left
+  for the caller (corpus `pr434`, `initmod`).
+
 - **An `always` block's trigger is an `EventControl` enum** (`behavior.rs`), not a bare
   list: `None` for `always begin … end`, `Implicit` for `@(*)`, and `Events(Vec<Event>)`
   for an explicit sensitivity list. The three forms simulate differently, so keep them

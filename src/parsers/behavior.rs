@@ -778,13 +778,16 @@ pub fn parse_sensitivity_list(input: &str) -> IResult<&str, EventControl> {
     ))(input)
 }
 
+/// `initial <statement>`.
+///
+/// The body is **one** statement, which is what the LRM says
+/// (`initial_construct ::= initial statement_or_null`) — a run of them would
+/// reach past the block and claim whatever followed it. `begin`…`end` is how
+/// a design writes more than one, and it is the first alternative
+/// [`statement_body`] tries.
 pub fn parse_initial_block(input: &str) -> IResult<&str, InitialBlock> {
     let (input, _) = ws(tag("initial"))(input)?;
-    let (input, assignments) = alt((
-        parse_block,
-        map(null_statement, |_| Vec::new()),
-        many1(procedural_statement),
-    ))(input)?;
+    let (input, assignments) = statement_body(input)?;
     let initial_block = InitialBlock::new(assignments);
     Ok((input, initial_block))
 }
@@ -795,11 +798,12 @@ pub fn parse_always_block(input: &str) -> IResult<&str, AlwaysBlock> {
         control.unwrap_or(EventControl::None)
     })(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, assignments) = alt((
-        parse_block,
-        map(null_statement, |_| Vec::new()),
-        many1(procedural_statement),
-    ))(input)?;
+    // One statement, not a run of them: `always @(posedge clk) q <= d;`
+    // followed by a module-level `assign` would otherwise read the `assign` as
+    // a *procedural* one inside the block and take the design's continuous
+    // driver away from it (corpus `pr434`, `pr1645518`). That is what the LRM
+    // says too — `always_construct ::= always statement`.
+    let (input, assignments) = statement_body(input)?;
 
     let block = AlwaysBlock::new(event_control, assignments);
 
@@ -1519,6 +1523,35 @@ mod tests {
         let block = assert_parses(parse_always_block, "always @(*) a = b;");
         assert_eq!(block.event_control, EventControl::Implicit);
         assert_eq!(block.statements.len(), 1);
+    }
+
+    /// An `always` or `initial` body that is not a `begin`…`end` block is
+    /// **one** statement and stops there.
+    ///
+    /// A run of them reaches past the block: `always @(posedge clk) q <= d;`
+    /// followed by a module-level `assign` reads the `assign` as a *procedural*
+    /// one inside the block, which takes the design's continuous driver away
+    /// and leaves the net reading `z` for the whole run (corpus `pr434`,
+    /// `initmod`). The remainder is what pins it — the caller has to be left
+    /// the second statement.
+    #[test]
+    fn test_a_bare_block_body_stops_after_one_statement() {
+        let (rest, block) = parse_always_block("always @(posedge clk) q <= d; assign y = q;")
+            .expect("block should parse");
+        assert_eq!(block.statements.len(), 1);
+        assert_eq!(rest.trim(), "assign y = q;");
+
+        let (rest, initial) =
+            parse_initial_block("initial a = 1; assign y = a;").expect("block should parse");
+        assert_eq!(initial.statements.len(), 1);
+        assert_eq!(rest.trim(), "assign y = a;");
+
+        // `begin`…`end` is how a design writes more than one.
+        let block = assert_parses(
+            parse_always_block,
+            "always @(posedge clk) begin a = 1; b = 2; end",
+        );
+        assert_eq!(block.statements.len(), 2);
     }
 
     /// The three `always` forms are different constructs and must not share a
