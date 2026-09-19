@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use visilog::parsers::modules::VerilogModule;
-use visilog::parsers::preprocessor::Preprocessor;
+use visilog::parsers::preprocessor::{Preprocessor, Timescale};
 use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
 use visilog::parsers::statements::ModuleStatement;
 use visilog::simulator::runner::Simulator;
@@ -173,6 +173,30 @@ fn corpus_preprocessor(root: &Path) -> Preprocessor {
     Preprocessor::new()
         .with_include_dir(root.join("ivtest"))
         .with_include_dir(root.join("ivtest").join("ivltests"))
+}
+
+/// The default `` `timescale `` an entry's `-f<file>` command files set.
+///
+/// Two entries carry one (`pr1403406a`, `pr1403406b`), and the whole of what
+/// their files say is `+timescale+1ns/1ps` — iverilog's option for the scale a
+/// module written before any directive is at. The *last* one wins, which is
+/// what iverilog does and what its own warning in `pr1403406b`'s gold file
+/// says it does. A command file that said anything else would be ignored here,
+/// which is why this reads the one option rather than pretending to be a
+/// command line.
+fn default_timescale(root: &Path, entry: &Entry) -> Option<Timescale> {
+    entry
+        .kind
+        .split(',')
+        .filter_map(|field| field.strip_prefix("-f"))
+        .filter_map(|path| std::fs::read_to_string(root.join("ivtest").join(path)).ok())
+        .flat_map(|text| {
+            text.split_whitespace()
+                .filter_map(|word| word.strip_prefix("+timescale+"))
+                .filter_map(|spec| Timescale::parse(spec.trim_end_matches('+')).ok())
+                .collect::<Vec<_>>()
+        })
+        .last()
 }
 
 /// The whole front end: expand the directives, then parse what comes out.
@@ -614,10 +638,16 @@ fn ivtest_corpus_closure_rate() {
         if std::env::var_os("VISILOG_DUMP_ERRORS").is_some() {
             println!("FILE\t{}", entry.name);
         }
+        // An entry that names a command file gets a preprocessor of its own,
+        // because the only option any of them carries is the *default*
+        // timescale and that is a property of the run rather than of the
+        // corpus. Everything else shares the one built above.
+        let configured = default_timescale(&root, entry)
+            .map(|timescale| corpus_preprocessor(&root).with_default_timescale(timescale));
         outcomes.push((
             entry.name.clone(),
             judge_with(
-                &preprocessor,
+                configured.as_ref().unwrap_or(&preprocessor),
                 &source,
                 gold.as_deref(),
                 &search_paths,

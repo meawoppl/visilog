@@ -16,10 +16,9 @@ use std::path::{Path, PathBuf};
 
 /// Directives that carry no meaning for this front end but must not be a parse
 /// error. Each is consumed together with the rest of its line.
-const IGNORED_DIRECTIVES: [&str; 24] = [
+const IGNORED_DIRECTIVES: [&str; 23] = [
     "begin_keywords",
     "end_keywords",
-    "resetall",
     "celldefine",
     "endcelldefine",
     "default_nettype",
@@ -147,7 +146,9 @@ pub struct Timescale {
 }
 
 impl Timescale {
-    fn parse(text: &str) -> Result<Timescale, String> {
+    /// Reads `<unit> / <precision>` — the text of a `` `timescale `` directive,
+    /// and also the text iverilog's `+timescale+1ns/1ps` carries.
+    pub fn parse(text: &str) -> Result<Timescale, String> {
         let (unit, precision) = text
             .split_once('/')
             .ok_or_else(|| "expected `<unit> / <precision>`".to_string())?;
@@ -309,6 +310,28 @@ pub struct Preprocessed {
     /// The last `` `timescale `` seen. Recorded rather than discarded because
     /// simulated time is otherwise a bare integer with no unit attached.
     pub timescale: Option<Timescale>,
+    /// Every `` `timescale `` and `` `resetall ``, paired with the offset in
+    /// [`text`](Preprocessed::text) from which it is in force.
+    ///
+    /// A directive is *positional*: a `` `timescale `` applies to the modules
+    /// that follow it and a `` `resetall `` puts the default back, so one file
+    /// may hold several modules at several scales. That is what
+    /// `$printtimescale` reports, and one field could not say it. The offsets
+    /// are into the **expanded** text, which is what the grammar sees, so a
+    /// module's own offset indexes straight into this list.
+    pub timescales: Vec<(usize, Option<Timescale>)>,
+}
+
+impl Preprocessed {
+    /// The `` `timescale `` in force at `offset` in [`text`](Preprocessed::text),
+    /// which is `None` when nothing had said one yet — the default, `1s / 1s`.
+    pub fn timescale_at(&self, offset: usize) -> Option<Timescale> {
+        self.timescales
+            .iter()
+            .take_while(|(at, _)| *at <= offset)
+            .last()
+            .and_then(|(_, timescale)| *timescale)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +366,11 @@ struct Cond {
 #[derive(Debug, Clone, Default)]
 pub struct Preprocessor {
     include_dirs: Vec<PathBuf>,
+    /// The `` `timescale `` a module written before any directive is at, and
+    /// the one `` `resetall `` puts back. `None` is IEEE 1364's default,
+    /// `1s / 1s`; iverilog's `+timescale+1ns/1ps` sets it to something else,
+    /// and the answer a design gets from `$printtimescale` changes with it.
+    default_timescale: Option<Timescale>,
 }
 
 impl Preprocessor {
@@ -353,6 +381,17 @@ impl Preprocessor {
     /// Add a directory to search for `` `include `` files.
     pub fn with_include_dir(mut self, dir: impl Into<PathBuf>) -> Preprocessor {
         self.include_dirs.push(dir.into());
+        self
+    }
+
+    /// Set the timescale a module written before any `` `timescale `` is at.
+    ///
+    /// This is iverilog's `+timescale+<unit>/<precision>`, and it is also what
+    /// `` `resetall `` restores — a design that resets goes back to whatever
+    /// the *simulator* was told the default is, not to `1s / 1s` (corpus
+    /// `pr1403406a`).
+    pub fn with_default_timescale(mut self, timescale: Timescale) -> Preprocessor {
+        self.default_timescale = Some(timescale);
         self
     }
 
@@ -367,7 +406,11 @@ impl Preprocessor {
             conds: Vec::new(),
             expanding: Vec::new(),
             open_includes: Vec::new(),
-            timescale: None,
+            timescale: self.default_timescale,
+            timescales: match self.default_timescale {
+                Some(timescale) => vec![(0, Some(timescale))],
+                None => Vec::new(),
+            },
         };
         let file = run.intern(name);
         run.scan(source, Origin::File(file))?;
@@ -395,6 +438,7 @@ impl Preprocessor {
                 segments: run.out.segments,
             },
             timescale: run.timescale,
+            timescales: run.timescales,
         })
     }
 }
@@ -467,9 +511,28 @@ struct Run<'a> {
     expanding: Vec<String>,
     open_includes: Vec<PathBuf>,
     timescale: Option<Timescale>,
+    timescales: Vec<(usize, Option<Timescale>)>,
 }
 
 impl Run<'_> {
+    /// Records that everything emitted from here on is at `timescale`.
+    ///
+    /// The offset is into the *output*, because that is the text the grammar
+    /// will see and so the only coordinate a parsed module can be placed on.
+    fn note_timescale(&mut self, timescale: Option<Timescale>) {
+        let at = self.out.text.len();
+        // A second directive at the same offset — two of them with nothing but
+        // whitespace between — replaces the first rather than shadowing it,
+        // so the list stays one entry per position.
+        if let Some((last, entry)) = self.timescales.last_mut() {
+            if *last == at {
+                *entry = timescale;
+                return;
+            }
+        }
+        self.timescales.push((at, timescale));
+    }
+
     fn intern(&mut self, name: &str) -> usize {
         if let Some(&id) = self.ids.get(name) {
             return id;
@@ -713,6 +776,18 @@ impl Run<'_> {
                     let timescale = Timescale::parse(rest.trim())
                         .map_err(|detail| self.malformed(loc, "timescale", detail))?;
                     self.timescale = Some(timescale);
+                    self.note_timescale(Some(timescale));
+                }
+            }
+            // The one pragma-like directive that is not inert: `` `resetall ``
+            // puts the *default* timescale back, so a module written after one
+            // is at `1s / 1s` however the file started (corpus `pr1403406`).
+            "resetall" => {
+                take_line(text, i);
+                if emitting {
+                    let default = self.config.default_timescale;
+                    self.timescale = default;
+                    self.note_timescale(default);
                 }
             }
             "include" => {
@@ -1482,6 +1557,55 @@ mod tests {
         );
         assert_eq!(result.timescale.unwrap().to_string(), "1ns/10ps");
         assert_eq!(result.text.trim(), "module m; endmodule");
+    }
+
+    /// A `` `timescale `` applies to the modules that *follow* it, so one file
+    /// may hold several at several scales — which is what `$printtimescale`
+    /// reports and what the single `timescale` field could not say.
+    /// `` `resetall `` puts the default back, and it is the only one of the
+    /// pragma-like directives that is not inert.
+    #[test]
+    fn test_every_timescale_is_recorded_with_where_it_takes_effect() {
+        let source = "`timescale 1us/1ns\nmodule a; endmodule\n\
+                      `timescale 10ns/10ps\nmodule b; endmodule\n\
+                      `resetall\nmodule c; endmodule\n";
+        let result = Preprocessor::new().preprocess(source, "test.v").unwrap();
+        let scale = |at: usize| {
+            result
+                .timescale_at(at)
+                .map_or("default".to_string(), |t| t.to_string())
+        };
+        let at = |name: &str| result.text.find(name).expect("module should be there");
+        assert_eq!(scale(at("module a")), "1us/1ns");
+        assert_eq!(scale(at("module b")), "10ns/10ps");
+        assert_eq!(scale(at("module c")), "default");
+        // The last one seen is still the design's, which is what a waveform
+        // header states.
+        assert_eq!(result.timescale, None);
+    }
+
+    /// `with_default_timescale` is iverilog's `+timescale+1ns/1ps`: the scale a
+    /// module written before any directive is at, *and* the one `` `resetall ``
+    /// restores — a design that resets goes back to what the simulator was told
+    /// rather than to `1s / 1s` (corpus `pr1403406a`).
+    #[test]
+    fn test_a_default_timescale_is_what_resetall_restores() {
+        let default = Timescale::parse("1ns/1ps").expect("should parse");
+        let source = "module a; endmodule\n`timescale 1ms/1ms\nmodule b; endmodule\n\
+                      `resetall\nmodule c; endmodule\n";
+        let result = Preprocessor::new()
+            .with_default_timescale(default)
+            .preprocess(source, "test.v")
+            .unwrap();
+        let scale = |name: &str| {
+            result
+                .timescale_at(result.text.find(name).expect("module should be there"))
+                .expect("a default was set")
+                .to_string()
+        };
+        assert_eq!(scale("module a"), "1ns/1ps");
+        assert_eq!(scale("module b"), "1ms/1ms");
+        assert_eq!(scale("module c"), "1ns/1ps");
     }
 
     #[test]

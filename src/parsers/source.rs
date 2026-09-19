@@ -3,7 +3,7 @@ use std::fmt;
 
 use nom::{
     branch::alt,
-    combinator::all_consuming,
+    combinator::{all_consuming, consumed, map},
     multi::many0,
     sequence::{preceded, terminated},
     IResult,
@@ -28,10 +28,31 @@ use super::{
 /// This is the grammar alone. A backtick directive is not part of the grammar,
 /// so a file that uses one has to go through [`parse_source`] first.
 pub fn parse_verilog_source(input: &str) -> IResult<&str, Vec<VerilogModule>> {
+    let (rest, modules) = parse_verilog_source_located(input)?;
+    Ok((
+        rest,
+        modules.into_iter().map(|(_, module)| module).collect(),
+    ))
+}
+
+/// [`parse_verilog_source`], with each module paired with the byte offset it
+/// started at.
+///
+/// The offset is what places a module against the `` `timescale `` directives
+/// the preprocessor recorded: a directive applies to the modules *after* it, so
+/// "which scale is this module at" is a question about position and nothing
+/// else. `many0` throws that away, which is the only reason this loop is
+/// written out.
+fn parse_verilog_source_located(input: &str) -> IResult<&str, Vec<(usize, VerilogModule)>> {
     all_consuming(terminated(
-        many0(preceded(
-            ws_and_comments,
-            alt((parse_module_declaration, parse_primitive_declaration)),
+        many0(map(
+            preceded(
+                ws_and_comments,
+                consumed(alt((parse_module_declaration, parse_primitive_declaration))),
+            ),
+            move |(text, module): (&str, VerilogModule)| {
+                (text.as_ptr() as usize - input.as_ptr() as usize, module)
+            },
         )),
         ws_and_comments,
     ))(input)
@@ -85,10 +106,21 @@ pub fn parse_source(source: &str) -> Result<ParsedSource, SourceError> {
 /// Parse text that has already been through a [`Preprocessor`], mapping a
 /// parse failure back to where it came from.
 pub fn parse_expanded(expanded: Preprocessed) -> Result<ParsedSource, SourceError> {
-    let modules = match parse_verilog_source(&expanded.text) {
+    let located = match parse_verilog_source_located(&expanded.text) {
         Ok((_, modules)) => modules,
         Err(error) => return Err(locate(&expanded.text, &expanded.map, error)),
     };
+    // A `` `timescale `` applies to the modules that follow it, so a module's
+    // scale is decided by where it sits. The grammar cannot see a directive at
+    // all — the preprocessor took them out — which is why the two halves only
+    // meet here.
+    let modules = located
+        .into_iter()
+        .map(|(at, mut module)| {
+            module.timescale = expanded.timescale_at(at);
+            module
+        })
+        .collect();
     Ok(ParsedSource {
         modules,
         timescale: expanded.timescale,
@@ -405,6 +437,37 @@ mod tests {
         assert_eq!(parsed.modules.len(), 1);
         assert_eq!(parsed.modules[0].identifier, "sized".into());
         assert_eq!(parsed.timescale.unwrap().to_string(), "1ns/1ps");
+    }
+
+    /// A module carries the `` `timescale `` in force where it was *written*,
+    /// which is what `$printtimescale` reports. The grammar cannot see a
+    /// directive at all, so the two halves only meet in `parse_expanded`: the
+    /// preprocessor records where each one takes effect and the parser records
+    /// where each module starts.
+    #[test]
+    fn test_each_module_carries_the_timescale_it_was_written_at() {
+        let source = "`timescale 1us/1ns\nmodule top; endmodule\n\
+                      `timescale 10ns/10ps\nmodule lower; endmodule\n\
+                      `resetall\nmodule plain; endmodule\n";
+        let parsed = parse_source(source).unwrap();
+        let scales: Vec<_> = parsed
+            .modules
+            .iter()
+            .map(|module| {
+                (
+                    module.identifier.name.as_str(),
+                    module.timescale.map(|t| t.to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            scales,
+            vec![
+                ("top", Some("1us/1ns".to_string())),
+                ("lower", Some("10ns/10ps".to_string())),
+                ("plain", None),
+            ]
+        );
     }
 
     #[test]

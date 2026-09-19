@@ -74,7 +74,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `behavior.rs` | `initial` / `always` blocks, sensitivity lists, `begin…end` and `fork…join` — named or not — `if`/`else`, `case`, `wait`, a statement-level event control, `$system_task(…)` calls, `function … endfunction`, `task … endtask` and the task enable, and the four procedural drive statements (`assign` / `deassign` / `force` / `release`) |
 | `statements.rs` | `ModuleStatement` — the union of things legal in a module body |
 | `modules.rs` | `module … endmodule`, ports, and module instantiation |
-| `source.rs` | `parse_verilog_source` — a whole file of modules — and `ModuleLibrary`, the name → module index |
+| `source.rs` | `parse_verilog_source` — a whole file of modules — `parse_verilog_source_located`, which pairs each with the offset that places it against the `` `timescale `` directives, and `ModuleLibrary`, the name → module index |
 | `base.rs` | the `RawToken` trait |
 
 ### The preprocessor
@@ -103,11 +103,14 @@ Supported: `` `define `` (object-like, function-like, argument defaults, `\` lin
 continuations), `` `undef ``/`` `undefineall ``, `` `ifdef ``/`` `ifndef ``/`` `elsif ``/
 `` `else ``/`` `endif `` including nesting, `` `timescale `` (recorded on `Preprocessed`
 and on `ModuleLibrary::timescale`, and handed to `Simulator::set_timescale` for a waveform
-dump's `$timescale`), `` `include ``
+dump's `$timescale`, *and* positionally in `Preprocessed::timescales` so each module knows
+the one it was written at), `` `resetall `` (which restores
+`Preprocessor::with_default_timescale`), `` `include ``
 with a search path set by `Preprocessor::with_include_dir`, the `` `" ``/`` `\`" ``/`` `` ``
 escapes, and the `` `__FILE__ ``/`` `__LINE__ `` builtins. `IGNORED_DIRECTIVES` skips
 `` `begin_keywords ``, `` `celldefine ``, `` `default_nettype `` and the rest of the
-pragma-like set together with the rest of their line.
+pragma-like set together with the rest of their line — `` `resetall `` is no longer one of
+them, because it puts the default timescale back.
 
 Gotchas that are load-bearing:
 
@@ -521,6 +524,51 @@ than being printed as its own text, which is the only way `%s` and `%0s` of
 space — a literal is a value wherever a number is wanted, and `%s` was the one
 specifier that did not treat it as one (corpus `string13`, `string14`, both of
 which iverilog 12.0 itself fails).
+
+**A `` `timescale `` belongs to a *module*, not to a file.** The directive applies to
+whatever follows it and `` `resetall `` puts the default back, so one file may hold
+several modules at several scales — which is what `$printtimescale` reports and what
+`Preprocessed::timescale`, a single field, could not say. The preprocessor therefore
+records `timescales`, a list of `(offset, scale)` pairs into the **expanded** text, and
+`parse_verilog_source_located` pairs each module with the offset it started at;
+`parse_expanded` is where the two halves meet, because the grammar never sees a directive
+at all. `VerilogModule::timescale` is the result, and it is `None` — the default, `1s /
+1s` — for a module built by anything but that path. `Preprocessor::with_default_timescale`
+is iverilog's `+timescale+1ns/1ps`, and it is what `` `resetall `` restores: a design that
+resets goes back to what the *simulator* was told, not to `1s / 1s` (corpus `pr1403406a`).
+`` `resetall `` is consequently the one pragma-like directive that is not inert and is no
+longer in `IGNORED_DIRECTIVES`.
+
+**`$printtimescale` is a question about the hierarchy, which flattening has just thrown
+away**, so `Elaborated::instances` carries it over: every instance under the hierarchical
+name a design writes it under — `top`, `top.dut`, `top.mid.leaf` — beside its module's
+scale. `TaskContext::describe_scopes` takes that list *and* a second one of every module
+by its own name, because a module the design never instantiated still has a scale and
+still answers (`$printtimescale(othertop)` in corpus `pr1701855`).
+
+The resolution rule is measured, not guessed. A name is tried **as written** first,
+shedding one trailing segment at a time until what is left names an instance or a module,
+and only then qualified by the calling scope — the other way round, `othertop` would
+become `top.othertop`, shed its tail and answer for `top`. What is printed is the *whole*
+name rather than the prefix that matched (`top.ipval` reports as `(top.ipval)` at `top`'s
+scale), and a bare `$printtimescale` reports the instance the call sits in, which is its
+`%m` scope with any named block shed off. Two renderings come from the store rather than
+from the text: a bit select of a **vector** is written back as the one-bit part select it
+stands for (`rgval[0:0]`) while a word of a **memory** keeps its single index
+(`rgarr[0]`), and only the declaration tells those apart.
+
+Its argument is kept as the **text it was written as**, at `TaskCall::compile` time. It
+names a scope rather than a value — an instance, a module, a task, an event — several of
+which cannot be evaluated at all, and `TaskCall::rename` would otherwise rewrite the
+identifier into a flat store name and lose the hierarchy the answer is about.
+
+Where it falls short of iverilog: a name whose *tail* names nothing is answered for the
+scope it lies in rather than refused, because the calling instance always matches some
+prefix — iverilog resolves the whole path through VPI and reports one that does not exist.
+And iverilog's own `Command File: Warning: default timescale is being set multiple times.`
+is a compiler diagnostic visilog has no channel for, which is the whole of why corpus
+`pr1403406b` is a gold mismatch while `pr1403406`, `pr1403406a`, `pr1701855` and
+`pr1701855b` match.
 
 **`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
 fractional digits, then the suffix, right-aligned in `min_width` (twenty by
@@ -1463,9 +1511,15 @@ iverilog's own `perl-lib/RegressionList.pm` splits it the same way, handing ever
 that begins with `+` to `vvp` and the rest to the compiler. `Entry::plusargs` keeps them
 and `judge_with` hands them to `Simulator::add_plusarg`; a design that reads one and is
 given nothing runs its checks against an option it was told it did not have, which is a
-wrong answer rather than a missing feature. The compiler fields are *not* passed — the
-command files `pr1403406a`/`b` name (`-fivltests/pr1403406-1.cf`, which set a default
-`` `timescale ``) have nowhere to go.
+wrong answer rather than a missing feature.
+
+**An entry's *kind* field can carry a `-f<file>` command file, and the one option any of
+them holds is the default timescale.** `pr1403406a` and `pr1403406b` are the two, and
+their files say only `+timescale+1ns/1ps`; `default_timescale` reads it and builds that
+entry a `Preprocessor` of its own through `with_default_timescale`. The last one wins,
+which is what iverilog does and what its own warning in `pr1403406b`'s gold says it does —
+and that warning, a compiler diagnostic with no channel here, is the whole of why
+`pr1403406b` is still a gold mismatch.
 
 Two rules make a gold comparison mean something (`gold_lines` / `first_difference`):
 

@@ -532,6 +532,7 @@ pub fn parse_primitive_declaration(input: &str) -> IResult<&str, VerilogModule> 
                 initial,
                 rows,
             })],
+            timescale: None,
         },
     ))
 }

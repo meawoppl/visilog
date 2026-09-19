@@ -228,6 +228,9 @@ pub enum SystemTask {
     DumpFlush,
     /// `$dumplimit` — stops the dump once the file reaches this many bytes.
     DumpLimit,
+    /// `$printtimescale` — reports the `` `timescale `` of the scope it names,
+    /// or of the one it was written in.
+    PrintTimescale,
     /// End the simulation. `$stop` is the same thing here — see
     /// [`resolve_task`].
     Finish,
@@ -280,6 +283,33 @@ impl TaskCall {
     /// never prints nothing by accident.
     pub fn compile(call: &SystemTaskCall) -> Result<TaskCall, SimulationError> {
         let task = resolve_task(&call.name)?;
+
+        // `$printtimescale(dut)` names a *scope*, not a value: an instance, a
+        // module, a task, a named block or a signal inside one. None of those
+        // is something to evaluate, and an event or a task name could not be
+        // evaluated at all — so the argument is kept as the text it was
+        // written as. Doing it here rather than later is what keeps it out of
+        // `TaskCall::rename`, which would rewrite an identifier into the flat
+        // store name and lose the hierarchy the answer is about.
+        if task == SystemTask::PrintTimescale {
+            let arguments = call
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    SystemTaskArgument::Expression(expression) => {
+                        Ok(TaskArgument::Text(expression.to_contracted_string()))
+                    }
+                    SystemTaskArgument::String(text) => Ok(TaskArgument::Text(text.clone())),
+                    SystemTaskArgument::Empty => Ok(TaskArgument::Text(String::new())),
+                    SystemTaskArgument::SystemFunction(name) => Err(unknown_task(name)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(TaskCall {
+                task,
+                arguments,
+                scope: String::new(),
+            });
+        }
 
         let arguments = call
             .arguments
@@ -351,6 +381,16 @@ impl TaskCall {
     }
 }
 
+/// How `$printtimescale` writes a scale: `1us / 1ns`, with the spaces
+/// iverilog puts round the slash, and `1s / 1s` for a module that declared no
+/// `` `timescale `` — the default the LRM gives.
+fn rendered_timescale(timescale: Option<Timescale>) -> String {
+    match timescale {
+        Some(timescale) => format!("{} / {}", timescale.unit, timescale.precision),
+        None => "1s / 1s".to_string(),
+    }
+}
+
 fn unknown_task(name: &str) -> SimulationError {
     SimulationError::SystemTask(format!("unknown system task `${}`", name))
 }
@@ -384,6 +424,11 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
         "stop" => return Ok(SystemTask::Finish),
         "time" => return Ok(SystemTask::Time),
         "timeformat" => return Ok(SystemTask::TimeFormat),
+        // `$printtimescale` ends in an `e` that is no radix and begins with a
+        // `p` that is no descriptor prefix, so there is nothing for the split
+        // to find — but it is spelled out here beside the other whole words
+        // rather than left to fall through to an error.
+        "printtimescale" => return Ok(SystemTask::PrintTimescale),
         "monitoron" => return Ok(SystemTask::MonitorControl(true)),
         "monitoroff" => return Ok(SystemTask::MonitorControl(false)),
         // `$fflush` ends in an `h` that is not a radix, the same way
@@ -599,6 +644,16 @@ pub struct TaskContext {
     /// Qualified port name → the store entry it was aliased onto, which is the
     /// only record that an instance's port has a name of its own.
     aliases: HashMap<String, String>,
+    /// Every module instance by its hierarchical name, and every module by its
+    /// own name, each with the `` `timescale `` it was written at.
+    ///
+    /// The two lists are kept apart because they answer different questions and
+    /// a name can be in either: `$printtimescale(top.dut)` names an instance,
+    /// while `$printtimescale(other)` names a module the design never
+    /// instantiated — which iverilog answers, and which nothing in a flattened
+    /// design could otherwise know about.
+    instances: Vec<(String, Option<Timescale>)>,
+    module_scales: Vec<(String, Option<Timescale>)>,
 }
 
 impl TaskContext {
@@ -644,6 +699,22 @@ impl TaskContext {
     /// [`VcdDump::add`].
     pub fn name_aliases(&mut self, aliases: HashMap<String, String>) {
         self.aliases = aliases;
+    }
+
+    /// Records the design's scopes and their timescales, which is what
+    /// `$printtimescale` reports.
+    ///
+    /// Flattening throws hierarchy away, so the instance list is handed over
+    /// rather than reconstructed; the module list comes from the parsed
+    /// source, because a module the design never instantiates still has a
+    /// timescale and `$printtimescale` will answer for it.
+    pub fn describe_scopes(
+        &mut self,
+        instances: Vec<(String, Option<Timescale>)>,
+        modules: Vec<(String, Option<Timescale>)>,
+    ) {
+        self.instances = instances;
+        self.module_scales = modules;
     }
 
     /// Whether anything is being recorded, which is the question the settle
@@ -866,10 +937,143 @@ impl TaskContext {
             }
             // `$finish` takes an optional diagnostic level, which says how much
             // the simulator should report about itself on the way out.
+            SystemTask::PrintTimescale => self.print_timescale(call, store)?,
             SystemTask::Finish => self.finished = true,
             SystemTask::Time => {}
         }
         Ok(())
+    }
+
+    /// `$printtimescale` — one line per argument, and one for the enclosing
+    /// scope when it is given none.
+    ///
+    /// iverilog 12.0 prints `Time scale of (top.dut) is 10ns / 10ps`, and a
+    /// module that declared no `` `timescale `` is at the default, `1s / 1s`.
+    fn print_timescale(
+        &mut self,
+        call: &TaskCall,
+        store: &StateStore,
+    ) -> Result<(), SimulationError> {
+        // `$printtimescale;` and `$printtimescale()` both ask about the scope
+        // the call sits in, which for a call inside a named block is the
+        // instance around it — the same stripping a named argument goes
+        // through.
+        let named: Vec<String> = call
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                TaskArgument::Text(text) if !text.trim().is_empty() => {
+                    Some(text.trim().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let wanted = if named.is_empty() {
+            vec![self.enclosing_instance(&call.scope)]
+        } else {
+            named
+        };
+        for name in wanted {
+            let (path, timescale) = self.resolve_scope(&name, &call.scope)?;
+            self.output.push(&format!(
+                "Time scale of ({}) is {}\n",
+                self.rendered_path(&path, store),
+                rendered_timescale(timescale)
+            ));
+        }
+        Ok(())
+    }
+
+    /// The scope a `$printtimescale` argument names, and its timescale.
+    ///
+    /// A name is tried **as written** first, shedding a trailing segment at a
+    /// time until what is left is an instance or a module, and only then
+    /// qualified by the calling scope. That order is what tells
+    /// `$printtimescale(othertop)` — a module the design never instantiated —
+    /// from `$printtimescale(dut)`, which is an instance of the module the
+    /// call sits in; the other way round, `top.othertop` would shed its tail
+    /// and answer for `top` (corpus `pr1701855`).
+    ///
+    /// What comes back is the *whole* candidate rather than the prefix that
+    /// matched, because that is what iverilog prints: `top.ipval` reports as
+    /// `(top.ipval)` at `top`'s scale, not as `(top)`.
+    fn resolve_scope(
+        &self,
+        name: &str,
+        scope: &str,
+    ) -> Result<(String, Option<Timescale>), SimulationError> {
+        // A select is not part of the path: `top.rgval[0]` is a bit of a
+        // signal in `top`, and the brackets are put back when it is printed.
+        let (path, select) = match name.find('[') {
+            Some(at) => (&name[..at], &name[at..]),
+            None => (name, ""),
+        };
+        let qualified = format!("{}.{}", self.enclosing_instance(scope), path);
+        for candidate in [path.to_string(), qualified] {
+            if let Some(timescale) = self.scale_of(&candidate) {
+                return Ok((format!("{}{}", candidate, select), timescale));
+            }
+        }
+        Err(SimulationError::SystemTask(format!(
+            "`$printtimescale` names `{}`, which is no scope in this design",
+            name
+        )))
+    }
+
+    /// The timescale of the innermost scope `candidate` lies in, shedding a
+    /// trailing segment at a time. `None` when no prefix of it names one.
+    fn scale_of(&self, candidate: &str) -> Option<Option<Timescale>> {
+        let mut path = candidate;
+        loop {
+            if let Some((_, timescale)) = self
+                .instances
+                .iter()
+                .chain(self.module_scales.iter())
+                .find(|(name, _)| name == path)
+            {
+                return Some(*timescale);
+            }
+            path = path.rsplit_once('.')?.0;
+        }
+    }
+
+    /// The instance a call sits in: its `%m` scope with any named block or
+    /// inlined task shed off the end.
+    ///
+    /// That is what a bare `$printtimescale` reports and what an unqualified
+    /// argument is resolved against. A call inside `initial begin : blk` has
+    /// the scope `top.blk`, and iverilog answers `(top)` for it — a block has
+    /// no timescale of its own (corpus `pr1701855b`).
+    fn enclosing_instance(&self, scope: &str) -> String {
+        let mut path = scope;
+        loop {
+            if self.instances.iter().any(|(name, _)| name == path) {
+                return path.to_string();
+            }
+            match path.rsplit_once('.') {
+                Some((head, _)) => path = head,
+                None => return scope.to_string(),
+            }
+        }
+    }
+
+    /// The path as iverilog writes it back: a bit select of a *vector* is
+    /// rendered as the one-bit part select it stands for (`rgval[0:0]`), while
+    /// a word of a memory keeps its single index (`rgarr[0]`). Only the
+    /// declaration tells the two apart, which is why the store is asked.
+    fn rendered_path(&self, path: &str, store: &StateStore) -> String {
+        let Some(at) = path.find('[') else {
+            return path.to_string();
+        };
+        let (name, select) = path.split_at(at);
+        let index = select.trim_matches(|c| c == '[' || c == ']');
+        // The top module is the root of the flat store and carries no prefix,
+        // so the store key is the path with that leading segment dropped.
+        let key = name.strip_prefix(&format!("{}.", self.top)).unwrap_or(name);
+        if store.memory(key).is_some() || index.contains(':') {
+            return path.to_string();
+        }
+        format!("{}[{}:{}]", name, index, index)
     }
 
     /// `$monitoron` / `$monitoroff`. Turning monitoring back on reports at
@@ -2872,6 +3076,18 @@ mod tests {
         assert!(!context.finished());
         run_in(&mut context, "$finish;", &mut store);
         assert!(context.finished());
+    }
+
+    /// `$printtimescale` in a context that was never told the design's scopes —
+    /// which is every `TaskContext` not built by `Simulator::setup`, including
+    /// the one `exec::execute_statements` runs a block against — reports the
+    /// name it was given rather than inventing a scale for it. A plausible
+    /// `1s / 1s` there would look exactly like a design whose modules really
+    /// declared nothing.
+    #[test]
+    fn test_printtimescale_without_a_scope_table_names_what_it_could_not_find() {
+        let message = error("$printtimescale(top.dut);");
+        assert!(message.contains("top.dut"), "{}", message);
     }
 
     /// `$stop` ends the run exactly as `$finish` does, printing nothing.

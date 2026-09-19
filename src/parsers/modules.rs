@@ -14,6 +14,7 @@ use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
     parameter::parse_parameter_port_list,
+    preprocessor::Timescale,
     simple::{range, signedness, ws, ws_and_comments, Range},
     statements::{parse_module_statement, ModuleStatement},
 };
@@ -23,6 +24,16 @@ pub struct VerilogModule {
     pub identifier: Identifier,
     pub ports: Vec<Port>,
     pub statements: Vec<ModuleStatement>,
+    /// The `` `timescale `` in force where this module was written, which is
+    /// what `$printtimescale` reports. `None` is the default, `1s / 1s`.
+    ///
+    /// A backtick directive is not part of the grammar, so the parser cannot
+    /// see one and always leaves this `None`;
+    /// [`parse_expanded`](crate::parsers::source::parse_expanded) stamps it
+    /// afterwards from the positions the preprocessor recorded. A module built
+    /// by a test therefore carries the default, which is what a design with no
+    /// directive in it has.
+    pub timescale: Option<Timescale>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -343,6 +354,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             identifier: mod_identifier,
             ports,
             statements,
+            timescale: None,
         },
     ))
 }
