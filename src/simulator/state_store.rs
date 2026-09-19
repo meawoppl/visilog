@@ -359,6 +359,36 @@ pub const REAL_RANGE: (i64, i64) = (REAL_WIDTH as i64 - 1, 0);
 /// copy of it and an expression that reads the signal reads it along with the
 /// bits; what makes it a *declared* property is that the store re-stamps it on
 /// every write, and a value cannot bring its own.
+/// The drivers of one bit of a net, tallied by what each was driving.
+///
+/// A driver that is contributing `z` — one that has let go, or whose `highz`
+/// half is the one that applies — is **not** counted at all, which is what
+/// makes `$countdrivers` of an undriven net `0` rather than the number of
+/// `assign` statements naming it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriverTally {
+    pub zero: u32,
+    pub one: u32,
+    pub unknown: u32,
+}
+
+impl DriverTally {
+    /// Counts one more driver, given the bit it is contributing.
+    pub fn count(&mut self, code: u8) {
+        match code {
+            crate::register::ZERO => self.zero += 1,
+            crate::register::ONE => self.one += 1,
+            crate::register::X => self.unknown += 1,
+            _ => {}
+        }
+    }
+
+    /// Every driver that is driving something.
+    pub fn total(&self) -> u32 {
+        self.zero + self.one + self.unknown
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalState {
     register: Register,
@@ -370,6 +400,11 @@ pub struct SignalState {
     /// same reason signedness does: the declaration is the only thing that
     /// knows, and it is set once and re-stamped rather than re-derived.
     net: bool,
+    /// How many drivers reached each bit at the last resolution, most
+    /// significant first — what `$countdrivers` reports. `None` unless the
+    /// design calls it, which is what keeps the tally off every other
+    /// design's propagation pass.
+    drivers: Option<Vec<DriverTally>>,
     /// The strength each bit was last *resolved* at, most significant first.
     ///
     /// `None` for everything but a net that goes through
@@ -389,6 +424,7 @@ impl SignalState {
             register,
             range,
             net: false,
+            drivers: None,
             strengths: None,
         }
     }
@@ -408,6 +444,7 @@ impl SignalState {
             register,
             range,
             net: false,
+            drivers: None,
             strengths: None,
         }
     }
@@ -428,6 +465,12 @@ impl SignalState {
     /// nothing resolves.
     pub fn strengths(&self) -> Option<&[Strength]> {
         self.strengths.as_deref()
+    }
+
+    /// How many drivers reached each bit at the last resolution, or `None` for
+    /// a design that never asked.
+    pub fn driver_counts(&self) -> Option<&[DriverTally]> {
+        self.drivers.as_deref()
     }
 
     /// The same signal, declared signed or unsigned.
@@ -791,6 +834,15 @@ impl Drive {
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
     name_to_signal: HashMap<String, SignalState>,
+    /// Whether the design calls `$countdrivers` anywhere. It is what turns the
+    /// driver tally on, so a design that never asks never builds one.
+    counts_drivers: bool,
+    /// A port bound to a plain identifier is *one* store entry with the
+    /// parent's signal, so the port's own qualified name has no entry — and a
+    /// testbench that reaches into the instance by that name has to find it.
+    /// Shared with the `Simulator` rather than copied, the way the file table
+    /// and the `$random` stream are.
+    aliases: Rc<HashMap<String, String>>,
     /// The memories the design declares, keyed by qualified name.
     ///
     /// Deliberately a second map rather than a field on [`SignalState`]: a
@@ -938,6 +990,11 @@ impl StateStore {
     pub fn frame(&self) -> StateStore {
         StateStore {
             name_to_signal: HashMap::new(),
+            // A frame holds no net, so it resolves nothing and tallies
+            // nothing; the alias table rides along because a body may read a
+            // design signal under a port's name.
+            counts_drivers: false,
+            aliases: Rc::clone(&self.aliases),
             name_to_memory: HashMap::new(),
             memory_journal: Vec::new(),
             journal: HashMap::new(),
@@ -1756,10 +1813,15 @@ impl StateStore {
         let range = declared
             .map(|signal| signal.range())
             .filter(|&range| range_width(range) == register.width());
-        let signal = match range {
+        let mut signal = match range {
             Some(range) => SignalState::with_range(register, range),
             None => SignalState::new(register),
         };
+        // Who drives the signal survives a write to it — see `set_ranged`.
+        if let Some(declared) = self.name_to_signal.get_mut(&name) {
+            signal.strengths = declared.strengths.take();
+            signal.drivers = declared.drivers.take();
+        }
         self.name_to_signal.insert(name, signal.as_net(net));
     }
 
@@ -1777,7 +1839,17 @@ impl StateStore {
         match self.name_to_signal.get_mut(&name) {
             Some(signal) => {
                 let net = signal.is_net();
+                // The strength each bit was resolved at and the drivers that
+                // reached it describe *who drives the signal*, which a write
+                // does not change — so they survive one, the way the declared
+                // net flag does. A write that moves a bit the recorded
+                // strength no longer describes is what the value check in
+                // `tasks::strengths` is for.
+                let strengths = signal.strengths.take();
+                let drivers = signal.drivers.take();
                 *signal = SignalState::with_range(register, range).as_net(net);
+                signal.strengths = strengths;
+                signal.drivers = drivers;
             }
             None => {
                 self.name_to_signal
@@ -1826,6 +1898,47 @@ impl StateStore {
         if let Some(signal) = self.name_to_signal.get_mut(name) {
             signal.strengths = Some(levels);
         }
+    }
+
+    /// Records how many drivers reached each bit of a net. Only
+    /// `Simulator::resolve_contributions` calls this, and only for a design
+    /// that calls `$countdrivers`.
+    pub fn set_driver_counts(&mut self, name: &str, counts: Vec<DriverTally>) {
+        if let Some(signal) = self.name_to_signal.get_mut(name) {
+            signal.drivers = Some(counts);
+        }
+    }
+
+    /// Whether the design asks `$countdrivers` anywhere, which is what decides
+    /// if the driver tally is kept at all. A design that does not pay one
+    /// `bool` per propagation pass.
+    pub fn counts_drivers(&self) -> bool {
+        self.counts_drivers
+    }
+
+    pub fn count_drivers(&mut self) {
+        self.counts_drivers = true;
+    }
+
+    /// The store entry a port aliased onto its parent's signal really is.
+    ///
+    /// A testbench reaching into an instance writes the port's own name
+    /// (`pad1.pad`), and flattening left no entry under it — the port and what
+    /// it was bound to are one entry under the *parent's* name. Only a name
+    /// the store does not have is looked up, so an ordinary one costs the hash
+    /// it already cost.
+    pub fn unalias<'a>(&'a self, name: &'a str) -> &'a str {
+        if self.name_to_signal.contains_key(name) {
+            return name;
+        }
+        match self.aliases.get(name) {
+            Some(entry) => entry.as_str(),
+            None => name,
+        }
+    }
+
+    pub fn name_aliases(&mut self, aliases: Rc<HashMap<String, String>>) {
+        self.aliases = aliases;
     }
 
     /// A signal for in-place modification. What it holds now is journalled

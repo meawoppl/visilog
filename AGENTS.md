@@ -680,6 +680,40 @@ how a design asks whether a non-ANSI port really took the data type declared bes
 `if ($bits(x) == $bits(integer))`, which is corpus `module_nonansi_integer1`,
 `task_nonansi_time1` and their four siblings.
 
+**`$countdrivers` is the one system function that is a question about the *design*, and
+what it wants is what `resolve_contributions` already builds.** It reports how many
+continuous drivers reached one **bit** of a net — the answer is `1` for a bit more than one
+driver reaches and `0` otherwise, and the rest comes back through up to five arguments
+(`forced`, `countD`, `count0`, `count1`, `countX`) written with `StateStore::owe_fill`, the
+queue a `$sscanf` already used. A driver contributing `z` is **not** counted at all, so an
+undriven net answers `0` rather than the number of `assign` statements naming it, and a
+`force` is reported *as* a force while the tally stays the one the net had before it
+(measured against iverilog 12.0; corpus `countdrivers2`).
+
+Three things make it work, and each is a seam rather than machinery of its own:
+
+- **A design that asks resolves every net a continuous driver names.** The tally is the
+  per-bit driver list `resolve_contributions` builds, so the net has to go through it rather
+  than be written plainly — and that is decided at `setup`, not when the call runs.
+  `Program::calls_system_function` is the question, asked once of every compiled block, and
+  `Simulator::resolve_every_driven_net` is the answer. Resolving a single `strong` driver
+  gives exactly what writing it gave, so no value moves; a design that never asks pays one
+  walk of its blocks at setup and nothing per pass.
+- **The tally is taken after `bond_nodes` has pooled**, so a bit joined to another — which
+  is what an `inout` port bound to a select is — reports the *node's* drivers and not its
+  own. That is what makes `$countdrivers(pad1.pad)` and `$countdrivers(bus[0])` agree
+  (corpus `countdrivers3`), and `StateStore::unalias` is the other half: a port bound to a
+  plain identifier is one entry with its parent's signal, so the port's own qualified name
+  has no entry for a testbench to find (corpus `countdrivers4`).
+- **A `force` contends but is not counted.** `Contribution::counted` is that distinction: a
+  drive is contributed so it resolves against the far side of a `tran` like any other
+  driver, and left out of the tally.
+
+Where it falls short is `countdrivers5`: iverilog counts **each `tran` as a driver** of the
+net it reaches, carrying what the other side resolved to, where this pools the node and
+reports the same total for every net in it. That is the same directional model the
+strength *reduction* across a bidirectional switch wants, and the two should land together.
+
 **`$stime` is unsigned, like the `$time` beside it**, because `time` is an unsigned type
 — and that is the field `%d` gives it: iverilog 12.0 prints `$display($stime)` in ten
 columns where an `integer` takes eleven (corpus `pr2842621`). iverilog is inconsistent
@@ -1944,17 +1978,17 @@ telling apart.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — and `call_function` for the design's own |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — `$countdrivers`, which is a question about the design rather than about a value, and `call_function` for the design's own |
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, and `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, and the per-bit `Strength` a resolved net was last settled at), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
