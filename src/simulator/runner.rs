@@ -611,6 +611,17 @@ impl Simulator {
         // ports on it. The dump is the only thing that wants the table by
         // value, and it is built once per elaboration.
         self.tasks.name_aliases(self.aliases.clone());
+        // `$printtimescale` is a question about the hierarchy, which
+        // flattening has just thrown away — so the instance list comes over
+        // here, together with every module's own scale, because a module the
+        // design never instantiated still has one and still answers.
+        self.tasks.describe_scopes(
+            elaborated.instances,
+            self.modules
+                .iter()
+                .map(|module| (module.identifier.name.clone(), module.timescale))
+                .collect(),
+        );
 
         self.is_setup = true;
 
@@ -5811,6 +5822,83 @@ mod tests {
         let mut simulator = Simulator::new(module);
         simulator.setup().expect("design should run");
         assert_eq!(simulator.output().lines(), vec!["0 0 5a"]);
+    }
+
+    /// `$printtimescale` reports the scale of the scope it names, and every
+    /// line here is what iverilog 12.0 prints for this design (corpus
+    /// `pr1701855`, whose gold file this is).
+    ///
+    /// Three rules are load-bearing. A name is tried **as written** first, so
+    /// `othertop` — a module the design never instantiated — answers for
+    /// itself rather than shedding its tail and answering for `top`. One that
+    /// names nothing on its own is qualified by the instance the call sits in,
+    /// so `dut` is `top.dut`. And what is printed is the *whole* name, not the
+    /// scope that matched it.
+    #[test]
+    fn test_printtimescale_reports_the_scope_it_names() {
+        let source = "`timescale 1us/1ns\n\
+             module top;\n\
+               initial begin\n\
+                 $printtimescale;\n\
+                 $printtimescale(dut);\n\
+                 $printtimescale(dut.dut);\n\
+                 $printtimescale(othertop);\n\
+               end\n\
+               lower dut();\n\
+             endmodule\n\
+             `timescale 10ns/10ps\n\
+             module lower; evenlower dut(); endmodule\n\
+             `timescale 1ns/10ps\n\
+             module evenlower; endmodule\n\
+             `timescale 1ms/1us\n\
+             module othertop; endmodule\n";
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should run");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "Time scale of (top) is 1us / 1ns",
+                "Time scale of (top.dut) is 10ns / 10ps",
+                "Time scale of (top.dut.dut) is 1ns / 10ps",
+                "Time scale of (othertop) is 1ms / 1us",
+            ]
+        );
+    }
+
+    /// A module that declared no `` `timescale `` is at the default, `1s / 1s`;
+    /// a named block has none of its own and answers for the instance around
+    /// it; and a bit select of a *vector* is written back as the one-bit part
+    /// select it stands for, where a word of a memory keeps its single index.
+    /// All of it is iverilog 12.0's, from corpus `pr1403406` and `pr1701855b`.
+    #[test]
+    fn test_printtimescale_defaults_and_renders_a_select_the_way_iverilog_does() {
+        let source = "module top;\n\
+               reg [1:0] rgval;\n\
+               reg rgarr [2:0];\n\
+               initial begin : blk\n\
+                 $printtimescale;\n\
+                 $printtimescale(top.rgval[0]);\n\
+                 $printtimescale(top.rgarr[0]);\n\
+                 $printtimescale(top.blk);\n\
+               end\n\
+             endmodule\n";
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should run");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "Time scale of (top) is 1s / 1s",
+                "Time scale of (top.rgval[0:0]) is 1s / 1s",
+                "Time scale of (top.rgarr[0]) is 1s / 1s",
+                "Time scale of (top.blk) is 1s / 1s",
+            ]
+        );
     }
 
     /// IEEE 1364-2005's load direction, measured against iverilog 12.0 on a

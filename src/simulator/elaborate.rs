@@ -55,6 +55,7 @@ use crate::parsers::{
     },
     nets::NetType as WireKind,
     operators::BinaryOperator,
+    preprocessor::Timescale,
     primitive::UdpTable,
     simple::Range,
     specify::{SpecParam, SpecParamValue},
@@ -193,6 +194,16 @@ pub struct Elaborated {
     /// Qualified name to the store entry it aliases, for ports that were bound
     /// to a parent signal and so have no entry of their own.
     pub aliases: HashMap<String, String>,
+    /// Every module instance, by the hierarchical name a design writes it
+    /// under — `top`, `top.dut`, `top.mid.leaf` — paired with the
+    /// `` `timescale `` its module was written at.
+    ///
+    /// Flattening throws hierarchy away everywhere else, and this is the one
+    /// thing that has to survive it: `$printtimescale` is a question *about*
+    /// the hierarchy, and a store key alone cannot say which module a signal
+    /// came from. The top module is the root and carries the name it was
+    /// declared with, where its store entries carry no prefix at all.
+    pub instances: Vec<(String, Option<Timescale>)>,
 }
 
 /// A net that drives itself, and the bit and strength it drives at.
@@ -218,6 +229,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             blocks: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
+            instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
         },
         stack: Vec::new(),
         defparams: BTreeMap::new(),
@@ -2024,6 +2036,14 @@ impl<'m> Elaborator<'m> {
         // whole of what a name inside it resolves to — the generate block it
         // may stand in is already part of the prefix it was created under.
         let prefix = format!("{}{}.", scope.prefix, instantiation.instance_name.name);
+        // The hierarchical name a design writes this instance under, which is
+        // the store prefix with the top module's own name in front: the top is
+        // the root of the flat name space and carries no prefix, but a design
+        // still calls it `top`.
+        self.out.instances.push((
+            scope.hierarchy(&instantiation.instance_name.name),
+            child.timescale,
+        ));
         let mut inner = Scope {
             module_prefix: prefix.clone(),
             prefix,
