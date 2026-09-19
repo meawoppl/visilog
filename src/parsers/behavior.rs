@@ -334,7 +334,7 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
 /// nothing that was already legal is given a second meaning here.
 fn parse_event_trigger(input: &str) -> IResult<&str, ProceduralStatements> {
     let (input, _) = ws(tag("->"))(input)?;
-    let (input, name) = ws(identifier)(input)?;
+    let (input, name) = ws(hierarchical_identifier)(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
     Ok((
@@ -493,11 +493,17 @@ fn parenthesized_expression(input: &str) -> IResult<&str, Expression> {
 
 /// A bare `$name` argument: `$display("%0d", $time)`.
 ///
-/// A `$name` that *is* followed by an argument list is a system function call
-/// and belongs to the expression grammar — `$display("%0d", $signed(a))` —
-/// so this form stops at the parenthesis and lets the expression layer take it.
+/// It is the *whole* argument or it is nothing, which is why the test is that
+/// the next token ends one. A `$name` followed by an argument list is a system
+/// function call and belongs to the expression grammar
+/// (`$display("%0d", $signed(a))`), and so does a `$name` that is merely the
+/// first operand of one — `$display("%d", $time - base)` is a subtraction, and
+/// stopping at the `$time` leaves a remainder the argument list cannot read.
 fn bare_system_function(input: &str) -> IResult<&str, String> {
-    terminated(system_name, peek(not(char('('))))(input)
+    terminated(
+        system_name,
+        peek(preceded(ws_and_comments, alt((char(','), char(')'))))),
+    )(input)
 }
 
 /// One argument, or the empty slot between two commas.
@@ -560,12 +566,11 @@ pub fn parse_if_statement(input: &str) -> IResult<&str, IfStatement> {
 
 fn parse_case_label(input: &str) -> IResult<&str, CaseLabel> {
     alt((
-        // The peek keeps an identifier like `default_state` from being read as
-        // the `default` keyword, which alt() could not back out of.
-        value(
-            CaseLabel::Default,
-            terminated(ws(tag("default")), peek(char(':'))),
-        ),
+        // The word boundary keeps an identifier like `default_state` from
+        // being read as the `default` keyword, which alt() could not back out
+        // of. It cannot be the `:` instead, because `default` is the one label
+        // the LRM lets a design write without one.
+        value(CaseLabel::Default, |i| keyword(i, "default")),
         map(
             separated_list1(ws(char(',')), verilog_expression),
             CaseLabel::Expressions,
@@ -573,9 +578,22 @@ fn parse_case_label(input: &str) -> IResult<&str, CaseLabel> {
     ))(input)
 }
 
+/// One arm of a `case`.
+///
+/// **The `:` is optional after `default` and required after anything else.**
+/// IEEE 1364-2005's `case_item` spells it `default [ : ] statement_or_null`,
+/// and corpus `casex3.9E` writes `default result = 3;`. Making it optional
+/// everywhere instead would let a label run straight into the statement after
+/// it, which is a wrong parse tree rather than an error.
 fn parse_case_item(input: &str) -> IResult<&str, CaseItem> {
     let (input, label) = parse_case_label(input)?;
-    let (input, _) = ws(char(':'))(input)?;
+    let (input, separator) = opt(ws(char(':')))(input)?;
+    if separator.is_none() && label != CaseLabel::Default {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Char,
+        )));
+    }
     let (input, statements) = statement_body(input)?;
 
     Ok((input, CaseItem { label, statements }))
@@ -708,7 +726,7 @@ fn parse_forever_statement(input: &str) -> IResult<&str, ProceduralStatements> {
 /// this an `@` in front of a keyword-led statement would read the keyword as
 /// the event it waits on.
 fn unreserved_identifier(input: &str) -> IResult<&str, Identifier> {
-    let (rest, name) = identifier(input)?;
+    let (rest, name) = hierarchical_identifier(input)?;
     if is_reserved_word(&name.name) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1752,6 +1770,29 @@ mod tests {
         );
     }
 
+    /// IEEE 1364-2005's `case_item` is `default [ : ] statement_or_null`, so
+    /// the colon after `default` — and only after `default` — is optional.
+    /// Corpus `casex3.9E` writes `default result = 3;`.
+    #[test]
+    fn test_a_default_arm_may_omit_its_colon() {
+        for source in [
+            "case (s) 1: a = 1; default b = 2; endcase",
+            "case (s) 1: a = 1; default: b = 2; endcase",
+        ] {
+            let statement = assert_parses(parse_case_statement, source);
+            assert_eq!(statement.items[1].label, CaseLabel::Default);
+            assert_eq!(statement.items[1].statements.len(), 1);
+        }
+    }
+
+    /// Every other label still needs its colon: without one a label would run
+    /// straight into the statement after it, which is a wrong parse tree
+    /// rather than an error.
+    #[test]
+    fn test_a_non_default_arm_still_needs_its_colon() {
+        assert!(parse_case_statement("case (s) 1 a = 1; endcase").is_err());
+    }
+
     #[test]
     fn test_parse_system_task_with_a_format_string_and_arguments() {
         let call = assert_parses(parse_system_task, r#"$display("a = %0d", a, $time);"#);
@@ -1762,6 +1803,32 @@ mod tests {
                 SystemTaskArgument::String("a = %0d".to_string()),
                 SystemTaskArgument::Expression(identifier_expression("a")),
                 SystemTaskArgument::SystemFunction("time".to_string()),
+            ]
+        );
+    }
+
+    /// A bare `$name` is only an argument when it is the *whole* argument.
+    /// `$time - base` is a subtraction, and reading just the `$time` leaves a
+    /// remainder the argument list cannot get past — which is what corpus
+    /// `sdf_del_max`, `pr1701889` and `verify_two_var_delays` stopped at.
+    #[test]
+    fn test_a_bare_system_function_does_not_claim_the_operand_of_an_operator() {
+        let call = assert_parses(parse_system_task, r#"$display("%d", $time - base);"#);
+        assert_eq!(
+            call.arguments[1],
+            SystemTaskArgument::Expression(Expression::Binary(
+                Box::new(Expression::SystemFunctionCall("time".to_string(), vec![])),
+                crate::parsers::operators::BinaryOperator::Subtraction,
+                Box::new(identifier_expression("base")),
+            ))
+        );
+
+        // …and the bare form still wins where the argument really does end.
+        assert_eq!(
+            assert_parses(parse_system_task, "$display($time , $realtime );").arguments,
+            vec![
+                SystemTaskArgument::SystemFunction("time".to_string()),
+                SystemTaskArgument::SystemFunction("realtime".to_string()),
             ]
         );
     }
@@ -2548,6 +2615,33 @@ mod tests {
             EventControl::Events(vec![Event::new(
                 EventTriggers::EitherEdge,
                 identifier_expression("ev"),
+            )]),
+        );
+    }
+
+    /// An event belongs to the module that declares it, so a design reaches one
+    /// in another module by its hierarchical name — `-> et1.m1.e2;` (corpus
+    /// `event3`) and `@top.toplevel_event` (corpus `pr572`). Both spellings
+    /// read the *whole* path, since that path is the flat store key the
+    /// trigger namespace is keyed by.
+    #[test]
+    fn test_an_event_is_triggered_and_waited_on_by_its_hierarchical_name() {
+        let statement = assert_parses(procedural_statement, "-> et1.m1.e2;");
+        let ProceduralStatements::Assignment(assignment) = statement else {
+            panic!("expected an assignment, got {:?}", statement);
+        };
+        assert_eq!(
+            *assignment.lhs(),
+            identifier_expression("et1.m1.e2"),
+            "a trigger names the event's whole path"
+        );
+
+        assert_parses_to(
+            parse_sensitivity_list,
+            "@top.toplevel_event",
+            EventControl::Events(vec![Event::new(
+                EventTriggers::EitherEdge,
+                identifier_expression("top.toplevel_event"),
             )]),
         );
     }

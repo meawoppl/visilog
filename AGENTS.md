@@ -669,6 +669,17 @@ and resolves down a different path. A `$name` nothing implements is
 `EvalError::UnknownSystemFunction`, never a zero, and a wrong argument count is
 `EvalError::SystemFunctionArity`.
 
+**`$bits` takes a data *type* as well as a value, and the type table is asked second.**
+`$bits(integer)` is 32, `$bits(time)` 64 and `$bits(reg)` 1 — the three spellings
+iverilog 12.0 accepts, where `$bits(real)` is "Invalid data type for $bits()" and
+`$bits(wire)` is a syntax error, so both of those stay names nothing declares rather than
+widths invented for them. `eval::type_width` is only consulted once the ordinary lookup
+has come back `UnknownIdentifier`, so anything the design declares always answers for
+itself; a type keyword is reserved and no plain identifier can be spelled one. That is
+how a design asks whether a non-ANSI port really took the data type declared beside it —
+`if ($bits(x) == $bits(integer))`, which is corpus `module_nonansi_integer1`,
+`task_nonansi_time1` and their four siblings.
+
 **`$stime` is unsigned, like the `$time` beside it**, because `time` is an unsigned type
 — and that is the field `%d` gives it: iverilog 12.0 prints `$display($stime)` in ten
 columns where an `integer` takes eleven (corpus `pr2842621`). iverilog is inconsistent
@@ -1254,12 +1265,24 @@ suspends inside an enabled task's body count — the body is already spliced in 
 Three seams keep it consistent with what was already there. `Program::splice` offsets a
 `Fork`'s branch targets like any other jump, so a `fork` inside a task works. `settle` skips
 a block that `is_forking`, for the same reason it skips one part way through a `wait` — it
-has not finished the run it is on. And `Simulator::cancel_scope` is **block oriented**: a
-`disable` naming a scope with a running `fork` in it has to cancel every branch and the
-block parked at the join, so it collects the *blocks* with a thread inside the scope, drops
-every cursor of each — queued, waiting, and the fork records, which are the only thing
-holding a parent at a join — and re-queues one cursor at the scope's end. A block has one
-activation at a time, which is what makes "every cursor of that block" the right set.
+has not finished the run it is on. And `Simulator::cancel_scope` is **block oriented when
+the scope contains the `fork` and thread oriented when the `fork` contains the scope**,
+which is the whole of the difference between the two cases and is decided per cursor by
+`is_branch_of_outside_fork`. A `disable` naming a scope with a running `fork` in it has to
+cancel every branch and the block parked at the join, so it collects the *blocks* with a
+thread inside the scope, drops every cursor of each — queued, in the round, waiting, and
+the fork records, which are the only thing holding a parent at a join — and re-queues one
+cursor at the scope's end. A block has one activation at a time, which is what makes "every
+cursor of that block" the right set. A `disable` naming a scope inside a **sibling branch**
+is the other case: only the cursor inside that scope stops, and it is re-queued **keeping
+its `fork` field**, so it still reaches its `JoinBranch` and the `fork` completes. Building
+a fresh `ExecutionCursor::new` for it instead gives it `fork: None`, which reaches
+`JoinBranch` as "the compiled layout and the scheduler have parted company" and is reported
+as `FORK_TIMING_UNSUPPORTED` — naming the wrong thing entirely. The question "is this fork
+inside the scope?" is asked of the fork record's *parent* cursor, which is the instruction
+the join sits at (corpus `disable3.6B`; measured against iverilog 12.0, which resumes the
+join at the instant of the `disable` rather than at the instant the cancelled branch would
+have finished).
 
 `join_any` and `join_none` are not implemented, and `block_between` closing on a
 word-boundary `keyword` rather than a bare `tag` is what keeps them out: without it,
@@ -1533,9 +1556,28 @@ functions, because a loop bound, an `if` condition and a `case` subject are made
 those; and *before* the declaration passes, because what a region unrolls **to** is
 declarations. A `parameter` written inside a block is the one thing evaluated as the
 block unrolls rather than in the pass that follows — a nested loop's bound may be made of
-it. A `function` or a `task` inside a block is a named error rather than a silent
-omission: `walk` compiled the module's subprograms before it got here, so one written
-inside a block would simply be missing from the store a call looks in.
+it.
+
+**A `function` inside a block is compiled in a *second* round, after the unrolling.** It
+belongs to the block, so it has no scope until the block has one — and the module's own
+functions are compiled again alongside it rather than kept from the first round, because
+`close_reads` has to see the whole call graph at once: a block's function may call one of
+the module's, and the outer call's frame has to hold what the inner one reads. The first
+round still happens where it always did, since a generate condition may itself be a call.
+A design with no function in a generate block never reaches the second round and pays one
+`Iterator::any`. The function's own name is then one of `declared_names`, which is what
+makes the bare `funfun(select)` written beside the `endfunction` resolve to `genblk1.funfun`
+rather than outwards to the module (corpus `generate_case2`); the hierarchical
+`blk.f(…)` written outside already resolved, since a block's prefix is the module's plus
+the label.
+
+A **`task`** inside a block is still a named error, and the reason is the `TaskTable`
+rather than the ordering: it is keyed by the name an enable *spells*, which is the bare one
+inside a block and outside it alike, so a task the block declares and one the module
+declares would share a single slot and the enable could not say which it meant. A function
+has no such table — it is stored under its qualified name and a call resolves through the
+scope like any other reference — which is the whole of why that half works and this one
+does not (#186).
 
 **A generate block is a *nested* scope, and that is the whole difference between it and
 an instance.** A module cannot see out of itself, so everything a module names is its
@@ -1545,9 +1587,9 @@ declare, mapped to the store entries they took — and it is what `resolve` asks
 is keyed by the **head** segment of a name, so a reference that reaches into a nested
 block (`inner[0].sig`) is qualified by the block that declares `inner`. The list is
 `declared_names`: the signals and parameters a block declares, the *instances* it
-creates, the *labels* of the generate blocks nested in it, and the *labels* of the named
-`begin : blk` blocks its `initial` and `always` bodies open, because a hierarchical
-reference reaches through all four.
+creates, the *functions* it declares, the *labels* of the generate blocks nested in it,
+and the *labels* of the named `begin : blk` blocks its `initial` and `always` bodies open,
+because a hierarchical reference reaches through all five.
 
 That last one is `block_labels`, and it is load-bearing rather than tidy: `elaborate`
 declares a named block's variables under `scope.qualified`, which inside a generate block
@@ -1816,16 +1858,46 @@ instance path in front through `Program::qualify_scopes` once it knows which ins
 block belongs to. A spliced task body is skipped there for the reason `rename_local` skips
 it — it was qualified when the task was compiled, and doing it twice would prefix it twice.
 
-**`%v` is a strength, and only two of them can be told from a value.** A `z` bit is driven
-by nothing, which is `HiZ`; every other bit reports `St`, because an ordinary continuous
-assignment and a gate both drive at `strong`. A `pullup`, a `tri0`/`tri1` or an
-`assign (pull1, strong0)` really is weaker and this prints `St1` where iverilog prints
-`Pu1` — `StateStore` keeps a *value* per signal and not a strength, so there is nothing to
-read the difference from. Corpus `multi_bit_strength` is exactly that gap, and so are the
-seven `%v` gold files of the switch family (`tran`, `tranif0`, `tranif1`, `rtran`,
-`rtranif0`, `rtranif1`, `switch_primitives`) — which also want the *ambiguous* strengths
-(`67X`, `SuH`, `StL`) the LRM gives a partly-driven node. Closing it means carrying a
-strength per bit through `resolve_contributions`.
+**`%v` is a strength, and a strength is a signed *interval* rather than a level.**
+`gates::Strength` is a pair of bounds over `-7..=7`: a negative number is a level driving
+toward `0`, a positive one toward `1`, and `0` is high impedance — so `St0` is `[-6, -6]`,
+`Pu1` is `[5, 5]` and a floating bit is `[0, 0]`. A driver that is certain what it drives is
+a *point* and one that is not is a *range*, and that range is the whole reason a level would
+not do: a driver that is "`0` at `strong`, or nothing" is `[-6, 0]`, which is the `StL`
+iverilog prints where a level alone could only say `StX`. **The value follows from the
+interval** rather than riding beside it — `0` when every level in the range drives toward
+`0`, `z` when the range is only high impedance, `x` for anything that straddles — so `StL`
+is an `x` as a value and a `0`-or-`z` as a strength, which is exactly what
+`$display("%b,%v", y, y)` prints in corpus `pr544`.
+
+`resolve_strength` folds the drivers of one bit into one of those, and `resolve_bit` is it
+read as a value. Two *unambiguous* drivers take a fast path — the stronger wins, and two
+tied and disagreeing give an `x` at that level, which is the interval `[-s, s]` — and
+anything ambiguous is the set of what every pair could settle on, kept as the interval that
+spans it. The rendering is IEEE 1364-2005's: the level's mnemonic beside the value (`St0`,
+`Pu1`), `L`/`H` for a range that reaches high impedance (`StL`, `SuH`), and — where the two
+ends disagree about the level, so no one mnemonic can carry both — the two **digits**
+instead (`65X` is a `strong` `0` against a `pull` `1`, `650` a definite `0` somewhere
+between the two).
+
+**The strength lives on the `SignalState`, and only a resolved net has one.**
+`resolve_contributions` is the one thing that knows a level, so it is the one thing that
+writes one (`StateStore::set_strengths`); every other signal's slot stays `None` and `%v`
+answers from the value the way it always did — a `z` bit is `HiZ` and everything else is
+`strong`, which is what an ordinary `assign` or a procedural write drives at anyway. So a
+design with no gate, no `tran` and no strength-bearing `assign` in it never allocates one.
+A recorded level is also *checked against the value* before it is printed, because a `force`
+or a procedural write lands on the net after the resolution that recorded it — a stale level
+would print a strength for a value it no longer describes. A **memory word** has no slot at
+all: a name is in the signal map or the memory map and never both.
+
+Still missing from the picture, and both are one gap rather than two: a switch or a
+three-state buffer whose **control is unknown** drives a hard `x` where iverilog drives the
+ambiguous `StL`/`StH` (corpus `pr544`, `pr1787394a`/`b`), and **nothing reduces or
+propagates a strength through a switch** — `tran` should drop a `supply` to `strong` and the
+`r`-prefixed forms reduce every level, which is what the seven `%v` gold files of the switch
+family (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`,
+`switch_primitives`) and corpus `resolv1` are waiting on.
 
 **A string is a value wherever a number is wanted.** `$display("%d", "A")` is 65:
 `TaskArgument::Text` reaches a numeric format as its own bytes, eight bits a character.
@@ -1839,13 +1911,13 @@ telling apart.
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names |
-| `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
+| `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, and `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, and the per-bit `Strength` a resolved net was last settled at), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
