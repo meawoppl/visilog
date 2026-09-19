@@ -847,8 +847,14 @@ fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
         Expression::FunctionCall(id, _) => store
             .function(&id.name)
             .is_some_and(|definition| definition.result.real),
+        // The whole real math library answers here beside the three casts,
+        // because a comparison sizes its operands against each other and a real
+        // has no width to share: `$sin(x) != 0.5` has to know before it
+        // evaluates either side.
         Expression::SystemFunctionCall(name, _) => {
             matches!(name.as_str(), "realtime" | "itor" | "bitstoreal")
+                || REAL_MATH_UNARY.contains(&name.as_str())
+                || REAL_MATH_BINARY.contains(&name.as_str())
         }
         Expression::Constant(_)
         | Expression::StringLiteral(_)
@@ -1029,7 +1035,7 @@ const TIME_WIDTH: usize = 64;
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 31] = [
+pub const SYSTEM_FUNCTIONS: [&str; 44] = [
     "time",
     "stime",
     "realtime",
@@ -1043,17 +1049,30 @@ pub const SYSTEM_FUNCTIONS: [&str; 31] = [
     "realtobits",
     "bitstoreal",
     "fopen",
-    // The real math library. Every one takes and returns a real, and an
-    // integer argument converts on the way in — `$sqrt(9)` is `3.0`.
+    // The real math library — see [`REAL_MATH_UNARY`] and
+    // [`REAL_MATH_BINARY`], which are what the evaluator matches on.
     "sqrt",
     "ln",
     "log10",
     "exp",
-    "pow",
     "floor",
     "ceil",
-    "hypot",
     "fabs",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "pow",
+    "atan2",
+    "hypot",
     // The reading half of file I/O. Every one of these is a system *function*
     // that writes through its argument list — see
     // [`StateStore::owe_fill`](crate::simulator::state_store::StateStore::owe_fill).
@@ -1067,6 +1086,25 @@ pub const SYSTEM_FUNCTIONS: [&str; 31] = [
     "fseek",
     "rewind",
 ];
+
+/// The one-argument members of IEEE 1364-2005's real math library, plus
+/// iverilog's `$fabs`.
+///
+/// Every one takes and returns a real, and an integer argument converts on the
+/// way in — `$sqrt(9)` is `3.0`, because an integer operand of a real function
+/// is a real. The list is a constant rather than a `|` chain in the evaluator
+/// because three places have to agree about it: the arm that computes the
+/// value, [`SYSTEM_FUNCTIONS`], which decides whether the name means anything
+/// at all, and [`expression_is_real`], which has to say the call is real
+/// *before* it is evaluated.
+const REAL_MATH_UNARY: [&str; 19] = [
+    "sqrt", "ln", "log10", "exp", "floor", "ceil", "fabs", "sin", "cos", "tan", "asin", "acos",
+    "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+];
+
+/// The two-argument members of the same library. `$atanh` is unary and lives
+/// above; `$atan2` is the two-argument arc tangent and lives here.
+const REAL_MATH_BINARY: [&str; 3] = ["pow", "atan2", "hypot"];
 
 /// Evaluates `$name(...)`, the simulator's own functions.
 ///
@@ -1307,7 +1345,7 @@ fn eval_system_function_bits(
         // argument converted on the way in — `$sqrt(9)` is `3.0`, because an
         // integer operand of a real function is a real. Checked against
         // iverilog 12.0 rather than assumed.
-        "sqrt" | "ln" | "log10" | "exp" | "floor" | "ceil" | "fabs" => {
+        _ if REAL_MATH_UNARY.contains(&name) => {
             arity("exactly one argument", &[1])?;
             let value = eval(&arguments[0], store)?.to_f64();
             let result = match name {
@@ -1318,16 +1356,32 @@ fn eval_system_function_bits(
                 "floor" => value.floor(),
                 "ceil" => value.ceil(),
                 "fabs" => value.abs(),
+                "sin" => value.sin(),
+                "cos" => value.cos(),
+                "tan" => value.tan(),
+                "asin" => value.asin(),
+                "acos" => value.acos(),
+                "atan" => value.atan(),
+                "sinh" => value.sinh(),
+                "cosh" => value.cosh(),
+                "tanh" => value.tanh(),
+                "asinh" => value.asinh(),
+                "acosh" => value.acosh(),
+                "atanh" => value.atanh(),
                 _ => unreachable!("the arm matched one of these names"),
             };
             Ok(Register::from_f64(result))
         }
-        "pow" | "hypot" => {
+        _ if REAL_MATH_BINARY.contains(&name) => {
             arity("exactly two arguments", &[2])?;
             let left = eval(&arguments[0], store)?.to_f64();
             let right = eval(&arguments[1], store)?.to_f64();
             let result = match name {
                 "pow" => left.powf(right),
+                // C's `atan2(y, x)`, and the argument order is the one place
+                // this family can be wrong without looking wrong: the *first*
+                // argument is the numerator.
+                "atan2" => left.atan2(right),
                 "hypot" => left.hypot(right),
                 _ => unreachable!("the arm matched one of these names"),
             };
@@ -3074,7 +3128,7 @@ mod tests {
                 // without leaving one behind.
                 "fopen" => "$fopen(\"\")".to_string(),
                 // The two-argument members of the real math library.
-                "pow" | "hypot" => format!("${}(a, a)", name),
+                _ if REAL_MATH_BINARY.contains(&name) => format!("${}(a, a)", name),
                 // The reading half, each against a descriptor nothing has
                 // open, which reads as end of file and touches no file.
                 "sscanf" => "$sscanf(\"1\", \"%d\", a)".to_string(),
@@ -3428,6 +3482,69 @@ mod tests {
         assert!((called("$pow(2.0, 10.0)") - 1024.0).abs() < 1e-9);
         assert!((called("$floor(2.7)") - 2.0).abs() < 1e-9);
         assert!((called("$ceil(2.1)") - 3.0).abs() < 1e-9);
+    }
+
+    /// The trigonometric and hyperbolic half of the same library. Every
+    /// expectation is the line `iverilog` 12.0 prints for `$display("%f", …)`
+    /// of the same call, so the argument order of `$atan2` — numerator first,
+    /// which is the one thing here that can be wrong without looking wrong — is
+    /// measured rather than assumed.
+    #[test]
+    fn test_trigonometric_system_functions() {
+        let store = StateStore::new();
+        let called = |source: &str| {
+            eval(&parse(source), &store)
+                .expect("should evaluate")
+                .to_f64()
+        };
+
+        assert!((called("$sin(0.81)") - 0.724287).abs() < 1e-6);
+        assert!((called("$cos(0.81)") - 0.689498).abs() < 1e-6);
+        assert!((called("$tan(0.81)") - 1.050455).abs() < 1e-6);
+        assert!((called("$asin(0.5)") - 0.523599).abs() < 1e-6);
+        assert!((called("$acos(0.5)") - 1.047198).abs() < 1e-6);
+        assert!((called("$atan(1.0)") - 0.785398).abs() < 1e-6);
+        assert!((called("$atan2(1.0, 2.0)") - 0.463648).abs() < 1e-6);
+        assert!((called("$sinh(1.0)") - 1.175201).abs() < 1e-6);
+        assert!((called("$cosh(1.0)") - 1.543081).abs() < 1e-6);
+        assert!((called("$tanh(1.0)") - 0.761594).abs() < 1e-6);
+        assert!((called("$asinh(1.0)") - 0.881374).abs() < 1e-6);
+        assert!((called("$acosh(2.0)") - 1.316958).abs() < 1e-6);
+        assert!((called("$atanh(0.5)") - 0.549306).abs() < 1e-6);
+        assert!((called("$hypot(3.0, 4.0)") - 5.0).abs() < 1e-9);
+    }
+
+    /// A call to the real math library is real *before* it is evaluated, which
+    /// is what a comparison needs: it sizes its two operands against each
+    /// other, and a real has no width to share. Corpus `pr2152011` is
+    /// `$floor(200000.0*$sin(cc*0.81)+0.5)`, where a `$sin` read as a bit
+    /// vector would take the integer `0` into the multiply.
+    #[test]
+    fn test_the_real_math_library_reads_as_real() {
+        let store = StateStore::new();
+        for name in REAL_MATH_UNARY.iter().chain(REAL_MATH_BINARY.iter()) {
+            let source = if REAL_MATH_BINARY.contains(name) {
+                format!("${}(1.0, 1.0)", name)
+            } else {
+                format!("${}(1.0)", name)
+            };
+            let call = parse(&source);
+            assert!(
+                expression_is_real(&call, &store),
+                "{} should read as real without evaluating",
+                source
+            );
+            assert!(
+                eval(&call, &store).expect("should evaluate").is_real(),
+                "{} should evaluate to a real",
+                source
+            );
+            assert!(
+                SYSTEM_FUNCTIONS.contains(name),
+                "${} is implemented but not listed as a system function",
+                name
+            );
+        }
     }
 
     /// An integer argument to a real function converts on the way in, so

@@ -1301,6 +1301,18 @@ the design's back is the kind of wrong answer that looks right. `%` is the excep
 LRM leaves it illegal and iverilog computes `fmod`, which is what corpus
 `mixed_type_div_mod` asserts, so that is what it does.
 
+**The real math library is the whole IEEE 1364-2005 set, and it lives in two constants.**
+`REAL_MATH_UNARY` (`$sqrt`, `$ln`, `$log10`, `$exp`, `$floor`, `$ceil`, iverilog's `$fabs`,
+and the trigonometric and hyperbolic family `$sin`…`$atanh`) and `REAL_MATH_BINARY`
+(`$pow`, `$atan2`, `$hypot`) are each its `f64` counterpart with the argument converted on
+the way in — `$sqrt(9)` is `3.0`, because an integer operand of a real function is a real.
+They are constants rather than a `|` chain in the evaluator because **three** places have
+to agree about the list and only one of them computes anything: the arm that evaluates the
+call, `SYSTEM_FUNCTIONS`, which decides whether the name means anything at all, and
+`expression_is_real`, which has to answer *before* the call is evaluated. Missing from that
+third one is what makes `$floor(200000.0*$sin(cc*0.81)+0.5)` size its operands as bit
+vectors (corpus `pr2152011`), and it is a wrong answer rather than an error.
+
 **Formatting is C's.** `%f` is six decimals, `%e` a mantissa and a two digit exponent, `%g`
 six significant figures with the trailing zeros dropped, `%E`/`%G` the same in capitals, and
 `%5.2f` is the precision field — which only these three read. An argument printed with *no*
