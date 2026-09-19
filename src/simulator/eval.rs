@@ -1234,6 +1234,28 @@ const SYSTEM_FUNCTION_WIDTH: usize = 32;
 /// `$stime` is the same value truncated to an `integer`.
 const TIME_WIDTH: usize = 64;
 
+/// How wide a *type keyword* is, for `$bits(integer)`.
+///
+/// `$bits` takes a data type as well as a value, and a type is the one argument
+/// the store has nothing to say about — which is why this is asked only once a
+/// lookup has already come back `UnknownIdentifier`: anything a design declares
+/// answers for itself. A type keyword is reserved, so no plain identifier can be
+/// spelled one; the name is taken a segment at a time all the same, since a
+/// reference written inside an instance arrives qualified.
+///
+/// The three are what iverilog 12.0 accepts — `$bits(reg)` is 1, `$bits(integer)`
+/// 32 and `$bits(time)` 64, while `$bits(real)` and `$bits(realtime)` are
+/// "Invalid data type for $bits()" and `$bits(wire)` is a syntax error. Answering
+/// for a type it refuses would be inventing a number.
+fn type_width(name: &str) -> Option<usize> {
+    match name.rsplit('.').next()? {
+        "reg" => Some(1),
+        "integer" => Some(SYSTEM_FUNCTION_WIDTH),
+        "time" => Some(TIME_WIDTH),
+        _ => None,
+    }
+}
+
 /// Every `$name` [`eval_system_function`] implements.
 ///
 /// Callers that have to decide whether a `$name` is meaningful *before* running
@@ -1697,10 +1719,18 @@ fn eval_system_function_bits(
             store.owe_fill(target, signed_result(i64::from(next)));
             Ok(signed_result(i64::from(value)))
         }
-        // The width of the operand, which every value here knows about itself.
+        // The width of the operand, which every value here knows about itself
+        // — or of a *type*, which nothing in the store does.
         "bits" => {
             arity("exactly one argument", &[1])?;
-            let width = eval(&arguments[0], store)?.width();
+            let width = match eval(&arguments[0], store) {
+                Ok(value) => value.width(),
+                Err(EvalError::UnknownIdentifier(name)) => match type_width(&name) {
+                    Some(width) => width,
+                    None => return Err(EvalError::UnknownIdentifier(name)),
+                },
+                Err(error) => return Err(error),
+            };
             Ok(Register::from_u128(width as u128, SYSTEM_FUNCTION_WIDTH))
         }
         // `$clog2(n)` is how many bits it takes to count `n` things: the
@@ -3566,6 +3596,37 @@ mod tests {
         assert_eq!(value_in("$bits(b)", &store), 4);
         assert_eq!(value_in("$bits({a, b})", &store), 12);
         assert_eq!(value_in("$bits(4'b1010)", &store), 4);
+    }
+
+    /// `$bits` takes a data *type* as well as a value, which is how a design
+    /// asks whether a port really was declared an `integer` — corpus
+    /// `module_nonansi_integer1`, `task_nonansi_time1` and their four siblings
+    /// all check `$bits(x) == $bits(integer)`.
+    ///
+    /// iverilog 12.0 accepts exactly three spellings:
+    ///
+    /// ```text
+    /// $bits(reg)      1
+    /// $bits(integer)  32
+    /// $bits(time)     64
+    /// $bits(real)     bt.v:7: error: Invalid data type for $bits().
+    /// $bits(wire)     b3.v:2: syntax error
+    /// ```
+    #[test]
+    fn test_bits_reports_the_width_of_a_type() {
+        let store = sample_store();
+        assert_eq!(value_in("$bits(reg)", &store), 1);
+        assert_eq!(value_in("$bits(integer)", &store), 32);
+        assert_eq!(value_in("$bits(time)", &store), 64);
+        // A type iverilog refuses stays a name nothing declares, rather than a
+        // width invented for it.
+        assert!(matches!(
+            eval(&parse("$bits(real)"), &store),
+            Err(EvalError::UnknownIdentifier(_))
+        ));
+        // And anything the design *does* declare answers for itself, since the
+        // type table is only asked once the lookup has already missed.
+        assert_eq!(value_in("$bits(a)", &store), 8);
     }
 
     #[test]
