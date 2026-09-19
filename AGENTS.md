@@ -303,6 +303,23 @@ the instantiation, which is why it travels with the port rather than with the co
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 
+**A reference the design writes to an aliased port is re-pointed in a pass of its own,
+after the walk.** `u_bar.x` has no store entry — the port *is* the parent's signal — and
+`Scope::resolve` cannot say so while the hierarchy is being walked: `instantiate` records
+the alias from the **build** pass, in source order, so a block written above the
+instantiation is compiled and renamed before the table has ever heard of the name.
+`Elaborator::resolve_aliased_references` therefore asks again at the end, rewriting the
+name through `Elaborated::aliases` — a rewrite rather than a lookup the store falls back
+on, because everything else about a name here is settled statically and a run-time
+indirection would be the odd one out. One pass settles every reference: an alias *target*
+is never itself an alias key, since `Binding::Alias` collapses a chain of connections to
+the signal at the top of it where the entry is recorded. Every collection an elaboration
+produces goes through it — the blocks' programs, sensitivity lists, `implicit_reads` and
+`writes`, the assignments, the gates, the UDPs, the pass switches, the pulled and resolved
+nets, the top's inputs, and the `FunctionDefinition`s on the store — because a
+hierarchical reference is legal wherever a name is and one collection left out would be
+silent. Corpus `pr587` and `tri2`.
+
 **A port and the parent's signal have to agree about signedness to be one entry.** A
 store entry carries *one* signedness — a value is bits plus how to read them — so
 `input signed [31:0] a` bound to a plain `reg [31:0]` cannot be aliased onto it: the
@@ -1211,10 +1228,20 @@ return from a task, and the common case in the corpus. Nothing else about it is 
 a `disable` inside a `for` inside the block leaves the whole block, because the jump is out
 of the range rather than out of a loop.
 
-The name is resolved against the enclosing scopes at **compile** time, innermost first
-(`enclosing_scope`), so `disable wait_loop` written in task `t` means `t.wait_loop` and the
-same word at the top of a module means `wait_loop`. A name matching no enclosing scope is
-left bare and looked for among every block's scopes when it runs. Both the scope table and
+The name is resolved at **compile** time, and the LRM's rule — search the enclosing scopes
+for a *declaration* of the label — is two questions rather than one. A label that **is** one
+of the enclosing scopes is `enclosing_scope`, asked innermost first as the statement is
+compiled, so `disable wait_loop` written in task `t` means `t.wait_loop` and the same word
+at the top of a module means `wait_loop`. That one has to be asked there rather than by
+lookup, since a block does not record its own range until its body has finished compiling.
+
+Anything else may still name a **sibling**, and that is `Program::resolve_sibling_disables`,
+a post-pass: `<enclosing prefix>.<name>` for each prefix from the innermost outwards, taking
+the first that names a range the program really holds. It is a post-pass because a sibling
+may be written *after* the `disable` — corpus `pr540c` disables the second `fork` branch
+from the first — so there is nothing to look up while the statement is in hand. A name that
+answers neither question is left bare and looked for among every block's scopes when it
+runs. Corpus `pr540b`, `pr540c`. Both the scope table and
 the `Instruction::Disable` go through `Program::rename_scopes` — beside the instruction
 rename, not inside it, because a block label is not a signal and must not travel through a
 map of a task's locals.
