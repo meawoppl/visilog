@@ -2132,6 +2132,14 @@ impl<'m> Elaborator<'m> {
         instantiation: &ModuleInstantiation,
         scope: &Scope,
     ) -> Result<HashMap<String, Register>, SimulationError> {
+        // A UDP declares no parameters, so `BUFG #5 bg(o, i);` is the
+        // instance's *delay* rather than an override. A gate's delay is parsed
+        // and ignored, and there is nothing more a primitive's can be here:
+        // both settle in zero time along with every other continuous driver.
+        if primitive_table(child).is_some() {
+            return Ok(HashMap::new());
+        }
+
         let declared = parameter_names(child);
 
         let mut pairs: Vec<(&str, &Expression)> = Vec::new();

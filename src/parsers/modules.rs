@@ -11,6 +11,7 @@ use nom::{
 };
 
 use super::{
+    delay::delay_operand,
     expr::{verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
     parameter::parse_parameter_port_list,
@@ -450,12 +451,26 @@ fn argument_block(input: &str) -> IResult<&str, ModuleInitArguments> {
     delimited(tag("("), parse_arguments, tag(")"))(input)
 }
 
+/// The `#` an instantiation may carry: `#(.WIDTH(8))`, `#(8)` or a bare `#8`.
+///
+/// The unparenthesised form is a *delay value* — one number or name, nothing
+/// more, exactly as it is in front of a statement. It means two different
+/// things depending on what is being instantiated, and the grammar cannot tell
+/// which: on a UDP it is the instance's delay, and on a module it sets the
+/// first parameter. So it is parsed as the one-element positional override it
+/// looks like, and `elaborate` reads it as a delay once it knows the child is
+/// a primitive — which is the first point at which anything does know.
 fn param_block(input: &str) -> IResult<&str, ModuleInitArguments> {
     let (input, _) = tag("#")(input)?;
     // `#` and its block are separate tokens, the same way `#` and a delay
     // value are: `bar # (.WIDTH(8)) u (…)` is legal.
     let (input, _) = ws_and_comments(input)?;
-    argument_block(input)
+    alt((
+        argument_block,
+        map(delay_operand, |value| {
+            ModuleInitArguments::Positional(vec![Some(value)])
+        }),
+    ))(input)
 }
 
 #[derive(Debug, PartialEq)]
@@ -804,6 +819,43 @@ mod tests {
         );
         assert_eq!(instantiation.module_name, "counter".into());
         assert_eq!(instantiation.instance_name, "dut".into());
+    }
+
+    /// `bar #345 bar1();` is the unparenthesised `#`, which is a *delay value*
+    /// — one number or name — and reads as a one-element positional override.
+    /// `foo #1 bar1(1'b0);` against a module whose first parameter is `n` is
+    /// exactly how iverilog reads it (corpus `pr3194155`).
+    #[test]
+    fn test_an_unparenthesised_hash_is_one_positional_parameter() {
+        let instantiation = assert_parses(parse_module_instantiation_statement, "bar #345 bar1();");
+        assert_eq!(instantiation.module_name, "bar".into());
+        assert_eq!(instantiation.instance_name, "bar1".into());
+        assert_eq!(
+            instantiation.parameters,
+            ModuleInitArguments::Positional(vec![Some(
+                verilog_expression("345")
+                    .expect("a constant should parse")
+                    .1
+            )])
+        );
+
+        // A name is a delay value too, and `#` is its own token.
+        let named = assert_parses(parse_module_instantiation_statement, "bar # tPD u (o, i);");
+        assert_eq!(
+            named.parameters,
+            ModuleInitArguments::Positional(vec![Some(Expression::Identifier("tPD".into()))])
+        );
+
+        // The parenthesised forms are unchanged.
+        let block = assert_parses(parse_module_instantiation_statement, "bar #(456) bar2();");
+        assert_eq!(
+            block.parameters,
+            ModuleInitArguments::Positional(vec![Some(
+                verilog_expression("456")
+                    .expect("a constant should parse")
+                    .1
+            )])
+        );
     }
 
     fn abc_123() -> ModuleInitArguments {

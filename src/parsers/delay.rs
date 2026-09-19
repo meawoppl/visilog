@@ -311,7 +311,11 @@ fn delay_term(input: &str) -> IResult<&str, Delay> {
 /// everywhere else: the integer grammar matches the `0` of `#0.9` and leaves
 /// `.9` for the statement, which then fails somewhere that says nothing about
 /// the delay.
-fn delay_operand(input: &str) -> IResult<&str, Expression> {
+///
+/// `modules.rs` shares it: the value of an unparenthesised `#` on an
+/// instantiation is the same token, whether the design meant a UDP's delay or
+/// a module's first parameter.
+pub(super) fn delay_operand(input: &str) -> IResult<&str, Expression> {
     alt((
         real_literal,
         map(verilog_const, Expression::Constant),
