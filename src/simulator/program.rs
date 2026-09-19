@@ -92,6 +92,16 @@ pub(crate) const FUNCTION_DELAY_UNSUPPORTED: SimulationError =
 pub(crate) const FUNCTION_EVENT_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a wait or event control inside a function");
 
+/// What a function body that writes one of the design's *arrays* reports.
+///
+/// A frame is handed copies of the memories the body reads, and the hand-back
+/// at the end of a call goes through [`StateStore::owe_fill`], which writes a
+/// signal — a memory is in the other map and has no such route. So the write
+/// would land in the copy and be dropped with the frame, which is the silent
+/// no-op every other body restriction is a named error to avoid.
+pub(crate) const FUNCTION_MEMORY_WRITE_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a function writing an array declared outside it");
+
 /// Ceiling on the instructions one [`resume`] may execute before it is called
 /// a non-terminating loop.
 ///
@@ -1625,6 +1635,21 @@ impl FunctionDefinition {
                     None => signal.register().clone(),
                 };
                 frame.set_ranged(name.clone(), value, signal.range());
+                continue;
+            }
+            // A name the design has as an *array* is copied in whole: an index
+            // moves during the body, so there is no one word to take. Only a
+            // function that really reads one pays for it, which is what keeps
+            // a frame costing the function rather than the design.
+            if let Some(memory) = store.memory(name) {
+                // A write would land in the copy and be dropped with it — the
+                // hand-back at the end of the call reads signals, and a memory
+                // is in the other map. That is exactly the silent no-op every
+                // other body restriction is a named error to avoid.
+                if self.writes.contains(name) {
+                    return Err(FUNCTION_MEMORY_WRITE_UNSUPPORTED);
+                }
+                frame.adopt_memory(name.clone(), memory.clone());
             }
         }
 

@@ -4876,6 +4876,65 @@ mod tests {
         assert_eq!(simulator.get("y").unwrap().to_u128(), Some(8));
     }
 
+    /// A frame is seeded with copies of the design *arrays* the body reads, not
+    /// only its signals — an index moves during the body, so there is no one
+    /// word to take. iverilog 12.0 prints `total is 6`.
+    #[test]
+    fn test_a_function_reads_a_design_array() {
+        let source = r#"
+            module top;
+                integer cindex[2:0];
+                integer i;
+                function integer total;
+                    input dummy;
+                    integer j;
+                    begin
+                        total = 0;
+                        for (j = 0; j < 3; j = j + 1) total = total + cindex[j];
+                    end
+                endfunction
+                initial begin
+                    for (i = 0; i < 3; i = i + 1) cindex[i] = i + 1;
+                    $display("total is %0d", total(0));
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "total is 6\n");
+    }
+
+    /// Writing one is refused by name instead. The frame holds a *copy*, and a
+    /// call hands its writes back through the signal map — a memory is in the
+    /// other one, so the write would be dropped with the frame. iverilog 12.0
+    /// carries it out (it prints `3` then `mem0=3`), so this is a gap named
+    /// rather than a rule; it was `UnknownSignal("mem")` before the read half
+    /// put the array in the frame at all.
+    #[test]
+    fn test_a_function_writing_a_design_array_is_named() {
+        let source = r#"
+            module top;
+                integer mem[1:0];
+                function integer stash;
+                    input [31:0] v;
+                    begin
+                        mem[0] = v;
+                        stash = v;
+                    end
+                endfunction
+                initial $display("%0d", stash(3));
+            endmodule
+        "#;
+        let error = setup_error(&[source], "top");
+        assert!(
+            error
+                .to_string()
+                .contains("a function writing an array declared outside it"),
+            "{}",
+            error
+        );
+    }
+
     /// Positional overrides bind in the order the child declares its
     /// parameters, which is `BASE` then `STEP`.
     #[test]

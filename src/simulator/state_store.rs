@@ -1700,6 +1700,16 @@ impl StateStore {
         self.name_to_memory.insert(name.into(), memory);
     }
 
+    /// Puts a memory that already exists into this store under `name`.
+    ///
+    /// The one caller is [`FunctionDefinition::call`](crate::simulator::program::FunctionDefinition::call),
+    /// which seeds a frame with copies of what the body reads: a memory has no
+    /// declaration to repeat here, only words that were filled somewhere else.
+    pub fn adopt_memory(&mut self, name: impl Into<String>, memory: Memory) {
+        let signed = memory.is_signed();
+        self.insert_memory(name, memory, signed);
+    }
+
     /// Whether the design declares any memory. `false` is exact.
     pub fn any_memory(&self) -> bool {
         self.any_memory
