@@ -519,18 +519,24 @@ fn split_task_name(name: &str) -> (bool, &str, Radix) {
 
 /// How `%t` renders a time value.
 ///
-/// `$timeformat(units, precision, suffix, min_width)` sets all four. The
-/// simulator's clock counts *ticks* and carries no timescale — nothing hands
-/// `Simulator` the `` `timescale `` the front end recorded — so `units` is
-/// range-checked and then taken to name the unit a tick already is. That is
-/// the identity for the `` `timescale 1ns `` plus `$timeformat(-9, …)` pairing
-/// that covers nearly every design using either, and it is why `units` is not
-/// stored: with no second unit to convert between there is nothing to scale by.
+/// `$timeformat(units, precision, suffix, min_width)` sets all four, and
+/// `units` is a real scale factor rather than a label. The clock counts ticks
+/// of the `` `timescale `` **unit** of the module a call sits in, and `%t`
+/// restates one of those in whatever power of ten the design named — so
+/// `` `timescale 1ns `` with `$timeformat(-6, …)` prints `10` as `0` and
+/// `$timeformat(-12, …)` prints it as `10000`. The units are held as
+/// femtoseconds, because a `` `timescale `` term is `1`, `10` or `100` of a
+/// unit and only the finest of them makes every scale an exact integer.
 ///
-/// What is left is real formatting: `precision` fractional digits after the
-/// tick count, then `suffix`, right-aligned in `min_width`.
+/// `None` is the unit the LRM gives a design that never called `$timeformat`:
+/// the **finest precision** any `` `timescale `` in it declared, which is why
+/// it cannot be resolved here — only [`TaskContext`] knows the design.
+///
+/// What is left is formatting: `precision` fractional digits, then `suffix`,
+/// right-aligned in `min_width`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimeFormat {
+    units: Option<u128>,
     precision: usize,
     suffix: String,
     min_width: usize,
@@ -539,13 +545,24 @@ pub struct TimeFormat {
 /// The field `%t` pads to when `$timeformat` has not said otherwise.
 const DEFAULT_TIME_WIDTH: usize = 20;
 
+/// One second, in femtoseconds — the `` `timescale `` a module that declared
+/// none is at, so a design with no directive anywhere counts ticks of a second
+/// and prints them in seconds, which is the identity it always was.
+const DEFAULT_SCALE_FS: u128 = 1_000_000_000_000_000;
+
 /// The powers of ten `$timeformat` may name, seconds down to femtoseconds.
 /// Anything outside is a named error rather than a silently odd unit.
 const TIME_UNIT_BOUNDS: (i128, i128) = (-15, 2);
 
+/// Femtoseconds in one unit of the power of ten `$timeformat` names.
+fn time_units_fs(exponent: i128) -> u128 {
+    10u128.pow((exponent - TIME_UNIT_BOUNDS.0) as u32)
+}
+
 impl Default for TimeFormat {
     fn default() -> Self {
         TimeFormat {
+            units: None,
             precision: 0,
             suffix: String::new(),
             min_width: DEFAULT_TIME_WIDTH,
@@ -557,30 +574,62 @@ impl TimeFormat {
     /// One time value as this format asks for it — without the field padding,
     /// which `%t` applies itself so an explicit `%12t` can override
     /// `min_width`.
-    fn render(&self, value: &Register) -> String {
+    ///
+    /// `tick_fs` is what one tick of the clock is worth where the call was
+    /// written and `default_fs` the unit a defaulted `$timeformat` prints in;
+    /// both are the caller's to know.
+    fn render(&self, value: &Register, tick_fs: u128, default_fs: u128) -> String {
         if value.has_unknown() {
             return unknown(value);
         }
-        // `%t` counts ticks, so a real time — `$realtime` — is rounded to one
-        // before it is rendered. Nothing rescales either form; see the type's
-        // own documentation.
-        let rounded;
-        let value = if value.is_real() {
-            rounded = Register::integer_from_f64(value.to_f64().round(), REAL_WIDTH);
-            &rounded
+        let units = self.units.unwrap_or(default_fs);
+        // A real time — `$realtime`, or a literal — carries a fraction of a
+        // tick, so it is scaled as a double and rounded by the field. An
+        // integer one is scaled exactly and *truncated*; both are iverilog's.
+        let mut text = if value.is_real() {
+            let scaled = value.to_f64() * tick_fs as f64 / units as f64;
+            format!("{:.*}", self.precision, scaled)
         } else {
-            value
+            scaled_ticks(&decimal(value), tick_fs, units, self.precision)
         };
-        let mut text = decimal(value);
-        if self.precision > 0 {
-            text.push('.');
-            for _ in 0..self.precision {
-                text.push('0');
-            }
-        }
         text.push_str(&self.suffix);
         text
     }
+}
+
+/// A tick count restated in units of `units` femtoseconds, with `digits`
+/// fractional digits.
+///
+/// The digits are **truncated** rather than rounded, which is what iverilog
+/// 12.0 does: 1500 ticks of `1ns` at `$timeformat(-6, 0, …)` is `1` and at
+/// `$timeformat(-6, 1, …)` is `1.5`. The whole scaling is integer, so a
+/// picosecond of a design running for a year is still exact.
+fn scaled_ticks(decimal: &str, tick_fs: u128, units: u128, digits: usize) -> String {
+    let (sign, magnitude) = match decimal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", decimal),
+    };
+    let scaled = magnitude
+        .parse::<u128>()
+        .ok()
+        .zip(10u128.checked_pow(digits.min(u32::MAX as usize) as u32))
+        .and_then(|(ticks, shift)| ticks.checked_mul(tick_fs)?.checked_mul(shift))
+        .map(|femtoseconds| femtoseconds / units);
+    let Some(scaled) = scaled else {
+        // Nothing this simulator can count reaches here — it takes a tick
+        // count near 2**128 femtoseconds, or a field asking for more digits
+        // than a `u128` holds — so the raw ticks are a better answer than a
+        // panic.
+        return decimal.to_string();
+    };
+    let mut text = scaled.to_string();
+    if digits > 0 {
+        while text.len() <= digits {
+            text.insert(0, '0');
+        }
+        text.insert(text.len() - digits, '.');
+    }
+    format!("{}{}", sign, text)
 }
 
 /// The one standing `$monitor`.
@@ -1037,6 +1086,35 @@ impl TaskContext {
         }
     }
 
+    /// What one tick of the clock is worth, in femtoseconds, where a call was
+    /// written: the `` `timescale `` **unit** of the module the scope belongs
+    /// to. A scope that names no module, or a module that declared no
+    /// directive, falls back to the design's own scale and then to one second
+    /// — the `1s / 1s` the LRM gives a module with no `` `timescale ``.
+    fn tick_fs(&self, scope: &str) -> u128 {
+        self.scale_of(scope)
+            .flatten()
+            .or(self.timescale)
+            .map_or(DEFAULT_SCALE_FS, |scale| {
+                u128::from(scale.unit.femtoseconds())
+            })
+    }
+
+    /// The unit `%t` prints in when `$timeformat` has named none: the finest
+    /// **precision** any `` `timescale `` in the design declared, which is what
+    /// the LRM asks for. `` `timescale 1ns/100ps `` with no `$timeformat` at
+    /// all therefore prints `#5` as `50`, measured against iverilog 12.0.
+    fn default_time_units(&self) -> u128 {
+        self.instances
+            .iter()
+            .chain(self.module_scales.iter())
+            .filter_map(|(_, scale)| *scale)
+            .chain(self.timescale)
+            .map(|scale| u128::from(scale.precision.femtoseconds()))
+            .min()
+            .unwrap_or(DEFAULT_SCALE_FS)
+    }
+
     /// The instance a call sits in: its `%m` scope with any named block or
     /// inlined task shed off the end.
     ///
@@ -1423,7 +1501,9 @@ impl TaskContext {
             // over the one `$timeformat` set, so `%0t` never pads.
             if specifier.eq_ignore_ascii_case(&'t') {
                 let value = self.value_of(argument, store)?;
-                let rendered = self.time_format.render(&value);
+                let rendered =
+                    self.time_format
+                        .render(&value, self.tick_fs(scope), self.default_time_units());
                 text.push_str(&pad(
                     rendered,
                     width.unwrap_or(self.time_format.min_width),
@@ -1471,8 +1551,6 @@ impl TaskContext {
             )));
         }
 
-        // The units are checked even though nothing scales by them: a design
-        // that names a unit this simulator could not mean should hear so.
         let units = self.integer_argument(&arguments[0], store, "`$timeformat` units")?;
         if units < TIME_UNIT_BOUNDS.0 || units > TIME_UNIT_BOUNDS.1 {
             return Err(SimulationError::SystemTask(format!(
@@ -1485,6 +1563,7 @@ impl TaskContext {
         let min_width = self.field_argument(&arguments[3], store, "`$timeformat` minimum width")?;
 
         self.time_format = TimeFormat {
+            units: Some(time_units_fs(units)),
             precision,
             suffix,
             min_width,
@@ -3333,7 +3412,11 @@ mod tests {
         );
     }
 
-    /// `$timeformat` with no arguments puts `%t` back where it started.
+    /// `$timeformat` with no arguments puts `%t` back where it started —
+    /// twenty columns of the tick this design counts, which with no
+    /// `` `timescale `` anywhere is a second. `$timeformat(-9, …)` asks for
+    /// that same tick in nanoseconds, so it is a thousand million of them;
+    /// iverilog 12.0 prints `7000000000.00 ns` for the same pairing.
     #[test]
     fn test_timeformat_with_no_arguments_restores_the_default() {
         let mut store = store_with(&[]);
@@ -3346,7 +3429,7 @@ mod tests {
 
         assert_eq!(
             context.output().lines(),
-            vec!["[ 5.0ns]", "[                   5]"]
+            vec!["[5000000000.0ns]", "[                   5]"]
         );
     }
 }
