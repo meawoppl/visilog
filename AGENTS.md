@@ -645,6 +645,17 @@ set that bit and change nothing else. It changes the answer in exactly five plac
 `%`, `>>>`, the relational operators, and the widening that happens when two operands of
 different widths meet or when a value is written into a wider target.
 
+**A literal's signedness is the flag the parser set, never the shape of the literal.** The
+line is drawn at the **base designator** and not at the size, so `42` is signed while
+`'d42`, `'b1010` and `4'd12` are not — and nothing about a parsed `'d42` distinguishes it
+from a parsed `42` except that flag, since both carry no size and a decimal base.
+`integer_constant` is therefore what records "signed", beside the `s` of `4'sd12`, and
+`VerilogConstant::is_signed` is a plain field read. Measured against iverilog 12.0 for a
+`localparam signed [31:0] S = -1;` written into a `reg [35:0]`: `'d0 + S` and `'b0 + S` are
+`0ffffffff` where `0 + S` and `'sd0 + S` are `fffffffff` (corpus `param-extend`). The
+knock-on is that a bare decimal's default `%d` field leaves room for a sign, which is one
+column wider (corpus `pr812`).
+
 **Widths are context-determined, and the target is where the context comes from.**
 Verilog sizes most expressions by the thing being assigned to: `reg [15:0] w; reg [7:0] a,
 b; w = a * b;` widens `a` and `b` to sixteen bits *before* multiplying, so the whole

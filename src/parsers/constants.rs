@@ -89,28 +89,35 @@ impl VerilogConstant {
         self
     }
 
+    /// A bare decimal, the spelling a genvar substitution and a delay use.
+    ///
+    /// It is signed because a decimal written with no base designator is — a
+    /// negative one has to read as one, since a genvar counting down reaches
+    /// `-1` and an unsigned `-1` is `4294967295`, which makes `i >= 0` true for
+    /// ever and the loop never end.
     pub fn from_int(value: i64) -> Self {
         VerilogConstant {
             size: None,
             base_type: VerilogBaseType::Decimal,
             value: value.to_string(),
-            // A negative value has to read as one: a genvar counting down
-            // reaches `-1`, and an unsigned `-1` is `4294967295`, which makes
-            // `i >= 0` true for ever and the loop never end.
-            signed: value < 0,
+            signed: true,
         }
     }
 
     /// Whether the literal is a two's complement number.
     ///
-    /// Two spellings make one: the `s` designator of `4'sd12`, and a decimal
-    /// written with neither a size nor a base — `42` is signed where `4'd42`
-    /// is not. The LRM draws that second line at the *base* rather than at the
-    /// size, so `'d42` is unsigned to it and signed here; nothing on this type
-    /// records whether a base was written, and an unsized based decimal is
-    /// rare enough not to be worth a field that could not be compared.
+    /// Two spellings make one and the flag carries both: the `s` designator of
+    /// `4'sd12`, and a decimal written with **no base designator at all** —
+    /// `42` is signed where `4'd42` is not, and so is `'d42`. The LRM draws
+    /// that line at the base rather than at the size, and iverilog 12.0 agrees:
+    /// for a `localparam signed [31:0] S = -1;` into a `reg [35:0]`, `'d0 + S`
+    /// is `0ffffffff` and `0 + S` is `fffffffff` (corpus `param-extend`).
+    ///
+    /// Asking the *shape* of the literal instead — no size and a decimal base —
+    /// cannot tell `42` from `'d42`, which is why this reads the flag the
+    /// parser set rather than working it out.
     pub fn is_signed(&self) -> bool {
-        self.signed || (self.size.is_none() && self.base_type == VerilogBaseType::Decimal)
+        self.signed
     }
 
     /// The declared bit width, e.g. the `8` of `8'hFF`. `None` when the
@@ -151,9 +158,14 @@ impl RawToken for VerilogConstant {
     }
 }
 
+/// `42` — a decimal written with no base designator, which is the one spelling
+/// that is **signed** without an `s`. `'d42` is the same digits with a base and
+/// is unsigned; only the parser can tell the two apart, so it is what records
+/// the answer.
 fn integer_constant(input: &str) -> IResult<&str, VerilogConstant> {
     map_res(decimal, |content| {
-        let cnst = VerilogConstant::new(None, VerilogBaseType::Decimal, content.to_string());
+        let cnst = VerilogConstant::new(None, VerilogBaseType::Decimal, content.to_string())
+            .with_signedness(true);
         Ok::<_, nom::Err<nom::error::Error<&str>>>(cnst)
     })(input)
 }
@@ -291,57 +303,16 @@ mod tests {
         );
     }
 
+    /// A bare decimal is [`VerilogConstant::from_int`]'s spelling exactly,
+    /// including its signedness — a decimal with no base designator is signed.
     #[test]
     fn test_integer_constants() {
-        assert_eq!(
-            integer_constant("123"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "123".to_string())
-            ))
-        );
-        assert_eq!(
-            integer_constant("0"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "0".to_string())
-            ))
-        );
-        assert_eq!(
-            integer_constant("456789"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "456789".to_string())
-            ))
-        );
-        assert_eq!(
-            integer_constant("42"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "42".to_string())
-            ))
-        );
-        assert_eq!(
-            integer_constant("987654321"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "987654321".to_string())
-            ))
-        );
-        assert_eq!(
-            integer_constant("987654321"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "987654321".to_string())
-            ))
-        );
-        assert_eq!(
-            integer_constant("42"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "42".to_string())
-            ))
-        );
+        for digits in ["123", "0", "456789", "42", "987654321"] {
+            assert_eq!(
+                integer_constant(digits),
+                Ok(("", VerilogConstant::from_int(digits.parse().unwrap())))
+            );
+        }
     }
 
     #[test]
@@ -445,27 +416,14 @@ mod tests {
                 VerilogConstant::new(Some(8), VerilogBaseType::Decimal, "234".to_string())
             ))
         );
-        assert_eq!(
-            verilog_const("123"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "123".to_string())
-            ))
-        );
-        assert_eq!(
-            verilog_const("0"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "0".to_string())
-            ))
-        );
-        assert_eq!(
-            verilog_const("456789"),
-            Ok((
-                "",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "456789".to_string())
-            ))
-        );
+        // A decimal with no base designator is signed, which is exactly what
+        // `from_int` spells.
+        for digits in ["123", "0", "456789"] {
+            assert_eq!(
+                verilog_const(digits),
+                Ok(("", VerilogConstant::from_int(digits.parse().unwrap())))
+            );
+        }
         assert_eq!(
             verilog_const("'b1010"),
             Ok((
@@ -585,11 +543,33 @@ mod tests {
         assert!(sized_const("5 ' h0").is_err());
         assert_eq!(
             verilog_const("5 ;"),
-            Ok((
-                " ;",
-                VerilogConstant::new(None, VerilogBaseType::Decimal, "5".to_string())
-            ))
+            Ok((" ;", VerilogConstant::from_int(5)))
         );
+    }
+
+    /// A decimal written with **no base designator** is signed; every other
+    /// literal is unsigned unless it carries an `s`. Measured against iverilog
+    /// 12.0 for a `localparam signed [31:0] S = -1;` written into a
+    /// `reg [35:0]`: `'d0 + S` is `0ffffffff` and `'b0 + S` is `0ffffffff`,
+    /// where `0 + S` and `'sd0 + S` are both `fffffffff`. Corpus
+    /// `param-extend` is the case, and reading the *shape* of the literal —
+    /// no size and a decimal base — cannot tell `0` from `'d0`.
+    #[test]
+    fn test_only_a_baseless_decimal_is_signed_without_an_s() {
+        for (source, signed) in [
+            ("42", true),
+            ("'d42", false),
+            ("'sd42", true),
+            ("'b1010", false),
+            ("'sb1010", true),
+            ("'h2a", false),
+            ("4'd12", false),
+            ("4'sd12", true),
+        ] {
+            let (rest, constant) = verilog_const(source).expect("should parse");
+            assert!(rest.is_empty(), "unparsed {:?} for {:?}", rest, source);
+            assert_eq!(constant.is_signed(), signed, "{}", source);
+        }
     }
 
     #[test]
