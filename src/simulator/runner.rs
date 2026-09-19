@@ -40,7 +40,7 @@ use crate::parsers::{
 };
 use crate::register::Register;
 use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
-use crate::simulator::eval::{eval_sized, EvalError};
+use crate::simulator::eval::{eval, eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
@@ -358,6 +358,37 @@ impl EventWatch {
     }
 }
 
+/// The starting value of every *non-plain* entry in a sensitivity list, which
+/// is what the first edge of that entry is measured from.
+///
+/// Taken where the design is elaborated and nothing has run yet, so a
+/// `posedge (clock & b)` over two untouched registers starts at `x` — and
+/// `clock` reaching `0` while `b` reaches `1111` is then the *negedge* of the
+/// expression it really is, rather than the posedge the rising operand looks
+/// like. A block whose entries are all plain gets an empty vector and pays
+/// nothing for the rest of the run.
+fn snapshot_event_values(control: &EventControl, state: &StateStore) -> Vec<Option<Register>> {
+    let EventControl::Events(events) = control else {
+        return Vec::new();
+    };
+    if events
+        .iter()
+        .all(|event| events::is_plain_event_expression(&event.expression))
+    {
+        return Vec::new();
+    }
+    events
+        .iter()
+        .map(|event| {
+            if events::is_plain_event_expression(&event.expression) {
+                None
+            } else {
+                eval(&event.expression, state).ok()
+            }
+        })
+        .collect()
+}
+
 /// What one continuous assignment carrying a `#delay` is driving, and what it
 /// is about to drive.
 ///
@@ -478,6 +509,22 @@ pub struct Simulator {
     /// one so the swap is free and a round costs a `fill` of bytes.
     ran_before: Vec<bool>,
     ran_now: Vec<bool>,
+    /// What each block's *non-plain* sensitivity entries last evaluated to —
+    /// one slot per entry in the block's list, `None` for an entry that names
+    /// a signal directly and is matched against the change journal instead.
+    ///
+    /// `always @(posedge clock & b)` has an edge of its own, which is not the
+    /// edge of either operand: `clock` going `x -> 0` beside `b` going
+    /// `x -> 1111` is a *negedge* of `clock & b` although the `b` operand rose.
+    /// Keeping the evaluated value is what lets the edge be asked of the
+    /// expression. A block whose entries are all plain — every design that
+    /// writes only `posedge clk` — keeps an empty vector, which is what keeps
+    /// the extra evaluation off the settle round's hot path.
+    event_values: Vec<Vec<Option<Register>>>,
+    /// Whether any block has an expression sensitivity entry at all, so that a
+    /// design that has none — nearly every design — asks one `bool` per settle
+    /// round rather than reaching into [`Simulator::event_values`] per block.
+    expression_events: bool,
     /// The `fork`…`join`s currently running, indexed by the number a branch
     /// cursor carries. A retired slot is `None` and is handed out again, so a
     /// `fork` inside a loop does not grow this without bound. Empty for a
@@ -550,6 +597,8 @@ impl Simulator {
             waiting: Vec::new(),
             ran_before: Vec::new(),
             ran_now: Vec::new(),
+            event_values: Vec::new(),
+            expression_events: false,
             forks: Vec::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
@@ -652,6 +701,12 @@ impl Simulator {
         self.blocks = elaborated.blocks;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
+        self.event_values = self
+            .blocks
+            .iter()
+            .map(|block| snapshot_event_values(&block.control, &self.state))
+            .collect();
+        self.expression_events = self.event_values.iter().any(|values| !values.is_empty());
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
         // An aliased port is a *name* the design has and the flat store does
@@ -872,6 +927,9 @@ impl Simulator {
             }
 
             let mut pending = Vec::new();
+            // Hoisted out of the loop: a design with no `posedge (a & b)` in
+            // it pays one `bool` for the whole round.
+            let expression_events = self.expression_events;
             for id in 0..self.blocks.len() {
                 // A free-running `always` waits on nothing, so `always_block_fires`
                 // would report it as firing on every edge. It is driven by time,
@@ -890,6 +948,13 @@ impl Simulator {
                     .any(|waiting| waiting.cursor.block == id)
                     || self.is_forking(id)
                 {
+                    // A sensitivity entry that is an *expression* still has to
+                    // be re-measured, or the round that does give the block a
+                    // turn would compare against a value several rounds old and
+                    // find an edge that never happened.
+                    if expression_events {
+                        self.refresh_event_values(id);
+                    }
                     continue;
                 }
                 // An edge the block made *itself* on its last run through
@@ -910,7 +975,12 @@ impl Simulator {
                 } else {
                     &edges[..]
                 };
-                if self.blocks[id].fires(offered, &self.state) {
+                let fires = if expression_events {
+                    self.block_fires(id, offered)
+                } else {
+                    self.blocks[id].fires(offered, &self.state)
+                };
+                if fires {
                     let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
                     pending.extend(updates);
                 }
@@ -928,6 +998,42 @@ impl Simulator {
         Err(SimulationError::NoConvergence {
             passes: MAX_DELTA_CYCLES,
         })
+    }
+
+    /// Whether the edges this round woke block `id`.
+    ///
+    /// A block all of whose sensitivity entries name a signal directly takes
+    /// the path it always took — the whole question is answered against the
+    /// change journal and nothing is evaluated. A block with an *expression*
+    /// entry goes through [`events::events_fire`] instead, which measures that
+    /// entry's edge from what it last evaluated to and records what it
+    /// evaluates to now.
+    fn block_fires(&mut self, id: usize, edges: &[SignalEdge]) -> bool {
+        if self.event_values[id].is_empty() {
+            return self.blocks[id].fires(edges, &self.state);
+        }
+        // Taken out and put back so the block and its values can be borrowed
+        // at once; it is a `Vec` move and the design that pays for it is one
+        // that wrote `posedge (a & b)`.
+        let mut values = std::mem::take(&mut self.event_values[id]);
+        let fired = match &self.blocks[id].control {
+            EventControl::Events(events) => {
+                events::events_fire(events, edges, &self.state, &mut values)
+            }
+            _ => false,
+        };
+        self.event_values[id] = values;
+        fired
+    }
+
+    /// Re-measures a block's *expression* sensitivity entries without asking
+    /// whether they fire, for the rounds the block is not offered a turn at
+    /// all. Nothing to do for a block whose entries all name a signal.
+    fn refresh_event_values(&mut self, id: usize) {
+        if self.event_values[id].is_empty() {
+            return;
+        }
+        self.block_fires(id, &[]);
     }
 
     /// Resumes every waiting block whose wait is now satisfied.
@@ -7121,6 +7227,58 @@ mod tests {
         simulator.advance(5).expect("time should advance");
 
         assert_eq!(simulator.output().lines(), vec!["hit=1110"]);
+    }
+
+    /// A sensitivity entry that is an *expression* has an edge of its own,
+    /// which is not the edge of any one operand. At time zero `clock` goes
+    /// `x -> 0` while `b` goes `x -> 1111`: `b`'s least significant bit rises,
+    /// but `clock & b` goes `xxxx -> 0000`, which is a **negedge**. Matching
+    /// the operands instead wakes the block there and puts every later count
+    /// one out.
+    ///
+    /// iverilog 12.0 on this design:
+    ///
+    /// ```text
+    /// 0 clock=0
+    /// 10 clock=1
+    /// 10 edge count=1
+    /// 20 clock=2
+    /// 30 clock=3
+    /// 30 edge count=2
+    /// ```
+    #[test]
+    fn test_a_posedge_of_an_expression_is_the_expressions_own_edge() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg [3:0] clock, b, count;
+                initial begin
+                    b = 4'b1111; count = 0;
+                    for (clock = 0; clock <= 3; clock = clock + 1) begin
+                        $display("%0t clock=%h", $time, clock);
+                        #10;
+                    end
+                end
+                always @(posedge clock & b) begin
+                    count = count + 1;
+                    $display("%0t edge count=%h", $time, count);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(100).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "0 clock=0",
+                "10 clock=1",
+                "10 edge count=1",
+                "20 clock=2",
+                "30 clock=3",
+                "30 edge count=2",
+            ]
+        );
     }
 
     /// An `always` block is sensitive only while it is *parked* at its event
