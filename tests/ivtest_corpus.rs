@@ -986,3 +986,107 @@ fn first_token(remainder: &str) -> String {
         text.chars().take(2).collect()
     }
 }
+
+/// **Run one corpus design and show what it printed.**
+///
+/// The closure report names the files that got a wrong answer; it cannot say
+/// *what* they got, because printing 1514 designs' output would bury the
+/// number the report exists for. So triage always came down to hand-rolling a
+/// throwaway unit test around one design — which is slow, easy to get subtly
+/// wrong (a corpus file with a backtick directive has to go through the
+/// preprocessor, not `parse_verilog_source`), and thrown away again each time.
+///
+/// `VISILOG_ONLY=<name>` is that probe, kept: it runs exactly the entry named,
+/// through the same `judge_with` every other entry goes through, and prints
+/// the outcome, the design's output, and — when the entry has a gold file —
+/// the two side by side with the first differing line marked.
+///
+/// ```text
+/// VISILOG_ONLY=pr2835632b cargo test --test ivtest_corpus ivtest_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn ivtest_probe() {
+    let Ok(wanted) = std::env::var("VISILOG_ONLY") else {
+        println!("set VISILOG_ONLY=<entry name> to probe one design");
+        return;
+    };
+    let Some((root, entries)) = load() else {
+        return;
+    };
+    let dir = root.join("ivtest").join("ivltests");
+    let preprocessor = corpus_preprocessor(&root);
+    let search_paths = [root.join("ivtest"), dir.clone()];
+
+    let Some(entry) = entries.iter().find(|e| e.name == wanted) else {
+        panic!("no corpus entry named `{}`", wanted);
+    };
+    let source = std::fs::read_to_string(dir.join(format!("{}.v", entry.name)))
+        .unwrap_or_else(|e| panic!("cannot read `{}.v`: {}", entry.name, e));
+    let gold = entry
+        .gold
+        .as_ref()
+        .and_then(|name| std::fs::read_to_string(root.join("ivtest").join("gold").join(name)).ok());
+
+    let outcome = judge_with(&preprocessor, &source, gold.as_deref(), &search_paths);
+    println!("=== {} ({}) ===", entry.name, entry.kind);
+    println!("outcome: {:?}\n", outcome);
+
+    // Re-run to get the text itself. `judge_with` answers an outcome rather
+    // than the output, and widening it for one debug affordance would put a
+    // second return value on the path every one of the 1514 entries takes.
+    let output = probe_output(&preprocessor, &source, &search_paths);
+    match gold {
+        None => {
+            println!("--- output ---");
+            print!("{}", output);
+        }
+        Some(gold) => {
+            println!("--- gold | got ---");
+            let gold_lines: Vec<&str> = gold.lines().collect();
+            let got_lines: Vec<&str> = output.lines().collect();
+            let mut marked = false;
+            for i in 0..gold_lines.len().max(got_lines.len()) {
+                let expected = gold_lines.get(i).copied().unwrap_or("<missing>");
+                let got = got_lines.get(i).copied().unwrap_or("<missing>");
+                let differs = expected.trim_end() != got.trim_end();
+                let mark = if differs && !marked {
+                    marked = true;
+                    " <<< first difference"
+                } else if differs {
+                    " <"
+                } else {
+                    ""
+                };
+                println!("{:>4} | {:<40} | {}{}", i + 1, expected, got, mark);
+            }
+        }
+    }
+}
+
+/// What a design printed, for [`ivtest_probe`]. An error on the way is
+/// reported as text rather than returned, because the probe wants to *see* a
+/// setup failure next to whatever the design managed to print first.
+fn probe_output(preprocessor: &Preprocessor, source: &str, search_paths: &[PathBuf]) -> String {
+    let Ok(parsed) = front_end(preprocessor, source) else {
+        return "<parse failed>\n".to_string();
+    };
+    let timescale = parsed.timescale;
+    let modules = parsed.modules;
+    let Some(top) = top_module(&modules) else {
+        return "<no top module>\n".to_string();
+    };
+    let mut simulator = Simulator::with_modules(modules, top);
+    simulator.set_timescale(timescale);
+    for directory in search_paths {
+        simulator.add_search_path(directory.clone());
+    }
+    simulator.set_output_directory(scratch_directory());
+    if let Err(error) = simulator.setup() {
+        return format!("<setup failed: {:?}>\n", error);
+    }
+    if let Err(error) = simulator.advance(TIME_BUDGET) {
+        return format!("{}<run failed: {:?}>\n", simulator.output().text(), error);
+    }
+    simulator.output().text().to_string()
+}

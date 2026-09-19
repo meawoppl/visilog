@@ -631,7 +631,7 @@ pub fn apply_drive(state: &mut StateStore, drive: &Drive) -> Result<bool, Simula
 /// stored.
 pub fn release_drive(state: &mut StateStore, target: &Expression) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
-    state.remove_drive(resolved.name(), DriveLevel::Force);
+    remove_drives_over(state, &resolved, DriveLevel::Force)?;
     // A `release` puts nothing back. A **net** reverts anyway, because its
     // continuous drivers reach it again on the next pass; a **variable** has no
     // driver, so it keeps the value the force left. That asymmetry is the whole
@@ -648,7 +648,52 @@ pub fn release_drive(state: &mut StateStore, target: &Expression) -> Result<(), 
 /// the value it last produced in place.
 pub fn deassign_drive(state: &mut StateStore, target: &Expression) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
-    state.remove_drive(resolved.name(), DriveLevel::Assign);
+    remove_drives_over(state, &resolved, DriveLevel::Assign)?;
+    Ok(())
+}
+
+/// Takes off every drive of `level` on the target's signal whose bits the
+/// target covers.
+///
+/// A drive is per **bit**, so two of them may hold different parts of one
+/// vector at once — and a `release` or `deassign` of one has to leave the
+/// other standing. `release bus[0]` over `force bus[0]` beside
+/// `force bus[3:2]` takes only the first, where removing by signal name alone
+/// took both and the `[3:2]` force silently vanished.
+///
+/// Releasing the *whole* signal takes every drive on it, whatever bits each
+/// one held, which is what `release bus;` means.
+fn remove_drives_over(
+    state: &mut StateStore,
+    target: &ResolvedTarget,
+    level: DriveLevel,
+) -> Result<(), SimulationError> {
+    let released = match target {
+        ResolvedTarget::Bits { indices, .. } => Some(indices.clone()),
+        _ => None,
+    };
+    let drives = state.drives();
+    let mut keep: Vec<bool> = Vec::with_capacity(drives.len());
+    for drive in drives.iter() {
+        if drive.name() != target.name() || drive.level() != level {
+            keep.push(true);
+            continue;
+        }
+        let Some(released) = released.as_deref() else {
+            keep.push(false);
+            continue;
+        };
+        keep.push(match resolve_target(state, drive.target())? {
+            // A drive goes only when the release names every bit it holds, so
+            // a release of part of a wider force leaves that force in place
+            // rather than dropping bits it did not name.
+            ResolvedTarget::Bits { indices, .. } => {
+                !indices.iter().all(|bit| released.contains(bit))
+            }
+            _ => false,
+        });
+    }
+    state.retain_drives(&keep);
     Ok(())
 }
 

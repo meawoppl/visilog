@@ -1128,31 +1128,48 @@ impl StateStore {
             .find(|drive| drive.name == name && drive.level == level)
     }
 
-    /// Installs a drive, replacing any of the same strength on the same signal.
+    /// Installs a drive, replacing one of the same strength on the same
+    /// *target*.
     ///
-    /// Re-`force`ing an already forced signal replaces what it drives; there
-    /// is nothing to remember, because a `release` puts nothing back.
+    /// Re-`force`ing an already forced target replaces what it drives; there
+    /// is nothing to remember, because a `release` puts nothing back. The key
+    /// is the target rather than the signal, because a drive is per **bit**:
+    /// `force bus[0]` and `force bus[3:2]` hold different parts of one vector
+    /// and both stand at once. Keying by signal name made the second silently
+    /// evict the first (corpus `force_release_reg_pv`, `assign_deassign_pv`).
+    ///
+    /// A new drive goes on the end, so where two of them do overlap the later
+    /// one is applied last and wins — which is the rule the LRM asks for,
+    /// falling out of the order rather than needing one of its own.
     pub fn install_drive(&mut self, drive: Drive) {
         let drives = Rc::make_mut(&mut self.drives);
-        match drives
-            .iter_mut()
-            .find(|existing| existing.name == drive.name && existing.level == drive.level)
-        {
-            Some(existing) => {
-                existing.target = drive.target;
-                existing.value = drive.value;
-            }
+        match drives.iter_mut().find(|existing| {
+            existing.name == drive.name
+                && existing.level == drive.level
+                && existing.target == drive.target
+        }) {
+            Some(existing) => existing.value = drive.value,
             None => drives.push(drive),
         }
     }
 
-    /// Takes the drive of `level` off `name`, handing it back to the caller.
-    pub fn remove_drive(&mut self, name: &str, level: DriveLevel) -> Option<Drive> {
-        let position = self
-            .drives
-            .iter()
-            .position(|drive| drive.name == name && drive.level == level)?;
-        Some(Rc::make_mut(&mut self.drives).remove(position))
+    /// Keeps the drives `keep` marks, which is positional over [`drives`].
+    ///
+    /// Which drives a `release` takes off is a question about the *bits* each
+    /// one holds, and resolving a target needs the evaluator — so the decision
+    /// is made in `exec::release_drive`, and this applies it.
+    ///
+    /// [`drives`]: StateStore::drives
+    pub fn retain_drives(&mut self, keep: &[bool]) {
+        if keep.iter().all(|keep| *keep) {
+            return;
+        }
+        let mut index = 0;
+        Rc::make_mut(&mut self.drives).retain(|_| {
+            let kept = keep.get(index).copied().unwrap_or(true);
+            index += 1;
+            kept
+        });
     }
 
     /// Records a function the design declared, under its qualified name.
