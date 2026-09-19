@@ -8,9 +8,7 @@ use nom::{
     IResult,
 };
 
-use crate::parsers::expr::{
-    bit_select, indexed_part_select, part_select, verilog_expression, word_select, Expression,
-};
+use crate::parsers::expr::{select, verilog_expression, Expression};
 use crate::parsers::gates::{drive_strength, DriveStrength};
 use crate::parsers::identifier::hierarchical_identifier;
 
@@ -234,18 +232,14 @@ pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
 /// The target of an assignment: a whole signal, a bit or part select of one, or
 /// a concatenation of those.
 ///
-/// `bit_select` is tried before `part_select` so that a conditional index —
-/// `q[a ? b : c]` — is read as a bit select rather than having its `:` mistaken
-/// for a part-select separator. Both bounds of a part select are ordinary
-/// expressions, so `q[n:m]` and `q[i]` work as well as literal indices.
+/// Every shape of `name[...]` comes from one parser, `expr::select`, which is
+/// also what makes `mem[i][3:0] = d;` a target: a bit select is read before a
+/// part select, so a conditional index — `q[a ? b : c]` — is not split at its
+/// `:`, and both bounds of a part select are ordinary expressions, so `q[n:m]`
+/// and `q[i]` work as well as literal indices.
 pub fn assignment_lhs(input: &str) -> IResult<&str, Expression> {
     alt((
-        // `mem[i][3:0] = d;` — before every single-bracket select, which would
-        // match the first bracket and leave the second unconsumed.
-        word_select,
-        bit_select,
-        indexed_part_select,
-        part_select,
+        select,
         // A hierarchical name is writable, not just readable: a testbench
         // reaching into a design writes `top.pass = 1'b1;`, and elaboration
         // has already flattened the store to exactly those dotted names.
