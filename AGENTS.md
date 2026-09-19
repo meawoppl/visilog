@@ -1758,8 +1758,9 @@ tripwire.
   the run, which is the whole reason the operator exists. `indexed_select_width` and
   `indexed_select_indices` are shared by the evaluator and by `resolve_target`, so reading
   and writing a select can never disagree about which bits it names. An unknown *base*
-  selects `x` when read — that is what a vector indexed by an unknown holds — but is a
-  named error as an assignment *target*, since a write would have nowhere to land.
+  selects `x` when read — that is what a vector indexed by an unknown holds — and a write
+  through one is **ignored** — the LRM says so and iverilog leaves the target untouched, as it
+  does for a write out of range. `ResolvedTarget::Nowhere` is that write.
   `indexed_part_select` is tried before `part_select`, which would otherwise read the `:`
   of `+:` as its own separator.
 - **`resolve_target` guards its part-select width, and must keep doing so.** A range like

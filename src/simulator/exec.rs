@@ -68,6 +68,11 @@ pub enum ResolvedTarget {
     /// paths that assume a single one check for it rather than trusting
     /// [`ResolvedTarget::name`].
     Parts(Vec<ResolvedTarget>),
+    /// A select whose index is not a known number, on the left of an
+    /// assignment. The LRM says such a write is ignored — as a write out of
+    /// range already is — and iverilog leaves the target untouched, so this is
+    /// a target the write lands nowhere in rather than an error.
+    Nowhere,
 }
 
 impl ResolvedTarget {
@@ -82,6 +87,7 @@ impl ResolvedTarget {
             ResolvedTarget::Bits { name, .. } => name,
             ResolvedTarget::Word { name, .. } => name,
             ResolvedTarget::Event(name) => name,
+            ResolvedTarget::Nowhere => "",
             ResolvedTarget::Parts(parts) => parts.first().map_or("", |part| part.name()),
         }
     }
@@ -119,6 +125,8 @@ impl ResolvedTarget {
             // Nothing is written into an event, so the value a trigger carries
             // is sized by itself and then thrown away.
             ResolvedTarget::Event(_) => SELF_DETERMINED,
+            // A write to nowhere is discarded, so its value sizes itself.
+            ResolvedTarget::Nowhere => SELF_DETERMINED,
             // A concatenation is as wide as its parts add up to, which is what
             // sizes the right hand side that fills it.
             ResolvedTarget::Parts(parts) => parts.iter().map(|part| part.width(state)).sum(),
@@ -145,9 +153,12 @@ impl ResolvedTarget {
             ResolvedTarget::Word { name, .. } => {
                 state.memory(name).is_some_and(|memory| memory.is_real())
             }
-            ResolvedTarget::Bits { .. } | ResolvedTarget::Event(_) | ResolvedTarget::Parts(_) => {
-                false
-            }
+            // Nothing is written through a select with no known index, so there
+            // is nothing to convert into.
+            ResolvedTarget::Bits { .. }
+            | ResolvedTarget::Event(_)
+            | ResolvedTarget::Parts(_)
+            | ResolvedTarget::Nowhere => false,
         }
     }
 }
@@ -285,17 +296,26 @@ pub fn resolve_target(
             if state.any_memory() && state.memory(&id.name).is_some() {
                 return Ok(ResolvedTarget::Word {
                     name: id.name.clone(),
-                    index: target_index(state, index)?,
+                    index: match known_index(state, index)? {
+                        Some(index) => index,
+                        None => return Ok(ResolvedTarget::Nowhere),
+                    },
                 });
             }
             Ok(ResolvedTarget::Bits {
                 name: id.name.clone(),
-                indices: vec![target_index(state, index)?],
+                indices: vec![match known_index(state, index)? {
+                    Some(index) => index,
+                    None => return Ok(ResolvedTarget::Nowhere),
+                }],
             })
         }
         Expression::PartSelect(id, first, second) => {
-            let first = target_index(state, first)?;
-            let second = target_index(state, second)?;
+            let (Some(first), Some(second)) =
+                (known_index(state, first)?, known_index(state, second)?)
+            else {
+                return Ok(ResolvedTarget::Nowhere);
+            };
             // A nonsense range — `a[1000000:0]`, or one whose bounds came out
             // of a parameter that is not what the design meant — names more
             // bits than any register has. Refusing it here is what stops the
@@ -324,11 +344,11 @@ pub fn resolve_target(
             upward,
         } => {
             let span = indexed_select_width(width, state)?;
-            // A write through an unknown base has nowhere to land. Reporting it
-            // rather than writing somewhere arbitrary keeps the rule that a
-            // wrong answer is never produced quietly.
-            let indices = indexed_select_indices(base, span, *upward, state)?
-                .ok_or_else(|| SimulationError::UnsupportedTarget(target.to_contracted_string()))?;
+            // A write through an unknown base is ignored — the LRM says so and
+            // iverilog leaves the target untouched, as for a write out of range.
+            let Some(indices) = indexed_select_indices(base, span, *upward, state)? else {
+                return Ok(ResolvedTarget::Nowhere);
+            };
             Ok(ResolvedTarget::Bits {
                 name: id.name.clone(),
                 indices,
@@ -449,6 +469,13 @@ pub fn drive_at(
     value: &Register,
     level: DriveLevel,
 ) -> Result<bool, SimulationError> {
+    // A write through an index that is not a known number lands nowhere. The
+    // LRM says it is ignored, exactly as a write out of range is, and iverilog
+    // leaves the target untouched — so it returns before anything, a real
+    // conversion included, looks at a target that names no bits.
+    if *target == ResolvedTarget::Nowhere {
+        return Ok(false);
+    }
     // A real and an integer are converted into each other here, before the
     // value is resized, because resizing is what would destroy it: an integer
     // widened to sixty-four bits and then read as a double is a number nothing
@@ -546,6 +573,7 @@ pub fn drive_at(
         }
         // Split above, before precedence was asked about.
         ResolvedTarget::Parts(_) => unreachable!("a concatenation is split first"),
+        ResolvedTarget::Nowhere => unreachable!("a write to nowhere returns first"),
     }
 }
 
@@ -566,7 +594,7 @@ pub fn install_drive(
     // A drive is recorded against one signal name, so a concatenation has no
     // place to live. Reporting it is better than installing it on the first
     // part and quietly losing the rest.
-    if resolved.is_multiple() {
+    if resolved.is_multiple() || resolved == ResolvedTarget::Nowhere {
         return Err(SimulationError::UnsupportedTarget(
             target.to_contracted_string(),
         ));
@@ -638,11 +666,12 @@ fn drive_word(
 
 /// A bit index on the left of an assignment has to be a constant, so anything
 /// that does not evaluate to a plain number is a target this driver cannot use.
-fn target_index(state: &StateStore, expr: &Expression) -> Result<i64, SimulationError> {
-    eval(expr, state)?
+/// The index a select on the left of an assignment names, or `None` when it is
+/// not a known number — which makes the write land nowhere rather than fail.
+fn known_index(state: &StateStore, expr: &Expression) -> Result<Option<i64>, SimulationError> {
+    Ok(eval(expr, state)?
         .to_u128()
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| SimulationError::UnsupportedTarget(expr.to_contracted_string()))
+        .and_then(|value| i64::try_from(value).ok()))
 }
 
 fn drive_bits(
