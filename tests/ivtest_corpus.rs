@@ -1062,14 +1062,20 @@ fn ivtest_probe() {
         .as_ref()
         .and_then(|name| std::fs::read_to_string(root.join("ivtest").join("gold").join(name)).ok());
 
-    let outcome = judge_with(&preprocessor, &source, gold.as_deref(), &search_paths);
+    let outcome = judge_with(
+        &preprocessor,
+        &source,
+        gold.as_deref(),
+        &search_paths,
+        &entry.plusargs,
+    );
     println!("=== {} ({}) ===", entry.name, entry.kind);
     println!("outcome: {:?}\n", outcome);
 
     // Re-run to get the text itself. `judge_with` answers an outcome rather
     // than the output, and widening it for one debug affordance would put a
     // second return value on the path every one of the 1514 entries takes.
-    let output = probe_output(&preprocessor, &source, &search_paths);
+    let output = probe_output(&preprocessor, &source, &search_paths, &entry.plusargs);
     match gold {
         None => {
             println!("--- output ---");
@@ -1101,7 +1107,12 @@ fn ivtest_probe() {
 /// What a design printed, for [`ivtest_probe`]. An error on the way is
 /// reported as text rather than returned, because the probe wants to *see* a
 /// setup failure next to whatever the design managed to print first.
-fn probe_output(preprocessor: &Preprocessor, source: &str, search_paths: &[PathBuf]) -> String {
+fn probe_output(
+    preprocessor: &Preprocessor,
+    source: &str,
+    search_paths: &[PathBuf],
+    plusargs: &[String],
+) -> String {
     let Ok(parsed) = front_end(preprocessor, source) else {
         return "<parse failed>\n".to_string();
     };
@@ -1116,6 +1127,9 @@ fn probe_output(preprocessor: &Preprocessor, source: &str, search_paths: &[PathB
         simulator.add_search_path(directory.clone());
     }
     simulator.set_output_directory(scratch_directory());
+    for plusarg in plusargs {
+        simulator.add_plusarg(plusarg.clone());
+    }
     if let Err(error) = simulator.setup() {
         return format!("<setup failed: {:?}>\n", error);
     }
