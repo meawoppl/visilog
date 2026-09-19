@@ -786,6 +786,17 @@ the same thing and its declaration runs after the port's, overwriting the fill, 
 spellings land on `x` with no special case. An array of nets gets the same treatment
 through `Memory::of_nets`.
 
+**A `reg` behind an *aliased* port wins the fill, because it is the net's driver.**
+`wire w; child u (w);` against `output reg w` inside the child is one store entry, so
+only one of the two declarations can fill it — and it is the child's: the `reg` drives
+that net, and what a driver has not said yet is `x` rather than `z`. A port bound to an
+expression already had this (it has an entry of its own), and the alias case is
+`StateStore::redeclare_as_variable`, called from `declare_port` for the header spelling
+and from `declare_local` for `output w; reg w;` in the body. It keeps the width aliasing
+gave the entry — the *parent's* — and changes only the fill and the net flag. Corpus
+`pr1792108`, `pr1645518` and `memidx` are that rule, and iverilog 12.0 was measured for
+all three spellings: `ansi=x body=x float=z`.
+
 **A name nothing declares that is *wired to something* is a net, not an error.** That is
 IEEE 1364-2005 §4.5, and `Elaborator::declare_implicit_nets` is where it happens: the
 three places are a module instance's port connection, a gate or primitive terminal, and

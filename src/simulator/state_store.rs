@@ -1468,6 +1468,27 @@ impl StateStore {
         self.declare_filled(name, range, signed, true, Register::high_impedance);
     }
 
+    /// Turns a signal that was declared a net into a variable, keeping the
+    /// width it was declared at and refilling it with `x`.
+    ///
+    /// This is what an **aliased** port that a child backs with a `reg` asks
+    /// for. The parent's `wire w;` and the child's `output reg w` are one store
+    /// entry here, so only one of the two fills can stand — and it is the
+    /// child's, because the `reg` is a driver: `w` reads `x` because its driver
+    /// has not said what it is, not `z` because nothing is driving it.
+    pub fn redeclare_as_variable(&mut self, name: &str) {
+        let Some(signal) = self.name_to_signal.get(name) else {
+            return;
+        };
+        let range = signal.range();
+        let signed = signal.is_signed();
+        self.name_to_signal.insert(
+            name.to_string(),
+            SignalState::with_range(Register::unknown(range_width(range)), range)
+                .with_signedness(signed),
+        );
+    }
+
     /// Declares a `real`: sixty-four bits read as a double, starting at `0.0`.
     ///
     /// It is the one variable that does **not** start unknown, and that is a
