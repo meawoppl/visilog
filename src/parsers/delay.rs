@@ -9,7 +9,7 @@ use nom::{
 
 use super::{
     constants::{verilog_const, VerilogConstant},
-    expr::{verilog_expression, Expression},
+    expr::{real_literal, verilog_expression, Expression},
     identifier::hierarchical_identifier,
     simple::{ws, ws_and_comments},
 };
@@ -114,7 +114,24 @@ impl Delay {
     /// this is clamped rather than wrapped: a value too wide to be an `i64`
     /// would otherwise come back negative and queue a block *before* the one
     /// that scheduled it.
+    ///
+    /// A **real** delay is rounded to a whole tick, half away from zero — the
+    /// same rounding an assignment of a real to an integer takes. The clock
+    /// counts ticks of the design's time unit and nothing here models a finer
+    /// precision, so `#2.5` is three ticks rather than two and a half; a design
+    /// that turns on a fraction of a unit is wrong by that rounding rather than
+    /// refused. Reading the sixty-four bits of the IEEE-754 encoding as a tick
+    /// count, which is what `to_u128` would do, is the answer that looks like
+    /// nothing went wrong.
     fn to_ticks(value: &Register) -> i64 {
+        if value.is_real() {
+            let ticks = value.to_f64().round();
+            return if ticks.is_finite() && ticks > 0.0 {
+                ticks as i64
+            } else {
+                0
+            };
+        }
         value.to_u128().unwrap_or(0).min(i64::MAX as u128) as i64
     }
 }
@@ -281,16 +298,22 @@ fn delay_term(input: &str) -> IResult<&str, Delay> {
     ))(input)
 }
 
-/// The value an *unparenthesised* delay may take: an unsigned number, or the
-/// name of a parameter or a variable.
+/// The value an *unparenthesised* delay may take: a real number, an unsigned
+/// integer, or the name of a parameter or a variable.
 ///
 /// It is deliberately not a full expression. A delay prefixes a statement and
 /// the two are separated by nothing but whitespace, so `#5 a = 1;` would give
 /// an expression parser `5 a` to chew on and `#2 -> ev;` would give it `2 - >`.
 /// The LRM says the same thing: an expression is legal here only inside
 /// parentheses.
+///
+/// The real number is tried **first**, for the reason it is tried first
+/// everywhere else: the integer grammar matches the `0` of `#0.9` and leaves
+/// `.9` for the statement, which then fails somewhere that says nothing about
+/// the delay.
 fn delay_operand(input: &str) -> IResult<&str, Expression> {
     alt((
+        real_literal,
         map(verilog_const, Expression::Constant),
         map(hierarchical_identifier, Expression::Identifier),
     ))(input)
@@ -389,6 +412,59 @@ mod tests {
         assert_eq!(parse_delay_statement("# 12 ;"), Ok(("", Delay::new(12))));
         // A `#` with nothing to delay by is still not a delay.
         assert!(parse_delay("# ;").is_err());
+    }
+
+    /// `#0.9`, `#2.5` and `#1e3` are delays. The integer grammar matches the
+    /// `0` of `#0.9` on its own, so the real number has to be tried first.
+    #[test]
+    fn test_a_delay_may_be_a_real_number() {
+        assert_eq!(
+            parse_delay("#0.9"),
+            Ok(("", Delay::from_expression(Expression::RealLiteral(0.9))))
+        );
+        assert_eq!(parse_delay("#2.5 clk = ~clk;").unwrap().0, "clk = ~clk;");
+        assert_eq!(parse_delay_statement("#0.9;").unwrap().0, "");
+        assert_eq!(
+            parse_delay("#(1.5)"),
+            Ok(("", Delay::from_expression(Expression::RealLiteral(1.5))))
+        );
+    }
+
+    /// The clock counts whole ticks, so a real delay is rounded — half away
+    /// from zero, the way an assignment of a real to an integer is.
+    #[test]
+    fn test_a_real_delay_rounds_to_a_whole_tick() {
+        let store = StateStore::new();
+        for (source, ticks) in [
+            ("#0.9", 1),
+            ("#0.1", 0),
+            ("#2.5", 3),
+            ("#2.4", 2),
+            ("#4.99", 5),
+            ("#1e3", 1000),
+        ] {
+            let delay = parse_delay(source)
+                .unwrap_or_else(|error| panic!("{} should parse: {:?}", source, error))
+                .1;
+            assert_eq!(delay.ticks(&store), Ok(ticks), "{}", source);
+        }
+    }
+
+    /// A real delay reaches the event queue as its rounded tick count: `#2.5`
+    /// leaves `a` unset at time 2 and set at time 3.
+    #[test]
+    fn test_a_real_delay_simulates_at_its_rounded_time() {
+        let source = "module m(); reg a; initial #2.5 a = 1; endmodule";
+        let (remaining, module) = parse_module_declaration(source).expect("module should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("setup should succeed");
+
+        simulator.advance(2).expect("advance should succeed");
+        assert_eq!(simulator.get("a").expect("a should exist").to_binary(), "x");
+
+        simulator.advance(1).expect("advance should succeed");
+        assert_eq!(simulator.get("a").expect("a should exist").to_binary(), "1");
     }
 
     #[test]
