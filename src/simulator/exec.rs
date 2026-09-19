@@ -1056,7 +1056,9 @@ mod tests {
 
     #[test]
     fn test_case_subject_with_an_unknown_bit_matches_only_default() {
-        // Plain `case` uses `==` semantics, so an `x` never matches a literal.
+        // Plain `case` compares for *identity*, so an `x` bit matches only
+        // another `x` — never the `0` of a known literal. iverilog 12.0 takes
+        // the default arm for `case (3'bx11)` against a lone `3'b111` label.
         let mut store = store_with(&[("sel", "1x"), ("q", "0000")]);
         run(
             r#"begin
@@ -1069,6 +1071,67 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(value(&store, "q"), "1111");
+    }
+
+    /// A plain `case` compares with case equality, so an `x` label matches an
+    /// `x` subject and a `z` label a `z` subject — and the two are still told
+    /// apart. Measured against iverilog 12.0, which prints `1:x11`, `2:z11`,
+    /// `3:def` and `4:def` for:
+    ///
+    /// ```text
+    /// v = 3'bx11; case (v) 3'b000:…"1:000"; 3'bx11:…"1:x11"; default:…"1:def"; endcase
+    /// v = 3'bz11; case (v) 3'bx11:…"2:x11"; 3'bz11:…"2:z11"; default:…"2:def"; endcase
+    /// v = 3'bx11; case (v) 3'bz11:…"3:z11"; default:…"3:def"; endcase
+    /// v = 3'bx11; case (v) 4'bxx11:…"4:4bxx11"; default:…"4:def"; endcase
+    /// ```
+    ///
+    /// The fourth is the width rule: the subject is widened with a `0`, so
+    /// `0x11` is not the `xx11` the label spells.
+    #[test]
+    fn test_case_labels_match_x_and_z_for_identity() {
+        let arms = r#"begin
+                case (sel)
+                    3'b000: q = 4'b0000;
+                    3'bx11: q = 4'b0001;
+                    3'bz11: q = 4'b0010;
+                    default: q = 4'b1111;
+                endcase
+            end"#;
+
+        for (subject, expected) in [("x11", "0001"), ("z11", "0010"), ("011", "1111")] {
+            let mut store = store_with(&[("sel", subject), ("q", "0000")]);
+            run(arms, &mut store).unwrap();
+            assert_eq!(value(&store, "q"), expected, "sel = {}", subject);
+        }
+
+        // A `z` label alone does not catch an `x` subject.
+        let mut store = store_with(&[("sel", "x11"), ("q", "0000")]);
+        run(
+            r#"begin
+                case (sel)
+                    3'bz11: q = 4'b0010;
+                    default: q = 4'b1111;
+                endcase
+            end"#,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(value(&store, "q"), "1111");
+
+        // A wider label is compared at the wider width, and the subject is
+        // padded with a known `0` rather than with more unknown bits.
+        let mut store = store_with(&[("sel", "x11"), ("q", "0000")]);
+        run(
+            r#"begin
+                case (sel)
+                    4'bxx11: q = 4'b0010;
+                    default: q = 4'b1111;
+                endcase
+            end"#,
+            &mut store,
+        )
+        .unwrap();
         assert_eq!(value(&store, "q"), "1111");
     }
 

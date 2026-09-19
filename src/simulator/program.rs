@@ -1866,17 +1866,22 @@ fn instruction_suspends(instruction: &Instruction) -> bool {
 
 /// Whether a `case` item matches the subject.
 ///
-/// A plain `case` compares with `==` semantics, so an `x` or `z` on either side
-/// makes the comparison unknown, which is not a match. `casez` and `casex`
-/// instead read those bits as don't-cares — on *either* side, so a subject bit
-/// is as much a wildcard as a label bit — and compare the rest for identity,
-/// which is what lets `casez` still tell an `x` apart from a `0`.
+/// A plain `case` compares with *case equality* — `===`, not `==` — so an `x`
+/// matches an `x` and a `z` matches a `z`, and the two are still told apart
+/// from each other and from a known bit. IEEE 1364-2005 §9.5 says so and
+/// iverilog 12.0 agrees: `case (3'bx11)` takes the `3'bx11` arm, `case (3'bz11)`
+/// takes the `3'bz11` arm and not the `3'bx11` one, and `case (3'bx11)` against
+/// a lone `3'bz11` arm takes the default. That is exactly what the four-state
+/// `Register` comparison already answers, so the whole of the rule is comparing
+/// at the wider of the two widths.
+///
+/// `casez` and `casex` instead read those bits as don't-cares — on *either*
+/// side, so a subject bit is as much a wildcard as a label bit — and compare
+/// the rest for identity, which is what lets `casez` still tell an `x` apart
+/// from a `0`.
 fn case_matches(subject: &Register, label: &Register, kind: CaseKind) -> bool {
     match kind {
         CaseKind::Exact => {
-            if subject.has_unknown() || label.has_unknown() {
-                return false;
-            }
             let width = subject.width().max(label.width());
             subject.resize(width) == label.resize(width)
         }
@@ -2367,8 +2372,14 @@ mod tests {
         assert_eq!(case_arm_for(&program, "0x"), "1000");
     }
 
+    /// A plain `case` is *case equality*, so a `z` label matches a `z` subject
+    /// and nothing else: an `x` subject falls to the default even though the
+    /// same bit is unknown, and a `0` takes the known arm. Measured against
+    /// iverilog 12.0 — `case (3'bz11)` takes the `3'bz11` arm in preference to
+    /// a `3'bx11` one, and `case (3'bx11)` against a lone `3'bz11` arm takes
+    /// the default.
     #[test]
-    fn test_a_plain_case_still_does_not_match_an_unknown_bit() {
+    fn test_a_plain_case_matches_an_unknown_bit_only_against_its_own_kind() {
         let program = compile(
             r#"begin
                 case (sel)
@@ -2379,9 +2390,7 @@ mod tests {
             end"#,
         );
 
-        // An unknown bit on either side makes the comparison unknown, which is
-        // not a match — so both a `z` label and a `z` subject fall through.
-        assert_eq!(case_arm_for(&program, "1z"), "1000");
+        assert_eq!(case_arm_for(&program, "1z"), "0001");
         assert_eq!(case_arm_for(&program, "1x"), "1000");
         assert_eq!(case_arm_for(&program, "10"), "0010");
     }
