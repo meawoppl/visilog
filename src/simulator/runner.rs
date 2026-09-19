@@ -46,11 +46,13 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_strength, Gate, PassSwitch, Strength};
+use crate::simulator::gates::{resolve_strength, Driven, Gate, PassSwitch, Strength};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
+use crate::simulator::state_store::DriverTally;
 use crate::simulator::state_store::{bit_position_in, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
+use std::rc::Rc;
 
 /// Ceiling on delta cycles within a single settle. A design that keeps
 /// producing edges past this is oscillating, not converging.
@@ -657,6 +659,25 @@ impl Simulator {
         // ports on it. The dump is the only thing that wants the table by
         // value, and it is built once per elaboration.
         self.tasks.name_aliases(self.aliases.clone());
+        // A testbench reaching into an instance by a port's own name — `$countdrivers
+        // (pad1.pad, …)` — has to find the entry that port was aliased onto, and `eval`
+        // is handed the store and nothing else.
+        self.state.name_aliases(Rc::new(self.aliases.clone()));
+        // `$countdrivers` reports what reached a net, which means the net has to be
+        // *resolved* between its drivers rather than simply written — and that is
+        // decided here, once, not when the call runs. So a design that asks anywhere
+        // resolves every net a continuous driver names, singly driven ones included:
+        // resolving one strong driver gives exactly what writing it gave, and the
+        // driver list it builds on the way is the answer. A design that never asks
+        // pays one walk of its compiled blocks at setup and nothing per pass.
+        if self
+            .blocks
+            .iter()
+            .any(|block| block.program.calls_system_function("countdrivers"))
+        {
+            self.state.count_drivers();
+            self.resolve_every_driven_net();
+        }
         // `$printtimescale` is a question about the hierarchy, which
         // flattening has just thrown away — so the instance list comes over
         // here, together with every module's own scale, because a module the
@@ -1679,10 +1700,11 @@ impl Simulator {
                 contributions.push(Contribution {
                     target: ResolvedTarget::Whole(pulled.name.clone()),
                     value: Register::from_bits(vec![pulled.code; width]),
-                    strength: DriveStrength {
+                    counted: true,
+                    strength: Driven::Declared(DriveStrength {
                         zero: pulled.strength,
                         one: pulled.strength,
-                    },
+                    }),
                 });
             }
             for (index, assignment) in self.assignments.iter().enumerate() {
@@ -1742,7 +1764,10 @@ impl Simulator {
                     contributions.push(Contribution {
                         target,
                         value,
-                        strength: assignment.strength().unwrap_or(DriveStrength::STRONG),
+                        counted: true,
+                        strength: Driven::Declared(
+                            assignment.strength().unwrap_or(DriveStrength::STRONG),
+                        ),
                     });
                 } else {
                     changed |= drive_resolved(&mut self.state, &target, &value)?;
@@ -1765,7 +1790,7 @@ impl Simulator {
                 ));
             }
             for (index, gate) in self.gates.iter().enumerate() {
-                let code = gate.evaluate(&self.state)?;
+                let (code, driven) = gate.evaluate(&self.state)?;
                 // A delay does not stop a gate being a continuous driver — it
                 // only changes which value it drives, exactly as it does for
                 // an `assign`. The fresh value goes into flight; what comes
@@ -1801,12 +1826,28 @@ impl Simulator {
                         }
                     }
                 };
+                // A **delayed** gate drives at what it declared, not at the
+                // strength its inputs say this instant: the two would be out
+                // of step, since the value in hand is the one that landed
+                // `#n` ago and the strength would be the one for the value
+                // still in flight. A `bufif1` whose enable has just gone away
+                // would then let go of the net at once and keep its turn-off
+                // delay for nothing (corpus `rise_fall_decay2`). The declared
+                // strength beside the landed value is exactly the pairing
+                // every delayed gate had before a strength was modelled at
+                // all; a delayed *switch* consequently drives at `strong`
+                // rather than passing its source's level on.
+                let driven = match self.gate_delays.get(index).and_then(Option::as_ref) {
+                    Some(_) => Driven::Declared(gate.strength),
+                    None => driven,
+                };
                 for output in &gate.outputs {
                     let target = scalar_output(&self.state, resolve_target(&self.state, output)?);
                     contributions.push(Contribution {
                         target,
                         value: value.clone(),
-                        strength: gate.strength,
+                        counted: true,
+                        strength: driven,
                     });
                 }
             }
@@ -1850,7 +1891,8 @@ impl Simulator {
                 contributions.push(Contribution {
                     target,
                     value,
-                    strength: DriveStrength::STRONG,
+                    counted: true,
+                    strength: Driven::Declared(DriveStrength::STRONG),
                 });
             }
             // A `force` or a procedural `assign` on a *resolved* net is a
@@ -1879,7 +1921,11 @@ impl Simulator {
                     contributions.push(Contribution {
                         target,
                         value,
-                        strength: DriveStrength::STRONG,
+                        // A `force` contends but is not a *driver*: iverilog
+                        // answers `$countdrivers` over a forced net with the
+                        // drivers it had before the force.
+                        counted: false,
+                        strength: Driven::Declared(DriveStrength::STRONG),
                     });
                 }
             }
@@ -1895,6 +1941,37 @@ impl Simulator {
             }
         }
         Err(SimulationError::NoConvergence { passes: limit })
+    }
+
+    /// Marks every net a continuous driver names as one to resolve.
+    ///
+    /// Only a design that calls `$countdrivers` goes through here: resolution
+    /// of a single `strong` driver gives what writing it gave, so the values
+    /// do not move, and what is gained is the per-bit driver list the answer
+    /// is read off. A target that does not resolve to a single signal — a
+    /// concatenation — is left alone, since `target_is_resolved` would refuse
+    /// it anyway.
+    fn resolve_every_driven_net(&mut self) {
+        let mut driven: Vec<String> = Vec::new();
+        let mut note = |target: &Expression, state: &StateStore| {
+            if let Ok(resolved) = resolve_target(state, target) {
+                if !resolved.is_multiple() {
+                    driven.push(resolved.name().to_string());
+                }
+            }
+        };
+        for assignment in &self.assignments {
+            note(assignment.lhs(), &self.state);
+        }
+        for gate in &self.gates {
+            for output in &gate.outputs {
+                note(output, &self.state);
+            }
+        }
+        for udp in &self.udps {
+            note(&udp.output, &self.state);
+        }
+        self.resolved_nets.extend(driven);
     }
 
     /// Whether a net has to be resolved between its drivers rather than simply
@@ -1980,7 +2057,7 @@ impl Simulator {
                 }
             };
             // Bits run most significant first, the way a `Register` is written.
-            let mut driven: Vec<Vec<Strength>> = vec![Vec::new(); width];
+            let mut driven: Vec<Vec<BitDriver>> = vec![Vec::new(); width];
             for contribution in &contributions {
                 if contribution.target.name() != name
                     || contribution.target.word_address() != address
@@ -1989,9 +2066,12 @@ impl Simulator {
                 }
                 match &contribution.target {
                     // A whole net, or a whole word of an array of nets.
-                    ResolvedTarget::Whole(_) | ResolvedTarget::Word { .. } => {
-                        contribute_whole(&mut driven, &contribution.value, contribution.strength)
-                    }
+                    ResolvedTarget::Whole(_) | ResolvedTarget::Word { .. } => contribute_whole(
+                        &mut driven,
+                        &contribution.value,
+                        contribution.strength,
+                        contribution.counted,
+                    ),
                     ResolvedTarget::Bits { indices, .. } => {
                         let signal = self
                             .state
@@ -2002,10 +2082,10 @@ impl Simulator {
                             let Some(position) = signal.bit_position(*index) else {
                                 continue;
                             };
-                            driven[position].push(Strength::driven(
-                                value.get_raw()[offset],
-                                contribution.strength,
-                            ));
+                            driven[position].push(BitDriver {
+                                strength: contribution.strength.of(value.get_raw()[offset]),
+                                counted: contribution.counted,
+                            });
                         }
                     }
                     // Bits of a word are grouped by the same address a whole
@@ -2022,10 +2102,10 @@ impl Simulator {
                             let Some(position) = bit_position_in(memory.range(), *index) else {
                                 continue;
                             };
-                            driven[position].push(Strength::driven(
-                                value.get_raw()[offset],
-                                contribution.strength,
-                            ));
+                            driven[position].push(BitDriver {
+                                strength: contribution.strength.of(value.get_raw()[offset]),
+                                counted: contribution.counted,
+                            });
                         }
                     }
                     // An event holds no value to resolve, and a concatenation
@@ -2057,7 +2137,7 @@ impl Simulator {
             let mut levels = self.state.strengths_of(&net.name, bits.len());
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
-                    let resolved = resolve_strength(drivers);
+                    let resolved = resolve_strength(drivers.iter().map(|d| d.strength));
                     bits[position] = resolved.value();
                     levels[position] = resolved;
                 }
@@ -2072,8 +2152,38 @@ impl Simulator {
             // A memory word has no strength recorded: a name is in the signal
             // map or the memory map and never both, and only the signal map
             // has somewhere to keep one.
+            //
+            // A **strength** that moved counts as a change, because a MOS
+            // switch passes its source's strength on: `pullup (w); bufif1 (w,
+            // 1'b1, g);` leaves `w` at `1` whether `g` is on or not and only
+            // the level moves, and the `pmos` downstream of it has to be
+            // re-evaluated or it carries the stale one for the rest of the run
+            // (corpus `resolv1`).
             if let ResolvedTarget::Whole(name) = &target {
+                changed |= self
+                    .state
+                    .get_signal(name)
+                    .is_some_and(|signal| signal.strengths() != Some(levels.as_slice()));
                 self.state.set_strengths(name, levels);
+                // The driver *tally* is what `$countdrivers` reports, and it
+                // is taken after `bond_nodes` has pooled — a bit joined to
+                // another by a `tran`, which is what an `inout` port bound to
+                // a select is, has the node's drivers and not its own (corpus
+                // `countdrivers3`). A design that never asks builds none.
+                if self.state.counts_drivers() {
+                    let counts = net
+                        .driven
+                        .iter()
+                        .map(|drivers| {
+                            let mut tally = DriverTally::default();
+                            for driver in drivers.iter().filter(|driver| driver.counted) {
+                                tally.count(driver.strength.value());
+                            }
+                            tally
+                        })
+                        .collect();
+                    self.state.set_driver_counts(name, counts);
+                }
             }
             changed |= drive_resolved(&mut self.state, &target, &Register::from_bits(bits))?;
         }
@@ -2165,7 +2275,7 @@ struct NetDrivers {
     /// What the net holds now. A bit no driver reaches keeps its value.
     bits: Vec<u8>,
     /// The drivers of each bit, most significant first.
-    driven: Vec<Vec<Strength>>,
+    driven: Vec<Vec<BitDriver>>,
 }
 
 /// Pools the driver lists of every bit a conducting pass switch joins.
@@ -2215,7 +2325,10 @@ fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
     for ends in cells.iter().flatten() {
         for (net, position) in ends {
             if let Some(drivers) = nets[*net].driven.get_mut(*position) {
-                drivers.push(Strength::HIGHZ);
+                drivers.push(BitDriver {
+                    strength: Strength::HIGHZ,
+                    counted: false,
+                });
             }
         }
     }
@@ -2229,7 +2342,7 @@ fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
         let second = node.cell(ends[1]);
         node.join(first, second);
     }
-    let mut pooled: HashMap<usize, Vec<Strength>> = HashMap::new();
+    let mut pooled: HashMap<usize, Vec<BitDriver>> = HashMap::new();
     for id in 0..node.cells.len() {
         let (net, position) = node.cells[id];
         let root = node.root(id);
@@ -2284,10 +2397,18 @@ impl Nodes {
 
 /// Adds one driver's claim on a whole net — or a whole memory word — to the
 /// per-bit driver lists.
-fn contribute_whole(driven: &mut [Vec<Strength>], value: &Register, strength: DriveStrength) {
+fn contribute_whole(
+    driven: &mut [Vec<BitDriver>],
+    value: &Register,
+    strength: Driven,
+    counted: bool,
+) {
     let value = value.coerced(driven.len());
     for (offset, slot) in driven.iter_mut().enumerate() {
-        slot.push(Strength::driven(value.get_raw()[offset], strength));
+        slot.push(BitDriver {
+            strength: strength.of(value.get_raw()[offset]),
+            counted,
+        });
     }
 }
 
@@ -2295,7 +2416,21 @@ fn contribute_whole(driven: &mut [Vec<Strength>], value: &Register, strength: Dr
 struct Contribution {
     target: ResolvedTarget,
     value: Register,
-    strength: DriveStrength,
+    strength: Driven,
+    /// Whether `$countdrivers` counts this one. A `force` or a procedural
+    /// `assign` is contributed so that it *contends* through a `tran` like any
+    /// other driver, but iverilog does not count one as a **driver** of the
+    /// net: `force n = 2'bxx;` over `wire [1:0] n = 2'b0x;` still answers one
+    /// driver, driving `0` (measured against iverilog 12.0, corpus
+    /// `countdrivers2`).
+    counted: bool,
+}
+
+/// One driver's claim on one *bit*, which is what the resolution is over.
+#[derive(Clone, Copy)]
+struct BitDriver {
+    strength: Strength,
+    counted: bool,
 }
 
 /// A gate terminal is one bit, so an output connected to a vector drives that
@@ -3924,6 +4059,114 @@ mod tests {
 
         simulator.advance(2).unwrap();
         assert_eq!(simulator.output().text(), "foo[0] = 01, foo[1] = 10\n");
+    }
+
+    /// `$countdrivers` counts the continuous drivers that reached one **bit**
+    /// of a net, and a driver contributing `z` is not one of them.
+    ///
+    /// Measured against iverilog 12.0, which is corpus `countdrivers2`:
+    /// `wire [1:0] n = 2'bzx;` answers `0` for bit 1 — the `assign` is there
+    /// but it is driving nothing — while `wire [1:0] n = 2'b0x;` answers one
+    /// driver, driving `0`.
+    #[test]
+    fn test_countdrivers_ignores_a_driver_that_is_floating() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+                wire [1:0] floating = 2'bzx;
+                wire [1:0] held = 2'b0x;
+                reg [15:0] multi, forced, all, zero, one, unknown;
+                initial begin
+                    #1;
+                    multi = $countdrivers(floating[1], forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d %0d",
+                             multi, forced, all, zero, one, unknown);
+                    multi = $countdrivers(held[1], forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d %0d",
+                             multi, forced, all, zero, one, unknown);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(2).unwrap();
+        assert_eq!(
+            simulator.output().text(),
+            "0 0 0 0 0 0
+0 0 1 1 0 0
+"
+        );
+    }
+
+    /// More than one driver makes the answer `1`, and each is counted by what
+    /// it is driving.
+    ///
+    /// iverilog 12.0 over corpus `countdrivers2`'s five-driver net answers
+    /// `multi = 1 countD = 6 count0 = 2 count1 = 3 countX = 1` for bit 1 of a
+    /// `wire [1:0]` declared `2'bxx` and assigned `0x`, `0x`, `1x`, `1x`, `1x`.
+    #[test]
+    fn test_countdrivers_counts_each_driver_by_what_it_drives() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+                wire [1:0] bus = 2'bxx;
+                assign bus = 2'b0x;
+                assign bus = 2'b0x;
+                assign bus = 2'b1x;
+                assign bus = 2'b1x;
+                assign bus = 2'b1x;
+                reg [15:0] multi, forced, all, zero, one, unknown;
+                initial begin
+                    #1;
+                    multi = $countdrivers(bus[1], forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d %0d",
+                             multi, forced, all, zero, one, unknown);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(2).unwrap();
+        assert_eq!(
+            simulator.output().text(),
+            "1 0 6 2 3 1
+"
+        );
+    }
+
+    /// A `force` is reported *as* a force and is not counted as a driver.
+    ///
+    /// Measured against iverilog 12.0: `wire [1:0] n = 2'b0x;` then
+    /// `force n = 2'bxx;` answers `forced = 1` with the driver tally it had
+    /// before the force — one driver, driving `0`. Counting the force as a
+    /// driver as well gives `countD = 2`, and clearing the tally when the net
+    /// is written gives `countD = 0`; both were real, and the second is why
+    /// `StateStore::set` keeps the tally across a write.
+    #[test]
+    fn test_a_force_is_reported_but_not_counted() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+                wire [1:0] n = 2'b0x;
+                reg [15:0] multi, forced, all, zero, one, unknown;
+                initial begin
+                    #1;
+                    multi = $countdrivers(n[1], forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d %0d",
+                             multi, forced, all, zero, one, unknown);
+                    force n = 2'bxx;
+                    multi = $countdrivers(n[1], forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d %0d",
+                             multi, forced, all, zero, one, unknown);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(2).unwrap();
+        assert_eq!(
+            simulator.output().text(),
+            "0 0 1 1 0 0
+0 1 1 1 0 0
+"
+        );
     }
 
     /// The same shape with drivers that *disagree*, which is what tells real

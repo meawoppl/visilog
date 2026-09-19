@@ -54,7 +54,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
 | `simple.rs` | whitespace, comments, `raw_pos_int`, `Range` and the `range` parser, `signedness`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
-| `numbers.rs` | raw binary / decimal / hex digit runs, and `real_number` — the one place a real number is spelled out |
+| `numbers.rs` | raw binary / hex digit runs, `unsigned_number` — a decimal run with `_` separators, which is a literal's size, a plain decimal and an unparenthesised delay — and `real_number`, the one place a real number is spelled out |
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
 | `string.rs` | double-quoted string literals |
 | `identifier.rs` | `Identifier`, identifier lists, bit/part select |
@@ -680,6 +680,40 @@ how a design asks whether a non-ANSI port really took the data type declared bes
 `if ($bits(x) == $bits(integer))`, which is corpus `module_nonansi_integer1`,
 `task_nonansi_time1` and their four siblings.
 
+**`$countdrivers` is the one system function that is a question about the *design*, and
+what it wants is what `resolve_contributions` already builds.** It reports how many
+continuous drivers reached one **bit** of a net — the answer is `1` for a bit more than one
+driver reaches and `0` otherwise, and the rest comes back through up to five arguments
+(`forced`, `countD`, `count0`, `count1`, `countX`) written with `StateStore::owe_fill`, the
+queue a `$sscanf` already used. A driver contributing `z` is **not** counted at all, so an
+undriven net answers `0` rather than the number of `assign` statements naming it, and a
+`force` is reported *as* a force while the tally stays the one the net had before it
+(measured against iverilog 12.0; corpus `countdrivers2`).
+
+Three things make it work, and each is a seam rather than machinery of its own:
+
+- **A design that asks resolves every net a continuous driver names.** The tally is the
+  per-bit driver list `resolve_contributions` builds, so the net has to go through it rather
+  than be written plainly — and that is decided at `setup`, not when the call runs.
+  `Program::calls_system_function` is the question, asked once of every compiled block, and
+  `Simulator::resolve_every_driven_net` is the answer. Resolving a single `strong` driver
+  gives exactly what writing it gave, so no value moves; a design that never asks pays one
+  walk of its blocks at setup and nothing per pass.
+- **The tally is taken after `bond_nodes` has pooled**, so a bit joined to another — which
+  is what an `inout` port bound to a select is — reports the *node's* drivers and not its
+  own. That is what makes `$countdrivers(pad1.pad)` and `$countdrivers(bus[0])` agree
+  (corpus `countdrivers3`), and `StateStore::unalias` is the other half: a port bound to a
+  plain identifier is one entry with its parent's signal, so the port's own qualified name
+  has no entry for a testbench to find (corpus `countdrivers4`).
+- **A `force` contends but is not counted.** `Contribution::counted` is that distinction: a
+  drive is contributed so it resolves against the far side of a `tran` like any other
+  driver, and left out of the tally.
+
+Where it falls short is `countdrivers5`: iverilog counts **each `tran` as a driver** of the
+net it reaches, carrying what the other side resolved to, where this pools the node and
+reports the same total for every net in it. That is the same directional model the
+strength *reduction* across a bidirectional switch wants, and the two should land together.
+
 **`$stime` is unsigned, like the `$time` beside it**, because `time` is an unsigned type
 — and that is the field `%d` gives it: iverilog 12.0 prints `$display($stime)` in ten
 columns where an `integer` takes eleven (corpus `pr2842621`). iverilog is inconsistent
@@ -1112,9 +1146,11 @@ terminate on one, and a static task's storage means real Verilog cannot recurse 
 `declare_tasks` compiles in dependency order by repeating until a pass compiles nothing
 new, so a task may enable one declared further down the file.
 
-Still unsupported: a hierarchical enable (`instance.task(…)`); a task enabled from inside a
-`function`, which is rejected by the function body analysis rather than by a check of its
-own. `signals.rs` is built but still unwired.
+Still unsupported: a hierarchical enable (`instance.task(…)`), which **parses** — the name
+is a hierarchical identifier like any other — and is then `UnknownTask` naming the whole
+path, because `declare_tasks` keys the definitions by the enabling module's own names
+(#173); a task enabled from inside a `function`, which is rejected by the function body
+analysis rather than by a check of its own. `signals.rs` is built but still unwired.
 
 **A `disable` is a jump when it can be, and a cancellation when it cannot.** A named block
 and an inlined task body each occupy a *range* of the compiled instruction list, and
@@ -1455,9 +1491,10 @@ is `0` rather than `x` — an unknown input that cannot change the answer does n
 answer unknown — and `or(1, z)` is `1`. A `z` reaching a *logic* gate is read as an `x`,
 which is the one place the switch family differs: `nmos` conducting a `z` passes a `z`,
 where `bufif1` enabled on a `z` gives an `x`. A three-state buffer whose control is unknown
-drives `x`, where the LRM allows the weaker `L`/`H`. `cmos` is deliberately **not** two
-resolved switches — `cmos(0, 1, x)` is `0`, where resolving a strong `0` against the `x` a
-half-open `pmos` reports would give `x` — so it asks whether *either* half conducts instead.
+drives `x` as a *value*; the LRM's weaker `L`/`H` is a **strength** and is `Gate::driving`'s.
+`cmos` is deliberately **not** two resolved switches — `cmos(0, 1, x)` is `0`, where
+resolving a strong `0` against the `x` a half-open `pmos` reports would give `x` — so it
+asks whether *either* half conducts instead, which is the same question its strength asks.
 
 An **array of instances** (`bufif1 drv [7:0] (bus, data, enable);`) is expanded at
 elaboration into one gate per index, because nothing downstream has a notion of an instance
@@ -1528,18 +1565,20 @@ Three things about a switch are **not** modelled, and each is measured rather th
 - **A control that is `x` or `z` is taken not to conduct.** iverilog conducts at an
   *ambiguous* strength instead, which gives the far side an `x` while leaving the driven
   side alone: `assign p = a; tranif1 (p, q, en);` with `a` at 1 and `en` unknown is
-  `p=1 q=x` there and `p=1 q=z` here. Saying "unknown" needs a strength that is a *range*
-  rather than a level, which `resolve_bit` has no shape for.
+  `p=1 q=x` there and `p=1 q=z` here. `Strength` now has the range shape that would take —
+  it is the pooling in `bond_nodes` that has nowhere to put a *directional* answer, since a
+  node is symmetric by construction (corpus `switch_primitives`).
 - **A switch delay changes nothing.** `tranif0 #(100) sw(gnd, net1, gnd);` delays the moment
   the switch opens or closes rather than a value, which is not the `DelayedDrive` machinery
   an `assign` or a gate uses. Corpus `pr3499807` is exactly that and fails honestly.
-- **Strength reduction and strength propagation are still absent.** The `r`-prefixed forms
-  pass the same values as their non-resistive counterparts, and nothing carries a strength
-  *through* a switch: corpus `resolv1` needs a `pmos` to carry a `pullup`'s `pull` strength
-  to its output, which — like `%v` printing `Pu1` rather than `St1` — would mean the store
-  carrying a strength per bit beside its value. That is what the seven `%v` gold files
-  (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`, `switch_primitives`) are
-  blocked on; they run and mismatch rather than failing to elaborate.
+- **Strength reduction across a bidirectional switch is still absent.** A *unidirectional*
+  one carries its input's strength through and the `r`-prefixed forms weaken it (see
+  `Gate::driving`), but `bond_nodes` pools the driver lists of a node and a pool is
+  symmetric, where a reduction is directional: a `tran` therefore passes a `supply` on
+  unchanged where iverilog drops it to `strong`, and an `rtran` chain does not weaken by a
+  level per switch. That is what the seven `%v` gold files (`tran`, `tranif0`, `tranif1`,
+  `rtran`, `rtranif0`, `rtranif1`, `switch_primitives`) are blocked on; they run and
+  mismatch rather than failing to elaborate.
 
 **A `generate` region is unrolled at elaboration, which is the same thing
 flattening an instance is, one level down.** `parsers/generate.rs` captures the
@@ -1891,13 +1930,47 @@ or a procedural write lands on the net after the resolution that recorded it —
 would print a strength for a value it no longer describes. A **memory word** has no slot at
 all: a name is in the signal map or the memory map and never both.
 
-Still missing from the picture, and both are one gap rather than two: a switch or a
-three-state buffer whose **control is unknown** drives a hard `x` where iverilog drives the
-ambiguous `StL`/`StH` (corpus `pr544`, `pr1787394a`/`b`), and **nothing reduces or
-propagates a strength through a switch** — `tran` should drop a `supply` to `strong` and the
-`r`-prefixed forms reduce every level, which is what the seven `%v` gold files of the switch
-family (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`,
-`switch_primitives`) and corpus `resolv1` are waiting on.
+**A driver that is not sure what it is driving is what the interval is *for*, and there are
+two of them.** `gates::Gate::driving` answers both, and everything else still drives at the
+`(strength0, strength1)` it declared:
+
+- **A control that is unknown makes the strength ambiguous, not the value.** A `bufif1`
+  whose enable is `x` is either driving its data or turned off, and `Strength::or_floating`
+  is that — the interval stretched to high impedance. The *value* is the `x` it always was;
+  what changes is that it prints `StL` rather than `StX` (corpus `pr544`, `pr1787394a`/`b`,
+  measured against iverilog 12.0). A `cmos` is the exception and stays the question
+  `complementary_switch` already asked: a half that is **definitely** open settles the
+  matter whatever the other half's control is doing, so `cmos(0, 1, x)` is a definite `St0`
+  where a lone `pmos` with an unknown gate is `StL`.
+- **A MOS switch passes the strength on its *input*** rather than declaring one, which is
+  what makes a `pullup` reach the far side of one still recognisably a `pull`:
+  `pullup (w); pmos (q, w, 1'b0);` beside `bufif0 (q, 1'b0, g);` answers `q = 0`, because
+  the switch carries `Pu1` and loses to the buffer's `St0` — driving at `strong` ties and
+  gives `x` (corpus `resolv1`, `br_gh99t`/`u`). `reduced` is IEEE 1364-2005 Table 7-8 on
+  top of it: a non-resistive switch drops `supply` to `strong`, an `r`-prefixed one weakens
+  every level.
+
+`Driven` is the seam that carries the two shapes — `Declared(DriveStrength)`, where each
+bit's strength follows from that bit's own value, against `Bit(Strength)`, one bit's
+strength worked out by the driver itself. A primitive terminal is one bit, which is why the
+second needs nothing per-bit.
+
+**A strength that moved counts as a change** in the propagation fixpoint, beside a value
+that moved. It has to: `pullup (w); bufif1 (w, 1'b1, g);` leaves `w` at `1` whether `g` is
+on or not and only the *level* moves, so a `pmos` downstream of it would carry the stale one
+for the rest of the run.
+
+Still missing: a **delayed** gate drives at its declared strength rather than at the one its
+inputs say this instant, because the value in hand is the one that landed `#n` ago and the
+two would otherwise be out of step — a `bufif1` whose enable has just gone away would let go
+of the net at once and keep its turn-off delay for nothing (corpus `rise_fall_decay2`), and
+a delayed *switch* consequently drives at `strong`. And nothing reduces a strength across a
+**bidirectional** switch: `bond_nodes` pools driver lists, which is symmetric, where a
+reduction is directional — so a `tran` carries a `supply` through where iverilog drops it to
+`strong`, and the `r`-prefixed forms do not weaken at all. That is what the seven `%v` gold
+files of the switch family (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`,
+`switch_primitives`) are still waiting on, together with a `tranif` whose control is unknown
+conducting at an ambiguous strength rather than not at all.
 
 **A string is a value wherever a number is wanted.** `$display("%d", "A")` is 65:
 `TaskArgument::Text` reaches a numeric format as its own bytes, eight bits a character.
@@ -1907,17 +1980,17 @@ telling apart.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
-| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — and `call_function` for the design's own |
+| `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — `$countdrivers`, which is a question about the design rather than about a value, and `call_function` for the design's own |
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, and `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, and the per-bit `Strength` a resolved net was last settled at), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -2145,12 +2218,18 @@ tripwire.
   #n …;` wait 3 and then 7. A delay that evaluates to `x` is zero, which is what iverilog
   does with one. `Delay::ticks(&store)` is still the single place a delay *mode* is chosen,
   so `+mindelays`/`+maxdelays` is still a one-function change; it just takes a store now.
-- **The unparenthesised form is a number or a name, and nothing more.** A delay prefixes a
-  statement with only whitespace between, so a full expression parser would read `#5 a = 1;`
-  as `5 a` and `#2 -> ev;` as `2 - >`. `delay_operand` is therefore a constant or a
-  hierarchical identifier, and an expression is legal only inside parentheses — which is
-  exactly what the LRM says. `#(2:10:17)` is the `min:typ:max` triple, tried first inside
-  those parentheses because the single-value branch would match `2` and choke on the `:`.
+- **The unparenthesised form is an `unsigned_number`, a real number or a name, and nothing
+  more.** A delay prefixes a statement with only whitespace between, so a full expression
+  parser would read `#5 a = 1;` as `5 a` and `#2 -> ev;` as `2 - >`. That is only half of
+  it: a **based** literal's size, base designator and digits may themselves be separated by
+  whitespace, so a general *constant* parser here reads the whole of `#1 'h00010203` as one
+  sized value and leaves the statement nothing to assign. `delay_operand` is therefore
+  `numbers::unsigned_number`, `real_literal` or a hierarchical identifier — exactly IEEE
+  1364-2005's `delay_value` — and a based literal is legal only inside parentheses, where a
+  closing `)` says where it ends. Corpus `const4` calls these the "potential ambiguities":
+  `i = # 9_7 'D 3;` waits 97 and assigns `'d3`, while `#(5 'D 3)` is a delay of 3.
+  `#(2:10:17)` is the `min:typ:max` triple, tried first inside those parentheses because
+  the single-value branch would match `2` and choke on the `:`.
 - **A `#delay` on an `assign` and a `#delay` on a gate are both simulated, through one
   production.** `parse_gate_delay` reads the `delay3` — up to three delays rather than one,
   `#(rise, fall, turn_off)` — into a `GateDelay`, and both an `assign` and a gate schedule
@@ -2206,6 +2285,12 @@ tripwire.
   side**, so a `z` in the subject is as much a don't-care as one in the label; testing only
   the label half is the easy mistake. `casez` still tells an `x` apart from a `0`.
   The `case` tag is a prefix of both keywords, so `parse_case_keyword` tries it last.
+  **The colon after `default` — and only after `default` — is optional**, which is IEEE
+  1364-2005's `case_item` (`default [ : ] statement_or_null`) and what corpus `casex3.9E`
+  writes. So what tells `default` from an identifier like `default_state` is the *word
+  boundary* rather than the colon that used to follow it; every other label still needs its
+  colon, since a label without one would run straight into the statement after it, which is
+  a wrong parse tree rather than an error.
   **A subject and its labels are not yet sized against each other**, which is the same
   mutual context a comparison already gets: they should be widened to the widest of *all*
   of them, read signed only when every one of them is, and compared as reals when any one
@@ -2262,11 +2347,30 @@ tripwire.
   one definition of what a `$name` looks like. A format string is a
   `SystemTaskArgument::String`, not an `Expression` — the expression grammar has no string
   operand. A *bare* `$name` argument (`$display("%0d", $time)`) is still a
-  `SystemTaskArgument::SystemFunction`, but only because `bare_system_function` refuses one
-  followed by `(`: `$display("%0d", $signed(a))` is an ordinary expression argument.
-  `TaskCall::compile` turns the bare form into an `Expression::SystemFunctionCall` after
-  checking it against `eval::SYSTEM_FUNCTIONS`, so a name nothing implements is still
+  `SystemTaskArgument::SystemFunction`, but only because `bare_system_function` insists the
+  **next token ends an argument** — a `,` or a `)`. Refusing only a following `(` is not
+  enough: `$display("%d", $time - base)` is a subtraction, and stopping at the `$time`
+  leaves a remainder the argument list cannot get past, which is a parse failure at the
+  end of the call rather than at the operator (corpus `sdf_del_max`, `pr1701889`,
+  `verify_two_var_delays`). `$display("%0d", $signed(a))` is an ordinary expression
+  argument. A system function may also be **separated from its argument list** —
+  `$fopen ("f", "r")`, corpus `pr1687193` — for the reason a call to one of the design's
+  own may: in an operand position a name followed by a parenthesised list can only be a
+  call. `TaskCall::compile` turns the bare form into an `Expression::SystemFunctionCall`
+  after checking it against `eval::SYSTEM_FUNCTIONS`, so a name nothing implements is still
   rejected at compile time and `$time` has exactly one implementation.
+- **The assignment operator is read longest-first, and `<=` is the trap.** `a op= b` stands
+  for `a = a op b` and `a++` for `a = a + 1`, folded into the right hand side by
+  `assignment::assignment_body` so nothing downstream learns the spelling. A non-blocking
+  assignment and the shift-assign `<<=` begin alike, so reading `<=` first gives `a <<= 1;`
+  a non-blocking assignment of `= 1` — a parse error somewhere that says nothing about the
+  operator. `assignment_operator` dispatches on the **first byte** rather than on a
+  fourteen-arm `alt`, because every assignment in a design comes through it and nearly all
+  are a plain `=`: the `alt` spelling measured 6–8% on `bench parse/*`. The increment is
+  tried **second**, only once the operator has failed outright, so an ordinary assignment
+  pays no second whitespace skip. `for_assignment` goes through the same production — the
+  `;` is the whole of the difference — so a `for` header cannot fall behind a statement on
+  what an assignment may be.
 - **A `#delay` is a statement *prefix*, not a field on an assignment.**
   `#5 a = 1;`, `#5 $display(…);`, `#5 begin … end`, `#5 if (…) …` and
   `#5 case (…) … endcase` all parse to `ProceduralStatements::Delayed { delay,
@@ -2443,7 +2547,21 @@ tripwire.
 - **A based literal is three tokens.** The size, the base designator and the digits are
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
-  literal — which is also what the LRM says.
+  literal — which is also what the LRM says. That whitespace is what makes an
+  unparenthesised delay an `unsigned_number` rather than a constant; see above.
+- **A size and a plain decimal are both `numbers::unsigned_number`**, which carries the `_`
+  separator anywhere but at the front. The *digits* of a based literal already did, which
+  is why `2_0'b0` (corpus `pr902`) read as the number `2` followed by an identifier and
+  `1_000` read as `1`. The leading-digit rule is load-bearing: `_5` is not a number but is
+  the start of an identifier, and a parser that claimed it would take `_x` for one.
+- **A `:` inside parentheses is a `min:typ:max` triple, and it is asked about *after* the
+  expression has been read.** A conditional has a `:` of its own and `conditional_layer`
+  has already taken it by the time `parenthetical` looks, so `(c ? a : b)` is unchanged and
+  an ordinary parenthesised expression pays one character comparison. The **typical** value
+  is the one kept — the same choice `Delay::ticks` makes, and what iverilog 12.0 does
+  (`parameter value = (1:2:3);` prints `2` with a `warning: Choosing typ expression.`).
+  The min and the max are dropped, because `Expression` has nowhere to keep them, so
+  `+mindelays` would not reach a triple written outside a delay.
 - **A backslash before a newline inside a string literal is a line continuation, and it
   contributes nothing.** IEEE 1364-2005 §3.6; iverilog 12.0 prints `ab` for a literal
   spelled `"a\<newline>b"`. It is `string.rs::line_continuation`, deliberately *not* one of
@@ -2495,7 +2613,17 @@ tripwire.
   last in `procedural_statement`'s `alt` *and* rejects anything `keywords::is_reserved_word`
   knows, so `wait (1);` is still a parse error rather than a task nothing declared. Without
   that guard five corpus files stop being parse failures and become `UnknownTask` failures
-  instead, which is a worse answer wearing a better one's clothes.
+  instead, which is a worse answer wearing a better one's clothes. The name it reads is
+  **hierarchical**, because a task belongs to the module that declares it and a design
+  reaches one across the hierarchy (`n.incr(1);`, `top.main.test1;`, `gen.foo_task;`). The
+  reserved-word guard still tests the path's *head* segment, which is all it ever had to.
+  Elaboration does not resolve one of those yet (#173), so those ten designs stop at
+  `UnknownTask` naming the path — which is the right place for them to stop.
+- **An event is reached by its hierarchical name too, in both the places one is named.**
+  `-> et1.m1.e2;` (corpus `event3`) and `@top.toplevel_event` (`pr572`) both read the whole
+  dotted path, which is the flat store key the trigger namespace is keyed by. The bare
+  `@name` form keeps its reserved-word guard on the head segment, so `always @* begin … end`
+  still reads `begin` as a statement rather than as an event.
 - **A `time` variable inside a `function` or `task` is 64 bits by being a `time`**, the way
   an `integer` is 32 by being an `integer`. `behavior.rs::declared_type` reads the keyword
   rather than treating it as a bare storage class, so `output time stamp;` is a 64-bit
@@ -2523,6 +2651,12 @@ tripwire.
   tree rather than an error. `specify.rs::terminal` is a name with an optional bit or part
   select and nothing else. The delay on the right of the `=` *is* an expression, which is
   how `= (tRise, tFall)` names two `specparam`s.
+- **A `specparam` is legal at module level as well as inside a `specify` block**, which is
+  IEEE 1364-2005's `module_or_generate_item_declaration` (corpus `br_gh732`). It comes back
+  from `specify.rs::parse_module_specparam` as a `SpecifyBlock` holding nothing else,
+  because a `specparam` is a constant the whole module may name either way and that is
+  already the only thing `elaborate` reads out of one — a second declaration form could
+  only disagree with the first about what a `specparam` means.
 - **A real number is parsed in exactly one place.** `numbers.rs::real_number` reads both of
   IEEE 1364's spellings — fixed point (`0.9`, `0.500`) and exponent (`1e3`, `1.5e-3`) — and
   three productions come to it: `expr.rs::real_literal`, a `specify` path delay and a

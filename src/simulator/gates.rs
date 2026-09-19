@@ -20,21 +20,31 @@
 //! they are all off. The same mechanism carries `(highz0, strong1)`, the open
 //! drain that floats instead of driving its `0`.
 //!
+//! A [`Strength`] is a *signed interval* rather than a level, which is what
+//! lets a driver say it is **not sure**: a primitive whose control is unknown
+//! is either driving its data or turned off, which is the whole span between
+//! the two. That is one of the two things [`Gate::driving`] answers; the other
+//! is that a MOS switch passes the strength on its *input* rather than
+//! declaring one, reduced if it is a resistive form.
+//!
 //! # What is not modelled
 //!
-//! The `r`-prefixed switches (`rnmos`, `rcmos`, `rtran`, …) reduce the strength
-//! of what they pass, which is not modelled, so they behave as their
-//! non-resistive counterparts. A switch's *delay* — `tranif0 #(100)`, which
-//! delays the moment the switch opens or closes rather than a value — is parsed
-//! and ignored. A `tranif` whose control is `x` or `z` is taken **not** to
-//! conduct, where iverilog conducts at an ambiguous strength and gives the far
-//! side an `x`; see [`PassSwitch::conducts`].
+//! A switch's *delay* — `tranif0 #(100)`, which delays the moment the switch
+//! opens or closes rather than a value — is parsed and ignored, and a
+//! **delayed** gate drives at its declared strength rather than at the one its
+//! inputs say this instant: the value in hand is the one that landed `#n` ago
+//! and the two would otherwise be out of step. A `tranif` whose control is `x`
+//! or `z` is taken **not** to conduct, where iverilog conducts at an ambiguous
+//! strength and gives the far side an `x`; see [`PassSwitch::conducts`]. And
+//! nothing reduces a strength across a *bidirectional* switch, so a `tran`
+//! carries a `supply` through where iverilog drops it to `strong`.
 
 use crate::parsers::delay::GateDelay;
 use crate::parsers::expr::Expression;
 use crate::parsers::gates::{DriveStrength, GateKind, StrengthLevel};
 use crate::register::{Register, ONE, X, Z, ZERO};
 use crate::simulator::eval::eval;
+use crate::simulator::exec::{resolve_target, ResolvedTarget};
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
 
@@ -140,17 +150,229 @@ impl Gate {
         })
     }
 
-    /// The bit this gate is driving, given the design's present state.
+    /// The bit this gate is driving and the strength it drives it at, given
+    /// the design's present state.
     ///
     /// A gate terminal is one bit wide, so an input wider than that is read at
     /// its least significant bit — the same bit a scalar connection would name.
-    pub fn evaluate(&self, state: &StateStore) -> Result<u8, SimulationError> {
+    pub fn evaluate(&self, state: &StateStore) -> Result<(u8, Driven), SimulationError> {
         let mut levels = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             levels.push(least_significant_bit(&eval(input, state)?));
         }
-        Ok(gate_output(self.kind, &levels))
+        let code = gate_output(self.kind, &levels);
+        Ok((code, self.driving(&levels, state)?))
     }
+
+    /// The strength this gate is driving at.
+    ///
+    /// Most gates simply drive at the `(strength0, strength1)` they were
+    /// declared with, and the value decides which half applies. The two that
+    /// do not are the whole of this function:
+    ///
+    /// - **A control that is unknown makes the strength ambiguous, not the
+    ///   value.** A `bufif1` whose enable is `x` is either driving its data or
+    ///   turned off, which is the interval between the two — iverilog 12.0
+    ///   prints `StL` for a `0` on the data and `PuL` at `(pull0, pull1)`,
+    ///   where a level alone could only say `StX` (corpus `pr544`,
+    ///   `pr1787394a`/`b`).
+    /// - **A MOS switch passes the strength on its data terminal** rather than
+    ///   declaring one, reduced if it is a resistive form. That is what makes
+    ///   `pmos (q, w, 1'b0);` carry a `pullup`'s `pull` through to `q`, where
+    ///   driving at `strong` would tie with a real `strong` driver and give
+    ///   `x` (corpus `resolv1`, `br_gh99t`/`u`).
+    fn driving(&self, levels: &[u8], state: &StateStore) -> Result<Driven, SimulationError> {
+        let Some(conducting) = conducting(self.kind, levels) else {
+            return Ok(Driven::Declared(self.strength));
+        };
+        if conducting == Conducting::No {
+            return Ok(Driven::Bit(Strength::HIGHZ));
+        }
+        // What the gate drives while it *is* conducting, asked of the same
+        // truth table the value comes from so the two cannot disagree.
+        let passing = gate_output(self.kind, &conducting_levels(self.kind, levels));
+        let open = if is_mos_switch(self.kind) {
+            reduced(
+                self.kind,
+                terminal_strength(&self.inputs[0], passing, state),
+            )
+        } else {
+            Strength::driven(passing, self.strength)
+        };
+        Ok(Driven::Bit(match conducting {
+            Conducting::Yes => open,
+            _ => open.or_floating(),
+        }))
+    }
+}
+
+/// The strength one driver of a bit contributes at.
+///
+/// Most drivers declare a `(strength0, strength1)` and let each bit's own
+/// value pick a half; a MOS switch and a primitive with an unknown control
+/// both work their strength out for themselves, and a primitive terminal is
+/// one bit, so there is nothing per-bit to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Driven {
+    Declared(DriveStrength),
+    Bit(Strength),
+}
+
+impl Driven {
+    /// The strength this driver pushes a given four-state bit with.
+    pub fn of(&self, code: u8) -> Strength {
+        match self {
+            Driven::Declared(strength) => Strength::driven(code, *strength),
+            Driven::Bit(strength) => *strength,
+        }
+    }
+}
+
+/// Whether a control-led primitive is passing its data, blocking it, or
+/// cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conducting {
+    Yes,
+    No,
+    Maybe,
+}
+
+/// Whether the primitive conducts, or `None` for one with no control at all —
+/// a logic gate or a pull source, which always drives at what it declared.
+fn conducting(kind: GateKind, levels: &[u8]) -> Option<Conducting> {
+    let active = match kind {
+        GateKind::Bufif1 | GateKind::Notif1 | GateKind::Nmos | GateKind::Rnmos => ONE,
+        GateKind::Bufif0 | GateKind::Notif0 | GateKind::Pmos | GateKind::Rpmos => ZERO,
+        // A complementary pair conducts when *either* half does, which is the
+        // one place a `cmos` is not the resolution of two switches: a half
+        // that is definitely open settles the question whatever the other
+        // half's control is doing.
+        GateKind::Cmos | GateKind::Rcmos => {
+            let n = level_conducts(levels[1], ONE);
+            let p = level_conducts(levels[2], ZERO);
+            return Some(match (n, p) {
+                (Conducting::Yes, _) | (_, Conducting::Yes) => Conducting::Yes,
+                (Conducting::No, Conducting::No) => Conducting::No,
+                _ => Conducting::Maybe,
+            });
+        }
+        _ => return None,
+    };
+    Some(level_conducts(levels[1], active))
+}
+
+/// Whether a primitive *passes* its data rather than buffering it, which is
+/// what makes it carry its source's strength. The `tran` family is not here:
+/// a bidirectional switch drives nothing at all and joins two nets instead.
+fn is_mos_switch(kind: GateKind) -> bool {
+    matches!(
+        kind,
+        GateKind::Nmos
+            | GateKind::Pmos
+            | GateKind::Rnmos
+            | GateKind::Rpmos
+            | GateKind::Cmos
+            | GateKind::Rcmos
+    )
+}
+
+/// Whether the primitive is one of the `r`-prefixed forms, which weaken what
+/// they pass.
+fn is_resistive(kind: GateKind) -> bool {
+    matches!(
+        kind,
+        GateKind::Rnmos
+            | GateKind::Rpmos
+            | GateKind::Rcmos
+            | GateKind::Rtran
+            | GateKind::Rtranif0
+            | GateKind::Rtranif1
+    )
+}
+
+fn level_conducts(control: u8, active: u8) -> Conducting {
+    if control == active {
+        Conducting::Yes
+    } else if control == invert_level(active) {
+        Conducting::No
+    } else {
+        Conducting::Maybe
+    }
+}
+
+/// The same input levels with every control forced to the value that opens the
+/// primitive, so [`gate_output`] answers what it drives *while* it is open.
+fn conducting_levels(kind: GateKind, levels: &[u8]) -> Vec<u8> {
+    match kind {
+        GateKind::Cmos | GateKind::Rcmos => vec![levels[0], ONE, ZERO],
+        GateKind::Bufif1 | GateKind::Notif1 | GateKind::Nmos | GateKind::Rnmos => {
+            vec![levels[0], ONE]
+        }
+        _ => vec![levels[0], ZERO],
+    }
+}
+
+/// The strength on a switch's data terminal.
+///
+/// A resolved net carries the level its own drivers settled at, which is the
+/// whole point — that is what a switch passes on. Anything else answers as an
+/// ordinary driver would, at `strong`, and so does a recorded level that no
+/// longer describes the value: a write that landed after the resolution which
+/// recorded it leaves a level behind that names a strength for a bit the net
+/// no longer holds.
+fn terminal_strength(terminal: &Expression, code: u8, state: &StateStore) -> Strength {
+    let fallback = Strength::driven(code, DriveStrength::STRONG);
+    // A terminal that names no storage — `{16'b0, data}`, which an array of
+    // instances slices with a shift (corpus `npmos2`, `rnpmos2`) — has no net
+    // behind it to read a level off, so it answers as an ordinary driver
+    // would. Asking is not an error here the way it is for an *output*
+    // terminal, which really does have to be written.
+    let Ok(target) = resolve_target(state, terminal) else {
+        return fallback;
+    };
+    let (name, index) = match &target {
+        ResolvedTarget::Whole(name) => (name, None),
+        ResolvedTarget::Bits { name, indices } => (name, indices.last().copied()),
+        _ => return fallback,
+    };
+    let Some(signal) = state.get_signal(name) else {
+        return fallback;
+    };
+    let Some(levels) = signal.strengths() else {
+        return fallback;
+    };
+    // A whole net names its least significant bit, which is the last of the
+    // most-significant-first list; a select names the bit its index maps to.
+    let position = match index {
+        Some(index) => signal.bit_position(index),
+        None => levels.len().checked_sub(1),
+    };
+    position
+        .and_then(|position| levels.get(position).copied())
+        .filter(|strength| strength.value() == code)
+        .unwrap_or(fallback)
+}
+
+/// A strength after a switch has passed it, IEEE 1364-2005 Table 7-8.
+///
+/// A non-resistive switch drops `supply` to `strong` and leaves everything
+/// else alone; an `r`-prefixed one weakens every level. Both bounds of the
+/// interval move, since a reduction is about the level rather than the value.
+fn reduced(kind: GateKind, strength: Strength) -> Strength {
+    let (low, high) = strength.bounds();
+    let reduce = |level: i8| {
+        let magnitude = match (is_resistive(kind), level.abs()) {
+            (false, 7) => 6,
+            (false, other) => other,
+            (true, 7) | (true, 6) => 5,
+            (true, 5) => 3,
+            (true, 4) | (true, 3) => 2,
+            (true, 2) | (true, 1) => 1,
+            (true, _) => 0,
+        };
+        level.signum() * magnitude
+    };
+    Strength::span(reduce(low), reduce(high))
 }
 
 /// One elaborated **bidirectional** pass switch.
@@ -323,12 +545,11 @@ fn switch(data: u8, control: u8, active: u8) -> u8 {
 /// A complementary pair on one node: an n-switch and a p-switch carrying the
 /// same data.
 ///
-/// It is deliberately *not* the resolution of the two halves. A switch whose
-/// control is unknown passes something between its data and `z`, which reads
-/// as `x` on its own but is not one: `cmos(0, 1, x)` is `0` in iverilog, where
-/// resolving a strong `0` against a strong `x` would give `x`. Asking whether
-/// *either* half conducts sidesteps the ambiguous strength that would take to
-/// model.
+/// It asks whether *either* half conducts rather than resolving the two, which
+/// is the same question [`conducting`] asks about its strength: a half that is
+/// definitely open settles the matter whatever the other half's control is
+/// doing, so `cmos(0, 1, x)` is a definite `0` where a lone `pmos` with an
+/// unknown gate would be the ambiguous `StL`.
 fn complementary_switch(data: u8, ncontrol: u8, pcontrol: u8) -> u8 {
     if ncontrol == ONE || pcontrol == ZERO {
         data
@@ -480,6 +701,16 @@ impl Strength {
     pub fn bounds(&self) -> (i8, i8) {
         (self.lo, self.hi)
     }
+
+    /// The same drive, *or nothing at all* — what a primitive whose control is
+    /// unknown is doing. It stretches the interval to high impedance, which is
+    /// the difference between `StX` and `StL`.
+    pub fn or_floating(&self) -> Strength {
+        Strength {
+            lo: self.lo.min(0),
+            hi: self.hi.max(0),
+        }
+    }
 }
 
 /// What one bit of a node carries when two drivers reach it.
@@ -530,9 +761,9 @@ fn resolve_levels(x: i8, y: i8) -> Strength {
 /// driving `z` or because that half of its strength is `highz`. Of the rest,
 /// the strongest wins outright; drivers tied at the strongest level agree on a
 /// value or the net is `x`. A net every driver has let go of is `z`.
-pub fn resolve_strength(drivers: &[Strength]) -> Strength {
+pub fn resolve_strength(drivers: impl IntoIterator<Item = Strength>) -> Strength {
     let mut resolved = Strength::HIGHZ;
-    for &driver in drivers {
+    for driver in drivers {
         resolved = resolve_pair(resolved, driver);
     }
     resolved
@@ -541,7 +772,7 @@ pub fn resolve_strength(drivers: &[Strength]) -> Strength {
 /// The four-state bit several drivers settle on — [`resolve_strength`] read as
 /// a value.
 pub fn resolve_bit(drivers: &[Strength]) -> u8 {
-    resolve_strength(drivers).value()
+    resolve_strength(drivers.iter().copied()).value()
 }
 
 #[cfg(test)]
@@ -609,8 +840,10 @@ mod tests {
     }
 
     /// A three-state buffer, with the data first and the control second. It
-    /// drives `z` when it is disabled and `x` when the control is unknown —
-    /// where the LRM allows the weaker `L`/`H`, iverilog reports `x`.
+    /// drives `z` when it is disabled and `x` when the control is unknown.
+    /// The `L`/`H` the LRM gives an unknown control is a *strength* rather
+    /// than a value and lives on [`Gate::driving`]; the value here is the `x`
+    /// iverilog reports.
     #[test]
     fn test_three_state_buffer_truth_tables() {
         check_binary(GateKind::Bufif1, "z0xxz1xxzxxxzxxx");
@@ -626,15 +859,15 @@ mod tests {
     fn test_switch_truth_tables() {
         check_binary(GateKind::Nmos, "z0xxz1xxzxxxzzzz");
         check_binary(GateKind::Pmos, "0zxx1zxxxzxxzzzz");
-        // The resistive variants pass the same values, only weaker — a
-        // strength reduction this simulator does not model.
+        // The resistive variants pass the same *values*, only weaker. The
+        // reduction is a strength and is `reduced`'s.
         check_binary(GateKind::Rnmos, "z0xxz1xxzxxxzzzz");
         check_binary(GateKind::Rpmos, "0zxx1zxxxzxxzzzz");
     }
 
-    /// `cmos` is the case that proves it is not two resolved switches:
-    /// `cmos(0, 1, x)` is `0`, where resolving a strong `0` against the `x` a
-    /// half-open `pmos` reports would give `x`.
+    /// `cmos` asks whether *either* half conducts: `cmos(0, 1, x)` is `0`,
+    /// where resolving a strong `0` against the `x` a half-open `pmos` reports
+    /// would give `x`.
     #[test]
     fn test_cmos_truth_table() {
         let expected = "0zxx00000xxx0xxx\
@@ -757,22 +990,22 @@ mod tests {
             one: StrengthLevel::Pull,
         };
         assert_eq!(
-            resolve_strength(&[Strength::driven(ONE, open_drain)]).bounds(),
+            resolve_strength([Strength::driven(ONE, open_drain)]).bounds(),
             (5, 5)
         );
         assert_eq!(
-            resolve_strength(&[Strength::driven(ZERO, open_drain)]).bounds(),
+            resolve_strength([Strength::driven(ZERO, open_drain)]).bounds(),
             (-6, -6)
         );
         // A `pullup` under a driven `strong` keeps the strong level, and holds
         // the net at `pull` once that driver lets go.
         let pull_up = Strength::driven(ONE, DriveStrength::PULL);
         assert_eq!(
-            resolve_strength(&[pull_up, Strength::STRONG_ZERO]).bounds(),
+            resolve_strength([pull_up, Strength::STRONG_ZERO]).bounds(),
             (-6, -6)
         );
         assert_eq!(
-            resolve_strength(&[pull_up, Strength::HIGHZ]).bounds(),
+            resolve_strength([pull_up, Strength::HIGHZ]).bounds(),
             (5, 5)
         );
     }
@@ -789,27 +1022,202 @@ mod tests {
         // A buffer at `pull` whose control is unknown: it drives 0, or floats.
         let maybe_pull_zero = Strength::span(-5, 0);
         assert_eq!(
-            resolve_strength(&[maybe_pull_zero, Strength::HIGHZ]).bounds(),
+            resolve_strength([maybe_pull_zero, Strength::HIGHZ]).bounds(),
             (-5, 0)
         );
-        assert_eq!(resolve_strength(&[maybe_pull_zero]).value(), X);
+        assert_eq!(resolve_strength([maybe_pull_zero]).value(), X);
         // `65X`: a strong 0-or-z beside a pull x.
         let maybe_strong_zero = Strength::span(-6, 0);
         let pull_unknown = Strength::span(-5, 5);
         assert_eq!(
-            resolve_strength(&[pull_unknown, maybe_strong_zero]).bounds(),
+            resolve_strength([pull_unknown, maybe_strong_zero]).bounds(),
             (-6, 5)
         );
         // `650`: a strong 0-or-z beside a definite pull 0 is a definite 0,
         // somewhere between the two levels.
         let pull_zero = Strength::span(-5, -5);
-        let resolved = resolve_strength(&[pull_zero, maybe_strong_zero]);
+        let resolved = resolve_strength([pull_zero, maybe_strong_zero]);
         assert_eq!(resolved.bounds(), (-6, -5));
         assert_eq!(resolved.value(), ZERO);
     }
 
     fn terminal(name: &str) -> Expression {
         Expression::Identifier(Identifier::new(name.to_string()))
+    }
+
+    /// A gate reading its terminals out of a store, so `Gate::evaluate` can be
+    /// asked what it drives *and* at what strength.
+    fn drives(kind: GateKind, strength: DriveStrength, levels: &[(&str, u8)]) -> (u8, Strength) {
+        let mut store = StateStore::new();
+        for (name, code) in levels {
+            store.declare(*name, (0, 0));
+            store.set(*name, Register::from_bits(vec![*code]));
+        }
+        let mut names: Vec<Expression> = vec![terminal("out")];
+        names.extend(levels.iter().map(|(name, _)| terminal(name)));
+        store.declare_net("out", (0, 0), false);
+        let gate = Gate::new(kind, strength, names, None).expect("a legal terminal count");
+        let (code, driven) = gate.evaluate(&store).expect("terminals resolve");
+        (code, driven.of(code))
+    }
+
+    /// **A control that is unknown makes the *strength* ambiguous, not the
+    /// value.** A three-state buffer whose enable is `x` is either driving its
+    /// data or turned off, which is the interval between the two.
+    ///
+    /// Measured against iverilog 12.0 (corpus `pr544`, whose gold file is two
+    /// `bufif1`s on one net): `bufif1` at `(pull0, pull1)` with a `0` on its
+    /// data and an `x` on its enable prints `x,PuL`, and with a `1` on its
+    /// data prints `x,PuH`. The *value* is the `x` it always was.
+    #[test]
+    fn test_an_unknown_control_drives_an_ambiguous_strength() {
+        let pull = DriveStrength::PULL;
+        assert_eq!(
+            drives(GateKind::Bufif1, pull, &[("d", ZERO), ("e", X)]),
+            (X, Strength::span(-5, 0)),
+            "PuL"
+        );
+        assert_eq!(
+            drives(GateKind::Bufif1, pull, &[("d", ONE), ("e", X)]),
+            (X, Strength::span(0, 5)),
+            "PuH"
+        );
+        // A `notif` inverts what it would drive, so the ambiguity is the other
+        // way round.
+        assert_eq!(
+            drives(
+                GateKind::Notif1,
+                DriveStrength::STRONG,
+                &[("d", ZERO), ("e", X)]
+            ),
+            (X, Strength::span(0, 6)),
+            "StH"
+        );
+        // An enable that is *known* is not ambiguous at all.
+        assert_eq!(
+            drives(GateKind::Bufif1, pull, &[("d", ZERO), ("e", ONE)]),
+            (ZERO, Strength::span(-5, -5)),
+            "Pu0"
+        );
+        assert_eq!(
+            drives(GateKind::Bufif1, pull, &[("d", ZERO), ("e", ZERO)]),
+            (Z, Strength::HIGHZ)
+        );
+    }
+
+    /// A `cmos` conducts when **either** half does, so a half that is
+    /// definitely open settles the question whatever the other is doing —
+    /// which is why `cmos(0, 1, x)` is a definite `St0` rather than the `StL`
+    /// a lone `pmos` with an unknown gate would give.
+    ///
+    /// Measured against iverilog 12.0, and it is corpus `pr1787394a`: `nmos
+    /// n1 (c, b, nctl); pmos p1 (c, b, pctl);` with `b` at `0`, `nctl` at `0`
+    /// and `pctl` at `x` prints `c=x(StL)`.
+    #[test]
+    fn test_a_complementary_pair_conducts_when_either_half_does() {
+        let strong = DriveStrength::STRONG;
+        assert_eq!(
+            drives(GateKind::Cmos, strong, &[("d", ZERO), ("n", ONE), ("p", X)]),
+            (ZERO, Strength::span(-6, -6)),
+            "St0"
+        );
+        assert_eq!(
+            drives(GateKind::Cmos, strong, &[("d", ZERO), ("n", X), ("p", X)]),
+            (X, Strength::span(-6, 0)),
+            "StL"
+        );
+        assert_eq!(
+            drives(
+                GateKind::Cmos,
+                strong,
+                &[("d", ZERO), ("n", ZERO), ("p", ONE)]
+            ),
+            (Z, Strength::HIGHZ)
+        );
+        // A lone `pmos` with an unknown gate is the ambiguous one.
+        assert_eq!(
+            drives(GateKind::Pmos, strong, &[("d", ZERO), ("p", X)]),
+            (X, Strength::span(-6, 0)),
+            "StL"
+        );
+    }
+
+    /// **A MOS switch passes the strength on its data terminal**, rather than
+    /// declaring one of its own — which is what makes a `pullup` reach the far
+    /// side of one still recognisably a `pull`.
+    ///
+    /// Corpus `resolv1` is the case: `pullup (w); pmos (q, w, 1'b0);` beside
+    /// `bufif0 (q, 1'b0, g);` answers `q = 0`, because the switch carries
+    /// `Pu1` and loses to the buffer's `St0`. Driving at `strong` instead ties
+    /// and gives `x`.
+    #[test]
+    fn test_a_switch_passes_the_strength_on_its_input() {
+        let mut store = StateStore::new();
+        store.declare_net("w", (0, 0), false);
+        store.set("w", Register::from_bits(vec![ONE]));
+        store.declare("g", (0, 0));
+        store.set("g", Register::from_bits(vec![ZERO]));
+        store.declare_net("q", (0, 0), false);
+        store.set_strengths("w", vec![Strength::span(5, 5)]);
+        let gate = Gate::new(
+            GateKind::Pmos,
+            DriveStrength::STRONG,
+            terminals(&["q", "w", "g"]),
+            None,
+        )
+        .unwrap();
+        let (code, driven) = gate.evaluate(&store).unwrap();
+        assert_eq!((code, driven.of(code)), (ONE, Strength::span(5, 5)), "Pu1");
+
+        // A resistive one weakens it on the way through: `pull` becomes
+        // `weak` (IEEE 1364-2005 Table 7-8).
+        let gate = Gate::new(
+            GateKind::Rpmos,
+            DriveStrength::STRONG,
+            terminals(&["q", "w", "g"]),
+            None,
+        )
+        .unwrap();
+        let (code, driven) = gate.evaluate(&store).unwrap();
+        assert_eq!((code, driven.of(code)), (ONE, Strength::span(3, 3)), "We1");
+    }
+
+    /// The reduction tables, IEEE 1364-2005 Table 7-8. A non-resistive switch
+    /// drops `supply` to `strong` and leaves everything else; an `r`-prefixed
+    /// one weakens every level.
+    ///
+    /// The resistive column is corpus `rtran`'s gold file read off a chain of
+    /// six switches: a `supply` driver reaches them as `Su`, `Pu`, `We`, `Me`,
+    /// `Sm`, `Sm`, `Sm`.
+    #[test]
+    fn test_strength_reduction_tables() {
+        for (level, plain, resistive) in [
+            (7, 6, 5),
+            (6, 6, 5),
+            (5, 5, 3),
+            (4, 4, 2),
+            (3, 3, 2),
+            (2, 2, 1),
+            (1, 1, 1),
+        ] {
+            assert_eq!(
+                reduced(GateKind::Nmos, Strength::span(level, level)).bounds(),
+                (plain, plain),
+                "nmos passing level {}",
+                level
+            );
+            assert_eq!(
+                reduced(GateKind::Rnmos, Strength::span(-level, -level)).bounds(),
+                (-resistive, -resistive),
+                "rnmos passing level -{}",
+                level
+            );
+        }
+        assert_eq!(
+            reduced(GateKind::Rnmos, Strength::HIGHZ),
+            Strength::HIGHZ,
+            "nothing to weaken"
+        );
     }
 
     fn terminals(names: &[&str]) -> Vec<Expression> {

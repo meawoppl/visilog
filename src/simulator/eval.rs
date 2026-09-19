@@ -60,7 +60,9 @@ use crate::simulator::exec::{range_width, resolve_target, ResolvedTarget};
 use crate::simulator::plusargs;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::scan::{self, Slot, END_OF_FILE};
-use crate::simulator::state_store::{random_from_seed, NotReadable, StateStore, MAX_CALL_DEPTH};
+use crate::simulator::state_store::{
+    random_from_seed, DriveLevel, NotReadable, SignalState, StateStore, MAX_CALL_DEPTH,
+};
 use crate::simulator::tasks::ascii;
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
@@ -1262,7 +1264,7 @@ fn type_width(name: &str) -> Option<usize> {
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 46] = [
+pub const SYSTEM_FUNCTIONS: [&str; 47] = [
     "time",
     "stime",
     "realtime",
@@ -1316,6 +1318,10 @@ pub const SYSTEM_FUNCTIONS: [&str; 46] = [
     "ftell",
     "fseek",
     "rewind",
+    // The one system function that is a question about the *design* rather
+    // than about a value: how many drivers reach a bit of a net. It writes
+    // through its arguments the way a scan does.
+    "countdrivers",
 ];
 
 /// The one-argument members of IEEE 1364-2005's real math library, plus
@@ -1478,6 +1484,39 @@ fn eval_system_function_bits(
                 }
                 None => Ok(signed_result(0)),
             }
+        }
+        // `$countdrivers(net, [forced, countD, count0, count1, countX])` —
+        // how many continuous drivers reached one *bit* of a net, and what
+        // each of them was driving. The answer is `1` for a bit more than one
+        // driver reaches and `0` otherwise; everything else comes back through
+        // the arguments, which is why this is one of the system functions that
+        // writes the design.
+        //
+        // A driver that is contributing `z` is not counted at all, so an
+        // undriven net answers `0` rather than the number of `assign`
+        // statements naming it (corpus `countdrivers2`, measured against
+        // iverilog 12.0).
+        "countdrivers" => {
+            if arguments.is_empty() || arguments.len() > 6 {
+                return Err(EvalError::SystemFunctionArity {
+                    name: name.to_string(),
+                    expected: "a net, and up to five variables to fill".to_string(),
+                    found: arguments.len(),
+                });
+            }
+            let (signal, position) = counted_bit(&arguments[0], store)?;
+            let tally = signal
+                .driver_counts()
+                .and_then(|counts| counts.get(position).copied())
+                .unwrap_or_default();
+            let forced = u32::from(forced_bit(&arguments[0], store)?);
+            let answers = [forced, tally.total(), tally.zero, tally.one, tally.unknown];
+            for (argument, answer) in arguments[1..].iter().zip(answers) {
+                let target = resolve_target(store, argument)
+                    .map_err(|error| EvalError::Scan(error.to_string()))?;
+                store.owe_fill(target, signed_result(i64::from(answer)));
+            }
+            Ok(signed_result(i64::from(u32::from(tally.total() > 1))))
         }
         "sscanf" | "fscanf" => {
             if arguments.len() < 2 {
@@ -1887,6 +1926,99 @@ fn whole_number(expression: &Expression, store: &StateStore) -> Result<Option<i6
     Ok(eval(expression, store)?
         .to_i128()
         .and_then(|value| i64::try_from(value).ok()))
+}
+
+/// The signal and bit position `$countdrivers` was asked about.
+///
+/// A net named whole reports its **least significant** bit, which is the same
+/// bit a scalar gate terminal names; a bit select names the bit its index maps
+/// to. The name goes through [`StateStore::unalias`], because a testbench
+/// reaching into an instance writes the *port's* name (`pad1.pad`) and
+/// flattening left the port and what it was bound to as one entry under the
+/// parent's (corpus `countdrivers4`).
+fn counted_bit<'a>(
+    argument: &Expression,
+    store: &'a StateStore,
+) -> Result<(&'a SignalState, usize), EvalError> {
+    let (name, index) = match argument {
+        Expression::Identifier(id) => (id.name.as_str(), None),
+        Expression::BitSelect(id, index) => {
+            (id.name.as_str(), Some(select_index(&eval(index, store)?)?))
+        }
+        _ => {
+            return Err(EvalError::Scan(
+                "`$countdrivers` takes a net or one bit of one".to_string(),
+            ))
+        }
+    };
+    let name = store.unalias(name);
+    let signal = store
+        .get_signal(name)
+        .ok_or_else(|| EvalError::UnknownIdentifier(name.to_string()))?;
+    let position = match index {
+        Some(Some(index)) => signal.bit_position(index),
+        // An index that is not a known number names no bit, and neither does
+        // one outside the declared range — which is what an out-of-range read
+        // already is.
+        Some(None) => None,
+        None => signal.width().checked_sub(1),
+    };
+    let position = position.ok_or_else(|| {
+        EvalError::Scan(format!(
+            "`$countdrivers` names a bit `{}` does not have",
+            name
+        ))
+    })?;
+    Ok((signal, position))
+}
+
+/// Whether a `force` is holding the bit `$countdrivers` was asked about.
+///
+/// A design that forces nothing costs one length compare, the same shape
+/// `exec::held_bits` uses to answer the same question about a write.
+fn forced_bit(argument: &Expression, store: &StateStore) -> Result<bool, EvalError> {
+    if !store.has_drives() {
+        return Ok(false);
+    }
+    let (signal, position) = counted_bit(argument, store)?;
+    let index = bit_index_at(signal.range(), position);
+    let wanted = store.unalias(name_of(argument));
+    let drives = store.drives();
+    for drive in drives.iter() {
+        if drive.level() != DriveLevel::Force || !drive.covers(wanted) {
+            continue;
+        }
+        let Ok(target) = resolve_target(store, drive.target()) else {
+            continue;
+        };
+        let covered = match &target {
+            ResolvedTarget::Whole(_) => true,
+            ResolvedTarget::Bits { name, indices } => name == wanted && indices.contains(&index),
+            _ => false,
+        };
+        if covered {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The declared index a position in a signal's range stands for.
+fn bit_index_at(range: (i64, i64), position: usize) -> i64 {
+    let (most, least) = range;
+    if most >= least {
+        most - position as i64
+    } else {
+        most + position as i64
+    }
+}
+
+/// The name a `$countdrivers` argument is about.
+fn name_of(argument: &Expression) -> &str {
+    match argument {
+        Expression::Identifier(id) | Expression::BitSelect(id, _) => id.name.as_str(),
+        _ => "",
+    }
 }
 
 /// Turns each argument of a scan into the place its conversion writes.
