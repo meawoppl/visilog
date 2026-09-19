@@ -40,20 +40,51 @@ impl From<String> for Identifier {
     }
 }
 
+/// Whether a run of characters is something [`simple_identifier`] would read
+/// whole: a letter or `_`, then letters, digits, `_` and `$`.
+///
+/// It is the question [`escaped_identifier`] asks to decide whether its
+/// backslash carried any information, so it has to agree with that parser
+/// exactly — which is why it is spelled out beside it rather than inferred.
+fn is_simple_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 /// An escaped identifier: `\\` then any run of printable, non-whitespace
 /// characters, terminated by whitespace.
 ///
 /// IEEE 1364 §3.7.1: "the backslash and the terminating white space are not
 /// considered part of the identifier". So `\\a ` and `a` name the *same*
 /// object, which `iverilog` confirms — assigning through one and reading
-/// through the other sees the same value. Stripping both here is what makes
-/// that fall out, with no special case anywhere downstream.
+/// through the other sees the same value, and corpus `escape3` asserts it of
+/// `\\cpu3 `, `cpu3`, `top.\\cpu3 ` and `\\top .cpu3` alike.
+///
+/// **The backslash is kept when the name it spells is not one a simple
+/// identifier could have spelled**, and that is not a hedge — it is what keeps
+/// an escaped name a single *segment* of the flat store's dotted name space.
+/// `reg \\bot.r ;` in the top module and `reg r;` inside an instance called
+/// `bot` are two different variables that a flattening simulator would
+/// otherwise give one key, `bot.r`; iverilog 12.0 keeps them apart (corpus
+/// `escape4`, `escape4b`, whose whole point is that `\\bot.r` is 1 while
+/// `bot.r` is 0). A name a simple identifier *could* have spelled has no such
+/// second reading, so it still collapses and nothing downstream sees a
+/// backslash it did not see before.
 fn escaped_identifier(input: &str) -> IResult<&str, Identifier> {
     let (input, _) = char('\\')(input)?;
     let (input, name) = take_while1(|c: char| !c.is_whitespace())(input)?;
     // The terminating whitespace belongs to the token, not to what follows.
     let (input, _) = multispace1(input)?;
-    Ok((input, Identifier::new(name.to_string())))
+    let name = if is_simple_identifier(name) {
+        name.to_string()
+    } else {
+        format!("\\{}", name)
+    };
+    Ok((input, Identifier::new(name)))
 }
 
 pub fn identifier(input: &str) -> IResult<&str, Identifier> {
@@ -169,10 +200,50 @@ mod tests {
     #[test]
     fn test_escaped_identifiers_drop_the_backslash_and_terminator() {
         assert_parses_to(identifier, "\\a ", "a".into());
-        assert_parses_to(identifier, "\\odd*name$ ", "odd*name$".into());
-        assert_parses_to(identifier, "\\in[0] ", "in[0]".into());
-        // Characters a simple identifier could never carry.
-        assert_parses_to(identifier, "\\1st.wire! ", "1st.wire!".into());
+        assert_parses_to(identifier, "\\_x1$ ", "_x1$".into());
+    }
+
+    /// A name a simple identifier could **not** have spelled keeps its
+    /// backslash, because the flat store's name space is dotted and an escaped
+    /// name is one segment of it. `reg \\bot.r ;` in the top module and `reg r;`
+    /// inside an instance called `bot` are two variables, and iverilog 12.0
+    /// keeps them apart — corpus `escape4` prints `\\bot.r == 1` and
+    /// `bot.r == 0`, and `escape4b` the same for a memory word.
+    ///
+    /// Nothing else is given a second spelling by this: `odd*name$` cannot be
+    /// written without the escape in the first place.
+    #[test]
+    fn test_an_escaped_identifier_that_is_not_a_simple_one_keeps_its_backslash() {
+        assert_parses_to(identifier, "\\bot.r ", "\\bot.r".into());
+        assert_parses_to(identifier, "\\odd*name$ ", "\\odd*name$".into());
+        assert_parses_to(identifier, "\\in[0] ", "\\in[0]".into());
+        assert_parses_to(identifier, "\\1st.wire! ", "\\1st.wire!".into());
+        assert_parses_to(identifier, "\\$I178 ", "\\$I178".into());
+    }
+
+    /// The hierarchical fold is where the collision the backslash prevents
+    /// would have happened: `bot.r` written as a path and `\\bot.r ` written as
+    /// one escaped name both end up as a single [`Identifier`], and only the
+    /// backslash tells them apart.
+    #[test]
+    fn test_an_escaped_name_and_the_path_it_spells_are_different_identifiers() {
+        let (_, escaped) = hierarchical_identifier("\\bot.r = 1;").unwrap();
+        let (_, path) = hierarchical_identifier("bot.r = 1;").unwrap();
+        assert_eq!(escaped.name, "\\bot.r");
+        assert_eq!(path.name, "bot.r");
+        assert_ne!(escaped, path);
+
+        // An escaped *segment* of a longer path keeps its backslash and the
+        // path is still folded whole, so a reference into an instance works.
+        let (_, inside) = hierarchical_identifier("dut.\\bot.r = 1;").unwrap();
+        assert_eq!(inside.name, "dut.\\bot.r");
+
+        // Corpus `escape3`: an escaped name that *is* a simple identifier still
+        // collapses, on both sides of the dot.
+        let (_, head) = hierarchical_identifier("\\top .cpu3 ").unwrap();
+        assert_eq!(head.name, "top.cpu3");
+        let (_, tail) = hierarchical_identifier("top.\\cpu3 ").unwrap();
+        assert_eq!(tail.name, "top.cpu3");
     }
 
     /// The terminator is required — without it there is no way to know where

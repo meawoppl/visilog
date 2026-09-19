@@ -6,9 +6,6 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
-
 use crate::parsers::expr::Expression;
 use crate::register::{Register, REAL_WIDTH, X};
 use crate::simulator::exec::ResolvedTarget;
@@ -17,12 +14,12 @@ use crate::simulator::tasks::Output;
 
 /// What the `$random` stream starts from.
 ///
-/// IEEE 1364 leaves an unseeded `$random` implementation defined, so the choice
-/// is ours; a fixed constant is the one that makes a design's output the same
-/// on every run, which is what a self-checking test that prints random stimulus
-/// needs. A simulation gets a fresh [`StateStore`], so the stream restarts at
-/// this seed every time a design is set up.
-const DEFAULT_RANDOM_SEED: u64 = 0;
+/// Zero is what iverilog's unseeded `$random` starts from, and
+/// [`uniform`] maps it to a stream of its own — so a design that draws random
+/// stimulus draws the *same* stimulus on every run, and the same stimulus
+/// iverilog draws. A simulation gets a fresh [`StateStore`], so the stream
+/// restarts here every time a design is set up.
+const DEFAULT_RANDOM_SEED: i32 = 0;
 
 /// How deep calls to a design's own functions may nest.
 ///
@@ -42,18 +39,72 @@ pub const MAX_CALL_DEPTH: usize = 32;
 
 /// The stream `$random` draws from.
 ///
+/// The whole of its state is one 32 bit seed, because that is all IEEE
+/// 1364-2005's reference generator has — see [`random_from_seed`].
 /// [`eval`](crate::simulator::eval::eval) is handed a `&StateStore` and nothing
 /// else, so the one system function that is not a pure function of its
 /// arguments has to advance its state through a shared reference — hence the
-/// [`RefCell`]. Cloning a store clones the stream's position with it, so a
+/// [`Cell`]. Cloning a store clones the stream's position with it, so a
 /// snapshot replays the same numbers.
 #[derive(Clone, Debug)]
-pub struct RandomStream(RefCell<StdRng>);
+pub struct RandomStream(Cell<i32>);
 
 impl Default for RandomStream {
     fn default() -> Self {
-        RandomStream(RefCell::new(StdRng::seed_from_u64(DEFAULT_RANDOM_SEED)))
+        RandomStream(Cell::new(DEFAULT_RANDOM_SEED))
     }
+}
+
+/// One draw of IEEE 1364-2005 17.9.3's `$random`: the value, and the seed the
+/// next draw starts from.
+///
+/// The algorithm is the standard's own reference C, transcribed — including
+/// its `float`-flavoured scaling and its truncation toward zero — because the
+/// point of it is that every simulator draws the *same* numbers from the same
+/// seed. Corpus `pr995` prints thirty-one seed/value pairs for each of two
+/// seeds and `pr556` prints two hundred and fifty-six draws of the unseeded
+/// stream, so any departure at all shows up immediately.
+///
+/// This is `rtl_dist_uniform(seed, INT32_MIN, INT32_MAX)`, whose bounds are
+/// the whole of `integer` — which is why only the last of that function's
+/// three branches is here.
+pub fn random_from_seed(seed: i32) -> (i32, i32) {
+    let (value, next) = uniform(seed, i32::MIN, i32::MAX);
+    let scaled = (value + 2147483648.0) / 4294967295.0;
+    let scaled = scaled * 4294967296.0 - 2147483648.0;
+    // The standard truncates toward zero and then steps a negative result one
+    // further down, which is C's `(int)(r - 1)` — a floor, spelled the long
+    // way round.
+    let drawn = if scaled >= 0.0 {
+        scaled as i32
+    } else {
+        (scaled - 1.0) as i32
+    };
+    (drawn, next)
+}
+
+/// The generator underneath [`random_from_seed`]: a linear congruential step
+/// on the seed, scaled into `start..=end`.
+///
+/// A seed of zero is replaced rather than used — an LCG started from zero is
+/// still a perfectly good stream here, but the standard says to start
+/// elsewhere and that constant is part of what makes an unseeded `$random`
+/// reproducible across simulators.
+fn uniform(seed: i32, start: i32, end: i32) -> (f64, i32) {
+    let old = if seed == 0 { 259341593u32 } else { seed as u32 };
+    let (a, b) = if start >= end {
+        (0.0, 2147483647.0)
+    } else {
+        (f64::from(start), f64::from(end))
+    };
+    let next = 69069u32.wrapping_mul(old).wrapping_add(1);
+    // 2^-23: the standard scales the seed's top bits as though they were the
+    // mantissa of a `float` between 1.0 and 2.0.
+    const D: f64 = 0.000_000_119_209_289_550_781_25;
+    let mut c = 1.0 + f64::from(next >> 9) * D;
+    c += c * D;
+    c = ((b - a) * (c - 1.0)) + a;
+    (c, next as i32)
 }
 
 /// Bit 31 of a descriptor marks a *file* descriptor rather than a
@@ -655,9 +706,11 @@ pub enum DriveLevel {
 /// only thing a running procedural block is handed is a [`StateStore`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drive {
-    /// The signal the target names, which is the key the precedence rule is
-    /// answered by.
-    name: String,
+    /// The signals the target names, which are the keys the precedence rule is
+    /// answered by. A concatenation target — `assign {a, b} = e;` — names
+    /// several, and the drive holds every one of them, so that a write to any
+    /// of them finds it.
+    names: Vec<String>,
     /// The left hand side, kept unresolved so that the drive re-resolves it the
     /// way a module-level continuous assignment does — a variable index in
     /// `force m[i] = e;` follows `i`.
@@ -668,21 +721,27 @@ pub struct Drive {
 
 impl Drive {
     pub fn new(
-        name: impl Into<String>,
+        names: Vec<String>,
         target: Expression,
         value: Expression,
         level: DriveLevel,
     ) -> Self {
         Drive {
-            name: name.into(),
+            names,
             target,
             value,
             level,
         }
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Whether this drive holds any part of `name`.
+    pub fn covers(&self, name: &str) -> bool {
+        self.names.iter().any(|held| held == name)
+    }
+
+    /// Every signal this drive holds part of.
+    pub fn names(&self) -> &[String] {
+        &self.names
     }
 
     pub fn target(&self) -> &Expression {
@@ -1228,11 +1287,11 @@ impl StateStore {
         Rc::clone(&self.drives)
     }
 
-    /// The drive of `level` installed on `name`, if there is one.
+    /// The drive of `level` holding any part of `name`, if there is one.
     pub fn drive(&self, name: &str, level: DriveLevel) -> Option<&Drive> {
         self.drives
             .iter()
-            .find(|drive| drive.name == name && drive.level == level)
+            .find(|drive| drive.level == level && drive.covers(name))
     }
 
     /// Installs a drive, replacing one of the same strength on the same
@@ -1251,7 +1310,7 @@ impl StateStore {
     pub fn install_drive(&mut self, drive: Drive) {
         let drives = Rc::make_mut(&mut self.drives);
         match drives.iter_mut().find(|existing| {
-            existing.name == drive.name
+            existing.names == drive.names
                 && existing.level == drive.level
                 && existing.target == drive.target
         }) {
@@ -1315,16 +1374,14 @@ impl StateStore {
     }
 
     /// The next number in the `$random` stream, as Verilog's 32 bit integer.
-    pub fn next_random(&self) -> u32 {
-        self.random.0.borrow_mut().next_u32()
-    }
-
-    /// Restarts the `$random` stream from `seed`, which is what `$random(seed)`
-    /// does. Verilog's seed argument is an `inout` the simulator writes back
-    /// through; nothing here writes back, so a design that re-seeds from a
-    /// variable it never changes draws the same number every time.
-    pub fn seed_random(&self, seed: u64) {
-        *self.random.0.borrow_mut() = StdRng::seed_from_u64(seed);
+    ///
+    /// This is the stream a bare `$random` draws from. `$random(seed)` keeps
+    /// its stream in the design's own variable instead and so does not come
+    /// here — see [`random_from_seed`].
+    pub fn next_random(&self) -> i32 {
+        let (value, next) = random_from_seed(self.random.0.get());
+        self.random.0.set(next);
+        value
     }
 
     /// Notes the value `name` holds right now, so that a write about to land on
@@ -1466,6 +1523,27 @@ impl StateStore {
     /// which is what iverilog prints, and what a three-state bus depends on.
     pub fn declare_net(&mut self, name: impl Into<String>, range: (i64, i64), signed: bool) {
         self.declare_filled(name, range, signed, true, Register::high_impedance);
+    }
+
+    /// Turns a signal that was declared a net into a variable, keeping the
+    /// width it was declared at and refilling it with `x`.
+    ///
+    /// This is what an **aliased** port that a child backs with a `reg` asks
+    /// for. The parent's `wire w;` and the child's `output reg w` are one store
+    /// entry here, so only one of the two fills can stand — and it is the
+    /// child's, because the `reg` is a driver: `w` reads `x` because its driver
+    /// has not said what it is, not `z` because nothing is driving it.
+    pub fn redeclare_as_variable(&mut self, name: &str) {
+        let Some(signal) = self.name_to_signal.get(name) else {
+            return;
+        };
+        let range = signal.range();
+        let signed = signal.is_signed();
+        self.name_to_signal.insert(
+            name.to_string(),
+            SignalState::with_range(Register::unknown(range_width(range)), range)
+                .with_signedness(signed),
+        );
     }
 
     /// Declares a `real`: sixty-four bits read as a double, starting at `0.0`.
@@ -1967,6 +2045,38 @@ mod tests {
             store.set_word("absent", 0, &Register::from_binary("1")),
             None
         );
+    }
+
+    /// The standard generator, checked against the first four seed/value pairs
+    /// of corpus `pr995`'s gold file — which is iverilog 12.0's own output for
+    /// `result = $random(seed);` starting from a seed of `1`.
+    #[test]
+    fn test_random_from_seed_matches_the_standard() {
+        let mut seed = 1i32;
+        let mut pairs = Vec::new();
+        for _ in 0..4 {
+            let (value, next) = random_from_seed(seed);
+            seed = next;
+            pairs.push((next as u32, value as u32));
+        }
+        assert_eq!(
+            pairs,
+            vec![
+                (0x0001_0dce, 0x8001_0e00),
+                (0x1c59_83f7, 0x9c59_8438),
+                (0xc359_37cc, 0x4359_3986),
+                (0x2e13_0a5d, 0xae13_0c5c),
+            ]
+        );
+    }
+
+    /// A seed of zero is a stream of its own rather than a degenerate one: the
+    /// generator replaces it, so the unseeded default draws real numbers.
+    /// Measured against iverilog 12.0's first unseeded `$random`, 303379748.
+    #[test]
+    fn test_random_default_seed_draws_a_real_number() {
+        let store = StateStore::new();
+        assert_eq!(store.next_random(), 303379748);
     }
 
     #[test]

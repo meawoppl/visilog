@@ -842,8 +842,16 @@ impl<'m> Elaborator<'m> {
         let local = &port.identifier.name;
         match scope.bindings.get(local) {
             // The parent's signal *is* this port. Declaring it again would give
-            // the port a second, immediately stale copy.
-            Some(Binding::Alias(_)) => return Ok(()),
+            // the port a second, immediately stale copy — but a port the child
+            // backs with a `reg` is a *driver* of that signal, so its fill is
+            // the one that stands.
+            Some(Binding::Alias(target)) => {
+                if port_is_variable(port) {
+                    let target = target.clone();
+                    self.out.state.redeclare_as_variable(&target);
+                }
+                return Ok(());
+            }
             Some(Binding::Driven(expression)) => {
                 let name = scope.qualified(local);
                 let range = self.resolve_range(&port.range, scope)?;
@@ -1399,11 +1407,16 @@ impl<'m> Elaborator<'m> {
 
     /// Declares a signal local to this instance.
     ///
-    /// A redeclaration of an aliased port (`output q;` followed by `reg q;`) is
-    /// skipped: the parent's signal is the one the port names, and resetting it
-    /// to `x` at the child's width would clobber it.
+    /// A redeclaration of an aliased port (`output q;` followed by `reg q;`)
+    /// keeps the parent's entry — resetting it to `x` at the *child's* width
+    /// would clobber the width aliasing gave it — but it does say the signal is
+    /// a **variable**, so an undriven one reads `x` rather than the `z` the
+    /// parent's `wire` filled it with. The `reg` is a driver of that net, and
+    /// what a driver has not said is `x` (corpus `pr1792108`, `pr1645518`).
     fn declare_local(&mut self, local: &str, range: (i64, i64), signed: bool, scope: &Scope) {
-        if matches!(scope.bindings.get(local), Some(Binding::Alias(_))) {
+        if let Some(Binding::Alias(target)) = scope.bindings.get(local) {
+            let target = target.clone();
+            self.out.state.redeclare_as_variable(&target);
             return;
         }
         self.out
@@ -2167,7 +2180,9 @@ impl<'m> Elaborator<'m> {
             if !scope.genvars.is_empty() {
                 substitute_genvars(&mut connection, &scope.genvars);
             }
-            let binding = match plain_identifier(&connection) {
+            let binding = match plain_identifier(&connection)
+                .filter(|_| self.can_alias(port, &connection, scope))
+            {
                 Some(id) => {
                     let outer = scope.resolve(&id.name);
                     if !self.out.state.contains(&outer) {
@@ -2217,6 +2232,37 @@ impl<'m> Elaborator<'m> {
         }
 
         self.walk(index, &inner)
+    }
+
+    /// Whether a port bound to a plain identifier may share that signal's
+    /// store entry.
+    ///
+    /// Aliasing makes the port and the parent's signal **one** value, and a
+    /// value carries how to read it — so a port whose declaration disagrees
+    /// with the parent's about signedness cannot be one: `input signed [31:0]
+    /// a` bound to a `reg [31:0]` would read unsigned inside the child, and
+    /// `a <= b` would compare `32'h80000000` as the largest number rather than
+    /// the smallest (corpus `pr1033`). Such a port keeps an entry of its own
+    /// and a continuous assignment carries the value across, which is the
+    /// arrangement a port bound to an *expression* already had.
+    ///
+    /// An `inout` is the one that cannot take it: it is read as well as
+    /// written and one assignment only runs one way, so it stays aliased and
+    /// keeps the parent's signedness.
+    fn can_alias(&self, port: &Port, connection: &Expression, scope: &Scope) -> bool {
+        if matches!(port.direction, PortDirection::InOut) {
+            return true;
+        }
+        if port.direction == PortDirection::Output && !is_drivable(connection) {
+            return true;
+        }
+        let Some(id) = plain_identifier(connection) else {
+            return true;
+        };
+        self.out
+            .state
+            .get_signal(&scope.resolve(&id.name))
+            .is_none_or(|outer| outer.is_signed() == port.signed)
     }
 
     /// Evaluates a `#(...)` block in the *parent's* scope, keyed by the child's
@@ -2387,17 +2433,19 @@ fn analyse_function_body(
     let mut outside: BTreeSet<String> = BTreeSet::new();
     for instruction in program.instructions() {
         match instruction {
-            Instruction::Blocking { target, .. } => match assigned_name(target) {
-                Some(name) if own.contains(name) => {}
-                Some(name) => {
-                    outside.insert(name.to_string());
-                }
-                None => {
+            Instruction::Blocking { target, .. } => {
+                let mut names = Vec::new();
+                if !assigned_names(target, &mut names) {
                     return Err(SimulationError::UnsupportedTarget(
                         target.to_contracted_string(),
-                    ))
+                    ));
                 }
-            },
+                for name in names {
+                    if !own.contains(name) {
+                        outside.insert(name.to_string());
+                    }
+                }
+            }
             // A scheduled write is a non-blocking assignment with a delay on
             // it, so it fails for both reasons at once; the non-blocking one
             // is the more specific.
@@ -2509,12 +2557,13 @@ fn assigned_name(target: &Expression) -> Option<&str> {
 
 /// Every signal a compiled body assigns.
 ///
-/// A target whose name cannot be read off it — a concatenation, which is
-/// several — contributes each of its parts, so the set is never short of a
-/// name the body really writes. Being short is the direction that matters: it
-/// is what a block measures "was that edge one of mine?" against.
+/// This is what a block measures "was that edge one of mine?" against — see
+/// [`TimedBlock::writes`] — so it must never be *short* of a name the body
+/// really writes. A concatenation target contributes each of its parts, which
+/// is what [`assigned_names`] already walks for the function-body analysis.
 fn written_names(program: &Program) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
+    let mut parts = Vec::new();
     for instruction in program.instructions() {
         let target = match instruction {
             Instruction::Blocking { target, .. }
@@ -2528,23 +2577,31 @@ fn written_names(program: &Program) -> BTreeSet<String> {
             | Instruction::Release(target) => target,
             _ => continue,
         };
-        collect_written_names(target, &mut names);
+        parts.clear();
+        assigned_names(target, &mut parts);
+        names.extend(parts.iter().map(|name| (*name).to_string()));
     }
     names
 }
 
-fn collect_written_names(target: &Expression, names: &mut BTreeSet<String>) {
-    match assigned_name(target) {
-        Some(name) => {
-            names.insert(name.to_string());
-        }
-        None => {
-            if let Expression::Concatenation(parts) = target {
-                for part in parts {
-                    collect_written_names(part, names);
-                }
+/// Every signal an assignment target writes, collected into `names`, reporting
+/// whether the whole target names signals at all.
+///
+/// A concatenation names one per part — `{tmp1, tmp2} = v;` is an ordinary
+/// Verilog target that `ResolvedTarget::Parts` already writes — and a part that
+/// names nothing fails the whole target the way a bare one does (corpus
+/// `constfunc14`).
+fn assigned_names<'a>(target: &'a Expression, names: &mut Vec<&'a str>) -> bool {
+    match target {
+        Expression::Concatenation(parts) => parts.iter().all(|part| assigned_names(part, names)),
+        Expression::Parenthetical(inner) => assigned_names(inner, names),
+        other => match assigned_name(other) {
+            Some(name) => {
+                names.push(name);
+                true
             }
-        }
+            None => false,
+        },
     }
 }
 
@@ -3830,6 +3887,89 @@ mod tests {
         // `count` is the same entry as the parent's `out` port.
         assert_eq!(simulator.get("dut.count").unwrap().to_u128(), Some(1));
         assert_eq!(simulator.get("out").unwrap().to_u128(), Some(1));
+    }
+
+    /// A `wire` in the parent bound to an `output reg` in the child reads `x`
+    /// before anything drives it, not `z`: the `reg` *is* the net's driver, and
+    /// what a driver has not said yet is unknown rather than floating. Both
+    /// spellings of the child's declaration say it — `output reg q` in the
+    /// header and `output q; reg q;` in the body.
+    ///
+    /// iverilog 12.0 prints `ansi=x body=x float=z` for this design.
+    #[test]
+    fn test_a_wire_driven_by_a_childs_reg_starts_unknown() {
+        let ansi = r#"
+            module ansi(output reg q);
+            endmodule
+        "#;
+        let body = r#"
+            module body(q);
+                output q;
+                reg q;
+            endmodule
+        "#;
+        let floating = r#"
+            module floating(q);
+                output q;
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                wire a, b, c;
+                ansi u1 (a);
+                body u2 (b);
+                floating u3 (c);
+                initial $display("ansi=%b body=%b float=%b", a, b, c);
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, ansi, body, floating], "top");
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["ansi=x body=x float=z"]);
+    }
+
+    /// A port whose declaration disagrees with the parent's about signedness
+    /// is not aliased: the entry it would share carries *one* signedness, and
+    /// the child's is the one its own body must read. So `input signed [3:0]`
+    /// bound to an unsigned `reg [3:0]` compares `4'b1000` as -8 rather than
+    /// as 8, in both header spellings and however the parent wrote the
+    /// connection.
+    ///
+    /// iverilog 12.0 prints `y1=0 y2=0 y3=0` for this design — `7 <= -8` is
+    /// false all three ways.
+    #[test]
+    fn test_a_signed_port_is_signed_inside_the_child() {
+        let sub = r#"
+            module sub(a, b, y);
+                input signed [3:0] a;
+                input signed [3:0] b;
+                output y;
+                assign y = a <= b;
+            endmodule
+        "#;
+        let ansi = r#"
+            module ansi(input signed [3:0] a, input signed [3:0] b, output y);
+                assign y = a <= b;
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                reg [3:0] p, q;
+                wire y1, y2, y3;
+                sub u1 (p, q, y1);
+                ansi u2 (p, q, y2);
+                sub u3 (p + 0, q + 0, y3);
+                initial begin
+                    p = 4'b0111;
+                    q = 4'b1000;
+                    #1 $display("y1=%b y2=%b y3=%b", y1, y2, y3);
+                end
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, sub, ansi], "top");
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["y1=0 y2=0 y3=0"]);
     }
 
     /// Combinational output flowing back up into a parent expression.

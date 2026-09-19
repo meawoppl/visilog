@@ -282,6 +282,17 @@ unconnected input is declared `z`. `Simulator::with_modules(modules, top)` is ho
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 
+**A port and the parent's signal have to agree about signedness to be one entry.** A
+store entry carries *one* signedness — a value is bits plus how to read them — so
+`input signed [31:0] a` bound to a plain `reg [31:0]` cannot be aliased onto it: the
+child would read its own port unsigned and `a <= b` would rank `32'h80000000` above
+`32'h7fffffff` (corpus `pr1033`, whose whole comment is that complaint). `can_alias` is
+that question, asked before `plain_identifier`'s answer is used, and a port that fails it
+takes the arrangement a port bound to an *expression* already had — its own entry, at its
+own declared signedness, with a continuous assignment carrying the value across. An
+`inout` is the exception and stays aliased: it is read as well as written, and one
+assignment only runs one way.
+
 **System tasks print into a buffer, not to stdout.** `$display`, `$write` and `$finish`
 are compiled to an `Instruction::Task` and carried out by
 `tasks::TaskContext`, which the `Simulator` owns: `simulator.output()` hands back
@@ -570,16 +581,32 @@ is a compiler diagnostic visilog has no channel for, which is the whole of why c
 `pr1403406b` is a gold mismatch while `pr1403406`, `pr1403406a`, `pr1701855` and
 `pr1701855b` match.
 
-**`$timeformat` sets how `%t` renders, but nothing rescales it.** `precision`
-fractional digits, then the suffix, right-aligned in `min_width` (twenty by
-default), with an explicit `%12t` overriding `min_width` and `%0t` meaning no
-padding at all. The `units` argument is range-checked and then taken to name the
-unit a tick already *is*: the clock counts ticks, and although
-`Simulator::set_timescale` now receives the `` `timescale `` the preprocessor recorded,
-only the waveform header reads it — nothing converts between it and `units` (#209).
-That is the identity for the `` `timescale 1ns `` plus
-`$timeformat(-9, …)` pairing that covers nearly every design using either, and
-wrong by a power of ten when they disagree — corpus `timeform1` is the case.
+**`$timeformat`'s `units` is a scale factor, and `%t` is the one place the
+`` `timescale `` reaches the output.** The clock counts ticks of the **unit** of the
+module a call was written in — `TaskContext::tick_fs`, which asks the same `scale_of`
+`$printtimescale` does — and `%t` restates one of those in the power of ten the design
+named, so `` `timescale 1ns `` with `$timeformat(-6, …)` prints `10` as `0` and with
+`$timeformat(-12, …)` prints it as `10000`. Both ends are held in **femtoseconds**,
+because a `` `timescale `` term is `1`, `10` or `100` of a unit and only the finest unit
+makes every ratio an exact integer.
+
+A design that never called `$timeformat` prints in the **finest precision** any
+`` `timescale `` in it declared (`TaskContext::default_time_units`), which is what the
+LRM asks for: `` `timescale 1ns/100ps `` renders `$time` of 5 as `50`. That is also why
+a design with no directive at all is unchanged — a module with no `` `timescale `` is at
+`1s / 1s`, so the tick and the display unit are both a second and the ratio is one.
+
+The scaling of an **integer** time is exact and **truncated** — 1500 ticks of `1ns` at
+`$timeformat(-6, 0, …)` is `1`, not `2`, and at `$timeformat(-6, 1, …)` is `1.5` — while
+a **real** one (`$realtime`, or a literal) is scaled as a double and rounded by the field
+width, since it carries a fraction of a tick. Both were measured against iverilog 12.0,
+which takes the two paths as well. `precision` fractional digits, then the suffix,
+right-aligned in `min_width` (twenty by default), with an explicit `%12t` overriding
+`min_width` and `%0t` meaning no padding at all.
+
+What is still not rescaled is *time itself*: `#5` advances five ticks whatever the
+module's unit is, so a design mixing `` `timescale 1ns `` and `` `timescale 1us ``
+modules runs both at the same rate where iverilog would not (#209).
 
 **A system *function* is an expression operand, and `eval` implements it.** `$time`,
 `$stime`, `$signed`, `$unsigned`, `$random`, `$fopen`, `$bits` and `$clog2` parse anywhere an
@@ -595,11 +622,31 @@ not pure functions of their arguments reach the simulation *through the store*:
 `StateStore::set_time` carries the clock `$time` reads — `Simulator::advance` moves it
 with `now`, and it is the only clock, which is why `TaskContext` no longer holds one —
 `StateStore::open_channel` / `open_descriptor` own the files `$fopen` opens, and
-`StateStore::next_random` / `seed_random` own the `$random` stream. The stream is a
-`RefCell<StdRng>` seeded from a fixed constant (`DEFAULT_RANDOM_SEED`, 0), so a design
-that draws random stimulus draws the *same* stimulus on every run and a self-checking
-test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
-write the seed back the way a real simulator's `inout` argument does.
+`StateStore::next_random` owns the `$random` stream.
+
+**`$random` is IEEE 1364-2005 17.9.3's generator, transcribed rather than chosen.** The
+point of that algorithm is that every simulator draws the *same* numbers from the same
+seed, so `state_store::random_from_seed` is the standard's reference C line for line —
+its `69069 * seed + 1` step, its `float`-flavoured scaling through `uniform`, and its
+truncation toward zero. The whole of the stream's state is one 32 bit seed
+(`DEFAULT_RANDOM_SEED`, 0, which `uniform` maps to a stream of its own), so a design that
+draws random stimulus draws the same stimulus on every run *and* the stimulus iverilog
+draws — corpus `pr556` prints 256 unseeded draws and `pr995` 93 seeded seed/value pairs,
+and either one catches any departure at all.
+
+**The two forms differ only in where the state is kept.** A bare `$random` advances the
+store's seed; `$random(seed)` reads the *design's* variable and writes the next seed back
+through it, because the argument is an `inout` — which is what makes `for (…) r =
+$random(s);` a sequence rather than one number repeated. The write-back goes on
+`StateStore::owe_fill`, the queue `$sscanf` already used, so it lands at the next
+instruction boundary and the statement after the call reads the new seed. A seed that is
+not a writable target is `EvalError::RandomSeed` naming it, never a stream that cannot
+move; an unknown bit of one reads as `0`, which is what iverilog takes from a four-state
+value asked for as an integer. A **second** draw in the same statement reads the seed out
+of that queue rather than out of the signal — `StateStore::pending_fill`, the same
+question a second call to a function with a side effect already asked — so
+`{$random(s), $random(s), $random(s), $random(s)}` is four different numbers (corpus
+`concat3`).
 
 **The plus-args are the one thing a design learns about its own invocation, and only a
 caller knows them.** `$test$plusargs("opt")` is a *prefix* match over the whole `+name=value`
@@ -770,6 +817,17 @@ the same thing and its declaration runs after the port's, overwriting the fill, 
 spellings land on `x` with no special case. An array of nets gets the same treatment
 through `Memory::of_nets`.
 
+**A `reg` behind an *aliased* port wins the fill, because it is the net's driver.**
+`wire w; child u (w);` against `output reg w` inside the child is one store entry, so
+only one of the two declarations can fill it — and it is the child's: the `reg` drives
+that net, and what a driver has not said yet is `x` rather than `z`. A port bound to an
+expression already had this (it has an entry of its own), and the alias case is
+`StateStore::redeclare_as_variable`, called from `declare_port` for the header spelling
+and from `declare_local` for `output w; reg w;` in the body. It keeps the width aliasing
+gave the entry — the *parent's* — and changes only the fill and the net flag. Corpus
+`pr1792108`, `pr1645518` and `memidx` are that rule, and iverilog 12.0 was measured for
+all three spellings: `ansi=x body=x float=z`.
+
 **A name nothing declares that is *wired to something* is a net, not an error.** That is
 IEEE 1364-2005 §4.5, and `Elaborator::declare_implicit_nets` is where it happens: the
 three places are a module instance's port connection, a gate or primitive terminal, and
@@ -837,6 +895,22 @@ resolves each drive's target and drops the ones whose bits the release names, wh
 why the decision is made in `exec` and applied by `StateStore::retain_drives` — resolving
 a target needs the evaluator, and the store has no evaluator.
 
+**A concatenation is a drive target like any other, and the drive holds every signal it
+names.** `assign {a, b, c, d} = 4'h2;` written inside a block is one drive under four
+names (`Drive::names` / `Drive::covers`), because the precedence rule is asked *per
+signal* — a write to `b` has to find it. Installing it on the first part and losing the
+rest is the wrong answer that the old named error was there to avoid; `ResolvedTarget::Parts`
+already split the value, so the only thing missing was somewhere for the drive to live.
+`exec::held_by` is the per-part half of `held_bits` and `exec::target_bits` /
+`released_covers` the per-part half of the release rule, so `deassign {a, b, c, d};` takes
+the drive its `assign` put in and a release of one part of a wider one still leaves it
+standing. Corpus `assign3.2D`, `assign3.2E`, measured against iverilog 12.0.
+
+A concatenation is also a target inside a **function** body — `{swap[3:0], swap[7:4]} =
+{hi, lo};` over the function's own result variable is corpus `constfunc14` — so
+`elaborate::assigned_names` asks each part for the signal it writes where `assigned_name`
+asked the target for one.
+
 **A `release` puts nothing back**, and the asymmetry that follows is the whole rule: a
 **net** reverts because its continuous drivers reach it again on the next pass, while a
 **variable** has no driver and so keeps the value the force left it holding. "On the next
@@ -895,7 +969,7 @@ new, so a task may enable one declared further down the file.
 
 Still unsupported: a hierarchical enable (`instance.task(…)`); a task enabled from inside a
 `function`, which is rejected by the function body analysis rather than by a check of its
-own; and concatenation as an assignment target. `signals.rs` is built but still unwired.
+own. `signals.rs` is built but still unwired.
 
 **A `disable` is a jump when it can be, and a cancellation when it cannot.** A named block
 and an inlined task body each occupy a *range* of the compiled instruction list, and
@@ -1325,6 +1399,18 @@ name — `main.dut.count` — and the top module is the root of the flat name sp
 carries no prefix, so `Scope::resolve` drops that leading segment. A scope of its own
 shadows it, which is why the `locals` lookup is asked first.
 
+**An escaped identifier keeps its backslash unless a simple identifier could have spelled
+it**, and that is what keeps it one *segment* of that dotted name space. IEEE 1364 §3.7.1
+says the backslash and the terminating whitespace are not part of the name, so `\a ` and
+`a` really are one object (corpus `escape3` asserts it of `\cpu3 `, `cpu3`, `top.\cpu3 `
+and `\top .cpu3` alike) — but dropping it unconditionally gives `reg \bot.r ;` in the top
+module and `reg r;` inside an instance called `bot` the *same* store key, and iverilog 12.0
+keeps them apart (corpus `escape4`, `escape4b`). `identifier::is_simple_identifier` is the
+question, spelled out beside `simple_identifier` so the two cannot disagree, and a name
+that answers yes still collapses — so nothing downstream sees a backslash it did not see
+before, and a name like `odd*name$` that has no unescaped spelling at all loses nothing by
+keeping one.
+
 **An output bound to a select is the alias run backwards.** `.y(bus[i])` — how a generate
 loop wires an instance per bit — cannot be aliased, because the port and `bus[i]` are not
 one store entry. The port keeps a signal of its own and a continuous assignment carries
@@ -1520,7 +1606,7 @@ telling apart.
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, and `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -1786,8 +1872,16 @@ tripwire.
   distinct — don't collapse `@(*)` into an empty `Events` list.
 - **`case`, `casez` and `casex` differ only in the comparison.** One `CaseKind`
   (`behavior.rs`) rides on `CaseStatement` and on every `Instruction::JumpIfMatch`, and
-  `program.rs`'s `case_matches` switches on it: `Exact` keeps `==` semantics, where an
-  `x`/`z` on either side is never a match, while the wildcard forms compare for *identity*
+  `program.rs`'s `case_matches` switches on it: `Exact` is **case equality** — `===`, not
+  `==` — so an `x` matches an `x` and a `z` matches a `z` while still being told apart from
+  each other and from a known bit, which is IEEE 1364-2005 §9.5 and what iverilog 12.0
+  does (`case (3'bx11)` takes the `3'bx11` arm; `case (3'bz11)` takes the `3'bz11` arm and
+  not the `3'bx11` one; `case (3'bx11)` against a lone `3'bz11` arm takes the default).
+  Reading it as `==` instead — an unknown on either side never matching — is what a `case`
+  whose arms enumerate `x` and `z` states catches, and it is silent everywhere else:
+  corpus `case3.8D` and `always3.1.6D` were exactly that. The four-state `Register`
+  comparison already answers it, so the whole of the rule is comparing at the wider of the
+  two widths. The wildcard forms instead compare for *identity*
   with the don't-care bits masked out — `Register::matches_ignoring_z` / `_xz`, which read
   the don't-care mask straight off the `unknown` bit plane. A wildcard counts on **either
   side**, so a `z` in the subject is as much a don't-care as one in the label; testing only
@@ -1990,6 +2084,16 @@ tripwire.
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
   literal — which is also what the LRM says.
+- **A backslash before a newline inside a string literal is a line continuation, and it
+  contributes nothing.** IEEE 1364-2005 §3.6; iverilog 12.0 prints `ab` for a literal
+  spelled `"a\<newline>b"`. It is `string.rs::line_continuation`, deliberately *not* one of
+  `parse_escape_sequence`'s alternatives, because it produces no character rather than one
+  — and it is tried before every other piece of a string's body, since they would all claim
+  its backslash. Getting it wrong is silent: the backslash falls through to the ordinary
+  character arm and keeps the newline with it, so the string holds two characters nothing
+  wrote (corpus `string12`). This is the *opposite* rule from a continuation in a
+  `` `define `` body, where the newline stays — a `//` comment there would otherwise
+  swallow the rest of the macro.
 - **A null statement leaves no node behind.** A bare `;` is a legal statement that compiles
   to nothing, so `behavior.rs::null_statement` returns `()` rather than a
   `ProceduralStatements` variant: `statement_body` gives an empty `Vec` for `else ;`, and
@@ -2072,6 +2176,14 @@ tripwire.
   takes an *identifier*, and `keywords::is_reserved_word` is what stops it: without
   that guard `always @* begin … end` reads `begin` as the event it waits on. This is
   the mirror image of the task-enable trap — the same helper, the other way round.
+- **An `always` or `initial` body is exactly one statement.** Both go through
+  `behavior.rs::statement_body`, the same production a conditional arm uses — a
+  `begin`…`end` block, a null statement, or a single statement. Reading a *run* of
+  statements instead let an unbracketed body swallow whatever followed the block, and
+  every form that is legal both inside a block and at module level is a way for it to do
+  so silently: `always @(posedge clk) d <= ~c;` followed by
+  `assign {e0, f0, g0, h0} = oo;` compiled to one three-instruction block, turning a
+  continuous driver into a procedural `assign` on a net (corpus `initmod`, `pr434`).
 - **A named block keeps its node; an unnamed one does not.** `parse_block` returns a
   `Vec<ProceduralStatements>` either way, so `always`/`initial`/`if` bodies are
   unchanged, but a `begin : name` comes back as a single

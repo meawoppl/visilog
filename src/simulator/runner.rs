@@ -1704,7 +1704,7 @@ impl Simulator {
             if self.state.has_drives() {
                 let drives = self.state.drives();
                 for drive in drives.iter() {
-                    if !self.is_resolved(drive.name()) {
+                    if !drive.names().iter().any(|name| self.is_resolved(name)) {
                         continue;
                     }
                     let target = resolve_target(&self.state, drive.target())?;
@@ -6549,7 +6549,16 @@ mod tests {
     }
 
     /// `%t` pads to twenty characters until `$timeformat` says otherwise, and
-    /// then renders exactly what it was asked for.
+    /// then renders exactly what it was asked for — scaled from the tick this
+    /// design counts to the unit it asked for. A design with no `` `timescale ``
+    /// is at `1s / 1s`, so a tick is a second and `$timeformat(-9, …)` asks for
+    /// it in nanoseconds. iverilog 12.0 prints the same three lines:
+    ///
+    /// ```text
+    /// default[                   7]
+    /// set[7000000000.00 ns]
+    /// narrow[7000000000.00 ns]
+    /// ```
     #[test]
     fn test_timeformat_configures_how_percent_t_renders() {
         let mut simulator = simulator_for(
@@ -6570,8 +6579,51 @@ mod tests {
             simulator.output().lines(),
             vec![
                 "default[                   7]",
-                "set[   7.00 ns]",
-                "narrow[7.00 ns]",
+                "set[7000000000.00 ns]",
+                "narrow[7000000000.00 ns]",
+            ]
+        );
+    }
+
+    /// `%t` scales from the tick the clock counts — the design's
+    /// `` `timescale `` unit — to the unit `$timeformat` names, and a design
+    /// that never called `$timeformat` prints in the finest *precision* its
+    /// directives declared. Measured against iverilog 12.0 for
+    /// `` `timescale 1ns/100ps ``, which prints:
+    ///
+    /// ```text
+    /// default[                  50]
+    /// us[   0.005000 us]
+    /// ps[5000 ps]
+    /// ```
+    #[test]
+    fn test_percent_t_scales_by_the_designs_timescale() {
+        let source = r#"
+            module scaled();
+                initial begin
+                    #5 $display("default[%t]", $time);
+                    $timeformat(-6, 6, " us", 14);
+                    $display("us[%t]", $time);
+                    $timeformat(-12, 0, " ps", 0);
+                    $display("ps[%0t]", $time);
+                end
+            endmodule
+        "#;
+        let (remaining, module) = parse_module_declaration(source).expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::new(module);
+        simulator.set_timescale(Some(
+            Timescale::parse("1ns/100ps").expect("a legal timescale"),
+        ));
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(10).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "default[                  50]",
+                "us[   0.005000 us]",
+                "ps[5000 ps]",
             ]
         );
     }
@@ -6983,6 +7035,63 @@ mod tests {
 
         simulator.advance(5).expect("time should advance");
         assert_eq!(simulator.get("v").unwrap().to_binary(), "0");
+    }
+
+    /// A procedural `assign` takes a **concatenation**, and it holds every
+    /// signal the concatenation names.
+    ///
+    /// iverilog 12.0 prints `0011`, `0010`, `1001` for this design: the write
+    /// of `4'h5` goes nowhere while the drive is installed, and the write of
+    /// `4'h9` lands once `deassign` has taken it off. Corpus `assign3.2D` and
+    /// `assign3.2E` are the same shape around a clock.
+    #[test]
+    fn test_a_procedural_assign_holds_every_part_of_a_concatenation() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg a, b, c, d;
+                initial begin
+                    {a, b, c, d} = 4'h3;
+                    $display("%b%b%b%b", a, b, c, d);
+                    assign {a, b, c, d} = 4'h2;
+                    {a, b, c, d} = 4'h5;
+                    $display("%b%b%b%b", a, b, c, d);
+                    deassign {a, b, c, d};
+                    {a, b, c, d} = 4'h9;
+                    $display("%b%b%b%b", a, b, c, d);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0011\n0010\n1001\n");
+    }
+
+    /// A concatenation is an assignment target inside a `function` body too,
+    /// including one over the function's own result variable.
+    ///
+    /// iverilog 12.0 prints `a5` for this design, which is corpus
+    /// `constfunc14`'s `concat1` in miniature. It used to be a named
+    /// `UnsupportedTarget` at elaboration, because the body walk asked each
+    /// target for the *one* signal it wrote.
+    #[test]
+    fn test_a_function_body_assigns_through_a_concatenation() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                function [7:0] swap(input [7:0] v);
+                    reg [3:0] hi, lo;
+                    begin
+                        {hi, lo} = v;
+                        {swap[3:0], swap[7:4]} = {hi, lo};
+                    end
+                endfunction
+                initial $display("%h", swap(8'h5a));
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "a5\n");
     }
 
     /// `force` is stronger than a procedural `assign`, and `release` hands the
