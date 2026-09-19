@@ -1102,14 +1102,24 @@ map of a task's locals.
 
 A `disable` of a scope the block is **not** inside cannot be a jump, because the block that
 is inside it is suspended somewhere only the driver can reach. That is `Resume::Disabled`,
-and `Simulator::cancel_scope` answers it: every cursor in the `EventQueue` and every entry
-in `waiting` whose program counter falls in that scope's range is taken out and re-queued
+and `Simulator::cancel_scope` answers it: every cursor in the `EventQueue`, in
+`Simulator::round` and in `waiting` whose program counter falls in that scope's range is
+taken out and re-queued
 at the scope's `end`, *at the current time*. Re-queueing rather than resuming inline is
 what puts the cancelled block's remaining output after the output of the block that
 disabled it, which is where iverilog puts it. A free-running `always` whose whole body was
 the disabled block then reaches its `Halt` and restarts — which is exactly how a design
 writes a restartable thread (corpus `pr987`), and it falls out of the rule
 `resume_block` already had rather than needing one of its own.
+
+**`Simulator::round` is a field rather than a local for exactly one reason: a `disable` has
+to reach it.** `advance` takes every cursor due at a timestamp off the queue *before* it
+resumes any of them, so a block due at this very instant that has not run yet is on neither
+the queue nor the `waiting` list — and a `disable` that looked only at those two would find
+nothing and let it run anyway. That is corpus `sdw_dsbl`, where the `disable` and the block
+it names are both due at time 15 and the `disable` runs first. The round is therefore taken
+one cursor at a time rather than iterated, so a cancellation part way through it is seen by
+what is left.
 
 Two things about it are deliberate. Disabling a scope that **exists but is not running**
 anywhere is a no-op, because that is what the LRM asks for: `always #6 disable foo;` cancels
