@@ -934,6 +934,25 @@ find. Inside a `function` the second rule is checked at elaboration instead
 (`Program::nonlocal_disable`), since a frame has no driver behind it to cancel anything
 with.
 
+**A block is sensitive only while it is *parked* at its event control, so a write it
+makes on its way through cannot wake it.** The block was not listening when the event
+happened, and by the time it comes back the event is in the past — which is why
+`always @(a or c) begin a = ~a; end` runs once per *external* change rather than for ever,
+and why corpus `event_list3`'s combinational block prints one pair of lines and not two.
+`TimedBlock::writes` is the set of names the body assigns, computed once at elaboration
+beside `implicit_reads`, and `Simulator::ran_before` / `ran_now` — one flag per block,
+swapped at the top of every settle round — say whether the block was running when they
+moved. An edge on a name in both is dropped from what that block is offered. It is the
+same rule `EventWatch`'s snapshot already gave a mid-block `@`, applied to the whole
+block's own arming point.
+
+Two things about it are deliberate. The set is **static**, so a signal the block *could*
+write is suppressed whether or not it did — which matches the LRM in the direction that
+matters, since anything moving while the block ran is missed anyway. And it is cleared
+after one round, because a write journalled in round N becomes an edge in round N+1 and
+nowhere else. An `@(*)` block gets an empty set: its read set already leaves its own
+targets out.
+
 **A block can suspend on the design as well as on the clock, and `Resume::Waiting` is
 how.** `wait (c) S` and `@(posedge clk) S` are both suspensions that no timestamp brings
 back, so they are not on the `EventQueue` at all: `Simulator::waiting` holds them, and

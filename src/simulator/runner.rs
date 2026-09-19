@@ -455,6 +455,17 @@ pub struct Simulator {
     /// round measures. Empty for a design that waits on nothing, which is what
     /// keeps the question off that round's hot path.
     waiting: Vec<Waiting>,
+    /// Which blocks ran in the previous settle round, and which have run in
+    /// this one — one flag per block, swapped at the top of every round.
+    ///
+    /// This is what tells an edge a block made *itself* from one the rest of
+    /// the design made. A block is sensitive only while it is parked at its
+    /// event control, so the writes it made on its last run through cannot
+    /// wake it; `TimedBlock::writes` says which names those are and this says
+    /// whether the block was running when they moved. Two vectors rather than
+    /// one so the swap is free and a round costs a `fill` of bytes.
+    ran_before: Vec<bool>,
+    ran_now: Vec<bool>,
     /// The `fork`…`join`s currently running, indexed by the number a branch
     /// cursor carries. A retired slot is `None` and is handed out again, so a
     /// `fork` inside a loop does not grow this without bound. Empty for a
@@ -523,6 +534,8 @@ impl Simulator {
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
             waiting: Vec::new(),
+            ran_before: Vec::new(),
+            ran_now: Vec::new(),
             forks: Vec::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
@@ -613,6 +626,8 @@ impl Simulator {
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
         self.blocks = elaborated.blocks;
+        self.ran_before = vec![false; self.blocks.len()];
+        self.ran_now = vec![false; self.blocks.len()];
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
         // An aliased port is a *name* the design has and the flat store does
@@ -769,6 +784,11 @@ impl Simulator {
     /// than hanging.
     fn settle(&mut self) -> Result<usize, SimulationError> {
         for delta in 1..=MAX_DELTA_CYCLES {
+            // The blocks that ran in the previous round are what this round
+            // measures "was that edge one of mine?" against, so the two lists
+            // change places here and the new one starts empty.
+            std::mem::swap(&mut self.ran_before, &mut self.ran_now);
+            self.ran_now.fill(false);
             // Taking the changes here, before the blocks run, is what makes the
             // next round's edges exactly what this round moves.
             let changes = self.state.take_changes();
@@ -829,7 +849,25 @@ impl Simulator {
                 {
                     continue;
                 }
-                if self.blocks[id].fires(&edges) {
+                // An edge the block made *itself* on its last run through
+                // does not wake it. A block is sensitive only while it is
+                // parked at its event control, so a write it made on its way
+                // to the end happened while it was not listening, and by the
+                // time it comes back the event is in the past. Corpus
+                // `event_list3`, whose block assigns a signal its own
+                // sensitivity list names and runs twice without this.
+                let filtered;
+                let offered = if self.ran_before[id] && !self.blocks[id].writes.is_empty() {
+                    filtered = edges
+                        .iter()
+                        .filter(|edge| !self.blocks[id].writes.contains(&edge.name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    &filtered[..]
+                } else {
+                    &edges[..]
+                };
+                if self.blocks[id].fires(offered) {
                     let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
                     pending.extend(updates);
                 }
@@ -1233,6 +1271,12 @@ impl Simulator {
         cursor: ExecutionCursor,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
         let id = cursor.block;
+        // Whatever this run writes, it writes while the block is *not* parked
+        // at its event control — so none of it can wake the block. The flag is
+        // what the next settle round measures that against.
+        if let Some(ran) = self.ran_now.get_mut(id) {
+            *ran = true;
+        }
         let mut pc = cursor.pc;
         let mut carried = Vec::new();
         // A `disable` of another block does not suspend the block that wrote
@@ -6477,6 +6521,42 @@ mod tests {
         simulator.setup().expect("design should run");
 
         assert_eq!(simulator.output().lines(), vec!["12 34 56 78"]);
+    }
+
+    /// An `always` block is sensitive only while it is *parked* at its event
+    /// control, so a write it makes on its way to the end cannot wake it: the
+    /// block was not listening when the event happened, and by the time it
+    /// comes back the event is in the past. A block that toggles a signal its
+    /// own sensitivity list names therefore runs once per *external* change
+    /// rather than for ever.
+    ///
+    /// iverilog 12.0 prints `runs=2 a=0`: once for the two writes at time
+    /// zero, once for the `c` at time ten, and not again for either of its own
+    /// two writes to `a`.
+    #[test]
+    fn test_a_block_is_not_woken_by_its_own_write() {
+        let mut simulator = simulator_for(
+            r#"
+            module feedback();
+                reg a, c;
+                integer runs;
+                initial begin
+                    runs = 0;
+                    a = 1'b0;
+                    c = 1'b0;
+                    #10 c = 1'b1;
+                    #10 $display("runs=%0d a=%b", runs, a);
+                end
+                always @(a or c) begin
+                    runs = runs + 1;
+                    a = ~a;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(30).expect("time should advance");
+
+        assert_eq!(simulator.output().lines(), vec!["runs=2 a=0"]);
     }
 
     /// `%t` pads to twenty characters until `$timeformat` says otherwise, and
