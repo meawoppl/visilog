@@ -181,6 +181,16 @@ pub struct TimedBlock {
     /// The `@(*)` read set, computed once here rather than on every delta
     /// cycle. Empty for the other two trigger forms, which never consult it.
     pub implicit_reads: BTreeSet<String>,
+    /// Every signal the body assigns, computed once here.
+    ///
+    /// A block is sensitive only while it is *parked* at its event control, so
+    /// a write it makes on its way through cannot wake it: the block is not
+    /// waiting when the event happens, and by the time it comes back the event
+    /// is in the past. This is the set the driver measures that with — see
+    /// [`Simulator::settle`](crate::simulator::runner::Simulator). Empty for
+    /// an `@(*)` block, which already leaves its own targets out of its read
+    /// set, and for a free-running one, which edges never wake.
+    pub writes: BTreeSet<String>,
     pub program: Program,
 }
 
@@ -2136,11 +2146,16 @@ impl<'m> Elaborator<'m> {
                     }
                     _ => BTreeSet::new(),
                 };
+                let writes = match block.event_control {
+                    EventControl::Events(_) => written_names(&program),
+                    _ => BTreeSet::new(),
+                };
                 self.out.blocks.push(TimedBlock {
                     kind: BlockKind::Always,
                     free_running: block.event_control == EventControl::None,
                     control,
                     implicit_reads,
+                    writes,
                     program,
                 });
             }
@@ -2161,6 +2176,7 @@ impl<'m> Elaborator<'m> {
                     free_running: false,
                     control: EventControl::None,
                     implicit_reads: BTreeSet::new(),
+                    writes: BTreeSet::new(),
                     program,
                 });
             }
@@ -2820,6 +2836,47 @@ fn assigned_names<'a>(target: &'a Expression, names: &mut Vec<&'a str>) -> bool 
             }
             None => false,
         },
+    }
+}
+
+/// Every signal a compiled body assigns.
+///
+/// A target whose name cannot be read off it — a concatenation, which is
+/// several — contributes each of its parts, so the set is never short of a
+/// name the body really writes. Being short is the direction that matters: it
+/// is what a block measures "was that edge one of mine?" against.
+fn written_names(program: &Program) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for instruction in program.instructions() {
+        let target = match instruction {
+            Instruction::Blocking { target, .. }
+            | Instruction::NonBlocking { target, .. }
+            | Instruction::Assign { target, .. }
+            | Instruction::Force { target, .. }
+            | Instruction::Hold { target, .. }
+            | Instruction::WriteHeld { target, .. }
+            | Instruction::ScheduleWrite { target, .. }
+            | Instruction::Deassign(target)
+            | Instruction::Release(target) => target,
+            _ => continue,
+        };
+        collect_written_names(target, &mut names);
+    }
+    names
+}
+
+fn collect_written_names(target: &Expression, names: &mut BTreeSet<String>) {
+    match assigned_name(target) {
+        Some(name) => {
+            names.insert(name.to_string());
+        }
+        None => {
+            if let Expression::Concatenation(parts) = target {
+                for part in parts {
+                    collect_written_names(part, names);
+                }
+            }
+        }
     }
 }
 
