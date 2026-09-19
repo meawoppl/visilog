@@ -424,7 +424,7 @@ fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
 /// than the digits, because nothing downstream has any use for the spelling.
 /// The `_` separators Verilog allows are dropped before the conversion, which
 /// is the only thing `f64::from_str` will not do itself.
-fn real_literal(input: &str) -> IResult<&str, Expression> {
+pub(super) fn real_literal(input: &str) -> IResult<&str, Expression> {
     map_res(real_number, |text: &str| {
         text.replace('_', "")
             .parse::<f64>()
