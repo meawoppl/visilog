@@ -221,6 +221,59 @@ pub fn control_fires(
     }
 }
 
+/// [`control_fires`]'s sensitivity list, for a block that has an entry with an
+/// edge of its **own**.
+///
+/// `previous` is one slot per entry, holding what a non-plain expression
+/// evaluated to at the last look — see [`is_plain_event_expression`]. A slot
+/// that is `Some` is answered by the edge of the *evaluated expression* and is
+/// refreshed here; a slot that is `None`, and every entry past the end of the
+/// slice, keeps the whole-signal reading [`event_fires`] documents.
+///
+/// Every slot is refreshed whether or not the list fires, so this deliberately
+/// does not short-circuit: a snapshot left behind by one round would measure
+/// the next round's edge from the wrong place. That is also why it is not what
+/// [`control_fires`] calls — an ordinary sensitivity list has nothing to
+/// refresh and stops at the first entry that fires.
+pub fn events_fire(
+    events: &[Event],
+    edges: &[SignalEdge],
+    state: &StateStore,
+    previous: &mut [Option<Register>],
+) -> bool {
+    let mut fired = false;
+    for (index, event) in events.iter().enumerate() {
+        match previous.get_mut(index) {
+            Some(slot @ Some(_)) => {
+                let Ok(now) = eval(&event.expression, state) else {
+                    continue;
+                };
+                let was = slot.replace(now.clone()).expect("slot matched as Some");
+                if was != now && SignalEdge::new(String::new(), was, now).matches(&event.trigger) {
+                    fired = true;
+                }
+            }
+            _ => fired |= event_fires(event, edges, state),
+        }
+    }
+    fired
+}
+
+/// Whether a sensitivity-list entry names a signal directly, rather than being
+/// an expression with an edge of its own.
+///
+/// A name, a bit select and a part select are all matched exactly against the
+/// change journal — [`narrowed`] is what makes the two select forms exact.
+/// Anything else, `posedge (a & b)` above all, has no entry in that journal at
+/// all: its edge is the edge of what it *evaluates* to, and the whole-signal
+/// reading [`event_fires`] falls back on fires on an edge of any operand.
+pub fn is_plain_event_expression(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::Identifier(_) | Expression::BitSelect(..) | Expression::PartSelect(..)
+    )
+}
+
 /// [`control_fires`] for a whole `always` block, deriving the `@(*)` read set
 /// from the block's own body.
 pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge], state: &StateStore) -> bool {

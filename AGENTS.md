@@ -1207,9 +1207,31 @@ moving `0000 -> 0010` answers `yes` for `clear[1]` and `no` for `clear`. `events
 is that question, and it takes the `&StateStore` `control_fires` now carries because both
 halves of the answer live there — the index (a substituted genvar is a constant, but a
 parameter or a signal is not) and the *declared range* the index has to be mapped through.
-A bit select and a part select are what it narrows; anything else — `posedge (a & b)`, an
-index that is not a number — keeps the over-approximating whole-signal reading
-`event_fires` has always documented. Corpus `pr1623097` and `automatic_events3`.
+A bit select and a part select are what it narrows; an index that is not a number keeps
+the over-approximating whole-signal reading `event_fires` has always documented. Corpus
+`pr1623097` and `automatic_events3`.
+
+**An entry that is not a name or a select of one has an edge of its own, and it is
+measured against what the entry last *evaluated* to.** `always @(posedge clock & b)` is
+not sensitive to a `posedge` of either operand: `clock` going `x -> 0` while `b` goes
+`x -> 1111` moves `clock & b` from `xxxx` to `0000`, which is a **negedge**, although `b`'s
+own least significant bit rose. So `Simulator::event_values` keeps one `Register` per
+non-plain entry per block, `events::is_plain_event_expression` is what decides which
+entries need one, and `events::events_fire` compares and refreshes them. The first
+comparison is against the value the expression had when the design was **elaborated** and
+nothing had run — all `x` for a design of untouched registers — which is what makes that
+first transition a negedge rather than the block's first wake (corpus `time2`, which counts
+6 edges where matching the operands counts 7; measured against iverilog 12.0).
+
+Three things about it are deliberate. A block that is *not* offered a turn — one part way
+through a `wait`, or one held at a `join` — still has its entries re-measured, or the round
+that does give it a turn would compare against a value several rounds old and find an edge
+that never happened. `Simulator::expression_events` is hoisted out of the block loop, so a
+design that writes only `posedge clk` asks one `bool` per settle round rather than reaching
+into a `Vec` per block. And `control_fires` keeps its own `events.iter().any(…)` rather
+than delegating to `events_fire`: `events_fire` deliberately does not short-circuit —
+every snapshot has to be refreshed whether the list fired or not — and routing an ordinary
+sensitivity list through it costs about 3.5% on `bench tick/counter_4bit`.
 
 **A block is sensitive only while it is *parked* at its event control, so a write it
 makes on its way through cannot wake it.** The block was not listening when the event
@@ -1983,12 +2005,12 @@ telling apart.
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — `$countdrivers`, which is a question about the design rather than about a value, and `call_function` for the design's own |
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
-| `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names |
+| `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names; and `events_fire` / `is_plain_event_expression`, the edge an entry that is an *expression* has of its own |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, and `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
