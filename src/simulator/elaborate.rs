@@ -154,13 +154,35 @@ pub struct TimedBlock {
     /// The `@(*)` read set, computed once here rather than on every delta
     /// cycle. Empty for the other two trigger forms, which never consult it.
     pub implicit_reads: BTreeSet<String>,
+    /// Every signal the body assigns, computed once here.
+    ///
+    /// A block is sensitive only while it is *parked* at its event control, so
+    /// a write it makes on its way through cannot wake it: the block is not
+    /// waiting when the event happens, and by the time it comes back the event
+    /// is in the past. This is the set the driver measures that with — see
+    /// [`Simulator::settle`](crate::simulator::runner::Simulator). Empty for
+    /// an `@(*)` block, which already leaves its own targets out of its read
+    /// set, and for a free-running one, which edges never wake.
+    pub writes: BTreeSet<String>,
     pub program: Program,
 }
 
 impl TimedBlock {
     /// Whether the edges observed this delta cycle wake this block.
-    pub fn fires(&self, edges: &[SignalEdge]) -> bool {
-        control_fires(&self.control, edges, &self.implicit_reads)
+    ///
+    /// `just_ran` is whether the block ran in the *previous* round, which is
+    /// what makes [`TimedBlock::writes`] mean something: the edges it made on
+    /// that run cannot wake it, because it was not parked at its event control
+    /// when they happened. A block that did not just run, or writes nothing,
+    /// pays one branch for the question.
+    pub fn fires(&self, edges: &[SignalEdge], just_ran: bool) -> bool {
+        let own = if just_ran {
+            &self.writes
+        } else {
+            const NONE: &BTreeSet<String> = &BTreeSet::new();
+            NONE
+        };
+        control_fires(&self.control, edges, &self.implicit_reads, own)
     }
 }
 
@@ -1912,11 +1934,16 @@ impl<'m> Elaborator<'m> {
                     }
                     _ => BTreeSet::new(),
                 };
+                let writes = match block.event_control {
+                    EventControl::Events(_) => written_names(&program),
+                    _ => BTreeSet::new(),
+                };
                 self.out.blocks.push(TimedBlock {
                     kind: BlockKind::Always,
                     free_running: block.event_control == EventControl::None,
                     control,
                     implicit_reads,
+                    writes,
                     program,
                 });
             }
@@ -1936,6 +1963,7 @@ impl<'m> Elaborator<'m> {
                     free_running: false,
                     control: EventControl::None,
                     implicit_reads: BTreeSet::new(),
+                    writes: BTreeSet::new(),
                     program,
                 });
             }
@@ -2525,6 +2553,35 @@ fn assigned_name(target: &Expression) -> Option<&str> {
         Expression::Parenthetical(inner) => assigned_name(inner),
         _ => None,
     }
+}
+
+/// Every signal a compiled body assigns.
+///
+/// This is what a block measures "was that edge one of mine?" against — see
+/// [`TimedBlock::writes`] — so it must never be *short* of a name the body
+/// really writes. A concatenation target contributes each of its parts, which
+/// is what [`assigned_names`] already walks for the function-body analysis.
+fn written_names(program: &Program) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut parts = Vec::new();
+    for instruction in program.instructions() {
+        let target = match instruction {
+            Instruction::Blocking { target, .. }
+            | Instruction::NonBlocking { target, .. }
+            | Instruction::Assign { target, .. }
+            | Instruction::Force { target, .. }
+            | Instruction::Hold { target, .. }
+            | Instruction::WriteHeld { target, .. }
+            | Instruction::ScheduleWrite { target, .. }
+            | Instruction::Deassign(target)
+            | Instruction::Release(target) => target,
+            _ => continue,
+        };
+        parts.clear();
+        assigned_names(target, &mut parts);
+        names.extend(parts.iter().map(|name| (*name).to_string()));
+    }
+    names
 }
 
 /// Every signal an assignment target writes, collected into `names`, reporting

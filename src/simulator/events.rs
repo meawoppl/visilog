@@ -211,11 +211,19 @@ pub fn control_fires(
     control: &EventControl,
     edges: &[SignalEdge],
     implicit_reads: &BTreeSet<String>,
+    own: &BTreeSet<String>,
 ) -> bool {
+    // The edges the asking block made itself on its last run through, which
+    // cannot wake it — see [`TimedBlock::fires`]. Empty for every caller that
+    // is not a whole `always` block, and empty for a block that did not just
+    // run, so the common case is one `is_empty` and nothing else.
+    let mine = |edge: &SignalEdge| !own.is_empty() && own.contains(&edge.name);
     match control {
         EventControl::None => true,
-        EventControl::Implicit => edges.iter().any(|edge| implicit_reads.contains(&edge.name)),
-        EventControl::Events(events) => events.iter().any(|event| event_fires(event, edges)),
+        EventControl::Implicit => edges
+            .iter()
+            .any(|edge| implicit_reads.contains(&edge.name) && !mine(edge)),
+        EventControl::Events(events) => events.iter().any(|event| event_fires(event, edges, &mine)),
     }
 }
 
@@ -226,7 +234,12 @@ pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge]) -> bool {
         EventControl::Implicit => signals_read(&block.statements),
         _ => BTreeSet::new(),
     };
-    control_fires(&block.event_control, edges, &implicit_reads)
+    control_fires(
+        &block.event_control,
+        edges,
+        &implicit_reads,
+        &BTreeSet::new(),
+    )
 }
 
 /// Whether one sensitivity-list entry matches an observed edge.
@@ -239,11 +252,11 @@ pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge]) -> bool {
 /// expression reads and fires when any of them shows a matching edge. That
 /// over-approximates — `posedge (a & b)` fires on a `posedge` of either operand
 /// — so a block may be woken more often than it should, never less.
-fn event_fires(event: &Event, edges: &[SignalEdge]) -> bool {
+fn event_fires(event: &Event, edges: &[SignalEdge], mine: &impl Fn(&SignalEdge) -> bool) -> bool {
     let names = event_signals(&event.expression);
     edges
         .iter()
-        .any(|edge| names.contains(&edge.name) && edge.matches(&event.trigger))
+        .any(|edge| names.contains(&edge.name) && edge.matches(&event.trigger) && !mine(edge))
 }
 
 /// Every signal name an event control is sensitive to.
@@ -668,11 +681,17 @@ mod tests {
     #[test]
     fn test_control_fires_none_always_fires() {
         let no_reads = BTreeSet::new();
-        assert!(control_fires(&EventControl::None, &[], &no_reads));
+        assert!(control_fires(
+            &EventControl::None,
+            &[],
+            &no_reads,
+            &BTreeSet::new()
+        ));
         assert!(control_fires(
             &EventControl::None,
             &[named_edge("clk", "0", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
     }
 
@@ -683,14 +702,21 @@ mod tests {
         assert!(control_fires(
             &EventControl::Implicit,
             &[named_edge("b", "0000", "0010")],
-            &reads
+            &reads,
+            &BTreeSet::new()
         ));
         assert!(!control_fires(
             &EventControl::Implicit,
             &[named_edge("c", "0", "1")],
-            &reads
+            &reads,
+            &BTreeSet::new()
         ));
-        assert!(!control_fires(&EventControl::Implicit, &[], &reads));
+        assert!(!control_fires(
+            &EventControl::Implicit,
+            &[],
+            &reads,
+            &BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -702,27 +728,31 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("rst", "1", "0")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         // Only clk moved, in the listed direction.
         assert!(control_fires(
             &control,
             &[named_edge("clk", "0", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         // clk moved the wrong way and rst did not move at all.
         assert!(!control_fires(
             &control,
             &[named_edge("clk", "1", "0")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         // A signal that is not in the list.
         assert!(!control_fires(
             &control,
             &[named_edge("data", "0", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
-        assert!(!control_fires(&control, &[], &no_reads));
+        assert!(!control_fires(&control, &[], &no_reads, &BTreeSet::new()));
     }
 
     #[test]
@@ -734,13 +764,15 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("rst", "1", "x")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         // x -> 1 is a posedge of clk.
         assert!(control_fires(
             &control,
             &[named_edge("clk", "x", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
     }
 
@@ -753,12 +785,14 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("b", "0101", "0111")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         assert!(!control_fires(
             &control,
             &[named_edge("c", "0", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
     }
 
@@ -771,17 +805,20 @@ mod tests {
         assert!(control_fires(
             &control,
             &[named_edge("a", "0", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         assert!(control_fires(
             &control,
             &[named_edge("b", "0", "1")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
         assert!(!control_fires(
             &control,
             &[named_edge("a", "1", "0")],
-            &no_reads
+            &no_reads,
+            &BTreeSet::new()
         ));
     }
 
