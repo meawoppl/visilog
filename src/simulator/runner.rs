@@ -29,7 +29,7 @@
 //! was connected to. Hand the simulator more than one module with
 //! [`Simulator::with_modules`].
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -431,6 +431,14 @@ pub struct Simulator {
     /// value its right hand side had when the statement ran, so nothing about
     /// it is re-read when it lands. Empty for a design that writes none.
     scheduled: Vec<(i64, PendingUpdate)>,
+    /// The cursors [`Simulator::advance`] has taken off the queue for the round
+    /// it is running and has not resumed yet.
+    ///
+    /// It is a field rather than a local because a `disable` has to be able to
+    /// reach it: a block due at this timestamp is off the queue from the moment
+    /// the round is collected, so [`Simulator::cancel_scope`] looking only at
+    /// the queue would find nothing and let it run anyway (corpus `sdw_dsbl`).
+    round: VecDeque<ExecutionCursor>,
     /// Whether the continuous assignments have been settled once, before the
     /// first block ran. See [`Simulator::advance`].
     settled_once: bool,
@@ -532,6 +540,7 @@ impl Simulator {
             gate_delays: Vec::new(),
             udp_delays: Vec::new(),
             scheduled: Vec::new(),
+            round: VecDeque::new(),
             settled_once: false,
             gates: Vec::new(),
             udps: Vec::new(),
@@ -575,6 +584,7 @@ impl Simulator {
         self.pass_switches.clear();
         self.resolved_nets.clear();
         self.scheduled.clear();
+        self.round.clear();
         self.settled_once = false;
         self.pulled_nets.clear();
         self.blocks.clear();
@@ -1136,13 +1146,13 @@ impl Simulator {
             // rounds: they land once, at the end of the timestep, which is
             // what makes `a <= b; b <= a;` across two blocks a swap.
             while self.queue.peek_time() == Some(time) {
-                let mut round = Vec::new();
                 while self.queue.peek_time() == Some(time) {
                     let (_, cursor) = self.queue.pop().expect("peeked time must pop");
-                    round.push(cursor);
+                    self.round.push_back(cursor);
                 }
-                resumptions += round.len();
+                resumptions += self.round.len();
                 if resumptions > MAX_RESUMPTIONS_PER_TIME {
+                    self.round.clear();
                     return Err(SimulationError::NoConvergence {
                         passes: resumptions,
                     });
@@ -1154,7 +1164,13 @@ impl Simulator {
                 // before it stops. Measured — an `always #10` beside an
                 // `initial #30 $finish` still runs at 30, and the monitor
                 // still prints that step's line.
-                for cursor in round {
+                //
+                // Taken one at a time rather than iterated, because a
+                // `disable` run by one of them reaches into this very list:
+                // `cancel_scope` drops the cursors of the block it cancelled
+                // from it, so a block due at this timestamp that has not run
+                // yet does not run at all.
+                while let Some(cursor) = self.round.pop_front() {
                     let (updates, _) = self.resume_block(cursor)?;
                     pending.extend(updates);
                 }
@@ -1417,10 +1433,16 @@ impl Simulator {
         // list — the fork record is the only thing holding it — so a `disable`
         // naming the scope the fork sits in has to look there as well or the
         // block would simply be lost.
+        // `round` is the fourth place a live cursor can be: `advance` takes
+        // every cursor due at this timestamp off the queue before it resumes
+        // any of them, so a block that is due *now* and has not run yet is on
+        // neither the queue nor the waiting list (corpus `sdw_dsbl`, where the
+        // `disable` and the block it names are both due at time 15).
         let live = self
             .queue
             .cursors()
             .copied()
+            .chain(self.round.iter().copied())
             .chain(self.waiting.iter().map(|waiting| waiting.cursor))
             .chain(self.forks.iter().flatten().map(|record| record.parent));
         let mut cancelled: Vec<(usize, usize)> = Vec::new();
@@ -1441,6 +1463,7 @@ impl Simulator {
         }
         let doomed: Vec<usize> = cancelled.iter().map(|(block, _)| *block).collect();
         self.queue.retain(|cursor| doomed.contains(&cursor.block));
+        self.round.retain(|cursor| !doomed.contains(&cursor.block));
         self.waiting
             .retain(|waiting| !doomed.contains(&waiting.cursor.block));
         for record in self.forks.iter_mut() {
@@ -9126,6 +9149,44 @@ mod tests {
         );
 
         simulator.advance(20).expect("time should advance");
+        assert_eq!(simulator.get("working").unwrap().to_binary(), "1");
+    }
+
+    /// A block due at the **same timestamp** as the `disable` that names it is
+    /// cancelled too, even though `advance` has already taken it off the queue
+    /// for this round. Corpus `sdw_dsbl`, which iverilog 12.0 answers
+    /// `PASSED` — the `disable` at time 15 runs first, and the statements
+    /// `my_block` had left at time 15 never run.
+    ///
+    /// The `disable` is queued for 15 at time 0 and `my_block`'s continuation
+    /// at time 10, so the queue's FIFO order puts the `disable` first. What it
+    /// could not see was the round itself: both cursors are off the queue by
+    /// the time either of them runs.
+    #[test]
+    fn test_disable_cancels_a_block_due_at_the_same_timestamp() {
+        let mut simulator = simulator_for(
+            r#"
+            module main();
+                reg working;
+                initial begin : my_block
+                    working = 1;
+                    #5;
+                    working = 1;
+                    #5;
+                    working = 1;
+                    #5;
+                    working = 0;
+                    #5;
+                end
+                initial begin
+                    #15;
+                    disable my_block;
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(30).expect("time should advance");
         assert_eq!(simulator.get("working").unwrap().to_binary(), "1");
     }
 
