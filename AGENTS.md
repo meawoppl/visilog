@@ -1995,6 +1995,16 @@ tripwire.
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
   literal — which is also what the LRM says.
+- **A backslash before a newline inside a string literal is a line continuation, and it
+  contributes nothing.** IEEE 1364-2005 §3.6; iverilog 12.0 prints `ab` for a literal
+  spelled `"a\<newline>b"`. It is `string.rs::line_continuation`, deliberately *not* one of
+  `parse_escape_sequence`'s alternatives, because it produces no character rather than one
+  — and it is tried before every other piece of a string's body, since they would all claim
+  its backslash. Getting it wrong is silent: the backslash falls through to the ordinary
+  character arm and keeps the newline with it, so the string holds two characters nothing
+  wrote (corpus `string12`). This is the *opposite* rule from a continuation in a
+  `` `define `` body, where the newline stays — a `//` comment there would otherwise
+  swallow the rest of the macro.
 - **A null statement leaves no node behind.** A bare `;` is a legal statement that compiles
   to nothing, so `behavior.rs::null_statement` returns `()` rather than a
   `ProceduralStatements` variant: `statement_body` gives an empty `Vec` for `else ;`, and
