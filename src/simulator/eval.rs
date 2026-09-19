@@ -2079,7 +2079,23 @@ fn based_bits(digits: &str, bits_per_digit: usize) -> Result<Register, EvalError
 }
 
 /// Decimal digits, rendered in the fewest bits that hold the value.
+///
+/// A decimal has **no unknown digit**, so the whole value is unknown or none of
+/// it is: `7'dx` is one `x` bit, which the size then extends into `xxxxxxx` the
+/// way a leading digit extends in any other base. That is IEEE 1364-2005 §3.5.1
+/// and it is why `2'dx` is two bits rather than seven — written into a
+/// `reg [6:0]` it is `00000xx` unsigned and `xxxxxxx` signed, exactly as a known
+/// two bit value would be (corpus `pr1792734`, measured against iverilog 12.0).
+/// `_` separators are already gone by the time the digits arrive here, so `7'dx_`
+/// is the same literal.
 fn decimal_bits(digits: &str) -> Result<Register, EvalError> {
+    if digits.len() == 1 {
+        match digits.as_bytes()[0].to_ascii_lowercase() {
+            b'x' => return Ok(Register::from_bits(vec![X])),
+            b'z' | b'?' => return Ok(Register::from_bits(vec![Z])),
+            _ => {}
+        }
+    }
     let value = digits
         .parse::<u128>()
         .map_err(|_| EvalError::MalformedConstant(digits.to_string()))?;
@@ -3018,6 +3034,39 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} failed to convert: {}", token, e));
             assert_eq!(parsed, converted, "{} and {} disagree", source, token);
         }
+    }
+
+    /// A decimal literal's value may be a single `x`, `z` or `?` standing for
+    /// the whole of it, which the size then extends — there is no such thing as
+    /// an unknown decimal *digit*, so `7'd1x` stays malformed.
+    ///
+    /// Measured against iverilog 12.0, which prints for corpus `pr1792734`:
+    ///
+    /// ```text
+    ///  7'dx: xxxxxxx,  7'dz: zzzzzzz,  7'd?: zzzzzzz
+    ///  2'dx: 00000xx,  2'dz: 00000zz,  2'd?: 00000zz
+    /// ```
+    ///
+    /// — the second line being `2'dx` written into a `reg [6:0]`, so two bits
+    /// zero extended rather than seven unknown ones.
+    #[test]
+    fn test_decimal_unknown_constant() {
+        let bits = |token: &str| {
+            constant_register(token)
+                .unwrap_or_else(|e| panic!("{} failed to convert: {}", token, e))
+                .to_binary()
+        };
+        assert_eq!(bits("7'dx"), "xxxxxxx");
+        assert_eq!(bits("7'dz"), "zzzzzzz");
+        assert_eq!(bits("7'd?"), "zzzzzzz");
+        assert_eq!(bits("2'dx"), "xx");
+        // The separators are not part of the value, so this is the same literal.
+        assert_eq!(bits("7'dx_"), "xxxxxxx");
+        // An unknown decimal *digit* is still malformed.
+        assert!(matches!(
+            constant_register("7'd1x"),
+            Err(EvalError::MalformedConstant(_))
+        ));
     }
 
     #[test]

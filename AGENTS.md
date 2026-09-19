@@ -2360,6 +2360,14 @@ tripwire.
   half wrong leaves `period !== 'hx` *true* for an untouched 64 bit register (corpus
   `pr673`).
 
+- **A decimal has no unknown *digit*, so `7'dx` is the whole value.** `x`, `z` and `?`
+  stand for one unknown bit, which the size then extends exactly as a leading digit
+  extends in any other base — so `7'dx` is `xxxxxxx` while `2'dx` is two bits, and written
+  into a `reg [6:0]` that is `00000xx` unsigned and `xxxxxxx` signed. `eval::decimal_bits`
+  is the one place it is read, and it asks for the *whole* digit string, so `7'd1x` is
+  still `MalformedConstant`: the other bases put the unknown in a digit and decimal cannot
+  (IEEE 1364-2005 §3.5.1; corpus `pr1792734`, whose gold file is every combination of
+  size, sign and symbol).
 - **A based literal is three tokens.** The size, the base designator and the digits are
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
