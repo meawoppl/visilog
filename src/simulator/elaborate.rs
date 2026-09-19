@@ -169,8 +169,20 @@ pub struct TimedBlock {
 
 impl TimedBlock {
     /// Whether the edges observed this delta cycle wake this block.
-    pub fn fires(&self, edges: &[SignalEdge]) -> bool {
-        control_fires(&self.control, edges, &self.implicit_reads)
+    ///
+    /// `just_ran` is whether the block ran in the *previous* round, which is
+    /// what makes [`TimedBlock::writes`] mean something: the edges it made on
+    /// that run cannot wake it, because it was not parked at its event control
+    /// when they happened. A block that did not just run, or writes nothing,
+    /// pays one branch for the question.
+    pub fn fires(&self, edges: &[SignalEdge], just_ran: bool) -> bool {
+        let own = if just_ran {
+            &self.writes
+        } else {
+            const NONE: &BTreeSet<String> = &BTreeSet::new();
+            NONE
+        };
+        control_fires(&self.control, edges, &self.implicit_reads, own)
     }
 }
 

@@ -856,18 +856,7 @@ impl Simulator {
                 // time it comes back the event is in the past. Corpus
                 // `event_list3`, whose block assigns a signal its own
                 // sensitivity list names and runs twice without this.
-                let filtered;
-                let offered = if self.ran_before[id] && !self.blocks[id].writes.is_empty() {
-                    filtered = edges
-                        .iter()
-                        .filter(|edge| !self.blocks[id].writes.contains(&edge.name))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    &filtered[..]
-                } else {
-                    &edges[..]
-                };
-                if self.blocks[id].fires(offered) {
+                if self.blocks[id].fires(&edges, self.ran_before[id]) {
                     let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
                     pending.extend(updates);
                 }
@@ -918,7 +907,7 @@ impl Simulator {
                 Some(watch) => {
                     let mut edges = watch.edges_since(&self.state);
                     edges.extend(triggers.iter().cloned());
-                    events::control_fires(&watch.control, &edges, &implicit)
+                    events::control_fires(&watch.control, &edges, &implicit, &implicit)
                 }
             };
             if wake {
