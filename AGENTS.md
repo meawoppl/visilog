@@ -934,6 +934,18 @@ find. Inside a `function` the second rule is checked at elaboration instead
 (`Program::nonlocal_disable`), since a frame has no driver behind it to cancel anything
 with.
 
+**An edge is a property of the least significant bit of the *triggering expression*, so
+a sensitivity entry that names a select is asked about those bits.** `always @(posedge
+clear[i])` — one block per bit, which is how a generate loop writes an asynchronous clear
+— is a `posedge` of bit `i` and nothing to do with bit 0 of the whole vector: `clear`
+moving `0000 -> 0010` answers `yes` for `clear[1]` and `no` for `clear`. `events::narrowed`
+is that question, and it takes the `&StateStore` `control_fires` now carries because both
+halves of the answer live there — the index (a substituted genvar is a constant, but a
+parameter or a signal is not) and the *declared range* the index has to be mapped through.
+A bit select and a part select are what it narrows; anything else — `posedge (a & b)`, an
+index that is not a number — keeps the over-approximating whole-signal reading
+`event_fires` has always documented. Corpus `pr1623097` and `automatic_events3`.
+
 **A block can suspend on the design as well as on the clock, and `Resume::Waiting` is
 how.** `wait (c) S` and `@(posedge clk) S` are both suspensions that no timestamp brings
 back, so they are not on the `EventQueue` at all: `Simulator::waiting` holds them, and
@@ -1494,7 +1506,7 @@ telling apart.
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — and `call_function` for the design's own |
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
-| `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
+| `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
