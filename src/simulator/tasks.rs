@@ -228,7 +228,8 @@ pub enum SystemTask {
     DumpFlush,
     /// `$dumplimit` — stops the dump once the file reaches this many bytes.
     DumpLimit,
-    /// End the simulation.
+    /// End the simulation. `$stop` is the same thing here — see
+    /// [`resolve_task`].
     Finish,
     /// The current simulated time. Meaningful as an argument; as a statement of
     /// its own the value has nowhere to go.
@@ -370,6 +371,17 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
     // whole words are matched before the family is split.
     match name {
         "finish" => return Ok(SystemTask::Finish),
+        // `$stop` asks the simulator to suspend and hand control back to
+        // whoever is driving it. There is nobody: visilog has no console, and
+        // a `Simulator` is a library object whose caller is waiting on
+        // `advance`. That is exactly the case iverilog spells `vvp -n`, whose
+        // own help text reads "Non-interactive ($stop = $finish)", so this is
+        // the equivalence iverilog itself draws rather than one invented here.
+        // Left to its debugger, `vvp` instead prints a
+        // `** VVP Stop(N) **` banner naming the source line and — reading an
+        // empty console — carries on; no gold file in the corpus records one,
+        // and visilog has no line numbers to name.
+        "stop" => return Ok(SystemTask::Finish),
         "time" => return Ok(SystemTask::Time),
         "timeformat" => return Ok(SystemTask::TimeFormat),
         "monitoron" => return Ok(SystemTask::MonitorControl(true)),
@@ -2859,6 +2871,28 @@ mod tests {
         let mut context = TaskContext::new();
         assert!(!context.finished());
         run_in(&mut context, "$finish;", &mut store);
+        assert!(context.finished());
+    }
+
+    /// `$stop` ends the run exactly as `$finish` does, printing nothing.
+    ///
+    /// That is the equivalence iverilog itself draws: `vvp -n` reads
+    /// "Non-interactive ($stop = $finish)" in its own help text, and visilog —
+    /// a library with no console — is by construction that case. Left to its
+    /// debugger `vvp` instead prints `** VVP Stop(0) **` and, reading an empty
+    /// console, carries on; no gold file in the corpus records that banner and
+    /// visilog has no source line to name in it. The optional argument is a
+    /// diagnostic level and is ignored, the way `$finish`'s is.
+    #[test]
+    fn test_stop_ends_the_run_the_way_finish_does() {
+        let mut store = store_with(&[]);
+        let mut context = TaskContext::new();
+        run_in(&mut context, "$stop;", &mut store);
+        assert!(context.finished());
+        assert_eq!(context.output().text(), "");
+
+        let mut context = TaskContext::new();
+        run_in(&mut context, "$stop(2);", &mut store);
         assert!(context.finished());
     }
 

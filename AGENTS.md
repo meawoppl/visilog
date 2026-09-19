@@ -292,6 +292,14 @@ whose text sits behind an `Rc<RefCell<String>>` so that a *handle* to it can be 
 the `StateStore` — which is how a `$display` written inside a function body prints; see
 "A call runs against a frame".
 
+**`$stop` resolves to the same `SystemTask::Finish`**, because a `Simulator` has no console
+to hand control back to — it is a library object whose caller is waiting on `advance`. That
+is exactly the case iverilog spells `vvp -n`, whose own help text reads
+"Non-interactive (`$stop` = `$finish`)", so the equivalence is iverilog's rather than one
+invented here. Left to its debugger `vvp` instead prints a `** VVP Stop(N) **` banner
+naming the source line and — reading an empty console — carries on; no gold file in the
+corpus records that banner, and visilog has no line numbers to name in one.
+
 **A descriptor is a bit mask, and bit 0 is the buffer.** `$fopen("work/a.txt")` hands back
 a *multi-channel descriptor* — one hot, allocated from bit 1 upwards, so the first file is
 2, the second 4, the third 8 — and `$fdisplay`/`$fwrite`/`$fmonitor`/`$fstrobe` write to
