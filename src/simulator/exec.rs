@@ -27,7 +27,7 @@
 //! this entry point can express: use [`resume`] directly for that.
 
 use crate::parsers::behavior::ProceduralStatements;
-use crate::parsers::expr::Expression;
+use crate::parsers::expr::{Expression, WordSelectKind};
 use crate::register::{Register, REAL_WIDTH};
 use crate::simulator::eval::{
     eval, eval_sized, indexed_select_indices, indexed_select_width, select_index, EvalError,
@@ -58,6 +58,13 @@ pub enum ResolvedTarget {
     /// One word of a memory, as in `mem[addr] <= d;`. Written the same way as a
     /// bit select and told apart from one by the declaration alone.
     Word { name: String, index: i64 },
+    /// Bits of one word of a memory, as in `mem[addr][3:1] <= d;` — the two
+    /// brackets of a [`Expression::WordSelect`], both already resolved.
+    WordBits {
+        name: String,
+        index: i64,
+        indices: Vec<i64>,
+    },
     /// A named event, as in `-> done;`. It holds no value, so the write that
     /// lands on it is a trigger and whatever was evaluated for it is dropped.
     Event(String),
@@ -86,6 +93,7 @@ impl ResolvedTarget {
             ResolvedTarget::Whole(name) => name,
             ResolvedTarget::Bits { name, .. } => name,
             ResolvedTarget::Word { name, .. } => name,
+            ResolvedTarget::WordBits { name, .. } => name,
             ResolvedTarget::Event(name) => name,
             ResolvedTarget::Nowhere => "",
             ResolvedTarget::Parts(parts) => parts.first().map_or("", |part| part.name()),
@@ -122,6 +130,9 @@ impl ResolvedTarget {
             ResolvedTarget::Word { name, .. } => state
                 .memory(name)
                 .map_or(SELF_DETERMINED, |memory| memory.width()),
+            // A select inside a word is as wide as the bits it names, the same
+            // as a select inside a signal.
+            ResolvedTarget::WordBits { indices, .. } => indices.len(),
             // Nothing is written into an event, so the value a trigger carries
             // is sized by itself and then thrown away.
             ResolvedTarget::Event(_) => SELF_DETERMINED,
@@ -156,6 +167,7 @@ impl ResolvedTarget {
             // Nothing is written through a select with no known index, so there
             // is nothing to convert into.
             ResolvedTarget::Bits { .. }
+            | ResolvedTarget::WordBits { .. }
             | ResolvedTarget::Event(_)
             | ResolvedTarget::Parts(_)
             | ResolvedTarget::Nowhere => false,
@@ -352,6 +364,54 @@ pub fn resolve_target(
             };
             Ok(ResolvedTarget::Bits {
                 name: id.name.clone(),
+                indices,
+            })
+        }
+        // `mem[i][3:1] = d;` — the word address and the bits inside it, both
+        // resolved here, exactly as each half is resolved on its own.
+        Expression::WordSelect { id, index, select } => {
+            if state.memory(&id.name).is_none() {
+                return Err(EvalError::NotAMemory(id.name.clone()).into());
+            }
+            let Some(index) = known_index(state, index)? else {
+                return Ok(ResolvedTarget::Nowhere);
+            };
+            let indices = match select {
+                WordSelectKind::Bit(bit) => match known_index(state, bit)? {
+                    Some(bit) => vec![bit],
+                    None => return Ok(ResolvedTarget::Nowhere),
+                },
+                WordSelectKind::Part(first, second) => {
+                    let (Some(first), Some(second)) =
+                        (known_index(state, first)?, known_index(state, second)?)
+                    else {
+                        return Ok(ResolvedTarget::Nowhere);
+                    };
+                    let selected = (first - second).unsigned_abs() as usize + 1;
+                    if selected > MAX_SELECT_WIDTH {
+                        return Err(EvalError::WidthOverflow(selected).into());
+                    }
+                    if first >= second {
+                        (second..=first).rev().collect()
+                    } else {
+                        (first..=second).collect()
+                    }
+                }
+                WordSelectKind::Indexed {
+                    base,
+                    width,
+                    upward,
+                } => {
+                    let span = indexed_select_width(width, state)?;
+                    match indexed_select_indices(&id.name, base, span, *upward, state)? {
+                        Some(indices) => indices,
+                        None => return Ok(ResolvedTarget::Nowhere),
+                    }
+                }
+            };
+            Ok(ResolvedTarget::WordBits {
+                name: id.name.clone(),
+                index,
                 indices,
             })
         }
@@ -565,6 +625,13 @@ pub fn drive_at(
             drive_bits(state, name, indices, value)
         }
         ResolvedTarget::Word { name, index } => drive_word(state, name, *index, value),
+        ResolvedTarget::WordBits {
+            name,
+            index,
+            indices,
+        } => state
+            .set_word_bits(name, *index, indices, value)
+            .ok_or_else(|| SimulationError::UnknownSignal(name.clone())),
         ResolvedTarget::Event(name) => {
             state.trigger_event(name);
             // A trigger moves no stored value, and saying otherwise would keep

@@ -2039,6 +2039,33 @@ tripwire.
   does for a write out of range. `ResolvedTarget::Nowhere` is that write.
   `indexed_part_select` is tried before `part_select`, which would otherwise read the `:`
   of `+:` as its own separator.
+- **Every shape of `name[...]` comes out of one parser, and that is what makes a second
+  bracket possible.** `expr.rs::select` reads the name, then one `bracketed_select`, then
+  asks for another; `mem[i][3:0]`, `mem[i][2]` and `mem[i][b +: 4]` are
+  `Expression::WordSelect`, whose `WordSelectKind` is the same three shapes a plain
+  select has, held without a name of their own because the name belongs to the word in
+  front of them. Four `alt` alternatives instead would re-parse the name and the first
+  bracket once per shape, and again to look for the second — that arrangement measured
+  **11% slower** on `bench parse/*` than this one, so `select` is the single entry point
+  and `operand_no_ws` and `assignment_lhs` both use it. `bracketed_select`'s
+  alternatives keep the historical order for the historical reasons — the bit before the
+  part so a conditional index (`q[a ? b : c]`) is not split at its `:`, the indexed part
+  before the plain one so the `:` of `+:` is not read as a separator — and each carries
+  its own brackets so the `alt` gets a second chance at a whole one rather than failing
+  inside a `delimited` that has already eaten the `[`. `bit_select` / `part_select` /
+  `indexed_part_select` survive as one-shape wrappers over the same parser, because a
+  `specify` path terminal takes exactly one select and must not take a word one.
+  A first bracket that is *not* a plain index is the whole select, since `mem[3:0][1]`
+  is not Verilog.
+  **Only a memory has a second dimension**, and nothing in the grammar can tell
+  `mem[i][2]` from a second select on a vector, so `a[0][1:0]` for a plain `a` is
+  `EvalError::NotAMemory` naming it rather than bits of the wrong thing — a packed
+  dimension (`reg [3:0][7:0] v;`) is still not modelled. A word is a bare `Register` with
+  no declared range, so the declared indices are mapped through the *memory's* range:
+  that is `state_store::bit_position_in`, the one copy of the mapping, which
+  `SignalState::bit_position` and `Memory::bit_of` / `with_bit_of` both go through.
+  `indexed_select_indices` asks the memory map for its "which end is most significant"
+  question only on a miss of the signal map, so an ordinary vector pays nothing.
 - **`resolve_target` guards its part-select width, and must keep doing so.** A range like
   `a[1000000:0]` names more bits than any register has; the evaluator always refused it,
   and the *write* path did not, so once enough designs elaborated to reach it one asked

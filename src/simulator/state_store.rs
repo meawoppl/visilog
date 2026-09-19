@@ -395,19 +395,7 @@ impl SignalState {
     /// most-significant-first bit vector, or `None` if the index is outside the
     /// declared range.
     pub fn bit_position(&self, index: i64) -> Option<usize> {
-        let (msb, lsb) = self.range;
-        let offset = if msb >= lsb {
-            if index > msb || index < lsb {
-                return None;
-            }
-            msb - index
-        } else {
-            if index < msb || index > lsb {
-                return None;
-            }
-            index - msb
-        };
-        Some(offset as usize)
+        bit_position_in(self.range, index)
     }
 
     /// The value of a single declared bit. Reading outside the declared range
@@ -473,6 +461,30 @@ pub struct Memory {
     addresses: (i64, i64),
     /// The `(msb, lsb)` range of one word.
     range: (i64, i64),
+}
+
+/// Where a declared bit index sits in a vector declared over `range`, counted
+/// from the *most significant* end — the order Verilog writes bits in.
+///
+/// `None` is an index outside the declared range, which reads `x` and
+/// discards a write. It is a free function rather than a method because a
+/// memory word is a bare [`Register`] with no range of its own: the mapping
+/// belongs to the declaration, and there are two kinds of declaration that
+/// carry one.
+pub fn bit_position_in(range: (i64, i64), index: i64) -> Option<usize> {
+    let (msb, lsb) = range;
+    let offset = if msb >= lsb {
+        if index > msb || index < lsb {
+            return None;
+        }
+        msb - index
+    } else {
+        if index < msb || index > lsb {
+            return None;
+        }
+        index - msb
+    };
+    Some(offset as usize)
 }
 
 impl Memory {
@@ -567,6 +579,27 @@ impl Memory {
             // reads too.
             None if self.is_real() => Register::from_f64(0.0),
             None => Register::unknown(self.width()).with_signedness(self.is_signed()),
+        }
+    }
+
+    /// The value of one declared bit of a word already read out of this
+    /// memory: the second bracket of `mem[a][i]`.
+    ///
+    /// It takes the word rather than the address so a part select costs one
+    /// read of the memory rather than one per bit.
+    pub fn bit_of(&self, word: &Register, index: i64) -> u8 {
+        match bit_position_in(self.range, index) {
+            Some(offset) => word.bit_from_lsb(self.width() - 1 - offset).unwrap_or(X),
+            None => X,
+        }
+    }
+
+    /// The same word with one declared bit replaced. A bit outside the declared
+    /// range is dropped, which is what an out-of-range write already does.
+    pub fn with_bit_of(&self, word: Register, index: i64, code: u8) -> Register {
+        match bit_position_in(self.range, index) {
+            Some(offset) => word.with_bit(self.width() - 1 - offset, code),
+            None => word,
         }
     }
 
@@ -1548,6 +1581,29 @@ impl StateStore {
             None => self.memory_journal.push((name.to_string(), before, after)),
         }
         Some(true)
+    }
+
+    /// Writes bits of one word of a memory — `mem[addr][3:1] = d;` — reporting
+    /// whether the stored value moved, or `None` when `name` is not a memory.
+    ///
+    /// The bits are placed through the memory's declared range and the word
+    /// then goes back through [`StateStore::set_word`], so the change is
+    /// journalled exactly as a whole-word write is. `indices` runs most
+    /// significant first, the order `ResolvedTarget::Bits` keeps.
+    pub fn set_word_bits(
+        &mut self,
+        name: &str,
+        address: i64,
+        indices: &[i64],
+        value: &Register,
+    ) -> Option<bool> {
+        let memory = self.name_to_memory.get(name)?;
+        let mut word = memory.word(Some(address));
+        let value = value.coerced(indices.len());
+        for (offset, &index) in indices.iter().enumerate() {
+            word = memory.with_bit_of(word, index, value.get_raw()[offset]);
+        }
+        self.set_word(name, address, &word)
     }
 
     /// Every memory written since the last call, as `(name, before, after)`,

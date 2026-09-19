@@ -50,7 +50,7 @@ use crate::simulator::exec::{
 };
 use crate::simulator::gates::{resolve_bit, Gate};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
-use crate::simulator::state_store::StateStore;
+use crate::simulator::state_store::{bit_position_in, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
 
@@ -1735,9 +1735,7 @@ impl Simulator {
                     continue;
                 }
                 match &contribution.target {
-                    // A word is driven whole: `foo[0][1]` is a bit of a word,
-                    // which the target grammar has no shape for, so a word's
-                    // only driver form is the whole of it.
+                    // A whole net, or a whole word of an array of nets.
                     ResolvedTarget::Whole(_) | ResolvedTarget::Word { .. } => {
                         contribute_whole(&mut driven, &contribution.value, contribution.strength)
                     }
@@ -1749,6 +1747,24 @@ impl Simulator {
                         let value = contribution.value.coerced(indices.len());
                         for (offset, index) in indices.iter().enumerate() {
                             let Some(position) = signal.bit_position(*index) else {
+                                continue;
+                            };
+                            let code = value.get_raw()[offset];
+                            driven[position].push((code, contribution.strength.of(code)));
+                        }
+                    }
+                    // Bits of a word are grouped by the same address a whole
+                    // word is, so this list is that word's — only the mapping
+                    // from a declared index to a position is the memory's
+                    // rather than a signal's.
+                    ResolvedTarget::WordBits { indices, .. } => {
+                        let memory = self
+                            .state
+                            .memory(name)
+                            .expect("a word select's memory was just looked up");
+                        let value = contribution.value.coerced(indices.len());
+                        for (offset, index) in indices.iter().enumerate() {
+                            let Some(position) = bit_position_in(memory.range(), *index) else {
                                 continue;
                             };
                             let code = value.get_raw()[offset];
@@ -1791,7 +1807,7 @@ impl Simulator {
 /// resolve against each other, and neither says anything about `foo[1]`.
 fn word_address(target: &ResolvedTarget) -> Option<i64> {
     match target {
-        ResolvedTarget::Word { index, .. } => Some(*index),
+        ResolvedTarget::Word { index, .. } | ResolvedTarget::WordBits { index, .. } => Some(*index),
         _ => None,
     }
 }
@@ -5440,6 +5456,66 @@ mod tests {
         );
 
         assert_eq!(simulator.output().lines(), vec!["10 20 30 40"]);
+    }
+
+    /// `mem[i][3:0]` — a select *inside* one word. The word index and the bit
+    /// index are the same syntax, and only the declaration says which is
+    /// which, so this is the test that catches the two being swapped.
+    #[test]
+    fn test_a_select_inside_a_memory_word_reads_and_writes() {
+        let simulator = simulator_for(
+            r#"
+            module word_select();
+                reg [7:0] mem [0:3];
+                reg [1:0] idx;
+                initial begin
+                    idx = 1;
+                    mem[0] = 8'b1010_0101;
+                    mem[1] = 8'b0000_0000;
+                    // read: a bit, a part and an indexed part of one word
+                    $display("%b %b %b %b", mem[0][7], mem[0][3:0], mem[0][4 +: 4],
+                             mem[idx][1:0]);
+                    // write: each of the three, leaving the rest of the word
+                    mem[1][0] = 1'b1;
+                    mem[1][7:6] = 2'b11;
+                    mem[1][4 +: 2] = 2'b01;
+                    mem[idx][2] = 1'b1;
+                    $display("%b %b", mem[1], mem[0]);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["1 0101 1010 00", "11010101 10100101"]
+        );
+    }
+
+    /// A word select on something that is not a memory is a named error, not a
+    /// select of the wrong thing: a vector has no second dimension.
+    #[test]
+    fn test_a_word_select_of_a_vector_is_reported() {
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module not_a_memory();
+                reg [7:0] vec;
+                wire q;
+                assign q = vec[0][1:0];
+            endmodule
+        "#,
+        )
+        .unwrap();
+        assert!(remaining.trim().is_empty());
+
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("design should elaborate");
+        let error = simulator.run().expect_err("a vector has no word");
+        assert!(
+            format!("{}", error).contains("not a memory"),
+            "unexpected error: {}",
+            error
+        );
     }
 
     /// A word nothing has written reads `x`, like any undriven register. This

@@ -2366,7 +2366,8 @@ fn is_drivable(expression: &Expression) -> bool {
         Expression::Identifier(_)
         | Expression::BitSelect(_, _)
         | Expression::PartSelect(_, _, _)
-        | Expression::IndexedPartSelect { .. } => true,
+        | Expression::IndexedPartSelect { .. }
+        | Expression::WordSelect { .. } => true,
         Expression::Parenthetical(inner) => is_drivable(inner),
         Expression::Concatenation(parts) => parts.iter().all(is_drivable),
         _ => false,
@@ -2404,7 +2405,8 @@ fn assigned_name(target: &Expression) -> Option<&str> {
         Expression::Identifier(id)
         | Expression::BitSelect(id, _)
         | Expression::PartSelect(id, _, _)
-        | Expression::IndexedPartSelect { id, .. } => Some(&id.name),
+        | Expression::IndexedPartSelect { id, .. }
+        | Expression::WordSelect { id, .. } => Some(&id.name),
         Expression::Parenthetical(inner) => assigned_name(inner),
         _ => None,
     }
@@ -2508,6 +2510,12 @@ impl BodyNames {
                 self.expression(base);
                 self.expression(width);
             }
+            Expression::WordSelect { index, select, .. } => {
+                self.expression(index);
+                for inner in select.expressions() {
+                    self.expression(inner);
+                }
+            }
             other => self.expression(other),
         }
     }
@@ -2569,6 +2577,13 @@ impl BodyNames {
                 self.reads.insert(id.name.clone());
                 self.expression(base);
                 self.expression(width);
+            }
+            Expression::WordSelect { id, index, select } => {
+                self.reads.insert(id.name.clone());
+                self.expression(index);
+                for inner in select.expressions() {
+                    self.expression(inner);
+                }
             }
         }
     }
@@ -2733,6 +2748,12 @@ fn substitute_genvars(expression: &mut Expression, genvars: &HashMap<String, i64
             substitute_genvars(base, genvars);
             substitute_genvars(width, genvars);
         }
+        Expression::WordSelect { index, select, .. } => {
+            substitute_genvars(index, genvars);
+            for inner in select.expressions_mut() {
+                substitute_genvars(inner, genvars);
+            }
+        }
     }
 }
 
@@ -2869,7 +2890,8 @@ fn operand_names<'e>(expression: &'e Expression, names: &mut Vec<&'e str>) {
         | Expression::StringLiteral(_)
         | Expression::BitSelect(..)
         | Expression::PartSelect(..)
-        | Expression::IndexedPartSelect { .. } => {}
+        | Expression::IndexedPartSelect { .. }
+        | Expression::WordSelect { .. } => {}
     }
 }
 
@@ -2975,6 +2997,13 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
             id.name = resolve(&id.name);
             rename_expression(base, resolve);
             rename_expression(width, resolve);
+        }
+        Expression::WordSelect { id, index, select } => {
+            id.name = resolve(&id.name);
+            rename_expression(index, resolve);
+            for inner in select.expressions_mut() {
+                rename_expression(inner, resolve);
+            }
         }
     }
 }

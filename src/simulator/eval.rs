@@ -52,7 +52,7 @@ use std::fmt;
 
 use crate::parsers::base::RawToken;
 use crate::parsers::constants::{VerilogBaseType, VerilogConstant};
-use crate::parsers::expr::Expression;
+use crate::parsers::expr::{Expression, WordSelectKind};
 use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, REAL_WIDTH, X, Z, ZERO};
@@ -90,6 +90,11 @@ pub enum EvalError {
     /// of one. Only a word select (`mem[addr]`) reads a memory, so this is a
     /// name that exists reported as what it is rather than as unknown.
     MemoryAsValue(String),
+    /// `a[0][1:0]` where `a` is a plain vector. Only a memory has a second
+    /// dimension to select from, and a vector with a packed one is not
+    /// modelled — so this names what was asked for rather than selecting
+    /// bits of the wrong thing.
+    NotAMemory(String),
     /// A named event read as though it were a value. An event has no value at
     /// all — it is triggered by `-> e;` and waited on by `@(e)` — so a name
     /// that exists is reported as what it is rather than as unknown.
@@ -153,6 +158,9 @@ impl fmt::Display for EvalError {
             }
             EvalError::MemoryAsValue(name) => {
                 write!(f, "memory `{}` has no value without a word select", name)
+            }
+            EvalError::NotAMemory(name) => {
+                write!(f, "`{}` is not a memory, so it has no second select", name)
             }
             EvalError::EventAsValue(name) => {
                 write!(f, "event `{}` has no value; it can only be triggered", name)
@@ -462,6 +470,62 @@ fn eval_in_context(
             let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
             Ok(widened(Register::from_bits(bits), width))
         }
+        // `mem[i][3:0]` — the word first, then the select inside it. A word is
+        // a bare `Register`, so the declared indices are mapped through the
+        // *memory's* range rather than a signal's.
+        Expression::WordSelect { id, index, select } => {
+            let Some(memory) = store.memory(&id.name) else {
+                return Err(EvalError::NotAMemory(id.name.clone()));
+            };
+            let address = numeric(&eval(index, store)?)?.and_then(|v| i64::try_from(v).ok());
+            let word = memory.word(address);
+            let value = match select {
+                WordSelectKind::Bit(bit) => {
+                    match numeric(&eval(bit, store)?)?.and_then(|v| i64::try_from(v).ok()) {
+                        Some(bit) => logic_bit(memory.bit_of(&word, bit)),
+                        None => Register::unknown(1),
+                    }
+                }
+                WordSelectKind::Part(first, second) => {
+                    let first = select_bound(first, store)?;
+                    let second = select_bound(second, store)?;
+                    let selected = (first - second).unsigned_abs() as usize + 1;
+                    if selected > MAX_SELECT_WIDTH {
+                        return Err(EvalError::WidthOverflow(selected));
+                    }
+                    let indices: Vec<i64> = if first >= second {
+                        (second..=first).rev().collect()
+                    } else {
+                        (first..=second).collect()
+                    };
+                    let bits: Vec<u8> = indices
+                        .into_iter()
+                        .map(|i| memory.bit_of(&word, i))
+                        .collect();
+                    Register::from_bits(bits)
+                }
+                WordSelectKind::Indexed {
+                    base,
+                    width: selected,
+                    upward,
+                } => {
+                    let span = indexed_select_width(selected, store)?;
+                    match indexed_select_indices(&id.name, base, span, *upward, store)? {
+                        Some(indices) => {
+                            let bits: Vec<u8> = indices
+                                .into_iter()
+                                .map(|i| memory.bit_of(&word, i))
+                                .collect();
+                            Register::from_bits(bits)
+                        }
+                        // An unknown base selects `x`, exactly as it does out
+                        // of a vector.
+                        None => Register::unknown(span),
+                    }
+                }
+            };
+            Ok(widened(value, width))
+        }
         // A call is as wide as its function was declared, and a context can
         // only pad that — it cannot reach the arguments, which the function's
         // own declaration sizes.
@@ -768,6 +832,10 @@ fn unary_keeps_signedness(op: &UnaryOperator) -> bool {
 fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
     match expr {
         Expression::Constant(constant) => constant.is_signed(),
+        // A select out of a word is a run of bits, and a run of bits is
+        // unsigned however the memory was declared — the same rule a part
+        // select of a signed `reg` follows.
+        Expression::WordSelect { .. } => false,
         // A real has a sign, and saying otherwise would make the *integer*
         // beside it unsigned: `2.5 > -1` has to read that `-1` as -1 rather
         // than as four billion before converting it.
@@ -831,6 +899,9 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
 fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
     match expr {
         Expression::RealLiteral(_) => true,
+        // A real has no bits to select from, so a select out of one is not
+        // itself real.
+        Expression::WordSelect { .. } => false,
         Expression::Identifier(id) => store
             .get_signal(&id.name)
             .is_some_and(|signal| signal.is_real()),
@@ -946,6 +1017,20 @@ fn sized_within(expr: &Expression) -> bool {
 pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
     match expr {
         Expression::Constant(constant) => constant.size().unwrap_or(UNSIZED_CONSTANT_WIDTH),
+        // As wide as the second bracket names, which is the same question the
+        // three plain selects answer.
+        Expression::WordSelect { select, .. } => match select {
+            WordSelectKind::Bit(_) => 1,
+            WordSelectKind::Part(first, second) => {
+                match (select_bound(first, store), select_bound(second, store)) {
+                    (Ok(first), Ok(second)) => (first - second).unsigned_abs() as usize + 1,
+                    _ => 1,
+                }
+            }
+            WordSelectKind::Indexed { width, .. } => {
+                indexed_select_width(width, store).unwrap_or(1)
+            }
+        },
         Expression::RealLiteral(_) => REAL_WIDTH,
         Expression::Identifier(id) => store
             .get_signal(&id.name)
@@ -1568,9 +1653,13 @@ pub fn indexed_select_indices(
     } else {
         (base, base - span + 1)
     };
+    // A memory is asked second, and only on a miss: `mem[a][b +: 4]` selects
+    // out of the *word*, whose range is the memory's declaration.
     let ascending = store
         .get_signal(name)
-        .is_some_and(|signal| signal.range().0 < signal.range().1);
+        .map(|signal| signal.range())
+        .or_else(|| store.memory(name).map(|memory| memory.range()))
+        .is_some_and(|(msb, lsb)| msb < lsb);
     Ok(Some(if ascending {
         (low..=high).collect()
     } else {
