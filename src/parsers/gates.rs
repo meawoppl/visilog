@@ -128,6 +128,23 @@ impl GateKind {
             .map(|(keyword, _)| *keyword)
             .expect("every gate kind comes from the keyword table")
     }
+
+    /// Whether this is a bidirectional pass switch.
+    ///
+    /// One conducts both ways and has no output terminal, so it elaborates to a
+    /// `simulator::gates::PassSwitch` — an edge between two nets — rather than
+    /// to a `Gate`, which is a driver of one.
+    pub fn is_bidirectional(&self) -> bool {
+        matches!(
+            self,
+            GateKind::Tran
+                | GateKind::Rtran
+                | GateKind::Tranif0
+                | GateKind::Tranif1
+                | GateKind::Rtranif0
+                | GateKind::Rtranif1
+        )
+    }
 }
 
 /// How hard a driver pushes, which is what decides a net with more than one of

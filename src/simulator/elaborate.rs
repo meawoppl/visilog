@@ -46,8 +46,9 @@ use crate::parsers::{
         TaskDeclaration,
     },
     constants::VerilogConstant,
+    delay::GateDelay,
     expr::Expression,
-    gates::{GateInstantiation, GateKind, StrengthLevel},
+    gates::{DriveStrength, GateInstantiation, GateKind, StrengthLevel},
     generate::{DefparamAssignment, GenerateBlock, GenerateItem, GenerateLoop},
     identifier::Identifier,
     modules::{
@@ -65,7 +66,7 @@ use crate::register::{Register, ONE, ZERO};
 use crate::simulator::eval::{eval, expression_width};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width};
-use crate::simulator::gates::Gate;
+use crate::simulator::gates::{Gate, PassSwitch};
 use crate::simulator::program::{
     block_scope, FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition,
     TaskParameter, TaskTable, FUNCTION_DELAY_UNSUPPORTED, FUNCTION_EVENT_UNSUPPORTED,
@@ -173,6 +174,10 @@ pub struct Elaborated {
     /// The user-defined primitives, which are continuous drivers beside the
     /// gates and settle in the same fixpoint.
     pub udps: Vec<Udp>,
+    /// The bidirectional pass switches. One is not a driver at all — it joins
+    /// two nets into a node whose drivers resolve *together*, which is why it
+    /// is held apart from [`Elaborated::gates`].
+    pub pass_switches: Vec<PassSwitch>,
     /// The names a gate drives. Those nets are *resolved* between all their
     /// continuous drivers instead of being written by whichever one ran last,
     /// which is the only way a three-state bus or a `pullup` can mean
@@ -224,6 +229,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             assignments: Vec::new(),
             gates: Vec::new(),
             udps: Vec::new(),
+            pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
@@ -1548,9 +1554,7 @@ impl<'m> Elaborator<'m> {
             delay
         });
         let Some(range) = &gate.instance.range else {
-            let gate = Gate::new(gate.kind, strength, terminals, delay)?;
-            self.push_gate(gate);
-            return Ok(());
+            return self.push_primitive(gate.kind, strength, terminals, delay);
         };
         // An array's bounds are a `Range` like any declaration's, so
         // `buf drv [N-1:0] (…)` is sized by the parameters in scope.
@@ -1560,9 +1564,40 @@ impl<'m> Elaborator<'m> {
                 .iter()
                 .map(|terminal| self.array_terminal(gate.kind, terminal, position, count))
                 .collect::<Result<Vec<Expression>, SimulationError>>()?;
-            let gate = Gate::new(gate.kind, strength, sliced, delay.clone())?;
-            self.push_gate(gate);
+            self.push_primitive(gate.kind, strength, sliced, delay.clone())?;
         }
+        Ok(())
+    }
+
+    /// Records one primitive instance, as whichever of the two shapes its
+    /// keyword names.
+    ///
+    /// A **bidirectional** switch has no output terminal, so it is not a driver
+    /// and cannot be a [`Gate`]: it joins two nets into a node instead. That
+    /// one question is the whole of the difference, and it is asked here so
+    /// that an arrayed instantiation goes through it too.
+    fn push_primitive(
+        &mut self,
+        kind: GateKind,
+        strength: DriveStrength,
+        terminals: Vec<Expression>,
+        delay: Option<GateDelay>,
+    ) -> Result<(), SimulationError> {
+        if kind.is_bidirectional() {
+            let switch = PassSwitch::new(kind, terminals)?;
+            // Both terminals are resolved nets: every driver of either one has
+            // to reach `resolve_contributions` rather than write the store, or
+            // the node's pool would be missing it.
+            for terminal in &switch.terminals {
+                if let Some(name) = assigned_name(terminal) {
+                    self.out.resolved_nets.insert(name.to_string());
+                }
+            }
+            self.out.pass_switches.push(switch);
+            return Ok(());
+        }
+        let gate = Gate::new(kind, strength, terminals, delay)?;
+        self.push_gate(gate);
         Ok(())
     }
 
@@ -1684,18 +1719,31 @@ impl<'m> Elaborator<'m> {
         if width != count {
             return Err(too_wide());
         }
-        // Only a plain signal can be sliced: a bit of `{16'b0, data}` is not
-        // something a `BitSelect` can name, and an output has to be drivable.
-        let Expression::Identifier(id) = terminal else {
-            return Err(too_wide());
+        // Only a plain signal or a part select of one can be sliced: a bit of
+        // `{16'b0, data}` is not something a `BitSelect` can name, and an
+        // output has to be drivable.
+        let (id, bounds) = match terminal {
+            Expression::Identifier(id) => (id, None),
+            Expression::PartSelect(id, first, second) => {
+                let bound = |expression: &Expression| -> Result<i64, SimulationError> {
+                    eval(expression, &self.out.state)
+                        .ok()
+                        .and_then(|value| value.to_u128())
+                        .and_then(|value| i64::try_from(value).ok())
+                        .ok_or_else(too_wide)
+                };
+                (id, Some((bound(first)?, bound(second)?)))
+            }
+            _ => return Err(too_wide()),
         };
         let Some(signal) = self.out.state.get_signal(&id.name) else {
             return Err(SimulationError::UnknownSignal(id.name.clone()));
         };
-        let (msb, lsb) = signal.range();
-        // `position` counts from the least significant end, and both the
-        // terminal and the instance array are walked that way — so which end
-        // the array's own range starts at cannot matter.
+        // A part select brings its own bounds; a bare name takes the whole
+        // net's. Either way `position` counts from the least significant end,
+        // and both the terminal and the instance array are walked that way —
+        // so which end either range starts at cannot matter.
+        let (msb, lsb) = bounds.unwrap_or_else(|| signal.range());
         let index = if msb >= lsb {
             lsb + position as i64
         } else {

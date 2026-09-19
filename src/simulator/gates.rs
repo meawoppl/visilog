@@ -22,13 +22,13 @@
 //!
 //! # What is not modelled
 //!
-//! A gate's delay is parsed and ignored — the gate settles in zero time along
-//! with every other continuous driver. The `r`-prefixed switches (`rnmos`,
-//! `rcmos`, …) reduce the strength of what they pass, which is not modelled
-//! either, so they behave as their non-resistive counterparts. The bidirectional
-//! switches (`tran`, `tranif0`, …) conduct both ways and have no output
-//! terminal at all; they are a **named error** at elaboration rather than a
-//! driver that quietly does nothing.
+//! The `r`-prefixed switches (`rnmos`, `rcmos`, `rtran`, …) reduce the strength
+//! of what they pass, which is not modelled, so they behave as their
+//! non-resistive counterparts. A switch's *delay* — `tranif0 #(100)`, which
+//! delays the moment the switch opens or closes rather than a value — is parsed
+//! and ignored. A `tranif` whose control is `x` or `z` is taken **not** to
+//! conduct, where iverilog conducts at an ambiguous strength and gives the far
+//! side an `x`; see [`PassSwitch::conducts`].
 
 use crate::parsers::delay::GateDelay;
 use crate::parsers::expr::Expression;
@@ -37,11 +37,6 @@ use crate::register::{Register, ONE, X, Z, ZERO};
 use crate::simulator::eval::eval;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
-
-/// A bidirectional pass switch conducts in both directions, so it has no
-/// output terminal to drive and cannot be a continuous driver at all.
-const BIDIRECTIONAL_UNSUPPORTED: SimulationError =
-    SimulationError::Unsupported("a bidirectional pass switch (`tran` and friends)");
 
 /// One elaborated primitive instance, with its terminals already split into
 /// the ones it drives and the ones it reads.
@@ -132,7 +127,9 @@ impl Gate {
             | GateKind::Tranif0
             | GateKind::Tranif1
             | GateKind::Rtranif0
-            | GateKind::Rtranif1 => return Err(BIDIRECTIONAL_UNSUPPORTED),
+            | GateKind::Rtranif1 => {
+                unreachable!("a bidirectional switch elaborates to a PassSwitch")
+            }
         };
         Ok(Gate {
             kind,
@@ -153,6 +150,83 @@ impl Gate {
             levels.push(least_significant_bit(&eval(input, state)?));
         }
         Ok(gate_output(self.kind, &levels))
+    }
+}
+
+/// One elaborated **bidirectional** pass switch.
+///
+/// A `tran` has no output terminal, so it is deliberately not a [`Gate`]: it
+/// does not *drive* anything, it makes its two terminals **one node**. A node's
+/// value is what every driver of every net in it resolves to *together*, which
+/// is the same [`resolve_bit`] every other contention already goes through — so
+/// the switch changes which contributions are pooled and nothing about the
+/// value rule.
+///
+/// Copying a value from one terminal to the other instead is the shape that
+/// looks right and is wrong: once `a` has been copied to `b`, a driver on `a`
+/// letting go leaves `b` holding the stale value, which copies straight back.
+/// A three-state bus wired through a `tran` would never float again.
+pub struct PassSwitch {
+    pub kind: GateKind,
+    /// The two nets it joins. Each is read as one bit, the way every other
+    /// primitive terminal is.
+    pub terminals: [Expression; 2],
+    /// A `tranif`'s control terminal and the level that makes it conduct.
+    /// `None` for `tran`/`rtran`, which always do.
+    pub control: Option<(Expression, u8)>,
+}
+
+impl PassSwitch {
+    /// Splits a bidirectional switch's terminal list, reporting a count the
+    /// kind cannot take.
+    pub fn new(kind: GateKind, terminals: Vec<Expression>) -> Result<PassSwitch, SimulationError> {
+        let found = terminals.len();
+        let wrong_count = || SimulationError::GateTerminals {
+            gate: kind.keyword(),
+            found,
+        };
+        let active = match kind {
+            GateKind::Tran | GateKind::Rtran => None,
+            GateKind::Tranif1 | GateKind::Rtranif1 => Some(ONE),
+            GateKind::Tranif0 | GateKind::Rtranif0 => Some(ZERO),
+            _ => return Err(wrong_count()),
+        };
+        let wanted = if active.is_some() { 3 } else { 2 };
+        if found != wanted {
+            return Err(wrong_count());
+        }
+        let mut terminals = terminals.into_iter();
+        let first = terminals.next().expect("the count was just checked");
+        let second = terminals.next().expect("the count was just checked");
+        let control =
+            active.map(|level| (terminals.next().expect("the count was just checked"), level));
+        Ok(PassSwitch {
+            kind,
+            terminals: [first, second],
+            control,
+        })
+    }
+
+    /// Whether the switch joins its two terminals as things stand.
+    ///
+    /// This is asked **every propagation pass** rather than partitioned once at
+    /// elaboration, because a `tranif`'s control moves during the run — corpus
+    /// `tran-keeper` gates a switch on the very net the switch is holding up.
+    /// A union-find built once would be right for `tran` and silently wrong for
+    /// the four `if` forms.
+    ///
+    /// A control that is `x` or `z` is taken not to conduct. iverilog conducts
+    /// at an *ambiguous* strength instead, which gives the far side an `x`
+    /// while leaving the driven side alone: measured against iverilog 12.0,
+    /// `assign p = 1; tranif1 (p, q, en);` with `en` unknown gives `p=1 q=x`,
+    /// where this gives `p=1 q=z`. Saying the far side is unknown needs a
+    /// strength that is a *range* rather than a level, which
+    /// [`resolve_bit`] has no shape for.
+    pub fn conducts(&self, state: &StateStore) -> Result<bool, SimulationError> {
+        match &self.control {
+            None => Ok(true),
+            Some((control, active)) => Ok(least_significant_bit(&eval(control, state)?) == *active),
+        }
     }
 }
 
@@ -616,28 +690,46 @@ mod tests {
         );
     }
 
-    /// A bidirectional switch has no output terminal, so it cannot be a
-    /// continuous driver. It stops here by name rather than quietly doing
-    /// nothing.
+    /// A bidirectional switch has no output terminal, so it is split by
+    /// [`PassSwitch::new`] rather than by [`Gate::new`]: two terminals for
+    /// `tran`/`rtran`, and two plus a control for the four `if` forms.
     #[test]
-    fn test_a_bidirectional_switch_is_a_named_error() {
-        for kind in [
-            GateKind::Tran,
-            GateKind::Rtran,
-            GateKind::Tranif0,
-            GateKind::Tranif1,
-            GateKind::Rtranif0,
-            GateKind::Rtranif1,
-        ] {
+    fn test_a_bidirectional_switch_splits_into_two_terminals_and_a_control() {
+        for kind in [GateKind::Tran, GateKind::Rtran] {
+            let switch = PassSwitch::new(kind, terminals(&["a", "b"])).unwrap();
+            assert!(
+                switch.control.is_none(),
+                "{} has no control",
+                kind.keyword()
+            );
             assert_eq!(
-                Gate::new(
-                    kind,
-                    DriveStrength::STRONG,
-                    terminals(&["a", "b", "c"]),
-                    None
-                )
-                .err(),
-                Some(BIDIRECTIONAL_UNSUPPORTED)
+                PassSwitch::new(kind, terminals(&["a", "b", "c"])).err(),
+                Some(SimulationError::GateTerminals {
+                    gate: kind.keyword(),
+                    found: 3
+                })
+            );
+        }
+        for (kind, active) in [
+            (GateKind::Tranif1, ONE),
+            (GateKind::Rtranif1, ONE),
+            (GateKind::Tranif0, ZERO),
+            (GateKind::Rtranif0, ZERO),
+        ] {
+            let switch = PassSwitch::new(kind, terminals(&["a", "b", "c"])).unwrap();
+            assert_eq!(
+                switch.control.map(|(_, level)| level),
+                Some(active),
+                "{} conducts on {}",
+                kind.keyword(),
+                active
+            );
+            assert_eq!(
+                PassSwitch::new(kind, terminals(&["a", "b"])).err(),
+                Some(SimulationError::GateTerminals {
+                    gate: kind.keyword(),
+                    found: 2
+                })
             );
         }
     }

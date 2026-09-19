@@ -33,6 +33,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::parsers::expr::Expression;
 use crate::parsers::{
     assignment::ContinuousAssignment,
     behavior::EventControl,
@@ -40,7 +41,7 @@ use crate::parsers::{
     modules::VerilogModule,
     preprocessor::Timescale,
 };
-use crate::register::Register;
+use crate::register::{Register, Z};
 use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
 use crate::simulator::eval::{eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
@@ -48,7 +49,7 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_bit, Gate};
+use crate::simulator::gates::{resolve_bit, Gate, PassSwitch};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::{bit_position_in, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
@@ -434,6 +435,11 @@ pub struct Simulator {
     /// The design's user-defined primitives, continuous drivers beside the
     /// gates and settled in the same fixpoint.
     udps: Vec<Udp>,
+    /// The design's bidirectional pass switches. One is not a driver — it joins
+    /// two nets into a node whose drivers resolve together — so it is held
+    /// apart from the gates. Empty for a design with no `tran` in it, which is
+    /// what keeps the question off the propagation hot path.
+    pass_switches: Vec<PassSwitch>,
     /// The nets a gate drives, which are resolved between all their continuous
     /// drivers rather than written by whichever one ran last. Empty for a
     /// design with no gates, which is what keeps the question off the hot path.
@@ -512,6 +518,7 @@ impl Simulator {
             settled_once: false,
             gates: Vec::new(),
             udps: Vec::new(),
+            pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
             blocks: Vec::new(),
@@ -545,6 +552,7 @@ impl Simulator {
         self.gate_delays.clear();
         self.gates.clear();
         self.udps.clear();
+        self.pass_switches.clear();
         self.resolved_nets.clear();
         self.scheduled.clear();
         self.settled_once = false;
@@ -601,6 +609,7 @@ impl Simulator {
             Vec::new()
         };
         self.udps = elaborated.udps;
+        self.pass_switches = elaborated.pass_switches;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
         self.blocks = elaborated.blocks;
@@ -1481,6 +1490,7 @@ impl Simulator {
             * (self.assignments.len()
                 + self.gates.len()
                 + self.udps.len()
+                + self.pass_switches.len()
                 + self.state.drive_count())
             + 4;
         // A continuous assignment is re-evaluated until the design stops
@@ -1647,7 +1657,42 @@ impl Simulator {
                     strength: DriveStrength::STRONG,
                 });
             }
-            changed |= self.resolve_contributions(contributions)?;
+            // A `force` or a procedural `assign` on a *resolved* net is a
+            // continuous driver of it like any other, so it joins the pool
+            // rather than only writing the net. On the net it names it wins
+            // either way — `exec::held_bits` discards the resolved write over a
+            // held bit — but through a `tran` it has to *contend* with what the
+            // far side is driving: iverilog 12.0 answers `assign y = a;
+            // tran (x, y); force x = 0;` with `a` at 1 as `x=0 y=x` (corpus
+            // `pr2937417b`).
+            // A drive keeps the *name* its target lands on, so a design that
+            // forces an ordinary register answers this without resolving
+            // anything — the same shape `resolved_nets` already answers with.
+            if self.state.has_drives() {
+                let drives = self.state.drives();
+                for drive in drives.iter() {
+                    if !self.is_resolved(drive.name()) {
+                        continue;
+                    }
+                    let target = resolve_target(&self.state, drive.target())?;
+                    if target.is_multiple() {
+                        continue;
+                    }
+                    let width = target.width(&self.state);
+                    let value = eval_sized(drive.value(), &self.state, width)?;
+                    contributions.push(Contribution {
+                        target,
+                        value,
+                        strength: DriveStrength::STRONG,
+                    });
+                }
+            }
+            // Which nets a `tran` joins is worked out here, every pass, rather
+            // than partitioned once at elaboration: a `tranif`'s control moves
+            // during the run, and corpus `tran-keeper` gates a switch on the
+            // very net it is holding up.
+            let switches = self.switch_bits()?;
+            changed |= self.resolve_contributions(contributions, &switches)?;
             changed |= self.apply_drives()?;
             if !changed {
                 return Ok(pass);
@@ -1689,8 +1734,9 @@ impl Simulator {
     fn resolve_contributions(
         &mut self,
         contributions: Vec<Contribution>,
+        switches: &[SwitchBits],
     ) -> Result<bool, SimulationError> {
-        if contributions.is_empty() {
+        if contributions.is_empty() && switches.is_empty() {
             return Ok(false);
         }
         // Grouped by net, in the order the drivers were written, so a design
@@ -1705,12 +1751,23 @@ impl Simulator {
                 nets.push(net);
             }
         }
-        let mut settled: Vec<(ResolvedTarget, Register)> = Vec::new();
+        // A switch terminal is a net whether or not anything drives it: an
+        // undriven one still has to be *written* — with whatever the node it
+        // joins resolved to, or with `z` when it joins nothing.
+        for switch in switches {
+            for end in &switch.ends {
+                let net = (end.name.as_str(), None);
+                if !nets.contains(&net) {
+                    nets.push(net);
+                }
+            }
+        }
+        let mut resolving: Vec<NetDrivers> = Vec::with_capacity(nets.len());
         for (name, address) in nets {
             // A memory word's width and held value come from the memory map,
             // and a signal's from the signal map — a name is in one or the
             // other, never both, so the address is what says which to ask.
-            let (width, mut bits) = match address {
+            let (width, bits) = match address {
                 Some(index) => {
                     let memory = self
                         .state
@@ -1779,25 +1836,236 @@ impl Simulator {
                     | ResolvedTarget::Nowhere => {}
                 }
             }
-            for (position, drivers) in driven.iter().enumerate() {
+            resolving.push(NetDrivers {
+                name: name.to_string(),
+                address,
+                bits,
+                driven,
+            });
+        }
+        // A design with no `tran` in it pays one `is_empty` for the question.
+        if !switches.is_empty() {
+            bond_nodes(&mut resolving, switches);
+        }
+        let mut changed = false;
+        for net in resolving {
+            let mut bits = net.bits;
+            for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
                     bits[position] = resolve_bit(drivers);
                 }
             }
-            let target = match address {
+            let target = match net.address {
                 Some(index) => ResolvedTarget::Word {
-                    name: name.to_string(),
+                    name: net.name,
                     index,
                 },
-                None => ResolvedTarget::Whole(name.to_string()),
+                None => ResolvedTarget::Whole(net.name),
             };
-            settled.push((target, Register::from_bits(bits)));
-        }
-        let mut changed = false;
-        for (target, value) in settled {
-            changed |= drive_resolved(&mut self.state, &target, &value)?;
+            changed |= drive_resolved(&mut self.state, &target, &Register::from_bits(bits))?;
         }
         Ok(changed)
+    }
+
+    /// Where each pass switch's terminals land in the flat store this pass, and
+    /// whether the switch is conducting.
+    ///
+    /// Both halves have to be asked afresh every pass: a `tranif`'s control is
+    /// an ordinary expression that moves during the run, and a terminal may be
+    /// a select whose index does.
+    fn switch_bits(&self) -> Result<Vec<SwitchBits>, SimulationError> {
+        if self.pass_switches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut bits = Vec::with_capacity(self.pass_switches.len());
+        for switch in &self.pass_switches {
+            let (Some(first), Some(second)) = (
+                self.terminal_bit(&switch.terminals[0])?,
+                self.terminal_bit(&switch.terminals[1])?,
+            ) else {
+                // A terminal naming a bit the net does not have joins nothing,
+                // which is what an out-of-range driver already contributes.
+                continue;
+            };
+            bits.push(SwitchBits {
+                ends: [first, second],
+                conducting: switch.conducts(&self.state)?,
+            });
+        }
+        Ok(bits)
+    }
+
+    /// The one bit of one net a switch terminal names.
+    ///
+    /// A whole net names its **least significant** bit, which is the same bit a
+    /// scalar connection to any other primitive terminal names — and a wider
+    /// terminal on a switch that is not an array is illegal Verilog anyway
+    /// (iverilog 12.0 refuses `tran t(p, q);` for two-bit `p` and `q` with
+    /// "Expression width 2 does not match width 1 of logic gate array port").
+    fn terminal_bit(&self, terminal: &Expression) -> Result<Option<TerminalBit>, SimulationError> {
+        let target = resolve_target(&self.state, terminal)?;
+        let (ResolvedTarget::Whole(name) | ResolvedTarget::Bits { name, .. }) = &target else {
+            return Err(SWITCH_TERMINAL_UNSUPPORTED);
+        };
+        let signal = self
+            .state
+            .get_signal(name)
+            .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
+        let position = match &target {
+            ResolvedTarget::Whole(_) => signal.width().checked_sub(1),
+            ResolvedTarget::Bits { indices, .. } if indices.len() == 1 => {
+                signal.bit_position(indices[0])
+            }
+            _ => return Err(SWITCH_TERMINAL_UNSUPPORTED),
+        };
+        Ok(position.map(|position| TerminalBit {
+            name: name.clone(),
+            position,
+        }))
+    }
+}
+
+/// A terminal a pass switch cannot join: a concatenation, an arithmetic
+/// expression, a memory word. Nothing about it is a bit of a net, so there is
+/// no node for it to be part of.
+const SWITCH_TERMINAL_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a `tran` terminal that is not a net or one bit of one");
+
+/// Where one end of a pass switch lands in the flat store.
+struct TerminalBit {
+    name: String,
+    /// The bit's position in the net's raw bits, most significant first — the
+    /// same indexing the per-bit driver lists use.
+    position: usize,
+}
+
+/// One pass switch measured against the design as it stands this pass.
+struct SwitchBits {
+    ends: [TerminalBit; 2],
+    conducting: bool,
+}
+
+/// One net's per-bit driver lists, before they are resolved.
+struct NetDrivers {
+    name: String,
+    address: Option<i64>,
+    /// What the net holds now. A bit no driver reaches keeps its value.
+    bits: Vec<u8>,
+    /// The drivers of each bit, most significant first.
+    driven: Vec<Vec<(u8, StrengthLevel)>>,
+}
+
+/// Pools the driver lists of every bit a conducting pass switch joins.
+///
+/// A `tran` makes its two terminals one **node**, and a node's value is what
+/// every driver of every net in it resolves to *together* — the same
+/// [`resolve_bit`] every other contention already goes through. So the whole of
+/// the model is that the bits in one node share one driver list, and nothing
+/// about the value rule changed. Copying a value from one terminal to the other
+/// instead latches: a driver letting go of `a` would leave `b` holding the
+/// stale value, which copies straight back, and the net would never float
+/// again.
+///
+/// The partition is by **bit** rather than by net, because `tran (a[0], a[1]);`
+/// joins two bits of one vector (corpus `pr3296466a`).
+///
+/// A terminal is seeded with `z` before anything is merged, and that is what
+/// makes a switch *opening* mean something: a net a `tranif` has just let go of
+/// has no driver of its own this pass, and without the seed it would keep the
+/// value it held. Measured against iverilog 12.0, `assign p = a;
+/// tranif1 (p, q, en);` gives `p=1 q=1` while `en` is high and `p=1 q=z` once
+/// it goes low.
+fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
+    // Which net each terminal belongs to, worked out while `nets` is only
+    // borrowed for reading. A switch whose terminal names no net in the list
+    // has nothing to join — `resolve_contributions` puts every terminal in the
+    // list, so that is only a net the store does not have.
+    let cells: Vec<Option<[(usize, usize); 2]>> = {
+        let index: HashMap<&str, usize> = nets
+            .iter()
+            .enumerate()
+            .filter(|(_, net)| net.address.is_none())
+            .map(|(position, net)| (net.name.as_str(), position))
+            .collect();
+        switches
+            .iter()
+            .map(|switch| {
+                let first = *index.get(switch.ends[0].name.as_str())?;
+                let second = *index.get(switch.ends[1].name.as_str())?;
+                Some([
+                    (first, switch.ends[0].position),
+                    (second, switch.ends[1].position),
+                ])
+            })
+            .collect()
+    };
+    for ends in cells.iter().flatten() {
+        for (net, position) in ends {
+            if let Some(drivers) = nets[*net].driven.get_mut(*position) {
+                drivers.push((Z, StrengthLevel::Highz));
+            }
+        }
+    }
+    let mut node = Nodes::default();
+    for (switch, ends) in switches.iter().zip(&cells) {
+        let Some(ends) = ends else { continue };
+        if !switch.conducting {
+            continue;
+        }
+        let first = node.cell(ends[0]);
+        let second = node.cell(ends[1]);
+        node.join(first, second);
+    }
+    let mut pooled: HashMap<usize, Vec<(u8, StrengthLevel)>> = HashMap::new();
+    for id in 0..node.cells.len() {
+        let (net, position) = node.cells[id];
+        let root = node.root(id);
+        let drivers = nets[net].driven.get(position).cloned().unwrap_or_default();
+        pooled.entry(root).or_default().extend(drivers);
+    }
+    for id in 0..node.cells.len() {
+        let (net, position) = node.cells[id];
+        let root = node.root(id);
+        if let (Some(slot), Some(drivers)) = (nets[net].driven.get_mut(position), pooled.get(&root))
+        {
+            *slot = drivers.clone();
+        }
+    }
+}
+
+/// The union-find that decides which bits are one node, rebuilt every pass.
+#[derive(Default)]
+struct Nodes {
+    /// Each cell's `(net, bit position)`, indexed by its id.
+    cells: Vec<(usize, usize)>,
+    ids: HashMap<(usize, usize), usize>,
+    parent: Vec<usize>,
+}
+
+impl Nodes {
+    /// The id of a cell, added to the partition the first time it is named.
+    fn cell(&mut self, cell: (usize, usize)) -> usize {
+        *self.ids.entry(cell).or_insert_with(|| {
+            self.cells.push(cell);
+            self.parent.push(self.parent.len());
+            self.parent.len() - 1
+        })
+    }
+
+    fn root(&mut self, mut id: usize) -> usize {
+        while self.parent[id] != id {
+            self.parent[id] = self.parent[self.parent[id]];
+            id = self.parent[id];
+        }
+        id
+    }
+
+    fn join(&mut self, first: usize, second: usize) {
+        let first = self.root(first);
+        let second = self.root(second);
+        if first != second {
+            self.parent[second] = first;
+        }
     }
 }
 
@@ -7241,28 +7509,265 @@ mod tests {
         assert_eq!(level(&simulator, "o3"), "0");
     }
 
-    /// A bidirectional pass switch conducts both ways and has no output
-    /// terminal, so it stops elaboration by name rather than quietly driving
-    /// nothing.
+    /// A `tran` makes its two terminals one node: `q` follows `p`'s driver,
+    /// and when that driver lets go **both** float rather than `q` latching the
+    /// value it was handed.
+    ///
+    /// Measured against iverilog 12.0, which prints `driven p=1 q=1` then
+    /// `released p=z q=z` for this design. The latch is exactly what a `tran`
+    /// modelled as a copy between its terminals would produce, and it is why
+    /// one is a node instead.
     #[test]
-    fn test_a_bidirectional_switch_is_reported_by_name() {
-        let (remaining, module) = parse_module_declaration(
+    fn test_a_tran_makes_one_node_that_floats_together() {
+        let mut simulator = simulator_for(
             r#"
-            module pass_switch();
-                wire a, b;
-                reg control;
-                tranif1 (a, b, control);
+            module joined();
+                reg a, en;
+                wire p, q;
+                bufif1 b1(p, a, en);
+                tran t1(p, q);
+                initial begin
+                    a = 1'b1;
+                    en = 1'b1;
+                    #2 en = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "p"), "1");
+        assert_eq!(level(&simulator, "q"), "1");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "p"), "z");
+        assert_eq!(level(&simulator, "q"), "z");
+    }
+
+    /// A `tranif1` joins its terminals only while the control says so, which is
+    /// why connectivity is recomputed every propagation pass rather than fixed
+    /// at elaboration.
+    ///
+    /// iverilog 12.0 on this design prints `en=1 p=1 q=1`, `en=0 p=1 q=z` and
+    /// `en=x p=1 q=x`. The unknown control is the one departure: this takes the
+    /// switch not to conduct, so `q` is `z` where iverilog gives `x` — saying
+    /// "unknown" there needs a strength that is a range rather than a level.
+    #[test]
+    fn test_a_tranif_joins_only_while_its_control_says_so() {
+        let mut simulator = simulator_for(
+            r#"
+            module gated();
+                reg a, en;
+                wire p, q;
+                assign p = a;
+                tranif1 t1(p, q, en);
+                initial begin
+                    a = 1'b1;
+                    en = 1'b1;
+                    #2 en = 1'b0;
+                    #2 en = 1'b1;
+                    #2 en = 1'bx;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "q"), "1");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "p"), "1");
+        assert_eq!(level(&simulator, "q"), "z");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "q"), "1");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "p"), "1");
+        assert_eq!(level(&simulator, "q"), "z");
+    }
+
+    /// Two drivers that meet through a `tran` resolve against each other, since
+    /// the switch pools them into one driver list rather than copying either
+    /// one across.
+    ///
+    /// iverilog 12.0 on this design prints `disagree p=x q=x`, `one side z p=1
+    /// q=1` and `both z p=z q=z`.
+    #[test]
+    fn test_drivers_meeting_through_a_tran_resolve_against_each_other() {
+        let mut simulator = simulator_for(
+            r#"
+            module contended();
+                reg a, b;
+                wire p, q;
+                assign p = a;
+                assign q = b;
+                tran t1(p, q);
+                initial begin
+                    a = 1'b1;
+                    b = 1'b0;
+                    #2 b = 1'bz;
+                    #2 a = 1'bz;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "p"), "x");
+        assert_eq!(level(&simulator, "q"), "x");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "p"), "1");
+        assert_eq!(level(&simulator, "q"), "1");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "p"), "z");
+        assert_eq!(level(&simulator, "q"), "z");
+    }
+
+    /// A node is a set of *bits*, not of nets: `tran (a[0], a[1]);` joins two
+    /// bits of one vector, which is corpus `pr3296466a`. iverilog 12.0 prints
+    /// `11` for it.
+    #[test]
+    fn test_a_tran_can_join_two_bits_of_one_net() {
+        let mut simulator = simulator_for(
+            r#"
+            module within();
+                reg foo;
+                tri [1:0] a;
+                assign a[0] = foo;
+                tran t1(a[0], a[1]);
+                initial begin
+                    foo = 1'b1;
+                    #2 foo = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "a"), "11");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "a"), "00");
+    }
+
+    /// A weak keeper: a switch gated on the very net it holds up, which is the
+    /// case a connectivity partition built once at elaboration cannot express.
+    /// This is corpus `tran-keeper`, and iverilog 12.0 prints `PASSED`.
+    #[test]
+    fn test_a_switch_gated_on_its_own_net_keeps_that_net() {
+        let mut simulator = simulator_for(
+            r#"
+            module keeper();
+                wire pin;
+                pullup   (weak1) (keep1);
+                pulldown (weak0) (keep0);
+                tranif1 (pin, keep1, pin);
+                tranif0 (pin, keep0, pin);
+                reg value, enable;
+                bufif1 (pin, value, enable);
+                initial begin
+                    value = 1'b0;
+                    enable = 1'b1;
+                    #2 enable = 1'b0;
+                    #2 value = 1'b1;
+                       enable = 1'b1;
+                    #2 enable = 1'b0;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "pin"), "0");
+        // The drive is removed; the keeper holds the pin where it was.
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "pin"), "0");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "pin"), "1");
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "pin"), "1");
+    }
+
+    /// A `force` on a net in a node is a **driver** of that node, not just a
+    /// write to the net it names: it wins outright on its own net and contends
+    /// with the far side's drivers through the switch.
+    ///
+    /// iverilog 12.0 on this design prints `x=0 y=x` — `x` reads the value it
+    /// was forced to, while `y`, driven to `1` by its own assignment, is the
+    /// contention between that and the forced `0`. This is corpus
+    /// `pr2937417b`.
+    #[test]
+    fn test_a_force_on_a_node_contends_through_the_switch() {
+        let mut simulator = simulator_for(
+            r#"
+            module forced_node();
+                reg a;
+                wire x, y;
+                assign y = a;
+                tran (x, y);
+                initial begin
+                    a = 1'b1;
+                    #2 force x = 1'b0;
+                    #2 release x;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "x"), "1");
+        assert_eq!(level(&simulator, "y"), "1");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "x"), "0");
+        assert_eq!(level(&simulator, "y"), "x");
+
+        simulator.advance(2).unwrap();
+        assert_eq!(level(&simulator, "x"), "1");
+        assert_eq!(level(&simulator, "y"), "1");
+    }
+
+    /// An arrayed switch may be wired to a *part* of a net, which is how
+    /// corpus `pr3296466d` joins `a` to the bottom half of `c`. The slice is
+    /// taken from the part select's own bounds rather than the net's, and both
+    /// are walked from their least significant end.
+    #[test]
+    fn test_an_arrayed_switch_slices_a_part_select_terminal() {
+        let mut simulator = simulator_for(
+            r#"
+            module halves();
+                reg foo;
+                tri [1:0] a;
+                tri [3:0] c;
+                assign a[0] = foo;
+                tran t1(a[0], a[1]);
+                tran t2[1:0](a, c[1:0]);
+                initial foo = 1'b1;
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(level(&simulator, "a"), "11");
+        assert_eq!(level(&simulator, "c"), "zz11");
+    }
+
+    /// A terminal that is not a net or a bit of one has no node to be part of,
+    /// and is a named error rather than a switch that silently joins nothing.
+    #[test]
+    fn test_a_tran_terminal_that_is_not_a_net_is_reported_by_name() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module bad_terminal();
+                wire a, b, c;
+                tran t1({a, b}, c);
             endmodule
         "#,
         )
-        .expect("a `tranif1` should parse");
-        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
-
+        .expect("a `tran` should parse");
         let mut simulator = Simulator::new(module);
+        simulator.setup().expect("elaboration records the switch");
         assert_eq!(
-            simulator.setup(),
+            simulator.run(),
             Err(SimulationError::Unsupported(
-                "a bidirectional pass switch (`tran` and friends)"
+                "a `tran` terminal that is not a net or one bit of one"
             ))
         );
     }
