@@ -1213,7 +1213,11 @@ fn system_function_is_signed(name: &str) -> bool {
         // `$realtobits` hands back a bit pattern rather than a number, so
         // there is no sign in it to read.
         // A descriptor is a bit mask, not a number to do arithmetic on.
-        "unsigned" | "time" | "realtobits" | "fopen" => false,
+        // `$stime` is `$time` truncated to thirty-two bits, and `time` is an
+        // unsigned type — which is also the width `%d` gives it: iverilog 12.0
+        // prints `$display($stime)` in ten columns where an `integer` takes
+        // eleven (corpus `pr2842621`).
+        "unsigned" | "time" | "stime" | "realtobits" | "fopen" => false,
         _ => true,
     }
 }
@@ -3626,6 +3630,12 @@ mod tests {
         assert_eq!(value_in("$stime", &store), 1234);
         assert_eq!(bits_in("$stime", &store).len(), 32);
         assert_eq!(bits_in("$time", &store).len(), 64);
+        // Both are *time* values, and `time` is an unsigned type — which is
+        // also the field `%d` gives them: iverilog 12.0 prints
+        // `$display($stime)` in ten columns where an `integer` takes eleven
+        // (corpus `pr2842621`).
+        assert!(!eval(&parse("$stime"), &store).unwrap().is_signed());
+        assert!(!eval(&parse("$time"), &store).unwrap().is_signed());
     }
 
     #[test]
