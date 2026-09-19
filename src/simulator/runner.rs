@@ -7822,6 +7822,36 @@ mod tests {
         );
     }
 
+    /// An arrayed instance's terminal may be an arbitrary expression of the
+    /// array's width, and each instance takes one bit of what it evaluates to.
+    ///
+    /// `{2'b10, lo}` names no storage, so a bit of it is not something a
+    /// `BitSelect` can name — it is read by a **shift** instead, which is all
+    /// one can ask of an expression, and all an *input* terminal needs.
+    /// iverilog 12.0 prints `1001` then `zzzz` for this design (corpus
+    /// `bufif`, `npmos2`, `rnpmos2`).
+    #[test]
+    fn test_an_array_terminal_may_be_an_expression() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                wire [3:0] bus;
+                reg [1:0] lo;
+                reg en;
+                bufif0 drv [3:0] (bus, {2'b10, lo}, en);
+                initial begin
+                    lo = 2'b01; en = 1'b0;
+                    #1 $display("%b", bus);
+                    en = 1'b1;
+                    #1 $display("%b", bus);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["1001", "zzzz"]);
+    }
+
     /// A gate inside an instantiated module drives the parent's net, because
     /// its terminals are renamed into the flat store like everything else.
     #[test]

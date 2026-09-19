@@ -1162,11 +1162,20 @@ at all. Its bounds are a `simple::Range` like a declaration's, so they go throug
 `resolve_range` and `buf drv [N-1:0] (…)` is sized by the parameters in scope. A terminal
 one bit wide is shared by every instance and a terminal exactly as wide
 as the array is sliced a bit apiece; the two are told apart by `expression_width`, and a
-terminal that is neither — or one that is wide but not a plain signal or a *part select* of
-one, like `{16'b0, data}` — is `SimulationError::GateArrayTerminal` rather than a silent
+terminal that is neither is `SimulationError::GateArrayTerminal` rather than a silent
 misconnection. A part select brings its own bounds (`tran t [1:0] (a, c[1:0]);`, corpus
 `pr3296466d`); both the array and the terminal are walked from their least significant end,
 so which way round either range was declared cannot matter.
+
+**How a terminal is sliced depends on whether it names storage.** A plain signal or a part
+select of one becomes a `BitSelect`, which is both readable and writable and so is what an
+*output* terminal needs. Anything else of the right width — `{16'b0, regff}` is the corpus
+case (`bufif`, `npmos2`, `rnpmos2`) — names no storage, so a bit of it is not something a
+`BitSelect` can name and it is read by a **shift** instead: `terminal >> position`, whose
+least significant bit is the one that instance wants. That is all one can ask of an
+expression and all an input terminal needs; a design that puts such a terminal in an
+*output* position fails exactly where a non-arrayed gate with the same output already
+fails, resolving it as a write target, by name.
 
 **A gate delay is simulated, on the machinery a delayed `assign` already had.** `Gate`
 carries the `#(rise, fall, turn_off)` it was written with and `Simulator::gate_delays`

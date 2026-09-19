@@ -1719,9 +1719,15 @@ impl<'m> Elaborator<'m> {
         if width != count {
             return Err(too_wide());
         }
-        // Only a plain signal or a part select of one can be sliced: a bit of
-        // `{16'b0, data}` is not something a `BitSelect` can name, and an
-        // output has to be drivable.
+        // Only a plain signal or a part select of one can be sliced into a
+        // `BitSelect`, which is the form an output needs because it has to be
+        // drivable. Anything else of the right width is sliced by a **shift**
+        // instead — `{16'b0, regff} >> position` reads bit `position` of
+        // whatever the expression evaluates to, which is what an *input*
+        // terminal wants and all one can ask of an expression that names no
+        // storage. A design that puts such a terminal in an output position
+        // fails where a non-arrayed gate with the same output already fails:
+        // resolving it as a write target, by name.
         let (id, bounds) = match terminal {
             Expression::Identifier(id) => (id, None),
             Expression::PartSelect(id, first, second) => {
@@ -1734,7 +1740,15 @@ impl<'m> Elaborator<'m> {
                 };
                 (id, Some((bound(first)?, bound(second)?)))
             }
-            _ => return Err(too_wide()),
+            other => {
+                return Ok(Expression::Binary(
+                    Box::new(other.clone()),
+                    BinaryOperator::ShiftRight,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(
+                        position as i64,
+                    ))),
+                ))
+            }
         };
         let Some(signal) = self.out.state.get_signal(&id.name) else {
             return Err(SimulationError::UnknownSignal(id.name.clone()));
