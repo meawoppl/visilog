@@ -276,9 +276,11 @@ fn eval_in_context(
         // operator below already asks its own operands, and an operand
         // evaluated in an unsigned context comes back unsigned — so by the time
         // an operator decides its result there is nothing left to demote.
-        Expression::Constant(constant) => {
-            widened_result(eval_constant(constant, signed_context), width)
-        }
+        Expression::Constant(constant) => widened_literal(
+            eval_constant(constant, signed_context),
+            width,
+            constant.extends_with_unknown(),
+        ),
         // A real is neither widened nor demoted: it is sixty-four bits that
         // are not a number of bits at all, and no context can make it wider or
         // make it read unsigned.
@@ -633,6 +635,33 @@ fn widened_result(value: Result<Register, EvalError>, width: usize) -> Result<Re
         return value;
     }
     Ok(widened(value?, width))
+}
+
+/// [`widened_result`] for a literal, which is the one value whose *own*
+/// spelling says how it extends.
+///
+/// An **unsized** literal is "at least 32 bits" and takes the width of whatever
+/// it is written against, so `'hx` in a 64 bit context is sixty-four `x`s and
+/// `'hz` is sixty-four `z`s — IEEE 1364-2005 3.5.1's rule that a literal whose
+/// most significant digit is `x` or `z` extends with it. Zero padding instead
+/// makes `period !== 'hx` *true* for an untouched 64 bit register, which is
+/// corpus `pr673`. A **sized** literal has already been extended to its own
+/// width by [`constant_bits`] and is an ordinary value from then on: `4'bx`
+/// written into a 64 bit register is `…000x`, measured against iverilog 12.0.
+#[inline(always)]
+fn widened_literal(
+    value: Result<Register, EvalError>,
+    width: usize,
+    extends_with_unknown: bool,
+) -> Result<Register, EvalError> {
+    if width == SELF_DETERMINED || !extends_with_unknown {
+        return widened_result(value, width);
+    }
+    let value = value?;
+    if value.width() >= width {
+        return Ok(value);
+    }
+    Ok(value.extend_msb(width).with_signedness(value.is_signed()))
 }
 
 #[cold]
@@ -997,6 +1026,12 @@ fn sized_within(expr: &Expression) -> bool {
             OperandRule::Compared | OperandRule::SelfDetermined
         ),
         Expression::Conditional(_, _, _) => true,
+        // An unsized `'hx` fills a wider context with `x`s, where padding the
+        // thirty-two bits it produced on its own fills with `0`s — so it is
+        // the one *leaf* whose value depends on which end the widening
+        // happens at, and a comparison against one has to measure. That is
+        // corpus `pr673`: `period !== 'hx` for an untouched 64 bit register.
+        Expression::Constant(constant) => constant.extends_with_unknown(),
         _ => false,
     }
 }
@@ -2655,6 +2690,51 @@ mod tests {
         let register = eval(&parse("42"), &StateStore::new()).unwrap();
         assert_eq!(register.width(), UNSIZED_CONSTANT_WIDTH);
         assert_eq!(register.to_u128(), Some(42));
+    }
+
+    /// An unsized literal whose leading digit is `x` or `z` fills whatever
+    /// width it is written against, where a *sized* one is the ordinary value
+    /// its own width made it and zero pads. Measured against iverilog 12.0:
+    ///
+    /// ```text
+    /// reg [63:0] p;
+    /// p = 'hx;   $display("%b", p);  // 64 x's
+    /// p = 'hz;   $display("%h", p);  // zzzzzzzzzzzzzzzz
+    /// p = 'hx1;  $display("%h", p);  // xxxxxxxxxxxxxxx1
+    /// p = 4'bx;  $display("%h", p);  // 000000000000000x
+    /// ```
+    #[test]
+    fn test_unsized_unknown_literal_fills_its_context() {
+        let store = StateStore::new();
+        let sized = |source: &str, width: usize| {
+            eval_sized(&parse(source), &store, width)
+                .unwrap_or_else(|e| panic!("{}: {}", source, e))
+                .to_binary()
+        };
+        assert_eq!(sized("'hx", 64), "x".repeat(64));
+        assert_eq!(sized("'hz", 64), "z".repeat(64));
+        assert_eq!(sized("'hx1", 64), format!("{}0001", "x".repeat(60)));
+        // A sized literal already said how wide it is; a context wider than
+        // that pads it with zeros like any other value.
+        assert_eq!(sized("4'bx", 64), format!("{}xxxx", "0".repeat(60)));
+        // A leading digit that is not `x` or `z` pads with zeros, and a signed
+        // decimal still sign extends.
+        assert_eq!(sized("'h1", 64), format!("{}1", "0".repeat(63)));
+        assert_eq!(sized("-1", 64), "1".repeat(64));
+    }
+
+    /// A comparison sizes its operands against each other, and an unsized
+    /// `'hx` is the one *leaf* that can tell which end the widening happened
+    /// at: `period !== 'hx` for an untouched 64 bit register is false, not
+    /// true. This is corpus `pr673` / issue #157.
+    #[test]
+    fn test_unsized_unknown_literal_compares_at_the_wider_width() {
+        let mut store = StateStore::new();
+        store.declare_signed("period", (63, 0), false);
+        assert_eq!(bits_in("period === 'hx", &store), "1");
+        assert_eq!(bits_in("period !== 'hx", &store), "0");
+        // A sized one is a different value and still compares as one.
+        assert_eq!(bits_in("period === 32'hx", &store), "0");
     }
 
     #[test]
