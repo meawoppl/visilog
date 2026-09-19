@@ -14,18 +14,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Directives that carry no meaning for this front end but must not be a parse
-/// error. Each is consumed together with the rest of its line.
-const IGNORED_DIRECTIVES: [&str; 23] = [
-    "begin_keywords",
+/// Directives that carry no meaning for this front end and take no argument.
+///
+/// The directive name is the whole of what is consumed. Taking the rest of the
+/// line instead swallows whatever the design wrote after it on the same line —
+/// `` module test `protect ( `` loses its parenthesis — and, when that rest
+/// opens a block comment, swallows only the opening half of it.
+const IGNORED_DIRECTIVES: [&str; 15] = [
     "end_keywords",
     "celldefine",
     "endcelldefine",
-    "default_nettype",
-    "unconnected_drive",
     "nounconnected_drive",
-    "line",
-    "pragma",
     "protect",
     "endprotect",
     "suppress_faults",
@@ -36,11 +35,22 @@ const IGNORED_DIRECTIVES: [&str; 23] = [
     "delay_mode_unit",
     "delay_mode_zero",
     "delay_mode_distributed",
+    "autoexpand_vectornets",
+];
+
+/// Ignored directives that take exactly one argument, which is consumed with
+/// them. The argument need not be on the directive's own line: a comment may
+/// sit between the two and a block comment may run across a newline.
+const IGNORED_DIRECTIVES_WITH_ARGUMENT: [&str; 5] = [
+    "begin_keywords",
+    "default_nettype",
+    "unconnected_drive",
     "default_decay_time",
     "default_trireg_strength",
-    "autoexpand_vectornets",
-    "uselib",
 ];
+
+/// Ignored directives whose argument list runs to the end of the line.
+const IGNORED_LINE_DIRECTIVES: [&str; 3] = ["line", "pragma", "uselib"];
 
 // ---------------------------------------------------------------------------
 // Timescale
@@ -782,8 +792,9 @@ impl Run<'_> {
             // The one pragma-like directive that is not inert: `` `resetall ``
             // puts the *default* timescale back, so a module written after one
             // is at `1s / 1s` however the file started (corpus `pr1403406`).
+            // It takes no argument, so like every other argumentless directive
+            // it consumes its own name and nothing else.
             "resetall" => {
-                take_line(text, i);
                 if emitting {
                     let default = self.config.default_timescale;
                     self.timescale = default;
@@ -826,13 +837,85 @@ impl Run<'_> {
                     self.out.emit(loc, &number);
                 }
             }
-            _ if IGNORED_DIRECTIVES.contains(&name.as_str()) => {
+            _ if IGNORED_DIRECTIVES.contains(&name.as_str()) => {}
+            _ if IGNORED_DIRECTIVES_WITH_ARGUMENT.contains(&name.as_str()) => {
+                self.skip_directive_argument(text, i, line, origin)?;
+            }
+            _ if IGNORED_LINE_DIRECTIVES.contains(&name.as_str()) => {
                 take_line(text, i);
             }
             _ => {
                 if emitting {
                     self.expand(&name, text, i, line, loc)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the one argument an ignored directive takes, and whatever
+    /// whitespace and comments sit in front of it.
+    ///
+    /// The whitespace and comments are copied through rather than dropped —
+    /// they are inert to the grammar and keeping them keeps the output's lines
+    /// aligned with the input's. The argument itself is dropped, since nothing
+    /// downstream knows what `` `default_nettype tri0 `` means.
+    fn skip_directive_argument(
+        &mut self,
+        text: &str,
+        i: &mut usize,
+        line: &mut usize,
+        origin: Origin,
+    ) -> Result<(), PreprocessError> {
+        let bytes = text.as_bytes();
+        loop {
+            let loc = origin.loc(*line);
+            let emitting = self.emitting();
+            match bytes.get(*i) {
+                Some(b'\n') => {
+                    if emitting {
+                        self.out.emit(loc, "\n");
+                    }
+                    *line += 1;
+                    *i += 1;
+                }
+                Some(b' ' | b'\t' | b'\r') => {
+                    let end = skip_blanks(bytes, *i);
+                    if emitting {
+                        self.out.emit(loc, &text[*i..end]);
+                    }
+                    *i = end;
+                }
+                Some(b'/') if bytes.get(*i + 1) == Some(&b'/') => {
+                    let end = line_end(bytes, *i);
+                    if emitting {
+                        self.out.emit(loc, &text[*i..end]);
+                    }
+                    *i = end;
+                }
+                Some(b'/') if bytes.get(*i + 1) == Some(&b'*') => {
+                    let Some(end) = block_end(bytes, *i) else {
+                        return Err(self.malformed(loc, "/*", "unterminated block comment"));
+                    };
+                    if emitting {
+                        self.out.emit(loc, &text[*i..end]);
+                    }
+                    *line += bytes[*i..end].iter().filter(|&&byte| byte == b'\n').count();
+                    *i = end;
+                }
+                _ => break,
+            }
+        }
+
+        // The argument is a quoted string (`` `begin_keywords "1364-2005" ``)
+        // or a bare word — a net type, a pull direction or a number.
+        if bytes.get(*i) == Some(&b'"') {
+            *i = string_end(bytes, *i);
+        } else {
+            while bytes.get(*i).is_some_and(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
+            }) {
+                *i += 1;
             }
         }
         Ok(())
@@ -1681,6 +1764,32 @@ mod tests {
         let source = "`begin_keywords \"1364-2005\"\n`celldefine\n`resetall\n\
                       `default_nettype none\nmodule m; endmodule\n`endcelldefine\n`end_keywords\n";
         assert_eq!(expand(source).trim(), "module m; endmodule");
+    }
+
+    /// An ignored directive that takes no argument consumes its own name and
+    /// nothing else, so whatever the design wrote after it on the same line
+    /// survives.
+    #[test]
+    fn test_ignored_directive_leaves_the_rest_of_its_line() {
+        assert_eq!(
+            expand("module test `protect (input a);\n").trim(),
+            "module test  (input a);"
+        );
+    }
+
+    /// The argument of an ignored directive may be separated from it by a
+    /// comment, including one that runs across a newline, and the comment is
+    /// copied through while the argument is dropped.
+    #[test]
+    fn test_ignored_directive_argument_may_follow_a_comment() {
+        assert_eq!(
+            expand("`default_nettype /* c */ wire /* d */\nmodule m; endmodule\n").trim(),
+            "/* c */  /* d */\nmodule m; endmodule"
+        );
+        assert_eq!(
+            expand("`begin_keywords/*\n c */\n\"1364-2005\"\nmodule m; endmodule\n").trim(),
+            "/*\n c */\n\nmodule m; endmodule"
+        );
     }
 
     #[test]
