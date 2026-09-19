@@ -57,6 +57,7 @@ use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::exec::{range_width, resolve_target};
+use crate::simulator::plusargs;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::scan::{self, Slot, END_OF_FILE};
 use crate::simulator::state_store::{NotReadable, StateStore, MAX_CALL_DEPTH};
@@ -138,6 +139,10 @@ pub enum EvalError {
     /// arguments than it was given, or an argument that cannot be written.
     /// Never a quiet count of zero, which a design reads as "did not match".
     Scan(String),
+    /// A `$value$plusargs` whose format string names no conversion, or a
+    /// conversion this simulator does not read. Never a quiet `0`, which a
+    /// design reads as "that plus-arg was not given".
+    PlusArgs(String),
 }
 
 impl fmt::Display for EvalError {
@@ -199,6 +204,7 @@ impl fmt::Display for EvalError {
                 found,
             } => write!(f, "`${}` takes {}, but was given {}", name, expected, found),
             EvalError::Scan(reason) => write!(f, "cannot read: {}", reason),
+            EvalError::PlusArgs(reason) => write!(f, "{}", reason),
         }
     }
 }
@@ -1035,7 +1041,7 @@ const TIME_WIDTH: usize = 64;
 /// it — [`TaskCall::compile`](crate::simulator::tasks::TaskCall::compile) — ask
 /// here, so an unrecognised name is rejected in one place. A name listed but
 /// not matched below still errors rather than evaluating to anything.
-pub const SYSTEM_FUNCTIONS: [&str; 44] = [
+pub const SYSTEM_FUNCTIONS: [&str; 46] = [
     "time",
     "stime",
     "realtime",
@@ -1049,6 +1055,10 @@ pub const SYSTEM_FUNCTIONS: [&str; 44] = [
     "realtobits",
     "bitstoreal",
     "fopen",
+    // The plus-args. Both names carry a `$` in the middle, which
+    // `expr.rs::system_name` already reads as part of one token.
+    "test$plusargs",
+    "value$plusargs",
     // The real math library — see [`REAL_MATH_UNARY`] and
     // [`REAL_MATH_BINARY`], which are what the evaluator matches on.
     "sqrt",
@@ -1208,6 +1218,46 @@ fn eval_system_function_bits(
         // The reading half. `$sscanf` and `$fscanf` differ in one thing —
         // where the characters come from — so everything past that point is
         // the one engine in [`scan`].
+        // The two plus-arg readers. `$test$plusargs` asks whether an option was
+        // given; `$value$plusargs` also *writes* the value into its second
+        // argument, so it goes through the same fill queue `$sscanf` does —
+        // `eval` is handed a `&StateStore` and cannot write one itself.
+        //
+        // A plus-arg nothing matches is `0` with the target left alone, which
+        // is not a failure: it is the answer `if (!$value$plusargs(…))` exists
+        // to read, and visilog has no command line, so a design run through the
+        // library sees an empty list unless its caller said otherwise.
+        "test$plusargs" => {
+            arity("exactly one option name", &[1])?;
+            let Some(prefix) = known_text(&arguments[0], store)? else {
+                return Ok(Register::from_u128(0, SYSTEM_FUNCTION_WIDTH));
+            };
+            Ok(signed_result(i64::from(plusargs::test(
+                store.plusargs(),
+                &prefix,
+            ))))
+        }
+        "value$plusargs" => {
+            arity("a format string and a target to fill", &[2])?;
+            let slot = scan_slots(&arguments[1..], store)?
+                .pop()
+                .expect("one argument gives one slot");
+            // A format with an unknown bit in it names no option, the same way
+            // one does for `$sscanf`.
+            let Some(format) = known_text(&arguments[0], store)? else {
+                return Ok(signed_result(0));
+            };
+            let real = slot.target.is_real(store);
+            let found = plusargs::value(store.plusargs(), &format, slot.width, real)
+                .map_err(EvalError::PlusArgs)?;
+            match found {
+                Some(value) => {
+                    store.owe_fill(slot.target, value);
+                    Ok(signed_result(1))
+                }
+                None => Ok(signed_result(0)),
+            }
+        }
         "sscanf" | "fscanf" => {
             if arguments.len() < 2 {
                 return Err(EvalError::SystemFunctionArity {
@@ -3135,6 +3185,10 @@ mod tests {
                 "fscanf" => "$fscanf(32'h8000_0009, \"%d\", a)".to_string(),
                 "fgets" | "ungetc" => format!("${}(a, 32'h8000_0009)", name),
                 "fseek" => "$fseek(32'h8000_0009, 0, 0)".to_string(),
+                // The plus-args, against an empty list: `$test` is `0` and
+                // `$value` is `0` with `a` left alone, which is the answer a
+                // design reads rather than a failure.
+                "value$plusargs" => "$value$plusargs(\"opt=%d\", a)".to_string(),
                 other => format!("${}(a)", other),
             };
             eval(&parse(&source), &store)
