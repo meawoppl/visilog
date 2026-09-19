@@ -12,10 +12,6 @@ pub fn binary(input: &str) -> IResult<&str, &str> {
     )(input)
 }
 
-pub fn decimal(input: &str) -> IResult<&str, &str> {
-    take_while1(|c: char| c.is_digit(10))(input)
-}
-
 pub fn hexadecimal(input: &str) -> IResult<&str, &str> {
     preceded(
         opt(char('_')),
