@@ -1161,10 +1161,20 @@ return from a task, and the common case in the corpus. Nothing else about it is 
 a `disable` inside a `for` inside the block leaves the whole block, because the jump is out
 of the range rather than out of a loop.
 
-The name is resolved against the enclosing scopes at **compile** time, innermost first
-(`enclosing_scope`), so `disable wait_loop` written in task `t` means `t.wait_loop` and the
-same word at the top of a module means `wait_loop`. A name matching no enclosing scope is
-left bare and looked for among every block's scopes when it runs. Both the scope table and
+The name is resolved at **compile** time, and the LRM's rule — search the enclosing scopes
+for a *declaration* of the label — is two questions rather than one. A label that **is** one
+of the enclosing scopes is `enclosing_scope`, asked innermost first as the statement is
+compiled, so `disable wait_loop` written in task `t` means `t.wait_loop` and the same word
+at the top of a module means `wait_loop`. That one has to be asked there rather than by
+lookup, since a block does not record its own range until its body has finished compiling.
+
+Anything else may still name a **sibling**, and that is `Program::resolve_sibling_disables`,
+a post-pass: `<enclosing prefix>.<name>` for each prefix from the innermost outwards, taking
+the first that names a range the program really holds. It is a post-pass because a sibling
+may be written *after* the `disable` — corpus `pr540c` disables the second `fork` branch
+from the first — so there is nothing to look up while the statement is in hand. A name that
+answers neither question is left bare and looked for among every block's scopes when it
+runs. Corpus `pr540b`, `pr540c`. Both the scope table and
 the `Instruction::Disable` go through `Program::rename_scopes` — beside the instruction
 rename, not inside it, because a block label is not a signal and must not travel through a
 map of a task's locals.

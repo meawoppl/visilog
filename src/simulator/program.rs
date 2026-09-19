@@ -269,6 +269,14 @@ pub struct Program {
     /// Only a `disable` reads them, so a design that never writes one carries
     /// an empty `Vec` and pays nothing.
     scopes: Vec<ScopeRange>,
+    /// Where each `disable` whose label was not one of its own enclosing
+    /// scopes sits, and the scope it was written in.
+    ///
+    /// It may still name a **sibling** block, and a sibling may be compiled
+    /// after it, so the lookup waits for
+    /// [`resolve_sibling_disables`](Program::resolve_sibling_disables) to run
+    /// over the finished program. Emptied there, so nothing downstream sees it.
+    sibling_disables: Vec<(usize, String)>,
 }
 
 /// How far a [`Program`] had been built, so that a compilation step can be
@@ -278,6 +286,7 @@ struct ProgramMark {
     instructions: usize,
     scopes: usize,
     inlined: usize,
+    sibling_disables: usize,
 }
 
 /// Why [`resume`] gave control back.
@@ -551,6 +560,59 @@ impl Program {
         Ok(program)
     }
 
+    /// Resolves every `disable` whose label was not one of its own enclosing
+    /// scopes against the blocks the program turned out to hold.
+    ///
+    /// The LRM resolves a bare label by searching the enclosing scopes for a
+    /// *declaration* of it, which is two questions rather than one.
+    /// [`enclosing_scope`] answers the first as the statement is compiled —
+    /// `disable blk` inside `blk`, the early exit, whose own range is not
+    /// recorded until its body has finished compiling and so cannot be looked
+    /// up at all. The second is a **sibling**: `disable gam` written in one
+    /// `fork` branch naming the block another branch opens (corpus `pr540b`,
+    /// `pr540c`). That is `<enclosing prefix>.<name>` for each prefix from the
+    /// innermost outwards, taking the first that names a range the program
+    /// really has.
+    ///
+    /// It is a post-pass because a sibling may be written *after* the
+    /// `disable` — `pr540c` disables the second `fork` branch from the first —
+    /// so the range does not exist while the statement is in hand. A name that
+    /// answers neither question is left bare, to be looked for among every
+    /// block's scopes when it runs.
+    fn resolve_sibling_disables(&mut self) {
+        for (pc, written) in std::mem::take(&mut self.sibling_disables) {
+            let Instruction::Disable { scope, .. } = &self.instructions[pc] else {
+                continue;
+            };
+            let Some(resolved) = self.sibling_scope(&written, scope) else {
+                continue;
+            };
+            if let Instruction::Disable { scope, .. } = &mut self.instructions[pc] {
+                *scope = resolved;
+            }
+        }
+    }
+
+    /// The qualified scope a bare label written inside `written` names, looking
+    /// outwards one segment at a time. `None` when no enclosing prefix spells a
+    /// range this program holds.
+    fn sibling_scope(&self, written: &str, name: &str) -> Option<String> {
+        let mut prefix = written.trim_end_matches('.');
+        loop {
+            if prefix.is_empty() {
+                return None;
+            }
+            let qualified = format!("{}.{}", prefix, name);
+            if self.scopes.iter().any(|range| range.name == qualified) {
+                return Some(qualified);
+            }
+            prefix = match prefix.rfind('.') {
+                Some(at) => &prefix[..at],
+                None => "",
+            };
+        }
+    }
+
     /// Marks every `disable` written inside a `fork` branch that names a scope
     /// the `fork` itself is inside, so that it goes to the driver rather than
     /// compiling to a jump.
@@ -603,6 +665,7 @@ impl Program {
     ) -> Result<Program, SimulationError> {
         let mut program = Program::default();
         program.compile_statements(statements, tasks, scope)?;
+        program.resolve_sibling_disables();
         Ok(program)
     }
 
@@ -967,10 +1030,17 @@ impl Program {
                 // matches none of them is left as it stands, to be found among
                 // the module's own scopes when it runs.
                 ProceduralStatements::Disable(name) => {
-                    self.emit(Instruction::Disable {
-                        scope: enclosing_scope(scope, &name.name),
+                    let named = enclosing_scope(scope, &name.name);
+                    let pc = self.emit(Instruction::Disable {
+                        scope: named.clone(),
                         escapes_fork: false,
                     });
+                    // A label that is not one of the enclosing scopes may
+                    // still be a sibling's, which cannot be looked up yet —
+                    // the block it names may be compiled after this one.
+                    if named == name.name {
+                        self.sibling_disables.push((pc, scope.to_string()));
+                    }
                 }
                 // Which `$name`s exist is settled here rather than while the
                 // design runs, so an unrecognised one fails before it can look
@@ -1500,6 +1570,7 @@ impl Program {
             instructions: self.instructions.len(),
             scopes: self.scopes.len(),
             inlined: self.inlined.len(),
+            sibling_disables: self.sibling_disables.len(),
         }
     }
 
@@ -1507,6 +1578,7 @@ impl Program {
         self.instructions.truncate(mark.instructions);
         self.scopes.truncate(mark.scopes);
         self.inlined.truncate(mark.inlined);
+        self.sibling_disables.truncate(mark.sibling_disables);
     }
 
     fn emit(&mut self, instruction: Instruction) -> usize {
@@ -1974,13 +2046,13 @@ pub fn block_scope(scope: &str, name: &str) -> String {
     format!("{}{}.", scope, name)
 }
 
-/// The scope `name` refers to when it is written inside `scope`.
+/// The scope an enclosing `disable` names when it is written inside `scope`.
 ///
 /// `disable` names a block by its bare label, and the label it means is the
 /// innermost enclosing one that matches — `disable wait_loop` inside task `t`
 /// is `t.wait_loop`, and the same word written at the top of a module is
-/// `wait_loop`. A name matching none of the enclosing scopes is left as it
-/// stands: it belongs to another block, and only the driver can find it.
+/// `wait_loop`. A name matching none of the enclosing scopes is handed back as
+/// it stands; [`Program::disabled_scope`] is what then looks for a sibling.
 fn enclosing_scope(scope: &str, name: &str) -> String {
     let mut rest = scope.trim_end_matches('.');
     while !rest.is_empty() {

@@ -9360,6 +9360,53 @@ mod tests {
         );
     }
 
+    /// A `disable` may name a **sibling** block's label rather than one of its
+    /// own enclosing scopes, and the sibling may be written *after* it — which
+    /// is why the name is resolved in a post-pass over the finished program
+    /// rather than while the statement is in hand.
+    ///
+    /// iverilog 12.0 on this design:
+    ///
+    /// ```text
+    /// 1 disabling later
+    /// 1 joined hit=0
+    /// ```
+    ///
+    /// The cancelled branch still arrives at the join, so the `fork` completes
+    /// at 1 rather than waiting for the `#5` it would have taken.
+    #[test]
+    fn test_disable_resolves_a_sibling_blocks_label() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                integer hit;
+                initial begin : outer
+                    hit = 0;
+                    fork
+                        begin
+                            #1;
+                            $display("%0t disabling later", $time);
+                            disable later;
+                        end
+                        begin : later
+                            #5;
+                            hit = 1;
+                            $display("%0t later ran", $time);
+                        end
+                    join
+                    $display("%0t joined hit=%0d", $time, hit);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(50).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["1 disabling later", "1 joined hit=0"]
+        );
+    }
+
     /// A `fork` may carry the label itself, and `disable` of it ends at the
     /// `join` rather than at the end of the block around it — so the statement
     /// after the `join` *does* run. iverilog 12.0 prints `5 PASSED` and then
