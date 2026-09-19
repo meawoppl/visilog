@@ -13,7 +13,7 @@ use nom::{
     character::complete::{alpha1, char},
     combinator::{map, map_res, not, opt, recognize, value},
     multi::{fold_many0, many1, separated_list0, separated_list1},
-    sequence::{pair, preceded, terminated, tuple},
+    sequence::{pair, preceded, separated_pair, terminated, tuple},
     IResult,
 };
 use nom::{combinator::peek, sequence::delimited};
@@ -394,10 +394,27 @@ impl std::fmt::Debug for Expression {
 }
 
 fn parenthetical(input: &str) -> IResult<&str, Expression> {
-    map(
-        delimited(tag("("), ws(verilog_expression), tag(")")),
-        |expr| Expression::Parenthetical(Box::new(expr)),
-    )(input)
+    let (rest, _) = tag("(")(input)?;
+    let (rest, expr) = ws(verilog_expression)(rest)?;
+    // A `:` here is a `min:typ:max` triple rather than the end of the
+    // expression, and it is asked about only *after* the expression has been
+    // read: a conditional (`(c ? a : b)`) has a `:` of its own, and the
+    // conditional layer has already taken it by the time this looks. So an
+    // ordinary parenthesised expression pays one character comparison.
+    let (rest, alternatives) = opt(preceded(
+        ws(char(':')),
+        separated_pair(verilog_expression, ws(char(':')), ws(verilog_expression)),
+    ))(rest)?;
+    let (rest, _) = tag(")")(rest)?;
+    // The *typical* value is the one used, which is the same choice
+    // `Delay::ticks` makes for a delay's triple: a `+mindelays` /
+    // `+maxdelays` run option is not implemented, and picking either end
+    // would be wrong for every design that does not ask for it.
+    let expr = match alternatives {
+        Some((typical, _maximum)) => typical,
+        None => expr,
+    };
+    Ok((rest, Expression::Parenthetical(Box::new(expr))))
 }
 
 /// `{N{a, b}}` — a concatenation repeated `N` times.
@@ -2063,6 +2080,32 @@ mod tests {
 
     fn ident(name: &str) -> Expression {
         Expression::Identifier(Identifier::new(name.to_string()))
+    }
+
+    #[test]
+    fn test_a_parenthesised_min_typ_max_takes_its_typical_value() {
+        // Measured against iverilog 12.0, which prints `2` for
+        // `parameter value = (1:2:3);` with a "Choosing typ expression."
+        // warning — corpus `pr1792152`.
+        assert_parses_to(
+            verilog_expression,
+            "(1:2:3)",
+            Expression::Parenthetical(Box::new(Expression::Constant(VerilogConstant::from_int(2)))),
+        );
+
+        // A conditional has a `:` of its own, and the conditional layer has
+        // already taken it by the time the triple is asked about — so an
+        // ordinary parenthesised expression is unchanged.
+        assert_parses_to(
+            verilog_expression,
+            "(a)",
+            Expression::Parenthetical(Box::new(ident("a"))),
+        );
+        let conditional = assert_parses(verilog_expression, "(c ? a : b)");
+        let Expression::Parenthetical(inner) = conditional else {
+            panic!("expected a parenthetical");
+        };
+        assert!(matches!(*inner, Expression::Conditional(..)));
     }
 
     #[test]
