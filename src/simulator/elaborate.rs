@@ -2152,7 +2152,9 @@ impl<'m> Elaborator<'m> {
             if !scope.genvars.is_empty() {
                 substitute_genvars(&mut connection, &scope.genvars);
             }
-            let binding = match plain_identifier(&connection) {
+            let binding = match plain_identifier(&connection)
+                .filter(|_| self.can_alias(port, &connection, scope))
+            {
                 Some(id) => {
                     let outer = scope.resolve(&id.name);
                     if !self.out.state.contains(&outer) {
@@ -2202,6 +2204,37 @@ impl<'m> Elaborator<'m> {
         }
 
         self.walk(index, &inner)
+    }
+
+    /// Whether a port bound to a plain identifier may share that signal's
+    /// store entry.
+    ///
+    /// Aliasing makes the port and the parent's signal **one** value, and a
+    /// value carries how to read it — so a port whose declaration disagrees
+    /// with the parent's about signedness cannot be one: `input signed [31:0]
+    /// a` bound to a `reg [31:0]` would read unsigned inside the child, and
+    /// `a <= b` would compare `32'h80000000` as the largest number rather than
+    /// the smallest (corpus `pr1033`). Such a port keeps an entry of its own
+    /// and a continuous assignment carries the value across, which is the
+    /// arrangement a port bound to an *expression* already had.
+    ///
+    /// An `inout` is the one that cannot take it: it is read as well as
+    /// written and one assignment only runs one way, so it stays aliased and
+    /// keeps the parent's signedness.
+    fn can_alias(&self, port: &Port, connection: &Expression, scope: &Scope) -> bool {
+        if matches!(port.direction, PortDirection::InOut) {
+            return true;
+        }
+        if port.direction == PortDirection::Output && !is_drivable(connection) {
+            return true;
+        }
+        let Some(id) = plain_identifier(connection) else {
+            return true;
+        };
+        self.out
+            .state
+            .get_signal(&scope.resolve(&id.name))
+            .is_none_or(|outer| outer.is_signed() == port.signed)
     }
 
     /// Evaluates a `#(...)` block in the *parent's* scope, keyed by the child's
@@ -3836,6 +3869,50 @@ mod tests {
         let mut simulator = simulator_for(&[top, ansi, body, floating], "top");
         simulator.advance(1).expect("time should advance");
         assert_eq!(simulator.output().lines(), vec!["ansi=x body=x float=z"]);
+    }
+
+    /// A port whose declaration disagrees with the parent's about signedness
+    /// is not aliased: the entry it would share carries *one* signedness, and
+    /// the child's is the one its own body must read. So `input signed [3:0]`
+    /// bound to an unsigned `reg [3:0]` compares `4'b1000` as -8 rather than
+    /// as 8, in both header spellings and however the parent wrote the
+    /// connection.
+    ///
+    /// iverilog 12.0 prints `y1=0 y2=0 y3=0` for this design — `7 <= -8` is
+    /// false all three ways.
+    #[test]
+    fn test_a_signed_port_is_signed_inside_the_child() {
+        let sub = r#"
+            module sub(a, b, y);
+                input signed [3:0] a;
+                input signed [3:0] b;
+                output y;
+                assign y = a <= b;
+            endmodule
+        "#;
+        let ansi = r#"
+            module ansi(input signed [3:0] a, input signed [3:0] b, output y);
+                assign y = a <= b;
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                reg [3:0] p, q;
+                wire y1, y2, y3;
+                sub u1 (p, q, y1);
+                ansi u2 (p, q, y2);
+                sub u3 (p + 0, q + 0, y3);
+                initial begin
+                    p = 4'b0111;
+                    q = 4'b1000;
+                    #1 $display("y1=%b y2=%b y3=%b", y1, y2, y3);
+                end
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[top, sub, ansi], "top");
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["y1=0 y2=0 y3=0"]);
     }
 
     /// Combinational output flowing back up into a parent expression.

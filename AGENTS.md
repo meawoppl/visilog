@@ -282,6 +282,17 @@ unconnected input is declared `z`. `Simulator::with_modules(modules, top)` is ho
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 
+**A port and the parent's signal have to agree about signedness to be one entry.** A
+store entry carries *one* signedness — a value is bits plus how to read them — so
+`input signed [31:0] a` bound to a plain `reg [31:0]` cannot be aliased onto it: the
+child would read its own port unsigned and `a <= b` would rank `32'h80000000` above
+`32'h7fffffff` (corpus `pr1033`, whose whole comment is that complaint). `can_alias` is
+that question, asked before `plain_identifier`'s answer is used, and a port that fails it
+takes the arrangement a port bound to an *expression* already had — its own entry, at its
+own declared signedness, with a continuous assignment carrying the value across. An
+`inout` is the exception and stays aliased: it is read as well as written, and one
+assignment only runs one way.
+
 **System tasks print into a buffer, not to stdout.** `$display`, `$write` and `$finish`
 are compiled to an `Instruction::Task` and carried out by
 `tasks::TaskContext`, which the `Simulator` owns: `simulator.output()` hands back
