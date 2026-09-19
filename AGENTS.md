@@ -1155,11 +1155,52 @@ terminate on one, and a static task's storage means real Verilog cannot recurse 
 `declare_tasks` compiles in dependency order by repeating until a pass compiles nothing
 new, so a task may enable one declared further down the file.
 
-Still unsupported: a hierarchical enable (`instance.task(…)`), which **parses** — the name
-is a hierarchical identifier like any other — and is then `UnknownTask` naming the whole
-path, because `declare_tasks` keys the definitions by the enabling module's own names
-(#173); a task enabled from inside a `function`, which is rejected by the function body
-analysis rather than by a check of its own. `signals.rs` is built but still unwired.
+**An enable of *another instance's* task is linked after the walk, not spliced where it is
+written.** `j.set(1'bz)`, `top.main.test1` and `test.foo` — the top module naming itself —
+are all a task the caller's own `TaskTable` has never heard of, and two things stop the
+splice happening where the enable is: the instance may be created further down the
+caller's own source, so there is no compiled body yet, and the body that eventually exists
+is resolved into the **child's** names rather than the caller's. So `compile_task_enable`
+leaves an `Instruction::HierarchicalEnable` holding the path and the caller's own argument
+expressions, and `Elaborator::link_hierarchical_enables` expands every one of them once
+the whole hierarchy has been walked.
+
+The path is renamed with the *scope table* rather than with the instructions, beside
+`disable` and for the same reason — it names a task, not a signal — so `Scope::resolve`
+answers it and an absolute name loses its leading top-module segment exactly as a
+reference to a signal does. `Elaborator::hierarchical_tasks` is the second copy of every
+task, keyed by `scope.qualified(name)` — `j.set`, `main.test1` — with its body already run
+through the declaring instance's `Scope::resolve`, which is why the link does **not**
+rename what it splices.
+
+The body goes on the **end** of the instruction list and the enable becomes a jump into
+it, with a jump back at the far end: splicing in place would move every jump target past
+the enable, and those targets are what the caller's own control flow is made of. Two
+things then fall out of that. A `repeat` counter in the linked body is tagged with the
+block's own number at link time (`tag_slots_in`), since the block was tagged long before;
+and `implicit_reads` / `writes` are recomputed for a block that was linked, because both
+were taken when the enable was still a marker holding nothing but a path.
+
+A **cycle** of hierarchical enables is found by name in the enable graph before anything
+is spliced (`recursive_enable`), because every round of linking is a real copy of every
+body in the cycle — the same `RecursiveTask` `declare_tasks` gives for a cycle inside one
+module, over the graph the whole design's tasks make between them. A path naming a task no
+instance declares is still `UnknownTask`: a dotted name defers the question, it does not
+drop it.
+
+A task enabled from inside a `function` is now refused by a check of its own — "a task
+enable inside a function" — rather than by whatever the inlined body happened to do next.
+That only reaches the hierarchical spelling; a *local* enable is spliced before
+`analyse_function_body` sees it and is still diagnosed by what the body does.
+
+Still unsupported: a task belonging to a module the design never instantiates, which is
+what the five corpus files with an enable into a second *root* module need
+(`mhead_task`, `pr2076425`, `def_nettype`) — `Simulator::with_modules` takes one top and
+everything else is reachable only through it. `signals.rs` is built but still unwired.
+
+Still unsupported: a task enabled from inside a `function`, which is rejected by the
+function body analysis rather than by a check of its own. `signals.rs` is built but still
+unwired.
 
 **A `disable` is a jump when it can be, and a cancellation when it cannot.** A named block
 and an inlined task body each occupy a *range* of the compiled instruction list, and
@@ -1346,20 +1387,33 @@ its `fork` field**, so it still reaches its `JoinBranch` and the `fork` complete
 a fresh `ExecutionCursor::new` for it instead gives it `fork: None`, which reaches
 `JoinBranch` as "the compiled layout and the scheduler have parted company" and is reported
 as `FORK_TIMING_UNSUPPORTED` — naming the wrong thing entirely. The question "is this fork
-inside the scope?" is asked of the fork record's *parent* cursor, which is the instruction
-the join sits at (corpus `disable3.6B`; measured against iverilog 12.0, which resumes the
-join at the instant of the `disable` rather than at the instant the cancelled branch would
-have finished).
+inside the scope?" is asked of the `Instruction::Fork` **site**, which `ForkJoin` keeps
+beside the parent cursor: a labelled `fork`'s own scope runs from that instruction up to
+but *not* including the join, so asking the parent — which sits at the join — answers `no`
+for the fork's own label and turns `disable F` into a per-thread cancellation (corpus
+`disable3.6B`, `pr718`; measured against iverilog 12.0, which resumes the join at the
+instant of the `disable` rather than at the instant the cancelled branch would have
+finished).
 
 `join_any` and `join_none` are not implemented, and `block_between` closing on a
 word-boundary `keyword` rather than a bare `tag` is what keeps them out: without it,
 `fork … join_any` would read as a plain `join` with a stray `_any` after it and hand the
-design semantics it did not ask for. They are a parse error instead. A `disable` written
-inside a branch naming a scope the `fork` itself sits in is `Unsupported` by name
-(`Program::check_fork_disables`, a post-pass because the enclosing block's range is not
-recorded until the block around the `fork` has finished compiling): the jump a local
-`disable` compiles to would stop the one thread that ran it and leave the join waiting for
-an arrival that can never come. A branch that genuinely never arrives holds *its own* join
+design semantics it did not ask for. They are a parse error instead.
+
+**A `disable` written inside a branch naming a scope the `fork` itself sits in is the one
+`disable` whose scope contains it and which still cannot be a jump.** The jump would stop
+the one thread that ran it and leave the join waiting for an arrival that can never come,
+so `Program::mark_fork_disables` flags it — `Instruction::Disable::escapes_fork` — and
+`resume` sends it to the driver like a non-local one. It is a post-pass because the
+enclosing block's range is not recorded until the block around the `fork` has finished
+compiling. `cancel_scope` then cancels the whole activation, which is what it already did
+for a scope containing a `fork`, and it now *says so*: it answers whether the block that
+ran the `disable` was one of the blocks it cancelled, and `resume_block` stops that thread
+instead of carrying on from the next instruction — carrying on would give the design two
+threads of one block. Corpus `disable_fork`, `pr540`, `pr718`. Where execution resumes is
+the scope's end and not the join, so `disable blk` for a `begin : blk` *around* the fork
+skips the statement after the `join` as well (measured against iverilog 12.0). A branch
+that genuinely never arrives holds *its own* join
 for ever, which is what the LRM says, and holds nothing else — the other branches still run
 and time still moves.
 
@@ -2010,7 +2064,7 @@ the *format string* reading of one first, and that is the only reason the two ev
 telling apart.
 | File | Role |
 | --- | --- |
-| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
+| `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` — twice, the second copy under the flat path a hierarchical enable of it resolves to |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — `$countdrivers`, which is a question about the design rather than about a value, and `call_function` for the design's own |
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
@@ -2018,7 +2072,7 @@ telling apart.
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |

@@ -226,7 +226,14 @@ pub enum Instruction {
     /// program counter is already inside it this is a jump to where that range
     /// ends. When it is not, the scope belongs to some other block and only
     /// the driver can reach it, which is what [`Resume::Disabled`] is for.
-    Disable(String),
+    ///
+    /// `escapes_fork` is the one case where the scope *does* contain the
+    /// program counter and the jump is still wrong: the `disable` sits in a
+    /// `fork` branch and names a scope the `fork` itself is inside. Jumping
+    /// would stop this one thread and leave its siblings running and the join
+    /// waiting for an arrival that can never come, so it goes to the driver
+    /// like a non-local one. [`Program::mark_fork_disables`] is what sets it.
+    Disable { scope: String, escapes_fork: bool },
     /// `fork … join` whose branches consume time — start one thread of
     /// execution per branch and suspend until every one of them has finished.
     ///
@@ -239,6 +246,23 @@ pub enum Instruction {
     /// The end of one `fork` branch. It ends *that thread*, not the block, and
     /// the last one to arrive is what lets the block past its `join`.
     JoinBranch,
+    /// `j.set(1'b1);` — an enable of a task belonging to **another instance**,
+    /// left standing until the whole hierarchy has been walked.
+    ///
+    /// A local enable is spliced where it is written, because the table of the
+    /// module's own tasks is in hand when the block is compiled. An instance's
+    /// task is not: the child may be instantiated further down the parent's own
+    /// source, so it has no compiled body yet — and when it does, that body is
+    /// resolved into the **child's** names rather than the caller's. So the
+    /// enable is left as this marker, with the path already run through
+    /// [`Scope::resolve`](super::elaborate) and the arguments already the
+    /// caller's names, and
+    /// [`link_hierarchical_enables`](Program::link_hierarchical_enables)
+    /// expands it once elaboration has walked everything.
+    HierarchicalEnable {
+        path: String,
+        arguments: Vec<Expression>,
+    },
     /// The end of the block.
     Halt,
 }
@@ -313,8 +337,15 @@ pub enum Resume {
     /// Hit a `fork` whose branches consume time. Start one thread at each of
     /// `branches` and hold this one at `pc` — the `join` — until the last of
     /// them arrives.
+    ///
+    /// `site` is the `Fork` instruction itself, which is the one point of the
+    /// layout that is inside a labelled `fork`'s own scope — the join is its
+    /// end and so is not. A `disable` of that label has to tell "the scope
+    /// contains this fork" from "this fork contains the scope", and only the
+    /// site answers both spellings the same way.
     Forked {
         branches: Vec<usize>,
+        site: usize,
         pc: usize,
         pending: Vec<PendingUpdate>,
     },
@@ -358,6 +389,9 @@ fn instruction_expressions(instruction: &Instruction) -> Vec<&Expression> {
         Instruction::JumpIfMatch { label, .. } => vec![label],
         Instruction::RepeatInit { count, .. } => vec![count],
         Instruction::Task(call) => call.expressions(),
+        // Its arguments are expressions like any other; its *path* is not —
+        // that names a task and travels with the scope table instead.
+        Instruction::HierarchicalEnable { arguments, .. } => arguments.iter().collect(),
         Instruction::EventWait(control) => match control {
             EventControl::Events(events) => events.iter().map(|event| &event.expression).collect(),
             _ => Vec::new(),
@@ -374,7 +408,7 @@ fn instruction_expressions(instruction: &Instruction) -> Vec<&Expression> {
         Instruction::Delay(delay) => delay.expressions().to_vec(),
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
-        | Instruction::Disable(_)
+        | Instruction::Disable { .. }
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => Vec::new(),
@@ -468,14 +502,39 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
                 rename_expression(expression, resolve);
             }
         }
+        // The arguments of a hierarchical enable are the *caller's*
+        // expressions, so they are renamed here like any others. Its path is
+        // not: it names a task rather than a signal, and travels with the
+        // scope table — see [`Program::rename_scopes`].
+        Instruction::HierarchicalEnable { arguments, .. } => {
+            for argument in arguments {
+                rename_expression(argument, resolve);
+            }
+        }
         // A `disable` names a scope rather than a signal, so it is renamed
         // beside the scope table it points into — see
         // [`Program::rename_scopes`] — and never through a map of variables.
         Instruction::Jump(_)
-        | Instruction::Disable(_)
+        | Instruction::Disable { .. }
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => {}
+    }
+}
+
+/// [`Program::tag_slots`] over a run of instructions, which is what a body
+/// linked in after the block was tagged needs.
+fn tag_slots_in(instructions: &mut [Instruction], tag: usize) {
+    for instruction in instructions {
+        match instruction {
+            Instruction::RepeatInit { counter, .. } | Instruction::RepeatNext { counter, .. } => {
+                *counter = format!("$b{}{}", tag, counter)
+            }
+            Instruction::Hold { slot, .. } | Instruction::WriteHeld { slot, .. } => {
+                *slot = format!("$b{}{}", tag, slot)
+            }
+            _ => {}
+        }
     }
 }
 
@@ -526,9 +585,16 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
                 replace(expression);
             }
         }
+        // A generate loop may index the argument of an enable it writes:
+        // `u[i].load(data[i]);`.
+        Instruction::HierarchicalEnable { arguments, .. } => {
+            for argument in arguments {
+                replace(argument);
+            }
+        }
         Instruction::Jump(_)
         | Instruction::RepeatNext { .. }
-        | Instruction::Disable(_)
+        | Instruction::Disable { .. }
         | Instruction::Fork { .. }
         | Instruction::JoinBranch
         | Instruction::Halt => {}
@@ -543,41 +609,46 @@ impl Program {
     ) -> Result<Program, SimulationError> {
         let mut program = Program::compile_body(statements, tasks, "")?;
         program.emit(Instruction::Halt);
-        program.check_fork_disables()?;
+        program.mark_fork_disables();
         Ok(program)
     }
 
-    /// Rejects a `disable` written inside a `fork` branch that names a scope
-    /// the `fork` itself is inside.
+    /// Marks every `disable` written inside a `fork` branch that names a scope
+    /// the `fork` itself is inside, so that it goes to the driver rather than
+    /// compiling to a jump.
     ///
     /// Terminating such a scope has to stop *every* branch and the block parked
-    /// at the join, and the jump a local `disable` compiles to would stop only
-    /// the one thread that ran it — leaving its siblings running and the join
-    /// waiting for an arrival that can never come. That is a wrong answer with
-    /// no symptom, so it is named here instead. The check is a post-pass rather
-    /// than part of `compile_fork` because the enclosing block's own range is
-    /// not recorded until the block around the `fork` has finished compiling.
-    fn check_fork_disables(&self) -> Result<(), SimulationError> {
+    /// at the join, and a jump would stop only the one thread that ran it —
+    /// leaving its siblings running and the join waiting for an arrival that
+    /// can never come. Only [`Simulator::cancel_scope`](super::runner::Simulator)
+    /// can reach the other threads, so the instruction is flagged here and
+    /// answered there. The pass is a post-pass rather than part of
+    /// `compile_fork` because the enclosing block's own range is not recorded
+    /// until the block around the `fork` has finished compiling.
+    fn mark_fork_disables(&mut self) {
+        let mut escaping = Vec::new();
         for (site, instruction) in self.instructions.iter().enumerate() {
             let Instruction::Fork { join, .. } = instruction else {
                 continue;
             };
-            for (pc, inner) in self.instructions[site + 1..*join].iter().enumerate() {
-                let Instruction::Disable(scope) = inner else {
+            for (offset, inner) in self.instructions[site + 1..*join].iter().enumerate() {
+                let Instruction::Disable { scope, .. } = inner else {
                     continue;
                 };
-                let pc = site + 1 + pc;
+                let pc = site + 1 + offset;
                 if self
                     .scope_end_containing(scope, pc)
                     .is_some_and(|end| end >= *join)
                 {
-                    return Err(SimulationError::Unsupported(
-                        "a `disable` inside a `fork` branch naming a scope around the `fork`",
-                    ));
+                    escaping.push(pc);
                 }
             }
         }
-        Ok(())
+        for pc in escaping {
+            if let Instruction::Disable { escapes_fork, .. } = &mut self.instructions[pc] {
+                *escapes_fork = true;
+            }
+        }
     }
 
     /// The same, without the trailing [`Instruction::Halt`] — a task's body,
@@ -661,8 +732,15 @@ impl Program {
             scope.name = resolve(&scope.name);
         }
         for instruction in &mut self.instructions {
-            if let Instruction::Disable(name) = instruction {
-                *name = resolve(name);
+            match instruction {
+                Instruction::Disable { scope, .. } => *scope = resolve(scope),
+                // A hierarchical enable's path names a task rather than a
+                // signal, and it is resolved exactly the way a reference to an
+                // instance's signal is: `top.main.test1` written inside `trig1`
+                // is the store's `main.test1`, because the top module is the
+                // root of the flat name space and carries no prefix.
+                Instruction::HierarchicalEnable { path, .. } => *path = resolve(path),
+                _ => {}
             }
         }
     }
@@ -697,7 +775,10 @@ impl Program {
             .iter()
             .enumerate()
             .find_map(|(pc, instruction)| match instruction {
-                Instruction::Disable(scope) if self.scope_end_containing(scope, pc).is_none() => {
+                Instruction::Disable {
+                    scope,
+                    escapes_fork,
+                } if *escapes_fork || self.scope_end_containing(scope, pc).is_none() => {
                     Some(scope.as_str())
                 }
                 _ => None,
@@ -763,18 +844,7 @@ impl Program {
     /// would let the two spell the same name. A spliced body is deliberately
     /// *not* skipped — its loops belong to this block as much as the rest.
     pub fn tag_slots(&mut self, tag: usize) {
-        for instruction in &mut self.instructions {
-            match instruction {
-                Instruction::RepeatInit { counter, .. }
-                | Instruction::RepeatNext { counter, .. } => {
-                    *counter = format!("$b{}{}", tag, counter)
-                }
-                Instruction::Hold { slot, .. } | Instruction::WriteHeld { slot, .. } => {
-                    *slot = format!("$b{}{}", tag, slot)
-                }
-                _ => {}
-            }
-        }
+        tag_slots_in(&mut self.instructions, tag);
     }
 
     /// Rewrites the names this program's *own* statements use, leaving the
@@ -955,7 +1025,10 @@ impl Program {
                 // matches none of them is left as it stands, to be found among
                 // the module's own scopes when it runs.
                 ProceduralStatements::Disable(name) => {
-                    self.emit(Instruction::Disable(enclosing_scope(scope, &name.name)));
+                    self.emit(Instruction::Disable {
+                        scope: enclosing_scope(scope, &name.name),
+                        escapes_fork: false,
+                    });
                 }
                 // Which `$name`s exist is settled here rather than while the
                 // design runs, so an unrecognised one fails before it can look
@@ -1429,9 +1502,21 @@ impl Program {
         arguments: &[Expression],
         tasks: &TaskTable,
     ) -> Result<(), SimulationError> {
-        let definition = tasks
-            .get(&name.name)
-            .ok_or_else(|| SimulationError::UnknownTask(name.name.clone()))?;
+        let Some(definition) = tasks.get(&name.name) else {
+            // A dotted name is a task of some *other* instance, which this
+            // module's own table cannot answer for and which nothing can
+            // answer for until the hierarchy has been walked. It is left as a
+            // marker rather than refused — see
+            // [`Instruction::HierarchicalEnable`].
+            if name.name.contains('.') {
+                self.emit(Instruction::HierarchicalEnable {
+                    path: name.name.clone(),
+                    arguments: arguments.to_vec(),
+                });
+                return Ok(());
+            }
+            return Err(SimulationError::UnknownTask(name.name.clone()));
+        };
         if arguments.len() != definition.arguments.len() {
             return Err(SimulationError::TaskArity {
                 name: name.name.clone(),
@@ -1472,6 +1557,98 @@ impl Program {
             end,
         });
         Ok(())
+    }
+
+    /// Expands every [`Instruction::HierarchicalEnable`] this program holds,
+    /// reporting whether it expanded any.
+    ///
+    /// `tasks` is every task in the design under the flat path a reference to
+    /// it resolves to — `j.set`, `main.test1` — each already renamed into the
+    /// names of the instance that declares it. So the expansion is **not**
+    /// renamed again, which is the whole reason it happens here rather than at
+    /// compile time: the block around it was resolved into the *caller's*
+    /// names long before this runs.
+    ///
+    /// The body goes on the **end** of the instruction list and the enable
+    /// becomes a jump into it, with a jump back at the far end. Splicing it in
+    /// place would move every jump target past the enable, and those targets
+    /// are what the caller's own control flow is made of; appending costs one
+    /// jump each way and moves nothing. A body that itself holds an enable of a
+    /// third instance is left for the next round, which is why this reports
+    /// whether it did anything.
+    pub fn link_hierarchical_enables(
+        &mut self,
+        tasks: &HashMap<String, TaskDefinition>,
+        tag: usize,
+    ) -> Result<bool, SimulationError> {
+        let sites: Vec<usize> = self
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, instruction)| {
+                matches!(instruction, Instruction::HierarchicalEnable { .. })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if sites.is_empty() {
+            return Ok(false);
+        }
+        for site in sites {
+            let Instruction::HierarchicalEnable { path, arguments } =
+                self.instructions[site].clone()
+            else {
+                unreachable!("the site was chosen by matching on it")
+            };
+            let definition = tasks
+                .get(&path)
+                .ok_or_else(|| SimulationError::UnknownTask(path.clone()))?
+                .clone();
+            if arguments.len() != definition.arguments.len() {
+                return Err(SimulationError::TaskArity {
+                    name: path,
+                    expected: definition.arguments.len(),
+                    found: arguments.len(),
+                });
+            }
+
+            let start = self.next();
+            for (argument, connection) in definition.arguments.iter().zip(&arguments) {
+                if argument.direction.copies_in() {
+                    self.emit(Instruction::Blocking {
+                        target: argument.variable(),
+                        value: connection.clone(),
+                    });
+                }
+            }
+            let body = self.next();
+            self.splice(&definition.program);
+            // A `repeat` counter inside the body is named after the instruction
+            // that created it, which `splice` has already made unique within
+            // this program. The block's own tag is what makes it unique
+            // *between* programs — two blocks enabling one task would otherwise
+            // count each other down.
+            tag_slots_in(&mut self.instructions[body..], tag);
+            for (argument, connection) in definition.arguments.iter().zip(&arguments) {
+                if argument.direction.copies_back() {
+                    self.emit(Instruction::Blocking {
+                        target: connection.clone(),
+                        value: argument.variable(),
+                    });
+                }
+            }
+            self.emit(Instruction::Jump(site + 1));
+            let end = self.next();
+            self.instructions[site] = Instruction::Jump(start);
+            // The scope a `disable` of this enable names covers the copies as
+            // well as the body, exactly as a local enable's does — and the
+            // name is already the flat path a `disable` was resolved to.
+            self.scopes.push(ScopeRange {
+                name: path,
+                start,
+                end,
+            });
+        }
+        Ok(true)
     }
 
     /// Everything a compilation step appends to, so that a step can be
@@ -1934,9 +2111,12 @@ pub fn resume(
             // with the statement following the block". Terminating one it is
             // not inside can only be done by whoever holds the other block's
             // resume point, so it goes back to the driver.
-            Instruction::Disable(scope) => match program.scope_end_containing(scope, pc) {
-                Some(end) => pc = end,
-                None => {
+            Instruction::Disable {
+                scope,
+                escapes_fork,
+            } => match program.scope_end_containing(scope, pc) {
+                Some(end) if !escapes_fork => pc = end,
+                _ => {
                     return Ok(Resume::Disabled {
                         scope: scope.clone(),
                         pc: pc + 1,
@@ -1950,11 +2130,18 @@ pub fn resume(
             Instruction::Fork { branches, join } => {
                 return Ok(Resume::Forked {
                     branches: branches.clone(),
+                    site: pc,
                     pc: *join,
                     pending,
                 })
             }
             Instruction::JoinBranch => return Ok(Resume::BranchDone { pending }),
+            // Elaboration links every one of these before the design runs, so
+            // reaching one means the task it names was never found — which is
+            // the same thing a local enable of a name nothing declares is.
+            Instruction::HierarchicalEnable { path, .. } => {
+                return Err(SimulationError::UnknownTask(path.clone()))
+            }
             Instruction::Halt => return Ok(Resume::Halted { pending }),
         }
     }
