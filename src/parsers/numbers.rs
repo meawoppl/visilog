@@ -26,7 +26,7 @@ pub fn hexadecimal(input: &str) -> IResult<&str, &str> {
 /// A decimal digit run with the `_` separators Verilog allows inside one. It
 /// has to *start* with a digit — `_5` is not a number — which is what keeps
 /// this from claiming the leading `_` of an identifier.
-fn unsigned_number(input: &str) -> IResult<&str, &str> {
+pub fn unsigned_number(input: &str) -> IResult<&str, &str> {
     recognize(pair(
         digit1,
         take_while(|c: char| c.is_ascii_digit() || c == '_'),
