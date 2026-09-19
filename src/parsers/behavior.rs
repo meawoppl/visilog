@@ -493,11 +493,17 @@ fn parenthesized_expression(input: &str) -> IResult<&str, Expression> {
 
 /// A bare `$name` argument: `$display("%0d", $time)`.
 ///
-/// A `$name` that *is* followed by an argument list is a system function call
-/// and belongs to the expression grammar — `$display("%0d", $signed(a))` —
-/// so this form stops at the parenthesis and lets the expression layer take it.
+/// It is the *whole* argument or it is nothing, which is why the test is that
+/// the next token ends one. A `$name` followed by an argument list is a system
+/// function call and belongs to the expression grammar
+/// (`$display("%0d", $signed(a))`), and so does a `$name` that is merely the
+/// first operand of one — `$display("%d", $time - base)` is a subtraction, and
+/// stopping at the `$time` leaves a remainder the argument list cannot read.
 fn bare_system_function(input: &str) -> IResult<&str, String> {
-    terminated(system_name, peek(not(char('('))))(input)
+    terminated(
+        system_name,
+        peek(preceded(ws_and_comments, alt((char(','), char(')'))))),
+    )(input)
 }
 
 /// One argument, or the empty slot between two commas.
@@ -1762,6 +1768,32 @@ mod tests {
                 SystemTaskArgument::String("a = %0d".to_string()),
                 SystemTaskArgument::Expression(identifier_expression("a")),
                 SystemTaskArgument::SystemFunction("time".to_string()),
+            ]
+        );
+    }
+
+    /// A bare `$name` is only an argument when it is the *whole* argument.
+    /// `$time - base` is a subtraction, and reading just the `$time` leaves a
+    /// remainder the argument list cannot get past — which is what corpus
+    /// `sdf_del_max`, `pr1701889` and `verify_two_var_delays` stopped at.
+    #[test]
+    fn test_a_bare_system_function_does_not_claim_the_operand_of_an_operator() {
+        let call = assert_parses(parse_system_task, r#"$display("%d", $time - base);"#);
+        assert_eq!(
+            call.arguments[1],
+            SystemTaskArgument::Expression(Expression::Binary(
+                Box::new(Expression::SystemFunctionCall("time".to_string(), vec![])),
+                crate::parsers::operators::BinaryOperator::Subtraction,
+                Box::new(identifier_expression("base")),
+            ))
+        );
+
+        // …and the bare form still wins where the argument really does end.
+        assert_eq!(
+            assert_parses(parse_system_task, "$display($time , $realtime );").arguments,
+            vec![
+                SystemTaskArgument::SystemFunction("time".to_string()),
+                SystemTaskArgument::SystemFunction("realtime".to_string()),
             ]
         );
     }
