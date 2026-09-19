@@ -1715,8 +1715,26 @@ pub fn resume(
             // after this reads the counter, not the expression.
             Instruction::RepeatInit { counter, count } => {
                 let count = eval(count, store)?;
-                // A count that is `x` or `z` runs the body zero times.
-                let count = count.to_u128().unwrap_or(0);
+                let count = if count.is_real() {
+                    // A real count is **rounded**, half away from zero, the
+                    // way a real written into an integer is: iverilog 12.0
+                    // runs `repeat (10.4)` ten times, `repeat (10.6)` eleven
+                    // and `repeat (3.5)` four. Reading the sixty-four bit
+                    // encoding as a number instead gives a count in the
+                    // billions, which is a runaway loop rather than an answer
+                    // (corpus `br967`). A count that rounds to zero or below —
+                    // `repeat (-0.4)` — runs the body zero times, and so does
+                    // a NaN, which no comparison is true of.
+                    let rounded = count.to_f64().round();
+                    if rounded >= 1.0 {
+                        rounded as u128
+                    } else {
+                        0
+                    }
+                } else {
+                    // A count that is `x` or `z` runs the body zero times.
+                    count.to_u128().unwrap_or(0)
+                };
                 store.set(
                     counter.clone(),
                     Register::from_u128(count, REPEAT_COUNTER_WIDTH),
@@ -2518,6 +2536,41 @@ mod tests {
 
         assert!(step(&program, 0, &mut store).is_none());
         assert_eq!(store.get("count").unwrap().to_u128(), Some(0));
+    }
+
+    /// A **real** count is rounded, half away from zero, the way a real
+    /// written into an integer is.
+    ///
+    /// iverilog 12.0 prints `10 11 0 4` for
+    /// `repeat (10.4)` / `repeat (10.6)` / `repeat (-0.4)` / `repeat (r)` with
+    /// `r` at 3.5. Reading the sixty-four bit encoding as a number instead
+    /// gives a count in the billions, which is a runaway loop rather than an
+    /// answer (corpus `br967`).
+    #[test]
+    fn test_a_real_repeat_count_is_rounded() {
+        let counted = |source: &str| {
+            let program = compile(source);
+            let mut store = store_with(&[("count", "00000000")]);
+            assert!(step(&program, 0, &mut store).is_none());
+            store.get("count").unwrap().to_u128()
+        };
+
+        assert_eq!(
+            counted("begin repeat (10.4) count = count + 1; end"),
+            Some(10)
+        );
+        assert_eq!(
+            counted("begin repeat (10.6) count = count + 1; end"),
+            Some(11)
+        );
+        assert_eq!(
+            counted("begin repeat (3.5) count = count + 1; end"),
+            Some(4)
+        );
+        assert_eq!(
+            counted("begin repeat (-0.4) count = count + 1; end"),
+            Some(0)
+        );
     }
 
     #[test]
