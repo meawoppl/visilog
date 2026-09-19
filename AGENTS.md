@@ -1864,6 +1864,15 @@ tripwire.
   state a resumption has, so a loop-local counter would be lost. A Verilog identifier
   cannot start with `$`, and `Program::rename` qualifies the name like any other signal, so
   two instances of one module count separately. An `x` count runs zero iterations.
+  **The index is unique within one program and not between two**, so `elaborate` stamps
+  each block's own position in the flat block list on it with `Program::tag_slots` — the
+  same treatment the `$hold$` slot of an intra-assignment control gets. Two `initial`
+  blocks both start at instruction zero, and sharing one counter makes `repeat (10)`
+  twice into five iterations apiece: corpus `pr923` stopped halfway through its output,
+  looking for all the world like a time budget. The tag goes in **front** where
+  `Program::splice`'s offset goes behind (`$b5$repeat$0` against `$repeat$0$5`), because
+  a shared separator at one end would let a task's loop inside block 0 and block 5's own
+  loop spell the same name.
 - **A zero-delay loop is bounded inside `resume`, not by the runner.** `MAX_DELTA_CYCLES`
   and `MAX_RESUMPTIONS_PER_TIME` both count *returns* from `resume`, and `forever a = 1;`
   never returns, so `program.rs::MAX_INSTRUCTIONS` is the bound that sees it and reports
