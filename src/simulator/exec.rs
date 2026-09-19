@@ -346,7 +346,8 @@ pub fn resolve_target(
             let span = indexed_select_width(width, state)?;
             // A write through an unknown base is ignored — the LRM says so and
             // iverilog leaves the target untouched, as for a write out of range.
-            let Some(indices) = indexed_select_indices(base, span, *upward, state)? else {
+            let Some(indices) = indexed_select_indices(&id.name, base, span, *upward, state)?
+            else {
                 return Ok(ResolvedTarget::Nowhere);
             };
             Ok(ResolvedTarget::Bits {

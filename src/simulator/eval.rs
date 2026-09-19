@@ -448,7 +448,8 @@ fn eval_in_context(
             // The base is the operand that is allowed to move, so an unknown
             // one is not an error the way a bad bound is — it selects `x`,
             // which is what a vector indexed by an unknown holds.
-            let Some(indices) = indexed_select_indices(base, span, *upward, store)? else {
+            let Some(indices) = indexed_select_indices(&id.name, base, span, *upward, store)?
+            else {
                 return Ok(widened(Register::unknown(span), width));
             };
             let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
@@ -1437,25 +1438,53 @@ pub fn indexed_select_width(expr: &Expression, store: &StateStore) -> Result<usi
 /// `None` means the base did not evaluate to a number, which for this operator
 /// is a legal outcome rather than an error: the base is the operand allowed to
 /// move at run time, so an unknown one selects `x`.
+///
+/// `name` is the vector being selected from, because *which end is most
+/// significant* is the vector's own declaration to say: `reg [-1:14]` is
+/// written from its low index down, so a select out of it runs the other way
+/// round from one out of a `reg [14:-1]`. That is the same rule a plain
+/// `PartSelect` follows from the order its two bounds were written in — this
+/// operator has only one bound, so it reads the declaration instead.
 pub fn indexed_select_indices(
+    name: &str,
     base: &Expression,
     span: usize,
     upward: bool,
     store: &StateStore,
 ) -> Result<Option<Vec<i64>>, EvalError> {
-    let Some(base) = numeric(&eval(base, store)?)?.and_then(|value| i64::try_from(value).ok())
-    else {
+    let value = eval(base, store)?;
+    let Some(bits) = numeric(&value)? else {
+        return Ok(None);
+    };
+    // A base is a *position* in a vector rather than a quantity, and a vector
+    // declared `[base+15:base]` for a negative `base` really does have negative
+    // indices — so a signed base has to be read as the negative number it is.
+    // Reading `-2` as `4294967294` selects nothing and answers `xxxx`, where
+    // iverilog straddles the bottom of the vector.
+    let base = if value.is_signed() {
+        i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
+    } else {
+        i64::try_from(bits).ok()
+    };
+    let Some(base) = base else {
         return Ok(None);
     };
     let span = span as i64;
-    // `+:` runs from the base upwards and `-:` from the base downwards; both
-    // come back most significant first.
+    // `+:` runs from the base upwards and `-:` from the base downwards; which
+    // end of that run is the *most significant* is the declaration's to say.
     let (high, low) = if upward {
         (base + span - 1, base)
     } else {
         (base, base - span + 1)
     };
-    Ok(Some((low..=high).rev().collect()))
+    let ascending = store
+        .get_signal(name)
+        .is_some_and(|signal| signal.range().0 < signal.range().1);
+    Ok(Some(if ascending {
+        (low..=high).collect()
+    } else {
+        (low..=high).rev().collect()
+    }))
 }
 
 /// How wide a string literal is: eight bits per character, most significant
