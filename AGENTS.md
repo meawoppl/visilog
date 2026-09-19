@@ -314,6 +314,26 @@ own declared signedness, with a continuous assignment carrying the value across.
 `inout` is the exception and stays aliased: it is read as well as written, and one
 assignment only runs one way.
 
+**A port is only aliased when it is the same number of bits as what it was bound to**,
+because one store entry has nowhere to extend or truncate. `Elaborator::reconcile_port_widths`
+turns a mismatched one back into exactly the shape a port bound to an expression has — its
+own entry plus a continuous assignment in the port's own direction — so the conversion is
+an assignment's: a signed port sign extends, an unsigned one zero extends, and a narrower
+target truncates. Measured against iverilog 12.0, which warns about each connection and
+then agrees bit for bit (corpus `pr2121536`, `pr2121536b`, whose signed output aliasing
+zero extended; and `pr1866215b`, whose data line now matches). It runs **after the
+parameters are declared**, which is the first moment a port's range has a value at all, and
+it leaves an `inout` aliased whatever its width — that one is read as well as written and
+one assignment only runs one way.
+
+The assignment it creates is **the only driver the elaborator adds on its own account**, so
+it cannot know whether the net it lands on is driven already. A design that miswires a
+port's direction drives both ends — iverilog coerces the port to `inout` and warns — and
+two plain drivers of one net overwrite each other every pass and never settle, so the net
+is named a `resolved_net` and both go through `resolve_contributions` instead, where an
+undriven `z` contributes nothing (corpus `br_gh127c`, `br_gh127f`, which stopped
+elaborating without it).
+
 **System tasks print into a buffer, not to stdout.** `$display`, `$write` and `$finish`
 are compiled to an `Instruction::Task` and carried out by
 `tasks::TaskContext`, which the `Simulator` owns: `simulator.output()` hands back
