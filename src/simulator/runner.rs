@@ -2704,6 +2704,35 @@ mod tests {
         assert_eq!(simulator.get("q").unwrap().to_binary(), "x");
     }
 
+    /// A parent's `wire` bound to a child's `output reg` is one store entry,
+    /// and it starts where the **variable** starts: `z` is what a net with no
+    /// driver reads, and this one has a driver — an untouched `reg`, which
+    /// reads `x`. A plain `output` beside it is a net and still reads `z`.
+    ///
+    /// iverilog 12.0 prints `w1=x n1=z` for this design (corpus `pr1645518`).
+    #[test]
+    fn test_a_wire_bound_to_an_output_reg_reads_x() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module child (A, N);
+              output reg A;
+              output N;
+            endmodule
+            module top;
+              wire w1, n1;
+              child c (w1, n1);
+              initial $display("w1=%b n1=%b", w1, n1);
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("advance should succeed");
+        assert_eq!(simulator.output().lines(), vec!["w1=x n1=z"]);
+    }
+
     /// `supply0`/`supply1` sit at their rail and `tri0`/`tri1` are pulled to a
     /// value that any real driver overrides.
     ///

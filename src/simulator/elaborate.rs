@@ -820,8 +820,19 @@ impl<'m> Elaborator<'m> {
         let local = &port.identifier.name;
         match scope.bindings.get(local) {
             // The parent's signal *is* this port. Declaring it again would give
-            // the port a second, immediately stale copy.
-            Some(Binding::Alias(_)) => return Ok(()),
+            // the port a second, immediately stale copy — but an `output reg`
+            // aliased onto a parent's `wire` still has to start where the
+            // *variable* starts: `z` is what a net with no driver reads, and
+            // this one has a driver, an untouched `reg` reading `x` (measured
+            // against iverilog 12.0; corpus `pr1645518`). Only the fill moves,
+            // so a waveform still declares it the `wire` the parent wrote.
+            Some(Binding::Alias(outer)) => {
+                if port_is_variable(port) {
+                    let outer = outer.clone();
+                    self.out.state.refill_unknown(&outer);
+                }
+                return Ok(());
+            }
             Some(Binding::Driven(expression)) => {
                 let name = scope.qualified(local);
                 let range = self.resolve_range(&port.range, scope)?;

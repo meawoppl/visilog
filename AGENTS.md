@@ -765,7 +765,12 @@ cosmetic — a variable with no assignment is unknown because nothing has *said*
 is, while a net with no driver is high-impedance because nothing is *driving* it, and a
 three-state bus depends on the distinction. `StateStore::declare_net` fills with `z` and
 `declare_signed` with `x`; `Port::net_type` is what picks between them, so `output reg q`
-is a variable while a plain `output` is a net. A `reg` in the *body* naming a port says
+is a variable while a plain `output` is a net. **An aliased port takes the variable's
+fill**: a port bound to a plain identifier is one store entry under two names, so a
+parent's `wire` bound to a child's `output reg` starts at `x` rather than `z` — the entry
+*has* a driver, and that driver is an untouched `reg`. `declare_port` refills it through
+`StateStore::refill_unknown`, which moves only the value and leaves the net flag alone, so
+a waveform still declares it the `wire` the parent wrote (corpus `pr1645518`). A `reg` in the *body* naming a port says
 the same thing and its declaration runs after the port's, overwriting the fill, so both
 spellings land on `x` with no special case. An array of nets gets the same treatment
 through `Memory::of_nets`.

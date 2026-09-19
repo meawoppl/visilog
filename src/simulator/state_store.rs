@@ -1468,6 +1468,25 @@ impl StateStore {
         self.declare_filled(name, range, signed, true, Register::high_impedance);
     }
 
+    /// Refills an already declared signal with `x`, the way an untouched
+    /// *variable* starts out, leaving everything else about the declaration —
+    /// its range, its signedness, its net flag — alone.
+    ///
+    /// An instance port bound to a parent signal is one store entry under two
+    /// names, so a parent's `wire` bound to a child's `output reg` has to start
+    /// where the **variable** starts: `z` is what a net with no driver reads,
+    /// and this one has a driver — an untouched `reg`, which reads `x`
+    /// (measured against iverilog 12.0). The net flag is deliberately kept, so
+    /// a waveform still declares it the `wire` the parent wrote.
+    pub fn refill_unknown(&mut self, name: &str) {
+        self.record(name);
+        let Some(signal) = self.name_to_signal.get_mut(name) else {
+            return;
+        };
+        let signed = signal.register.is_signed();
+        signal.register = Register::unknown(signal.register.width()).with_signedness(signed);
+    }
+
     /// Declares a `real`: sixty-four bits read as a double, starting at `0.0`.
     ///
     /// It is the one variable that does **not** start unknown, and that is a
