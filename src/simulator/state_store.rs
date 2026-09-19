@@ -1424,6 +1424,17 @@ impl StateStore {
         self.functions.get(name)
     }
 
+    /// Every definition, to be rewritten in place.
+    ///
+    /// The one caller is elaboration's alias pass, which has to reach the names
+    /// a function body holds for the reason it has to reach the ones a block
+    /// holds — a hierarchical reference is legal in either. A frame shares the
+    /// table by `Rc`, so this is the same `make_mut` a declaration goes
+    /// through, and it runs before any frame exists.
+    pub fn functions_mut(&mut self) -> &mut HashMap<String, FunctionDefinition> {
+        Rc::make_mut(&mut self.functions)
+    }
+
     /// Counts one more call onto the stack, or reports that the chain of calls
     /// has gone too deep to be anything but runaway recursion.
     ///

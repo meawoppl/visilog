@@ -303,6 +303,23 @@ the instantiation, which is why it travels with the port rather than with the co
 of more than one module is handed over; `Simulator::new(module)` still takes a single
 module as its own top.
 
+**A reference the design writes to an aliased port is re-pointed in a pass of its own,
+after the walk.** `u_bar.x` has no store entry — the port *is* the parent's signal — and
+`Scope::resolve` cannot say so while the hierarchy is being walked: `instantiate` records
+the alias from the **build** pass, in source order, so a block written above the
+instantiation is compiled and renamed before the table has ever heard of the name.
+`Elaborator::resolve_aliased_references` therefore asks again at the end, rewriting the
+name through `Elaborated::aliases` — a rewrite rather than a lookup the store falls back
+on, because everything else about a name here is settled statically and a run-time
+indirection would be the odd one out. One pass settles every reference: an alias *target*
+is never itself an alias key, since `Binding::Alias` collapses a chain of connections to
+the signal at the top of it where the entry is recorded. Every collection an elaboration
+produces goes through it — the blocks' programs, sensitivity lists, `implicit_reads` and
+`writes`, the assignments, the gates, the UDPs, the pass switches, the pulled and resolved
+nets, the top's inputs, and the `FunctionDefinition`s on the store — because a
+hierarchical reference is legal wherever a name is and one collection left out would be
+silent. Corpus `pr587` and `tri2`.
+
 **A port and the parent's signal have to agree about signedness to be one entry.** A
 store entry carries *one* signedness — a value is bits plus how to read them — so
 `input signed [31:0] a` bound to a plain `reg [31:0]` cannot be aliased onto it: the
