@@ -25,8 +25,10 @@
 //!
 //! A port connected to a general expression (`.a(x + 1)`) cannot be aliased.
 //! An input gets a real signal of its own plus a continuous assignment from the
-//! parent's expression; an output is not drivable that way at all and is
-//! reported as [`SimulationError::UndrivablePort`].
+//! parent's expression; an output bound to something *writable* gets the same
+//! assignment run outwards, and one bound to something that cannot be written
+//! at all is reported as [`SimulationError::UndrivablePort`]. An `inout` is
+//! neither — see [`Binding::Bonded`].
 //!
 //! An unconnected input is floating, so it is declared `z`. An unconnected
 //! output is a real signal the child drives that simply nobody reads, so it
@@ -65,7 +67,7 @@ use crate::parsers::{
 use crate::register::{Register, ONE, ZERO};
 use crate::simulator::eval::{eval, expression_width};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
-use crate::simulator::exec::{drive, range_width};
+use crate::simulator::exec::{drive, range_width, resolve_target, ResolvedTarget};
 use crate::simulator::gates::{Gate, PassSwitch};
 use crate::simulator::program::{
     block_scope, FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition,
@@ -264,6 +266,14 @@ enum Binding {
     /// signal of its own and a continuous assignment carries it outwards,
     /// which is the alias run backwards.
     Driving(Expression),
+    /// An `inout` bound to something that is not a plain signal.
+    ///
+    /// Neither direction of the alias will do: the port is read *and* written,
+    /// and a continuous assignment only runs one way. The port gets a signal
+    /// of its own and each of its bits is **bonded** to the matching bit of
+    /// the connection, which is the node model a `tran` already has — so the
+    /// two are not copied into each other, their drivers are pooled.
+    Bonded(Expression),
 }
 
 /// One instance's — or one generate block's — view of the flat name space.
@@ -861,6 +871,13 @@ impl<'m> Elaborator<'m> {
                     Expression::Identifier(Identifier::new(name)),
                 ));
                 return Ok(());
+            }
+            Some(Binding::Bonded(target)) => {
+                let target = target.clone();
+                let name = scope.qualified(local);
+                let range = self.resolve_range(&port.range, scope)?;
+                self.out.state.declare_net(name.clone(), range, port.signed);
+                return self.bond_port(&name, &target);
             }
             None => {}
         }
@@ -1731,6 +1748,104 @@ impl<'m> Elaborator<'m> {
         Ok(())
     }
 
+    /// Joins each bit of an `inout` port to the matching bit of what the
+    /// parent bound it to.
+    ///
+    /// A port bound to a plain identifier is *aliased* — it and the parent's
+    /// signal are one store entry — and a select cannot be, because the port
+    /// and `bus[0]` are not one entry. An **output** bound to one is carried
+    /// out by a continuous assignment, but an `inout` is read as well as
+    /// written and one assignment only runs one way. So the port keeps a
+    /// signal of its own and the two are made **one node**, bit by bit, which
+    /// is exactly what a `tran` between them would mean: the drivers of both
+    /// are pooled and resolved together, rather than either side's value being
+    /// copied into the other. Copying is the shape that looks right and is
+    /// wrong for the reason [`PassSwitch`] gives — once the value has been
+    /// copied, a driver letting go leaves the far side holding it.
+    ///
+    /// Both sides are walked from their **least significant** end, so a
+    /// connection narrower than the port leaves the port's high bits joined to
+    /// nothing — which is what an unconnected bit of a net already is.
+    fn bond_port(&mut self, name: &str, target: &Expression) -> Result<(), SimulationError> {
+        let outer = self.bit_expressions(target)?;
+        let inner =
+            self.bit_expressions(&Expression::Identifier(Identifier::new(name.to_string())))?;
+        for (port_bit, outer_bit) in inner.into_iter().rev().zip(outer.into_iter().rev()) {
+            let switch = PassSwitch::new(GateKind::Tran, vec![port_bit, outer_bit])?;
+            // Both terminals are resolved nets, for the reason a `tran`'s are:
+            // every driver of either one has to reach the node's pool rather
+            // than write the store.
+            for terminal in &switch.terminals {
+                if let Some(name) = assigned_name(terminal) {
+                    self.out.resolved_nets.insert(name.to_string());
+                }
+            }
+            self.out.pass_switches.push(switch);
+        }
+        Ok(())
+    }
+
+    /// The bits an expression names, each as the one-bit select that names it,
+    /// most significant first.
+    ///
+    /// It goes through `resolve_target` so that a name, a select and a
+    /// concatenation of those are all answered by the production that already
+    /// decides which bits an assignment writes — the two cannot then disagree
+    /// about which bit of `{qh, Q}` is which.
+    fn bit_expressions(&self, expression: &Expression) -> Result<Vec<Expression>, SimulationError> {
+        let mut bits = Vec::new();
+        self.push_bit_expressions(&resolve_target(&self.out.state, expression)?, &mut bits)?;
+        Ok(bits)
+    }
+
+    fn push_bit_expressions(
+        &self,
+        target: &ResolvedTarget,
+        bits: &mut Vec<Expression>,
+    ) -> Result<(), SimulationError> {
+        let bit_of = |name: &str, index: i64| {
+            Expression::BitSelect(
+                Identifier::new(name.to_string()),
+                Box::new(Expression::Constant(VerilogConstant::from_int(index))),
+            )
+        };
+        match target {
+            ResolvedTarget::Whole(name) => {
+                let signal = self
+                    .out
+                    .state
+                    .get_signal(name)
+                    .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
+                let (msb, lsb) = signal.range();
+                for offset in 0..signal.width() as i64 {
+                    let index = if msb >= lsb {
+                        msb - offset
+                    } else {
+                        msb + offset
+                    };
+                    bits.push(bit_of(name, index));
+                }
+                Ok(())
+            }
+            ResolvedTarget::Bits { name, indices } => {
+                for index in indices {
+                    bits.push(bit_of(name, *index));
+                }
+                Ok(())
+            }
+            ResolvedTarget::Parts(parts) => {
+                for part in parts {
+                    self.push_bit_expressions(part, bits)?;
+                }
+                Ok(())
+            }
+            // A memory word, an event, or a select whose index is not a
+            // constant: nothing here is a bit of a net, so there is no node for
+            // it to be part of.
+            other => Err(SimulationError::UnsupportedTarget(other.name().to_string())),
+        }
+    }
+
     /// Records a gate and the nets it drives, which are the ones that have to
     /// be resolved rather than simply written.
     fn push_gate(&mut self, gate: Gate) {
@@ -2212,11 +2327,15 @@ impl<'m> Elaborator<'m> {
                 // continuous assignment carries it out to the target. An
                 // output bound to something that cannot be written at all,
                 // like `a + 1`, is still a named error, because there is
-                // nowhere for the child's value to go — and so is an `inout`,
-                // which is read as well as written and would need the
-                // assignment to run both ways.
+                // nowhere for the child's value to go.
                 None if port.direction == PortDirection::Output && is_drivable(&connection) => {
                     Binding::Driving(renamed(&connection, scope))
+                }
+                // An `inout` is read *and* written, so neither direction of
+                // the assignment will do. It is bonded instead — see
+                // [`Binding::Bonded`].
+                None if port.direction == PortDirection::InOut && is_drivable(&connection) => {
+                    Binding::Bonded(renamed(&connection, scope))
                 }
                 None => {
                     return Err(SimulationError::UndrivablePort {

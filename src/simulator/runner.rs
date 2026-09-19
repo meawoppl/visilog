@@ -2690,6 +2690,44 @@ mod tests {
         assert_eq!(simulator.output().lines(), vec!["0 1 7"]);
     }
 
+    /// An `inout` bound to a **select** is bonded to it, not assigned from it:
+    /// the port and the parent's bit become one node, so the connection
+    /// carries a value in both directions.
+    ///
+    /// `t1` drives nothing and still reads the `1` that the parent's own
+    /// `assign bus[1] = 1'b1;` puts on its bit, which is what a
+    /// `Binding::Driving` assignment could not do — it only runs outwards.
+    /// iverilog 12.0 prints `bus=10 q0=0 q1=1`.
+    #[test]
+    fn test_an_inout_bound_to_a_select_carries_both_ways() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module tap(inout p, input drive, input value, output q);
+              assign p = drive ? value : 1'bz;
+              assign q = p;
+            endmodule
+            module top;
+              wire [1:0] bus;
+              wire q0, q1;
+              reg d0, v0, d1, v1;
+              tap t0(bus[0], d0, v0, q0);
+              tap t1(bus[1], d1, v1, q1);
+              assign bus[1] = 1'b1;
+              initial begin
+                d0 = 1'b1; v0 = 1'b0; d1 = 1'b0; v1 = 1'b0;
+                #1 $display("bus=%b q0=%b q1=%b", bus, q0, q1);
+              end
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("advance should succeed");
+        assert_eq!(simulator.output().lines(), vec!["bus=10 q0=0 q1=1"]);
+    }
+
     /// unknown because nothing has said what it is, while a net with no driver
     /// is high-impedance because nothing is driving it.
     ///
