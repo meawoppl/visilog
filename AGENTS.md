@@ -839,7 +839,12 @@ a target needs the evaluator, and the store has no evaluator.
 
 **A `release` puts nothing back**, and the asymmetry that follows is the whole rule: a
 **net** reverts because its continuous drivers reach it again on the next pass, while a
-**variable** has no driver and so keeps the value the force left it holding. "On the next
+**variable** has no driver and so keeps the value the force left it holding. A net is
+therefore *floated* at the release (`exec::floats_when_released`): `propagate` re-asserts
+every continuous driver in the same settle round, so a driven net is restored before
+anything reads the `z` and the change journal shows no edge — while a net **nothing**
+drives really does read `z`, which leaving the forced value standing could not say
+(corpus `pr1735836`). "On the next
 pass" is load-bearing and is a known gap (#235): iverilog re-resolves the net at the
 `release` itself, so a design that reads the net in the *same* timestep sees the driver's
 value where this reads the value the force left (corpus `pr1832097a`). A releasing
