@@ -334,7 +334,7 @@ pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> 
 /// nothing that was already legal is given a second meaning here.
 fn parse_event_trigger(input: &str) -> IResult<&str, ProceduralStatements> {
     let (input, _) = ws(tag("->"))(input)?;
-    let (input, name) = ws(identifier)(input)?;
+    let (input, name) = ws(hierarchical_identifier)(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
     Ok((
@@ -708,7 +708,7 @@ fn parse_forever_statement(input: &str) -> IResult<&str, ProceduralStatements> {
 /// this an `@` in front of a keyword-led statement would read the keyword as
 /// the event it waits on.
 fn unreserved_identifier(input: &str) -> IResult<&str, Identifier> {
-    let (rest, name) = identifier(input)?;
+    let (rest, name) = hierarchical_identifier(input)?;
     if is_reserved_word(&name.name) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -2548,6 +2548,33 @@ mod tests {
             EventControl::Events(vec![Event::new(
                 EventTriggers::EitherEdge,
                 identifier_expression("ev"),
+            )]),
+        );
+    }
+
+    /// An event belongs to the module that declares it, so a design reaches one
+    /// in another module by its hierarchical name — `-> et1.m1.e2;` (corpus
+    /// `event3`) and `@top.toplevel_event` (corpus `pr572`). Both spellings
+    /// read the *whole* path, since that path is the flat store key the
+    /// trigger namespace is keyed by.
+    #[test]
+    fn test_an_event_is_triggered_and_waited_on_by_its_hierarchical_name() {
+        let statement = assert_parses(procedural_statement, "-> et1.m1.e2;");
+        let ProceduralStatements::Assignment(assignment) = statement else {
+            panic!("expected an assignment, got {:?}", statement);
+        };
+        assert_eq!(
+            *assignment.lhs(),
+            identifier_expression("et1.m1.e2"),
+            "a trigger names the event's whole path"
+        );
+
+        assert_parses_to(
+            parse_sensitivity_list,
+            "@top.toplevel_event",
+            EventControl::Events(vec![Event::new(
+                EventTriggers::EitherEdge,
+                identifier_expression("top.toplevel_event"),
             )]),
         );
     }
