@@ -2333,16 +2333,52 @@ fn relational(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Result<Reg
     Ok(logic_bit(if result { ONE } else { ZERO }))
 }
 
-/// `==` and `!=` produce one bit, and are `x` if either operand contains an
-/// unknown bit. The narrower operand is widened first, sign extended when both
-/// sides are signed — which is what makes `-1 == 32'hffffffff` true and
-/// `$signed(4'b1111) == 4'd15` false.
+/// `==` and `!=` produce one bit. The narrower operand is widened first, sign
+/// extended when both sides are signed — which is what makes
+/// `-1 == 32'hffffffff` true and `$signed(4'b1111) == 4'd15` false.
+///
+/// **An unknown bit only makes the answer unknown when it could still change
+/// it.** A *known* pair of bits that disagrees settles the question whatever
+/// the unknown ones hold — the two values cannot be equal — so
+/// `4'bxxx0 != 4'b0001` is `1` and `4'bxxx0 == 4'b0001` is `0`, where
+/// `4'bxxx1 != 4'b0001` is `x`. That is what iverilog 12.0 answers; the LRM's
+/// flat "`x` if either operand contains an `x` or `z`" is the coarser reading,
+/// and taking it turns a determinable comparison into an `x` that then
+/// poisons everything built on it.
 fn logical_equality(op: &BinaryOperator, lhs: &Register, rhs: &Register) -> Register {
     if lhs.has_unknown() || rhs.has_unknown() {
-        return Register::unknown(1);
+        if !known_bits_differ(lhs, rhs) {
+            return Register::unknown(1);
+        }
+        let differ = matches!(op, BinaryOperator::LogicalInequality);
+        return logic_bit(if differ { ONE } else { ZERO });
     }
     let matched = matches!(op, BinaryOperator::LogicalEquality) == equal_values(lhs, rhs);
     logic_bit(if matched { ONE } else { ZERO })
+}
+
+/// Whether any pair of *known* bits disagrees, once the narrower operand has
+/// been widened the way [`equal_values`] widens it.
+///
+/// Only [`logical_equality`] asks, and only when one side already has an
+/// unknown bit in it, so the walk never touches the ordinary comparison.
+#[cold]
+fn known_bits_differ(lhs: &Register, rhs: &Register) -> bool {
+    let width = lhs.width().max(rhs.width());
+    let widen = |value: &Register| {
+        if lhs.is_signed() && rhs.is_signed() {
+            value.sign_extended(width)
+        } else {
+            value.resize(width)
+        }
+    };
+    let (left, right) = (widen(lhs), widen(rhs));
+    (0..width).any(
+        |index| match (left.bit_from_lsb(index), right.bit_from_lsb(index)) {
+            (Some(a), Some(b)) => matches!((a, b), (ZERO, ONE) | (ONE, ZERO)),
+            _ => false,
+        },
+    )
 }
 
 /// `===` and `!==` compare all four states exactly and are never `x`. The
@@ -2875,6 +2911,45 @@ mod tests {
         assert_eq!(bits("4'd6 != 4'd6"), "0");
         // Widths are padded before comparing.
         assert_eq!(bits("8'd1 == 4'd1"), "1");
+    }
+
+    /// An unknown bit makes `==` unknown only when it could still change the
+    /// answer. A pair of *known* bits that disagrees settles the question
+    /// whatever the unknown ones hold, so a comparison that is determinable
+    /// is answered rather than poisoned.
+    ///
+    /// iverilog 12.0, for the six lines below in order:
+    ///
+    /// ```text
+    /// a 0
+    /// b 1
+    /// c x
+    /// d x
+    /// e 1
+    /// f 1
+    /// ```
+    ///
+    /// The relational operators keep the coarse rule — `4'b1xxx > 4'b0111` is
+    /// `x` there even though it is determinable — so this is deliberately not
+    /// applied to them.
+    #[test]
+    fn test_a_known_bit_settles_an_equality() {
+        assert_eq!(bits("4'bxxx0 == 4'b0001"), "0");
+        assert_eq!(bits("4'bxxx0 != 4'b0001"), "1");
+        // Every known pair agrees, so the unknown ones still decide.
+        assert_eq!(bits("4'bxxx1 == 4'b0001"), "x");
+        assert_eq!(bits("4'bxxx1 != 4'b0001"), "x");
+        // A `z` is as unknown as an `x`, and the order of the operands does
+        // not matter.
+        assert_eq!(bits("4'bzzz0 != 4'b0001"), "1");
+        assert_eq!(bits("4'b0001 == 4'bxxx0"), "0");
+        // Both sides may be unknown.
+        assert_eq!(bits("4'bxxx0 != 4'bxxx1"), "1");
+        // The narrower operand is widened first: `3'bx01` is `0x01`, whose
+        // known bits all agree with `0001`.
+        assert_eq!(bits("3'bx01 == 4'b0001"), "x");
+        // A relational operator is untouched.
+        assert_eq!(bits("4'b1xxx > 4'b0111"), "x");
     }
 
     #[test]
