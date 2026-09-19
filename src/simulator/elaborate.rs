@@ -125,6 +125,31 @@ const MAX_MEMORY_DEPTH: usize = 1 << 20;
 /// This is well past any design that plausibly elaborates.
 const MAX_GENERATE_ITERATIONS: usize = 4096;
 
+/// How many times one module may appear on the path from the top down to what
+/// is being walked.
+///
+/// A module *may* instantiate itself: IEEE 1364-2005 allows it as long as a
+/// `generate` condition stops the recursion, which is how a design writes a
+/// tree of adders (`sum #(n/2, width)` beside `sum #(n-n/2, width)`, corpus
+/// `pr2728812a`). So "this module is already on the stack" is not the
+/// question — the question is whether the recursion *terminates*, and a depth
+/// bound is what answers it without evaluating the generate conditions twice.
+/// It counts repeats of one module rather than the stack's length, so an
+/// ordinary deep hierarchy is not limited by it.
+///
+/// It is deliberately small: `walk` recurses on the host's own stack, so a
+/// bound big enough to be generous is a stack overflow rather than an error.
+const MAX_INSTANTIATION_DEPTH: usize = 24;
+
+/// How many instances one design may elaborate to in total.
+///
+/// A depth bound alone bounds the shape of a recursion but not the work it
+/// does: a module that instantiates *itself twice* and terminates at depth
+/// twenty is 2**20 real instances, every one of them declared into the flat
+/// store. Counting the instances is what bounds that, and it is well past any
+/// design that plausibly elaborates.
+const MAX_INSTANCES: usize = 65_536;
+
 /// `walk` compiles a module's functions and tasks before it unrolls a
 /// generate region, so one written *inside* a block would be missing from the
 /// store a call looks in — a call that quietly found nothing is the hardest
@@ -240,6 +265,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
         },
         stack: Vec::new(),
+        walked: 0,
         defparams: BTreeMap::new(),
         blocks_generated: 0,
     };
@@ -395,13 +421,17 @@ struct Elaborator<'m> {
     modules: &'m [VerilogModule],
     out: Elaborated,
     /// Module indices on the path from the top down to what is being walked
-    /// now. A module that reaches itself through this is recursive, which no
-    /// amount of flattening can terminate.
+    /// now. A module that reaches itself through this more than
+    /// [`MAX_INSTANTIATION_DEPTH`] times is recursing without terminating,
+    /// which no amount of flattening can settle.
     stack: Vec<usize>,
     /// The `defparam` overrides seen so far, by the flat name of the parameter
     /// each one addresses. An instantiation takes the ones that name it; what
     /// is left over at the end named nothing and is reported.
     defparams: BTreeMap<String, Register>,
+    /// How many instances have been walked, which is what bounds a recursion
+    /// that *branches* — see [`MAX_INSTANCES`].
+    walked: usize,
     /// How many unnamed generate blocks have been given a `genblk` number.
     /// A block with no label still needs a scope — two iterations of an
     /// unnamed loop body would otherwise declare the same names twice.
@@ -413,7 +443,11 @@ impl<'m> Elaborator<'m> {
         let modules = self.modules;
         let module = &modules[index];
 
-        if self.stack.contains(&index) {
+        self.walked += 1;
+        if self.walked > MAX_INSTANCES
+            || self.stack.iter().filter(|walked| **walked == index).count()
+                >= MAX_INSTANTIATION_DEPTH
+        {
             return Err(SimulationError::RecursiveInstantiation(
                 module.identifier.name.clone(),
             ));
@@ -4765,6 +4799,68 @@ mod tests {
         assert_eq!(
             setup_error(&[ping, pong], "ping"),
             SimulationError::RecursiveInstantiation("ping".to_string())
+        );
+    }
+
+    /// A module **may** instantiate itself, as long as a `generate` condition
+    /// stops the recursion — IEEE 1364-2005 allows it and it is how a design
+    /// writes a tree or a chain of a parameterised depth.
+    ///
+    /// iverilog 12.0 prints `1` then `0` for this design. Corpus
+    /// `pr2728812a` is the branching version, a tree of adders.
+    #[test]
+    fn test_recursion_a_generate_condition_terminates_is_elaborated() {
+        let chain = r#"
+            module chain #(parameter n = 4) (input [n-1:0] in, output out);
+                generate
+                    if (n == 1)
+                        assign out = in[0];
+                    else begin
+                        wire lower;
+                        chain #(n-1) c (in[n-2:0], lower);
+                        assign out = lower | in[n-1];
+                    end
+                endgenerate
+            endmodule
+        "#;
+        let top = r#"
+            module top();
+                wire y;
+                reg [3:0] v;
+                chain #(4) u (v, y);
+                initial begin
+                    v = 4'b0100;
+                    #1 $display("%b", y);
+                    v = 4'b0000;
+                    #1 $display("%b", y);
+                end
+            endmodule
+        "#;
+
+        let mut simulator = simulator_for(&[chain, top], "top");
+        simulator.advance(3).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["1", "0"]);
+    }
+
+    /// A recursion that *branches* is still reported, and cheaply: the walk is
+    /// depth first, so the first branch reaches the depth bound after
+    /// [`MAX_INSTANTIATION_DEPTH`] instances rather than after `2**depth` of
+    /// them. [`MAX_INSTANCES`] is what covers the other shape — a recursion
+    /// that does terminate, at a depth whose branching makes it enormous.
+    #[test]
+    fn test_a_branching_recursion_is_rejected() {
+        let fork = r#"
+            module fork_tree(
+                input clk
+            );
+                fork_tree left (.clk(clk));
+                fork_tree right (.clk(clk));
+            endmodule
+        "#;
+
+        assert_eq!(
+            setup_error(&[fork], "fork_tree"),
+            SimulationError::RecursiveInstantiation("fork_tree".to_string())
         );
     }
 
