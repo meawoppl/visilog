@@ -563,6 +563,12 @@ impl Simulator {
             .ok_or_else(|| SimulationError::UnknownModule(self.top.clone()))?;
         let elaborated = elaborate(&self.modules, top)?;
         self.state = elaborated.state;
+        // A `$display` inside a function body prints through the store, which
+        // is all `eval` is handed. Linking the two *after* elaboration is what
+        // makes a constant function's output disappear: the store the
+        // parameters were evaluated against had a buffer of its own, and
+        // iverilog drops that output too.
+        self.state.print_into(self.tasks.output().clone());
         if let Some(directory) = &self.output_directory {
             self.state.set_output_directory(directory.clone());
         }
@@ -1443,6 +1449,11 @@ impl Simulator {
                 + self.udps.len()
                 + self.state.drive_count())
             + 4;
+        // A continuous assignment is re-evaluated until the design stops
+        // moving, so a function called from one prints an unpredictable number
+        // of times. That is refused by name, on exactly the terms an
+        // outstanding `$sscanf` fill already is — one length compare per pass.
+        let printed = self.state.output().len();
         for pass in 1..=limit {
             let mut changed = false;
             let mut contributions: Vec<Contribution> = Vec::new();
@@ -1529,12 +1540,19 @@ impl Simulator {
                 }
             }
             // A continuous assignment is re-evaluated on every pass, so one
-            // whose right hand side reads a file or writes its arguments would
-            // do so an unpredictable number of times. That is refused by name
-            // rather than applied or dropped.
+            // whose right hand side reads a file, writes its arguments or
+            // calls a function that writes a design signal would do so an
+            // unpredictable number of times. That is refused by name rather
+            // than applied or dropped.
             if self.state.owes_fills() {
                 return Err(SimulationError::Unsupported(
-                    "a `$sscanf`, `$fscanf` or `$fgets` in a continuous assignment",
+                    "an expression that writes the design — `$sscanf` or a function \
+                     with a side effect — in a continuous assignment",
+                ));
+            }
+            if self.state.output().len() != printed {
+                return Err(SimulationError::Unsupported(
+                    "a `$display` in a function called from a continuous assignment",
                 ));
             }
             for (index, gate) in self.gates.iter().enumerate() {
@@ -4627,12 +4645,14 @@ mod tests {
     fn test_a_function_body_that_cannot_be_run_is_rejected() {
         let rejected = [
             ("#5 f = 1;", "a delay inside a function"),
-            ("$display(\"hi\");", "a system task inside a function"),
-            ("f <= 1;", "a non-blocking assignment inside a function"),
+            // `$display` is allowed now — it prints into the buffer the frame
+            // shares with the design. A `$strobe` still is not: it reports at
+            // the end of a timestep, on a `TaskContext` the call outlives.
             (
-                "outside = 1;",
-                "a function assigning a signal outside itself",
+                "$strobe(\"hi\");",
+                "a deferred system task inside a function",
             ),
+            ("f <= 1;", "a non-blocking assignment inside a function"),
             ("f = $random;", "`$random` inside a function"),
         ];
 
@@ -4661,6 +4681,226 @@ mod tests {
                 format!("{} is not supported by the simulator", expected)
             );
         }
+    }
+
+    /// A `$display` inside a function body prints, and it prints **before**
+    /// whatever the statement that made the call goes on to print.
+    ///
+    /// The frame carries the design's `Output` handle, so the line lands the
+    /// moment it runs rather than at some boundary afterwards. iverilog 12.0
+    /// prints exactly this order for the same design:
+    ///
+    /// ```text
+    ///   inside f(1)
+    /// outer sees 2
+    ///   inside f(2)
+    ///   inside f(3)
+    /// x = 7
+    /// ```
+    #[test]
+    fn test_a_function_prints_before_the_statement_that_called_it() {
+        let mut simulator = simulator_for(
+            r#"
+            module printer;
+                integer x;
+                function integer f;
+                    input integer a;
+                    begin
+                        $display("  inside f(%0d)", a);
+                        f = a + 1;
+                    end
+                endfunction
+
+                initial begin
+                    $display("outer sees %0d", f(1));
+                    x = f(2) + f(3);
+                    $display("x = %0d", x);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("the design should run");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "  inside f(1)",
+                "outer sees 2",
+                "  inside f(2)",
+                "  inside f(3)",
+                "x = 7",
+            ]
+        );
+    }
+
+    /// A function called while the design is still being *elaborated* prints
+    /// nothing, because the store the parameters are evaluated against has a
+    /// buffer of its own and only `setup` links the design's.
+    ///
+    /// That is what iverilog does with a constant function: `constfunc13` and
+    /// `mixed_width_case` are the same design written the two ways, and their
+    /// output is identical — the constant version's thirteen lines come from
+    /// its `initial` block rather than from inside the function.
+    #[test]
+    fn test_a_constant_function_prints_nothing() {
+        let mut simulator = simulator_for(
+            r#"
+            module constant_printer;
+                function integer f;
+                    input integer a;
+                    begin
+                        $display("elaborating %0d", a);
+                        f = a + 1;
+                    end
+                endfunction
+
+                localparam RESULT = f(1);
+
+                initial $display("result %0d", RESULT);
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("the design should run");
+        assert_eq!(simulator.output().lines(), vec!["result 2"]);
+    }
+
+    /// A continuous assignment is re-evaluated until the design stops moving,
+    /// so a function it calls prints an unpredictable number of times. That is
+    /// refused by name, on the same terms an outstanding `$sscanf` fill is —
+    /// printing twice what iverilog prints once is a wrong answer wearing a
+    /// working simulator's clothes (corpus `br948`).
+    #[test]
+    fn test_a_function_that_prints_cannot_drive_a_continuous_assignment() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module driven(output y);
+                reg a;
+                function invert;
+                    input value;
+                    begin
+                        invert = ~value;
+                        $display("invert %b", value);
+                    end
+                endfunction
+
+                assign y = invert(a);
+            endmodule
+        "#,
+        )
+        .expect("module should parse");
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("the design should elaborate");
+        let error = simulator
+            .run()
+            .expect_err("the assignment should be refused");
+        assert_eq!(
+            error.to_string(),
+            "a `$display` in a function called from a continuous assignment \
+             is not supported by the simulator"
+        );
+    }
+
+    /// A function may write a design signal, and the write reaches the design.
+    ///
+    /// The body runs against a frame, so the write cannot land where it is
+    /// made; it is queued the way a `$sscanf`'s argument is and carried out at
+    /// the next instruction boundary. iverilog prints `1 2` for this design —
+    /// the call's own result *and* the signal it left behind.
+    #[test]
+    fn test_a_function_may_write_a_design_signal() {
+        let mut simulator = simulator_for(
+            r#"
+            module side_effect;
+                integer count;
+                integer result;
+                function integer bump;
+                    input integer step;
+                    begin
+                        count = count + step;
+                        bump = count;
+                    end
+                endfunction
+
+                initial begin
+                    count = 0;
+                    result = bump(1);
+                    $display("%0d %0d", result, count);
+                    result = bump(1);
+                    $display("%0d %0d", result, count);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("the design should run");
+        assert_eq!(simulator.output().lines(), vec!["1 1", "2 2"]);
+    }
+
+    /// Two calls in *one* expression see each other's writes.
+    ///
+    /// Nothing drains the queue between them, so the second call seeds its
+    /// frame from what the first one owes rather than from a signal it has not
+    /// reached yet. That is the whole of what corpus `concat3` measures: with
+    /// a stale read both halves of `{ufunc(0), ufunc(0)}` come back the same,
+    /// and the design reports the concatenation order as broken.
+    #[test]
+    fn test_two_calls_in_one_expression_see_each_others_writes() {
+        let mut simulator = simulator_for(
+            r#"
+            module ordered;
+                integer count;
+                reg [63:0] pair;
+                function integer bump;
+                    input dummy;
+                    begin
+                        count = count + 1;
+                        bump = count;
+                    end
+                endfunction
+
+                initial begin
+                    count = 0;
+                    pair = {bump(0), bump(0)};
+                    $display("%0d %0d %0d", pair[63:32], pair[31:0], count);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("the design should run");
+        assert_eq!(simulator.output().lines(), vec!["1 2 2"]);
+    }
+
+    /// A function with a side effect cannot drive a continuous assignment, for
+    /// the reason one that prints cannot: the assignment is re-evaluated until
+    /// the design settles, so the side effect would happen an unpredictable
+    /// number of times (corpus `concat4`).
+    #[test]
+    fn test_a_function_with_a_side_effect_cannot_drive_a_continuous_assignment() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module driven(output [31:0] y);
+                integer count;
+                function integer bump;
+                    input dummy;
+                    begin
+                        count = count + 1;
+                        bump = count;
+                    end
+                endfunction
+
+                assign y = bump(0);
+            endmodule
+        "#,
+        )
+        .expect("module should parse");
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("the design should elaborate");
+        let error = simulator
+            .run()
+            .expect_err("the assignment should be refused");
+        assert_eq!(
+            error.to_string(),
+            "an expression that writes the design — `$sscanf` or a function with a \
+             side effect — in a continuous assignment is not supported by the simulator"
+        );
     }
 
     /// A parameter's value may be a call, which is why functions are compiled

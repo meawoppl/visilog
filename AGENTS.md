@@ -287,7 +287,10 @@ which is exactly what a self-checking corpus test needs. `$finish` sets a flag r
 exiting the process; `advance` and `poke` become no-ops once it is set, and `now` stops
 where it stopped. Which `$name`s exist is decided at *compile* time by `TaskCall::compile`,
 so an unrecognised task is an error naming it rather than a silent no-op — a design that
-quietly printed nothing would look just like one that passed.
+quietly printed nothing would look just like one that passed. The buffer is an `Output`,
+whose text sits behind an `Rc<RefCell<String>>` so that a *handle* to it can be given to
+the `StateStore` — which is how a `$display` written inside a function body prints; see
+"A call runs against a frame".
 
 **A descriptor is a bit mask, and bit 0 is the buffer.** `$fopen("work/a.txt")` hands back
 a *multi-channel descriptor* — one hot, allocated from bit 1 upwards, so the first file is
@@ -339,7 +342,9 @@ block's last statement, since the drain comes before the fetch of `Halt`. A desi
 scan pays one `RefCell` length check per instruction. A frame gets a fresh queue rather
 than a shared one, so a `$sscanf` in a function fills the function's own variables. A
 continuous assignment is re-evaluated every pass, so one that owes a fill is refused by
-name in `propagate` rather than reading a file an unpredictable number of times.
+name in `propagate` rather than reading a file an unpredictable number of times — which
+is the same check that refuses a *function* with a side effect there, since one hands its
+writes back through this queue too.
 
 The conversions live in `scan.rs`, one engine over a `Source` that is either the string
 or the file's `Reader`, and every rule was measured against iverilog 12.0:
@@ -607,8 +612,8 @@ find its body.
 **A call runs against a frame, which is a `StateStore` of its own.**
 `FunctionDefinition::call` builds one holding the result variable, the arguments, the
 locals, and *copies* of the design signals the body reads, then runs the body through the
-same `resume` every other procedural body goes through. Nothing the body writes reaches
-the design — which is exactly why a call can be made from an evaluator holding a shared
+same `resume` every other procedural body goes through. The body's writes land in the
+frame — which is exactly why a call can be made from an evaluator holding a shared
 reference — and every call gets its own frame, so **recursion works**: `fact(n) = n *
 fact(n - 1)` returns 120 for 5. `MAX_CALL_DEPTH` (64) is what makes a function that never
 reaches its base case `EvalError::FunctionCallDepth` rather than a stack overflow; the
@@ -620,13 +625,48 @@ that one reads too, or the inner call's frame would be missing it. An `@(*)` blo
 implicit sensitivity list is extended the same way — a block whose only reader of a signal
 is a call still has to wake when that signal moves.
 
-Because a frame is thrown away, a function body that would need to be seen from outside is
-a **named error at elaboration**, never a silent no-op: a `#delay`, a system task (its
-output would go into a `TaskContext` nobody reads), a non-blocking assignment (its write
-lands after the call has ended), an assignment to a signal outside the function, and
-`$random` (the stream it would advance is the frame's). Those five are the whole list, and
-`$display` inside a function is the one worth revisiting — it needs an output sink the
-evaluator can reach.
+**Two things a body does are visible from outside the frame, and both reach the design
+through the store, because the store is all `eval` is handed.**
+
+A **`$display`** prints into the design's own buffer. `Output` holds its text behind an
+`Rc<RefCell<String>>` — the shape the `$random` stream and the `FileTable` already use —
+and `Simulator::setup` hands the store the handle its `TaskContext` prints into, so
+`FunctionDefinition::call` can give the body a `TaskContext::printing_into` that buffer.
+The line therefore lands *as it is printed*, which is what makes the ordering right with
+no draining anywhere: `$display("outer %0d", f(1));` prints `f`'s line **first**, which is
+what iverilog 12.0 does (corpus `function2`, `disblock2`, `pr355`). Only the tasks that
+print *now* are allowed — `TaskCall::prints_now` — since a `$strobe`, a `$monitor`, a
+`$dumpvars` or a `$finish` all leave state on a `TaskContext` the call outlives.
+
+Linking the store to that buffer **after** elaboration is deliberate: the store the
+parameters were evaluated against has a buffer of its own, so a **constant** function's
+output disappears. That is iverilog's behaviour, and corpus `constfunc13` (constant calls)
+and `mixed_width_case` (the same design at run time) print the same thirteen lines for
+exactly that reason.
+
+A **write to a design signal** goes on `StateStore::owe_fill`, the queue a `$sscanf` write
+already used, and is carried out at the next instruction boundary. `FunctionDefinition`
+therefore keeps `writes` beside `reads` — a written name is *in* `reads` too, since a
+frame has to hold a signal to write it — and `close_reads` closes both over the call
+graph, because an inner call hands its write back into the *outer* call's frame and the
+outer call has to pass it on. Two calls in one expression see each other's writes:
+`{ufunc(0), ufunc(0)}` has nothing between them to drain the queue, so `call` seeds its
+frame through `StateStore::pending_fill` first (corpus `concat3`, `pr2842621_std`).
+
+**Neither may reach a continuous assignment.** `propagate` re-evaluates every assignment
+until the design settles, so a function called from one would print — or write — an
+unpredictable number of times. Both are refused by name there, the second through the
+`owes_fills` check that was already in place and the first through a length compare on the
+output buffer either side of the pass. That is corpus `br948` and `concat4`, and it is the
+same trade the fill rule already made: two of a line iverilog prints once is a wrong
+answer wearing a working simulator's clothes.
+
+What is left is the list a frame really would swallow, and each is still a **named error
+at elaboration**: a `#delay`, a *deferred* system task, a non-blocking assignment, a
+`force` or procedural `assign`, a `wait` or event control, a `disable` of a scope outside
+the body, and `$random` (the stream it would advance is the frame's). A write to a design
+**memory** is not on the list and does not need to be — the frame does not copy memories
+in, so the body's own write is the ordinary `UnknownSignal` it would be anywhere else.
 
 **An undriven net reads `z`; an untouched variable reads `x`.** The difference is not
 cosmetic — a variable with no assignment is unknown because nothing has *said* what it
@@ -1305,8 +1345,8 @@ telling apart.
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
 | `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
-| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into, the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills`) a scan writes its arguments through, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -1563,6 +1603,14 @@ tripwire.
   side**, so a `z` in the subject is as much a don't-care as one in the label; testing only
   the label half is the easy mistake. `casez` still tells an `x` apart from a `0`.
   The `case` tag is a prefix of both keywords, so `parse_case_keyword` tries it last.
+  **A subject and its labels are not yet sized against each other**, which is the same
+  mutual context a comparison already gets: they should be widened to the widest of *all*
+  of them, read signed only when every one of them is, and compared as reals when any one
+  of them is. Today each side is self-determined and the label is truncated to the
+  subject's width, so `case (3'sb100)` matches the label `4'sb0100`. Corpus
+  `mixed_width_case` and `constfunc13` are that gap, and they fail honestly — they run and
+  print `FAILED`. Fixing it means `Instruction::CaseSubject` knowing its arms, since the
+  labels are separate `JumpIfMatch` instructions by the time `resume` sees them.
 - **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
   hits the network. Don't re-enable it in CI without gating it.
 - **A declared range holds *expressions*, and a literal one is folded where it is
@@ -1708,14 +1756,16 @@ tripwire.
   a definition each. A `$name` is still never qualified — it is the simulator's, not the
   design's.
 - **What a function body may not do is checked once, at elaboration.** `analyse_function_body`
-  walks the compiled instructions and rejects a `#delay`, a system task, a non-blocking
-  assignment, a write to anything the function does not declare, `$random`, and a `disable`
-  naming a scope outside the body — each with a name. A `disable` of a block the function
-  *is* inside is fine, because that one is a jump and needs no driver; corpus `disblock2` is
-  exactly that. Every one of them is something a frame would silently swallow, and a call that
-  quietly did nothing is the hardest kind of wrong answer to find. The same walk is what
-  produces the read set a call copies into its frame, so adding a new `Instruction` means
-  teaching `BodyNames` about it or a function will stop seeing what it reads.
+  walks the compiled instructions and rejects a `#delay`, a *deferred* system task (one that
+  does not print where it stands — `TaskCall::prints_now` is the question), a non-blocking
+  assignment, a `force` or procedural `assign`, a `wait` or event control, `$random`, and a
+  `disable` naming a scope outside the body — each with a name. A `disable` of a block the
+  function *is* inside is fine, because that one is a jump and needs no driver; corpus
+  `disblock2` is exactly that. Every one of them is something a frame would silently swallow,
+  and a call that quietly did nothing is the hardest kind of wrong answer to find. The same
+  walk is what collects the **writes** a call hands back to the design and produces the read
+  set a call copies into its frame, so adding a new `Instruction` means teaching `BodyNames`
+  about it or a function will stop seeing what it reads.
 - **A function item is told from a statement by whether it declares a type.**
   `behavior.rs::function_item` gives up unless it saw a direction or a storage keyword —
   `input`, `reg`, `wire`, `integer`, `time`, `signed`, or a range — which is what lets

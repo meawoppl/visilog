@@ -1462,6 +1462,12 @@ pub struct FunctionDefinition {
     /// calls. A call copies exactly these into its frame, so it costs the
     /// function rather than the design.
     pub reads: BTreeSet<String>,
+    /// The design signals the body *assigns*, which are a subset of `reads` —
+    /// a frame has to hold a signal to write it. Nearly every function has
+    /// none; one that has some is the side-effecting kind the corpus measures
+    /// concatenation order with, and a call hands each of these back to the
+    /// design through [`StateStore::owe_fill`].
+    pub writes: BTreeSet<String>,
     /// The functions this one calls, which is what `reads` is closed over.
     pub calls: BTreeSet<String>,
     pub program: Program,
@@ -1484,12 +1490,23 @@ impl FunctionDefinition {
         store: &StateStore,
     ) -> Result<Register, SimulationError> {
         let mut frame = store.frame();
+        // A write an earlier call in the *same expression* made is still owed
+        // to the design — `{ufunc(0), ufunc(0)}` is two calls between which
+        // nothing drains the queue — so it is read from there rather than from
+        // the signal it has not reached yet. A design whose functions write
+        // nothing never has one outstanding, which is what `owes_fills` is
+        // asked once for.
+        let owed = store.owes_fills();
         for name in &self.reads {
             // A name the design does not have is left out rather than invented:
             // the body reading it is then the same `UnknownIdentifier` it would
             // be anywhere else.
             if let Some(signal) = store.get_signal(name) {
-                frame.set_ranged(name.clone(), signal.register().clone(), signal.range());
+                let value = match owed.then(|| store.pending_fill(name)).flatten() {
+                    Some(pending) => pending,
+                    None => signal.register().clone(),
+                };
+                frame.set_ranged(name.clone(), value, signal.range());
             }
         }
 
@@ -1511,11 +1528,14 @@ impl FunctionDefinition {
             drive_resolved(&mut frame, &target, value)?;
         }
 
-        // Nothing in a function body may print, and nothing in one may
-        // suspend: both are rejected when the function is elaborated, which is
-        // why the context here is a fresh one nobody reads and a suspension is
-        // an error rather than a resume point.
-        let mut tasks = TaskContext::new();
+        // A `$display` in the body prints into the *design's* buffer, which is
+        // the one thing the frame carries across from the store — everything
+        // else this context holds (the `$strobe` queue, the armed `$monitor`,
+        // the dump) belongs to a timestep no frame outlives, which is why
+        // `analyse_function_body` admits only the tasks that print at once.
+        // Nothing in a body may suspend, so a suspension is an error here
+        // rather than a resume point.
+        let mut tasks = TaskContext::printing_into(store.output().clone());
         match resume(&self.program, 0, &mut frame, &mut tasks)? {
             Resume::Halted { .. } => {}
             Resume::Suspended { .. } => return Err(FUNCTION_DELAY_UNSUPPORTED),
@@ -1526,6 +1546,17 @@ impl FunctionDefinition {
             // as a plain block.
             Resume::Forked { .. } | Resume::BranchDone { .. } => {
                 return Err(FORK_TIMING_UNSUPPORTED)
+            }
+        }
+
+        // What the body wrote to a *design* signal is owed to the design. It
+        // cannot be written here — `eval` holds a shared reference — so it is
+        // queued the way a `$sscanf`'s argument is and carried out at the next
+        // instruction boundary, which is the first moment the statement that
+        // made the call has finished with it.
+        for name in &self.writes {
+            if let Some(value) = frame.get(name) {
+                store.owe_fill(ResolvedTarget::Whole(name.clone()), value.clone());
             }
         }
 
