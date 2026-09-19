@@ -19,9 +19,11 @@
 //! no format specifier prints in, and what is left is the task itself. So
 //! `$fdisplayh` is "to a descriptor, one line, hex by default".
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
@@ -44,29 +46,49 @@ const STANDARD_OUTPUT: u32 = 1;
 /// complete once something terminates it; [`Output::lines`] reads the buffer
 /// back split on newlines, with a trailing unterminated `$write` as its own
 /// last entry.
+///
+/// The text sits behind an [`Rc`] so that a *handle* to it can be given to the
+/// [`StateStore`], which is the only thing
+/// [`eval`](crate::simulator::eval::eval) is handed — that is what lets a
+/// `$display` written inside a function body print into the design's own
+/// buffer, in the order it ran, rather than into a context nobody reads. It is
+/// the same shape the `$random` stream and the file table already use, and
+/// pushing through a shared reference is what makes it work at all.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Output {
-    text: String,
+    text: Rc<RefCell<String>>,
 }
 
 impl Output {
     /// Everything printed so far, newlines and all.
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn text(&self) -> String {
+        self.text.borrow().clone()
     }
 
     /// The printed lines, without their newlines.
-    pub fn lines(&self) -> Vec<&str> {
-        self.text.lines().collect()
+    pub fn lines(&self) -> Vec<String> {
+        self.text.borrow().lines().map(str::to_string).collect()
     }
 
     /// Whether the design has printed anything at all.
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.text.borrow().is_empty()
     }
 
-    fn push(&mut self, text: &str) {
-        self.text.push_str(text);
+    /// How many bytes have been printed. `propagate` reads it either side of a
+    /// pass to find out whether a continuous assignment printed anything.
+    pub fn len(&self) -> usize {
+        self.text.borrow().len()
+    }
+
+    /// Throws away everything printed so far *without* breaking the handle, so
+    /// a store already sharing this buffer keeps sharing it.
+    fn clear(&self) {
+        self.text.borrow_mut().clear();
+    }
+
+    fn push(&self, text: &str) {
+        self.text.borrow_mut().push_str(text);
     }
 }
 
@@ -243,6 +265,13 @@ pub struct TaskCall {
 }
 
 impl TaskCall {
+    /// Whether this call prints where it stands, rather than deferring to the
+    /// end of a timestep or reaching for state of its own. It is the one
+    /// question a function body's analysis asks of a task.
+    pub fn prints_now(&self) -> bool {
+        matches!(self.task, SystemTask::Print(_))
+    }
+
     /// Resolves a parsed `$name(...)` against the tasks the simulator
     /// implements.
     ///
@@ -565,6 +594,22 @@ impl TaskContext {
         TaskContext::default()
     }
 
+    /// A context whose `$display` lands in someone else's buffer.
+    ///
+    /// This is what a function call's body runs against:
+    /// [`FunctionDefinition::call`](crate::simulator::program::FunctionDefinition::call)
+    /// hands it the frame's [`Output`] handle, which is the design's own, so a
+    /// line printed inside a function is appended the moment it runs — before
+    /// whatever the statement that made the call goes on to print. iverilog
+    /// 12.0 puts it there: `$display("outer %0d", f(1));` prints f's line
+    /// first.
+    pub fn printing_into(output: Output) -> Self {
+        TaskContext {
+            output,
+            ..TaskContext::default()
+        }
+    }
+
     /// Everything the design has printed.
     pub fn output(&self) -> &Output {
         &self.output
@@ -623,7 +668,10 @@ impl TaskContext {
     /// Forgets everything one elaboration produced — the output, the `$finish`
     /// mark, the deferred queues and the `%t` format.
     pub fn reset(&mut self) {
-        self.output = Output::default();
+        // Cleared rather than replaced: a store handed this buffer's handle by
+        // `setup` goes on holding it across an elaboration, and a fresh
+        // `Output` would leave the two pointing at different strings.
+        self.output.clear();
         self.finished = false;
         self.strobes.clear();
         self.monitor = None;

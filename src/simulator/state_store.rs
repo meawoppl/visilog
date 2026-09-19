@@ -13,6 +13,7 @@ use crate::parsers::expr::Expression;
 use crate::register::{Register, REAL_WIDTH, X};
 use crate::simulator::exec::ResolvedTarget;
 use crate::simulator::program::FunctionDefinition;
+use crate::simulator::tasks::Output;
 
 /// What the `$random` stream starts from.
 ///
@@ -769,6 +770,22 @@ pub struct StateStore {
     /// The writes a system *function* owes the design. See
     /// [`owe_fill`](StateStore::owe_fill).
     fills: RefCell<Vec<(ResolvedTarget, Register)>>,
+    /// Where a `$display` written inside a *function* body prints.
+    ///
+    /// [`eval`](crate::simulator::eval::eval) is handed a `&StateStore` and
+    /// nothing else, so this is the only route a function call has to the
+    /// buffer the design prints into — the same reasoning that put the
+    /// `$random` stream and the file table here.
+    /// [`Simulator::setup`](crate::simulator::runner::Simulator::setup) hands
+    /// over the handle its `TaskContext` prints into, and [`frame`](StateStore::frame)
+    /// passes it down, so a nested call prints into the same string in the
+    /// order the calls ran.
+    ///
+    /// A store nobody has linked keeps a buffer of its own, which is what
+    /// makes a *constant* function evaluated while the design is still being
+    /// elaborated print nothing — iverilog 12.0 drops that output too (corpus
+    /// `constfunc13`).
+    output: Output,
 }
 
 impl StateStore {
@@ -824,7 +841,21 @@ impl StateStore {
             // `$sscanf` inside a function body fills the function's variables
             // and nothing the design can see.
             fills: RefCell::new(Vec::new()),
+            // Shared, like the file table: what a function body prints is the
+            // design's output, and it has to land in it as it is printed.
+            output: self.output.clone(),
         }
+    }
+
+    /// The buffer a `$display` inside a function body prints into.
+    pub fn output(&self) -> &Output {
+        &self.output
+    }
+
+    /// Points the store at the buffer the driver's `TaskContext` prints into,
+    /// which is what makes a function body's output the design's output.
+    pub fn print_into(&mut self, output: Output) {
+        self.output = output;
     }
 
     /// Records a write a system *function* made through its argument list.
@@ -848,6 +879,25 @@ impl StateStore {
     /// anything that allocates.
     pub fn owes_fills(&self) -> bool {
         !self.fills.borrow().is_empty()
+    }
+
+    /// The value a queued write is going to put into `name`, if one is.
+    ///
+    /// A function that writes a design signal queues that write here, and two
+    /// calls in one expression — `{ufunc(0), ufunc(0)}` — happen with nothing
+    /// in between to drain the queue. So the second call seeds its frame from
+    /// what the first one owes rather than from the signal, which is the only
+    /// way the two answer differently (corpus `concat3`). The *last* entry
+    /// wins, since the queue is in call order.
+    pub fn pending_fill(&self, name: &str) -> Option<Register> {
+        self.fills
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|(target, value)| match target {
+                ResolvedTarget::Whole(written) if written == name => Some(value.clone()),
+                _ => None,
+            })
     }
 
     /// Hands the outstanding writes over and starts a fresh list.

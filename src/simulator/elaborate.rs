@@ -71,25 +71,24 @@ use crate::simulator::program::{
 };
 use crate::simulator::runner::SimulationError;
 use crate::simulator::state_store::StateStore;
+
 use crate::simulator::udp::Udp;
 
-/// A function body prints into a [`TaskContext`](crate::simulator::tasks::TaskContext)
-/// nobody reads — a call happens inside an expression, and an expression has no
-/// way to hand output back — so a body that prints is rejected rather than
-/// silently swallowed.
+/// A task that prints *now* is fine inside a function body — the frame carries
+/// the design's [`Output`](crate::simulator::tasks::Output) handle, so the line
+/// lands where and when it was printed. Everything else in the family belongs
+/// to a timestep or to a file the frame would take with it: a `$strobe` and a
+/// `$monitor` report at the end of a timestep the call is long gone by, a
+/// `$readmemh` writes a memory the frame does not hold, and `$finish` sets a
+/// mark the driver reads off its own context. Each of those would be swallowed,
+/// so each is still named here.
 const FUNCTION_TASK_UNSUPPORTED: SimulationError =
-    SimulationError::Unsupported("a system task inside a function");
+    SimulationError::Unsupported("a deferred system task inside a function");
 
 /// A non-blocking assignment defers its write past the end of the call, and a
 /// call ends the moment the expression around it needs the value.
 const FUNCTION_NONBLOCKING_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a non-blocking assignment inside a function");
-
-/// A call runs against a frame of its own, so a write to anything outside the
-/// function would be thrown away with the frame. Losing it quietly would make a
-/// design that depends on it look like one that works.
-const FUNCTION_SIDE_EFFECT_UNSUPPORTED: SimulationError =
-    SimulationError::Unsupported("a function assigning a signal outside itself");
 
 /// A `force` or a procedural `assign` installs a drive that outlives the
 /// statement, and a call's frame does not outlive the call — so a drive
@@ -1094,6 +1093,7 @@ impl<'m> Elaborator<'m> {
             arguments,
             locals,
             reads: names.reads,
+            writes: names.writes,
             calls: names.calls,
             program,
         })
@@ -2250,11 +2250,17 @@ fn analyse_function_body(
     program: &Program,
     own: &BTreeSet<String>,
 ) -> Result<BodyNames, SimulationError> {
+    // The design signals the body assigns. They are not frame variables, so
+    // the frame has to be given copies of them to write into and the call has
+    // to hand what it wrote back afterwards.
+    let mut outside: BTreeSet<String> = BTreeSet::new();
     for instruction in program.instructions() {
         match instruction {
             Instruction::Blocking { target, .. } => match assigned_name(target) {
                 Some(name) if own.contains(name) => {}
-                Some(_) => return Err(FUNCTION_SIDE_EFFECT_UNSUPPORTED),
+                Some(name) => {
+                    outside.insert(name.to_string());
+                }
                 None => {
                     return Err(SimulationError::UnsupportedTarget(
                         target.to_contracted_string(),
@@ -2273,7 +2279,10 @@ fn analyse_function_body(
             | Instruction::Force { .. }
             | Instruction::Deassign(_)
             | Instruction::Release(_) => return Err(FUNCTION_DRIVE_UNSUPPORTED),
-            Instruction::Task(_) => return Err(FUNCTION_TASK_UNSUPPORTED),
+            // `$display` and `$write` print into the buffer the frame shares
+            // with the design; anything else in the family needs state the
+            // frame throws away.
+            Instruction::Task(call) if !call.prints_now() => return Err(FUNCTION_TASK_UNSUPPORTED),
             Instruction::Delay(_) => return Err(FUNCTION_DELAY_UNSUPPORTED),
             // A `wait` and an event control are both suspensions, and a call
             // happens at one instant: there is no later for the body to come
@@ -2300,6 +2309,11 @@ fn analyse_function_body(
     }
     // What the function declares itself is not something a call has to copy in.
     names.reads.retain(|name| !own.contains(name));
+    // A signal the body writes has to be *in* the frame for the write to land,
+    // even when nothing in the body reads it — `outside = 1;` names it nowhere
+    // else.
+    names.reads.extend(outside.iter().cloned());
+    names.writes = outside;
     Ok(names)
 }
 
@@ -2373,6 +2387,10 @@ struct BodyNames {
     reads: BTreeSet<String>,
     /// Every function the body calls, under the name it resolved to.
     calls: BTreeSet<String>,
+    /// The design signals the body assigns — the ones that are *not* frame
+    /// variables. They are filled in by [`analyse_function_body`] rather than
+    /// by the walk, because only it knows which names the function declares.
+    writes: BTreeSet<String>,
     /// Whether anything in the body draws from the `$random` stream.
     random: bool,
 }
@@ -2573,28 +2591,36 @@ fn compile_task(
     })
 }
 
-/// Adds to every function's read set the reads of the functions it calls, until
-/// nothing more is added.
+/// Adds to every function's read and write sets those of the functions it
+/// calls, until nothing more is added.
 ///
 /// A call seeds its frame from the store it was called against, so a function
 /// that calls another has to copy in what *that* one reads as well — otherwise
-/// the inner call would find the design signals it wanted missing. A cycle in
-/// the call graph is what the fixpoint is for: a recursive function's reads are
-/// its own.
+/// the inner call would find the design signals it wanted missing. The writes
+/// close the same way and for the mirror reason: an inner call hands its write
+/// back into the *outer* call's frame, and the outer call has to know to pass
+/// it on or the design would never see it. A cycle in the call graph is what
+/// the fixpoint is for: a recursive function's reads are its own.
 fn close_reads(functions: &mut BTreeMap<String, FunctionDefinition>) {
     loop {
         let mut grew = false;
         let names: Vec<String> = functions.keys().cloned().collect();
         for name in names {
             let mut inherited = BTreeSet::new();
+            let mut written = BTreeSet::new();
             for called in &functions[&name].calls {
                 if let Some(definition) = functions.get(called) {
                     inherited.extend(definition.reads.iter().cloned());
+                    written.extend(definition.writes.iter().cloned());
                 }
             }
             let definition = functions.get_mut(&name).expect("a staged function");
             for read in inherited {
                 grew |= definition.reads.insert(read);
+            }
+            for write in written {
+                grew |= definition.writes.insert(write.clone());
+                definition.reads.insert(write);
             }
         }
         if !grew {
