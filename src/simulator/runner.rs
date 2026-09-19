@@ -1618,7 +1618,8 @@ impl Simulator {
                     // it unresolved so it goes down the plain write path.
                     ResolvedTarget::Word { .. }
                     | ResolvedTarget::Event(_)
-                    | ResolvedTarget::Parts(_) => {}
+                    | ResolvedTarget::Parts(_)
+                    | ResolvedTarget::Nowhere => {}
                 }
             }
             let mut bits: Vec<u8> = signal.register().get_raw().to_vec();
@@ -2790,6 +2791,36 @@ mod tests {
             simulator.output().text(),
             "o=0101 y=1101\nu[0].o=1 p[1].y=11 p[0].a=01\n"
         );
+    }
+
+    /// A write through an index that is not a known number is **ignored** —
+    /// a bit, a memory word and an indexed part select alike. That is what the
+    /// LRM specifies, the same as for a write out of range, and iverilog 12.0
+    /// prints `v=00 mem0=11 mem1=22 w=0000` for this design.
+    #[test]
+    fn test_a_write_through_an_unknown_index_is_ignored() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [7:0] v;
+                reg [7:0] mem [0:3];
+                reg [15:0] w;
+                reg [2:0] ix;
+                reg [3:0] base;
+                initial begin
+                    v = 8'h00; mem[0] = 8'h11; mem[1] = 8'h22; w = 16'h0000;
+                    ix = 3'bx; base = 4'bx;
+                    v[ix] = 1'b1;
+                    mem[ix] = 8'hff;
+                    w[base +: 4] = 4'hf;
+                    $display("v=%h mem0=%h mem1=%h w=%h", v, mem[0], mem[1], w);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "v=00 mem0=11 mem1=22 w=0000\n");
     }
 
     #[test]
