@@ -7007,6 +7007,39 @@ mod tests {
         assert_eq!(simulator.get("w").unwrap().to_binary(), "1");
     }
 
+    /// A net **nothing drives** floats when it is released. There is no
+    /// driver to put a value back and a net has no value of its own, so
+    /// leaving the forced one standing would claim something is driving it.
+    ///
+    /// iverilog 12.0, over a `wire [1:0]` forced to `10` and then released:
+    ///
+    /// ```text
+    /// held  bare=10
+    /// freed bare=zz
+    /// ```
+    #[test]
+    fn test_release_floats_a_net_nothing_drives() {
+        let mut simulator = simulator_for(
+            r#"
+            module released();
+                wire [1:0] bare;
+                initial begin
+                    #5 force bare = 2'b10;
+                    #5 release bare;
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.get("bare").unwrap().to_binary(), "zz");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("bare").unwrap().to_binary(), "10");
+
+        simulator.advance(5).expect("time should advance");
+        assert_eq!(simulator.get("bare").unwrap().to_binary(), "zz");
+    }
+
     /// Drive precedence is per **bit**, not per signal name.
     ///
     /// iverilog 12.0, forcing `r[1]` of a `reg [3:0] r` that starts `0000`:
