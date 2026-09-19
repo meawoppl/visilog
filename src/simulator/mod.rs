@@ -4,6 +4,7 @@ pub mod event_queue;
 pub mod events;
 pub mod exec;
 pub mod gates;
+pub mod plusargs;
 pub mod program;
 pub mod runner;
 pub mod scan;

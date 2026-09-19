@@ -710,6 +710,16 @@ pub struct StateStore {
     /// The table is shared rather than copied so that a call's frame — itself a
     /// store — can call a function in turn without cloning every compiled body.
     functions: Rc<HashMap<String, FunctionDefinition>>,
+    /// The `+name=value` words the simulation was started with, without their
+    /// `+`.
+    ///
+    /// Here for the reason the `$random` stream and the file table are:
+    /// `$test$plusargs` and `$value$plusargs` are system *functions*, so
+    /// [`eval`](crate::simulator::eval::eval) is the only thing that can read
+    /// them and it is handed a `&StateStore` and nothing else. Shared rather
+    /// than copied, and never written after `setup`, so a call's frame reads
+    /// the same list the design does.
+    plusargs: Rc<Vec<String>>,
     /// How many function calls are on the stack above this store.
     call_depth: Cell<usize>,
     /// Whether any signal here was declared signed.
@@ -823,6 +833,7 @@ impl StateStore {
             time: self.time,
             random: RandomStream::default(),
             functions: Rc::clone(&self.functions),
+            plusargs: Rc::clone(&self.plusargs),
             call_depth: Cell::new(self.call_depth.get()),
             any_signed: false,
             any_real: false,
@@ -927,6 +938,19 @@ impl StateStore {
     /// system *function*, and `eval` is handed the store and nothing else.
     pub fn set_search_paths(&mut self, directories: Vec<PathBuf>) {
         self.files.0.borrow_mut().search_paths = directories;
+    }
+
+    /// The `+name=value` words the simulation was started with, without their
+    /// `+`. See [`Simulator::add_plusarg`](crate::simulator::runner::Simulator::add_plusarg).
+    pub fn set_plusargs(&mut self, plusargs: Vec<String>) {
+        self.plusargs = Rc::new(plusargs);
+    }
+
+    /// What `$test$plusargs` and `$value$plusargs` read. An empty list is an
+    /// ordinary answer — a design that finds no plus-arg is told so — not a
+    /// design that has gone wrong.
+    pub fn plusargs(&self) -> &[String] {
+        &self.plusargs
     }
 
     /// The path a name denotes when it is being *read*: itself if it is

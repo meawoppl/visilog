@@ -553,6 +553,42 @@ that draws random stimulus draws the *same* stimulus on every run and a self-che
 test can assert on it; `$random(seed)` restarts the stream from the seed, but does not
 write the seed back the way a real simulator's `inout` argument does.
 
+**The plus-args are the one thing a design learns about its own invocation, and only a
+caller knows them.** `$test$plusargs("opt")` is a *prefix* match over the whole `+name=value`
+word — `+option=1` answers it, and `""` answers whenever there is any plus-arg at all —
+and `$value$plusargs("option=%h", v)` matches the same way and writes the text after the
+prefix into `v`. They live on the `StateStore` (`set_plusargs` / `plusargs`) for the reason
+`$fopen` and `$random` do: both are system *functions*, so `eval` is the only thing that
+can read them. `Simulator::add_plusarg` is the seam, beside `add_search_path`, and it takes
+the word with or without its `+`; the conversions themselves are `plusargs.rs`.
+
+**An empty plus-arg list is an answer, not a failure.** visilog has no CLI, so a design
+run through the library sees nothing unless its caller says otherwise — `$test` is `0` and
+`$value` is `0` with its target **untouched**, which is exactly the branch
+`if (!$value$plusargs(…))` exists to take. The corpus harness reads the `+` fields out of
+the entry's own line in `regress-vlg.list`, which is where iverilog's `RegressionList.pm`
+reads them from; without that, four self-checking designs would run their checks against
+an option they had been told they were not given.
+
+**The conversions are deliberately not `scan.rs`'s**, and every rule was measured against
+iverilog 12.0. Text that will not convert is `x` at the target's width **and the call still
+answers `1`** — a plus-arg is a value the design was handed, so reading it is not optional —
+where a `$sscanf` would stop and report how far it got. An *empty* value is `0` rather than
+`x`, and iverilog draws no warning for that one. `_` is a separator anywhere, including
+leading; a sign negates the value in whatever base it was written and the answer is sign
+extended (`+neg=-1_00` read as `%h` into a `reg [7:0]` is `8'h00`); `x` and `z` are digits
+of the base for `%b`/`%o`/`%h`/`%x` and stand for the whole value for `%d`, where `?` is
+**not** one of them; `%e`/`%f`/`%g` take the longest numeric prefix, so `9.825units` is
+`9.825`; `%s` lands at the low end of its target. The conversion letter's case does not
+matter and `%x` is `%h`. A format with no `%` in it is `EvalError::PlusArgs` naming it,
+never a quiet `0` — that would look exactly like a plus-arg nobody gave.
+
+Two things iverilog does that this does not. It prints a `WARNING:` line on **standard
+output** naming the offending text and the source line, which visilog has no line numbers
+to name. And it applies the write before the statement that made the call has finished, so
+`$display("%h", $value$plusargs(…), v)` prints the *new* `v`, where here the fill lands at
+the next instruction boundary like `$sscanf`'s and prints the old one.
+
 **Signedness is modelled.** `reg signed [3:0] a;`,
 `wire signed`, `input signed`, an `integer`, `4'sd12` and a bare decimal like `42` are all
 signed; everything else is unsigned. It rides on the `Register` a lookup produces — a
@@ -1358,15 +1394,16 @@ telling apart.
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` |
 | `eval.rs` | `eval(&Expression, &StateStore) -> Result<Register, EvalError>` — the four-state expression evaluator, plus `eval_sized` for an assignment's right hand side; signedness *and* width (`expression_is_signed` / `expression_width` / `operand_rule` / `widened`), realness (`expression_is_real` / `real_binary` / `real_unary`), the `$name` system functions and the `SYSTEM_FUNCTIONS` table naming them — including the reading half, `$sscanf` / `$fscanf` / `$fgets` / `$fgetc` / `$ungetc` / `$feof` / `$ftell` / `$fseek` / `$rewind` — and `call_function` for the design's own |
+| `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` — edge detection and sensitivity matching |
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `gate_output`, the four-state truth tables; and `resolve_bit`, the strength-ordered net resolution |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, and `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness and whether it was declared a net), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream, the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
@@ -1419,6 +1456,16 @@ two populations get outcomes of their own (`GoldMatch` / `GoldMismatch`) so they
 distinguishable in the report. `gold=` is scanned for across every field past the
 directory, not read from a fixed position, because the optional top-module name comes
 first when an entry has one (`shellho1 normal ivltests top gold=shellho1.gold`).
+
+**An entry's *kind* field carries the plus-args, and they are part of the test.** It is
+comma separated after `normal` — `br937 normal,+string=0123456789 ivltests` — and
+iverilog's own `perl-lib/RegressionList.pm` splits it the same way, handing every field
+that begins with `+` to `vvp` and the rest to the compiler. `Entry::plusargs` keeps them
+and `judge_with` hands them to `Simulator::add_plusarg`; a design that reads one and is
+given nothing runs its checks against an option it was told it did not have, which is a
+wrong answer rather than a missing feature. The compiler fields are *not* passed — the
+command files `pr1403406a`/`b` name (`-fivltests/pr1403406-1.cf`, which set a default
+`` `timescale ``) have nowhere to go.
 
 Two rules make a gold comparison mean something (`gold_lines` / `first_difference`):
 

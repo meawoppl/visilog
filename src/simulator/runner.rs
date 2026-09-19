@@ -476,6 +476,11 @@ pub struct Simulator {
     /// after the process working directory. Kept here and handed to each fresh
     /// store for the same reason `output_directory` is.
     search_paths: Vec<PathBuf>,
+    /// The `+name=value` words the design was started with, without their `+`.
+    /// Kept here and handed to each fresh store for the same reason
+    /// `search_paths` is: [`Simulator::setup`] builds a new `StateStore` and
+    /// what the caller configured outlives any one elaboration.
+    plusargs: Vec<String>,
     /// The `` `timescale `` the source declared, which a waveform dump states
     /// in its header. A `Simulator` is built from parsed *modules* and a
     /// timescale is a property of the *file*, so — like the search path and the
@@ -520,6 +525,7 @@ impl Simulator {
             tasks: TaskContext::new(),
             output_directory: None,
             search_paths: Vec::new(),
+            plusargs: Vec::new(),
             timescale: None,
         }
     }
@@ -573,6 +579,7 @@ impl Simulator {
             self.state.set_output_directory(directory.clone());
         }
         self.state.set_search_paths(self.search_paths.clone());
+        self.state.set_plusargs(self.plusargs.clone());
         self.assignments = elaborated.assignments;
         // A design that names no delay on any `assign` keeps an empty vector,
         // so the propagation loop asks nothing per pass.
@@ -917,6 +924,22 @@ impl Simulator {
     pub fn add_search_path(&mut self, directory: impl Into<PathBuf>) {
         self.search_paths.push(directory.into());
         self.state.set_search_paths(self.search_paths.clone());
+    }
+
+    /// Adds one `+name=value` word to what `$test$plusargs` and
+    /// `$value$plusargs` read, with or without its leading `+`.
+    ///
+    /// A plus-arg is the one thing a design learns about its own invocation,
+    /// and visilog has no command line to learn it from — so, like the search
+    /// path, it is something only the caller knows. A design given none is told
+    /// so rather than failing: `$test$plusargs` answers `0` and
+    /// `$value$plusargs` answers `0` and leaves its target alone, which is
+    /// exactly what a design checks for.
+    pub fn add_plusarg(&mut self, plusarg: impl AsRef<str>) {
+        let plusarg = plusarg.as_ref();
+        self.plusargs
+            .push(plusarg.strip_prefix('+').unwrap_or(plusarg).to_string());
+        self.state.set_plusargs(self.plusargs.clone());
     }
 
     /// Where a relative `$fopen` or `$writemem…` path is written, which
@@ -5707,6 +5730,87 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("visilog-{}", name));
         fs::create_dir_all(&directory).expect("scratch directory should be creatable");
         directory
+    }
+
+    /// The plus-args a caller handed the simulator reach a design through
+    /// `$test$plusargs` and `$value$plusargs`, and a plus-arg nothing matches
+    /// leaves its target **alone** — which is the answer a design reads, not a
+    /// failure. Every line is what iverilog 12.0 prints for the same design run
+    /// as `vvp … +option=0123456789abcdef +rate=2.5`.
+    ///
+    /// Each read is its own statement on purpose: a fill lands at the next
+    /// instruction boundary, the same way `$sscanf`'s does, so a design that
+    /// reads the target in the *same* statement as the call sees the old value
+    /// where iverilog sees the new one.
+    #[test]
+    fn test_plusargs_reach_a_design_and_a_missing_one_changes_nothing() {
+        let (remaining, module) = parse_module_declaration(
+            r#"
+            module reader();
+                reg [63:0] wide;
+                reg [31:0] norm;
+                real rate;
+                integer code;
+                initial begin
+                    $display("%0d %0d", $test$plusargs("opt"), $test$plusargs("nope"));
+                    code = $value$plusargs("option=%h", wide);
+                    $display("%0d %h", code, wide);
+                    code = $value$plusargs("option=%h", norm);
+                    $display("%0d %h", code, norm);
+                    code = $value$plusargs("missing=%d", norm);
+                    $display("%0d %h", code, norm);
+                    code = $value$plusargs("rate=%f", rate);
+                    $display("%0d %f", code, rate);
+                end
+            endmodule
+        "#,
+        )
+        .expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+
+        let mut simulator = Simulator::new(module);
+        // With and without the `+`, which is how a caller has it either way.
+        simulator.add_plusarg("+option=0123456789abcdef");
+        simulator.add_plusarg("rate=2.5");
+        simulator.setup().expect("design should run");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "1 0",
+                "1 0123456789abcdef",
+                "1 89abcdef",
+                "0 89abcdef",
+                "1 2.500000",
+            ]
+        );
+    }
+
+    /// A design handed no plus-args at all is *told* so rather than stopped:
+    /// `$test$plusargs` is `0` and `$value$plusargs` is `0` with its target
+    /// untouched, which is exactly the branch `if (!$value$plusargs(…))` exists
+    /// to take. visilog has no command line, so this is what every caller that
+    /// says nothing gets.
+    #[test]
+    fn test_a_design_with_no_plusargs_is_told_so() {
+        let (_, module) = parse_module_declaration(
+            r#"
+            module reader();
+                reg [7:0] opt;
+                integer code;
+                initial begin
+                    opt = 8'h5a;
+                    code = $value$plusargs("size=%d", opt);
+                    $display("%0d %0d %h", $test$plusargs("size"), code, opt);
+                end
+            endmodule
+        "#,
+        )
+        .expect("design should parse");
+
+        let mut simulator = Simulator::new(module);
+        simulator.setup().expect("design should run");
+        assert_eq!(simulator.output().lines(), vec!["0 0 5a"]);
     }
 
     /// IEEE 1364-2005's load direction, measured against iverilog 12.0 on a

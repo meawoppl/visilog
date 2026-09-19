@@ -57,6 +57,16 @@ struct Entry {
     name: String,
     kind: String,
     gold: Option<String>,
+    /// The `+name=value` words the entry asks the simulator to be started
+    /// with, without their `+`.
+    ///
+    /// They ride in the *kind* field, comma separated after `normal` —
+    /// `br937 normal,+string=0123456789 ivltests` — which is exactly where
+    /// iverilog's own driver reads them from: `perl-lib/RegressionList.pm`
+    /// splits that field on commas and hands everything beginning with `+` to
+    /// `vvp`. A field that does not begin with `+` is a compiler argument and
+    /// is not one of these.
+    plusargs: Vec<String>,
 }
 
 /// Parses a regression list. Lines are
@@ -76,7 +86,17 @@ fn entries(list: &str) -> Vec<Entry> {
             let gold = fields
                 .find_map(|field| field.strip_prefix("gold="))
                 .map(str::to_string);
-            Some(Entry { name, kind, gold })
+            let plusargs = kind
+                .split(',')
+                .filter_map(|field| field.strip_prefix('+'))
+                .map(str::to_string)
+                .collect();
+            Some(Entry {
+                name,
+                kind,
+                gold,
+                plusargs,
+            })
         })
         .collect()
 }
@@ -442,7 +462,7 @@ fn scratch_directory() -> PathBuf {
 }
 
 fn judge(source: &str) -> Outcome {
-    judge_with(&Preprocessor::new(), source, None, &[])
+    judge_with(&Preprocessor::new(), source, None, &[], &[])
 }
 
 /// [`judge`], with an include path — which only the corpus itself needs, since
@@ -453,6 +473,7 @@ fn judge_with(
     source: &str,
     gold: Option<&str>,
     search_paths: &[PathBuf],
+    plusargs: &[String],
 ) -> Outcome {
     let Ok(parsed) = front_end(preprocessor, source) else {
         return Outcome::ParseFailed;
@@ -472,6 +493,13 @@ fn judge_with(
     // they came from, so the harness — which does know — supplies the path.
     for directory in search_paths {
         simulator.add_search_path(directory.clone());
+    }
+    // A plus-arg is the one thing a design learns about its own invocation, and
+    // the entry's own line in the list is where iverilog's driver reads it
+    // from. Without these a design that reads one runs its checks against an
+    // option it has been told it was not given.
+    for plusarg in plusargs {
+        simulator.add_plusarg(plusarg);
     }
     // A corpus design that opens a file writes it *next to itself* — every one
     // of them names `work/…`, which is the directory iverilog's own test driver
@@ -588,7 +616,13 @@ fn ivtest_corpus_closure_rate() {
         }
         outcomes.push((
             entry.name.clone(),
-            judge_with(&preprocessor, &source, gold.as_deref(), &search_paths),
+            judge_with(
+                &preprocessor,
+                &source,
+                gold.as_deref(),
+                &search_paths,
+                &entry.plusargs,
+            ),
         ));
     }
 
@@ -827,7 +861,7 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
     "#;
     let gold = "  a = 3\n  b = 4\n";
     assert_eq!(
-        judge_with(&Preprocessor::new(), source, Some(gold), &[]),
+        judge_with(&Preprocessor::new(), source, Some(gold), &[], &[]),
         Outcome::GoldMatch
     );
 
@@ -835,13 +869,13 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
     // leading indent is not, because column alignment is what these tests check.
     let sloppy = "  a = 3   \n  b = 4";
     assert_eq!(
-        judge_with(&Preprocessor::new(), source, Some(sloppy), &[]),
+        judge_with(&Preprocessor::new(), source, Some(sloppy), &[], &[]),
         Outcome::GoldMatch
     );
 
     // A different value must be reported as a mismatch, naming where it parted.
     let wrong = "  a = 3\n  b = 5\n";
-    let outcome = judge_with(&Preprocessor::new(), source, Some(wrong), &[]);
+    let outcome = judge_with(&Preprocessor::new(), source, Some(wrong), &[], &[]);
     match outcome {
         Outcome::GoldMismatch(difference) => {
             assert!(
@@ -862,7 +896,7 @@ fn harness_scores_a_gold_test_by_comparing_its_output() {
         endmodule
     "#;
     assert_eq!(
-        judge_with(&Preprocessor::new(), mute, Some(""), &[]),
+        judge_with(&Preprocessor::new(), mute, Some(""), &[], &[]),
         Outcome::Silent
     );
 }
