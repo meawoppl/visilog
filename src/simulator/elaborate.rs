@@ -152,12 +152,15 @@ const MAX_INSTANTIATION_DEPTH: usize = 24;
 /// design that plausibly elaborates.
 const MAX_INSTANCES: usize = 65_536;
 
-/// `walk` compiles a module's functions and tasks before it unrolls a
-/// generate region, so one written *inside* a block would be missing from the
-/// store a call looks in — a call that quietly found nothing is the hardest
-/// kind of wrong answer to find.
-const GENERATE_SUBPROGRAM_UNSUPPORTED: SimulationError =
-    SimulationError::Unsupported("a function or task declared inside a generate block");
+/// A task is keyed in the [`TaskTable`] by the name an enable *spells*, which
+/// is the bare one both inside a generate block and outside it — so a task
+/// declared in a block and one declared by the module around it have a single
+/// slot between them, and the enable cannot say which it meant. A function has
+/// no such table: it is stored under its qualified name and a call resolves
+/// through the scope like any other reference, which is why that half is
+/// supported and this one is not.
+const GENERATE_TASK_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("a task declared inside a generate block");
 
 /// A memory bigger than [`MAX_MEMORY_DEPTH`] words.
 const MEMORY_TOO_LARGE: SimulationError =
@@ -507,7 +510,13 @@ impl<'m> Elaborator<'m> {
         // task enable written inside one is not read as a name nothing
         // declares.
         let tasks = self.declare_tasks(module, scope)?;
-        self.declare_functions(module, scope, &tasks)?;
+        let own_functions: Vec<(&ModuleStatement, &Scope)> = module
+            .statements
+            .iter()
+            .filter(|statement| matches!(statement, ModuleStatement::FunctionDeclaration(_)))
+            .map(|statement| (statement, &*scope))
+            .collect();
+        self.declare_functions(&own_functions, &tasks)?;
         for statement in deferred {
             self.declare(statement, scope)?;
         }
@@ -536,6 +545,32 @@ impl<'m> Elaborator<'m> {
             if let ModuleStatement::GenerateRegion(items) = statement {
                 self.expand_generate(items, scope, &mut generated)?;
             }
+        }
+
+        // A function declared *inside* a generate block belongs to that block,
+        // so it cannot be compiled until the region has been unrolled and the
+        // block has a scope. The module's own are compiled a second time
+        // alongside it rather than being kept from the first round, because
+        // `close_reads` has to see the whole call graph at once — a block's
+        // function may call one of the module's, and the outer call's frame has
+        // to hold what the inner one reads. A design with no function in a
+        // generate block does none of this and pays one `Iterator::any`.
+        if generated
+            .iter()
+            .any(|(statement, _)| matches!(statement, ModuleStatement::FunctionDeclaration(_)))
+        {
+            let all: Vec<(&ModuleStatement, &Scope)> = module
+                .statements
+                .iter()
+                .filter(|statement| matches!(statement, ModuleStatement::FunctionDeclaration(_)))
+                .map(|statement| (statement, &*scope))
+                .chain(
+                    generated
+                        .iter()
+                        .map(|(statement, inner)| (*statement, inner)),
+                )
+                .collect();
+            self.declare_functions(&all, &tasks)?;
         }
 
         for statement in &module.statements {
@@ -638,10 +673,7 @@ impl<'m> Elaborator<'m> {
                     ModuleStatement::Defparam(assignments) => {
                         self.record_defparams(assignments, scope)?
                     }
-                    ModuleStatement::FunctionDeclaration(_)
-                    | ModuleStatement::TaskDeclaration(_) => {
-                        return Err(GENERATE_SUBPROGRAM_UNSUPPORTED)
-                    }
+                    ModuleStatement::TaskDeclaration(_) => return Err(GENERATE_TASK_UNSUPPORTED),
                     _ => out.push((statement, scope.clone())),
                 },
                 GenerateItem::Block(block) => self.expand_block(block, None, scope, out)?,
@@ -1212,12 +1244,11 @@ impl<'m> Elaborator<'m> {
     /// what it calls needs all of them in hand.
     fn declare_functions(
         &mut self,
-        module: &VerilogModule,
-        scope: &Scope,
+        declarations: &[(&ModuleStatement, &Scope)],
         tasks: &TaskTable,
     ) -> Result<(), SimulationError> {
         let mut staged: BTreeMap<String, FunctionDefinition> = BTreeMap::new();
-        for statement in &module.statements {
+        for (statement, scope) in declarations {
             if let ModuleStatement::FunctionDeclaration(function) = statement {
                 let definition = self.compile_function(function, scope, tasks)?;
                 staged.insert(definition.result.name.clone(), definition);
@@ -3379,6 +3410,12 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
         ModuleStatement::ModuleInstantiation(instantiation) => {
             names.push(instantiation.instance_name.name.clone())
         }
+        // A function declared inside a generate block is stored under the
+        // block's prefix, so a call written inside the block has to resolve
+        // through it — without the name here, `funfun(select)` beside the
+        // `endfunction` resolves outwards to the module and finds nothing
+        // (corpus `generate_case2`).
+        ModuleStatement::FunctionDeclaration(function) => names.push(function.name.name.clone()),
         // A named block is a scope, and one opened inside a generate block
         // belongs to that block: `elaborate` declares its variables under the
         // block's prefix, so the label has to be here or a reference to one of
@@ -3784,6 +3821,57 @@ mod tests {
         );
         simulator.advance(1).expect("the design should run");
         assert_eq!(simulator.output().text(), "i=7\n");
+    }
+
+    /// A function declared inside a generate block belongs to that block, so it
+    /// is stored under the block's prefix — `blk.f` — and a call resolves to it
+    /// through the scope the way any other reference does: the bare `f(…)`
+    /// written beside the `endfunction`, and the hierarchical `blk.f(…)` written
+    /// outside. The block's own signals are what the two spellings have to agree
+    /// about, since the body reads them through the same resolver.
+    ///
+    /// iverilog 12.0 prints `inside=5 outside=9` for this design.
+    #[test]
+    fn test_a_function_declared_inside_a_generate_block_is_scoped_to_it() {
+        let source = r#"
+            module top;
+                generate
+                    if (1) begin : blk
+                        function [7:0] twice;
+                            input [7:0] a;
+                            twice = a + a;
+                        endfunction
+                        initial $display("inside=%0d", twice(2) + 1);
+                    end
+                endgenerate
+                initial #1 $display("outside=%0d", blk.twice(4) + 1);
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "inside=5\noutside=9\n");
+    }
+
+    /// A *task* in a generate block is still a named error, because the
+    /// [`TaskTable`] is keyed by the name an enable spells — which is the bare
+    /// one inside a block and outside it alike, so the two would share a slot.
+    #[test]
+    fn test_a_task_declared_inside_a_generate_block_is_named() {
+        let source = r#"
+            module top;
+                generate
+                    if (1) begin : blk
+                        task nudge;
+                            $display("nudged");
+                        endtask
+                    end
+                endgenerate
+            endmodule
+        "#;
+        assert!(matches!(
+            setup_error(&[source], "top"),
+            SimulationError::Unsupported("a task declared inside a generate block")
+        ));
     }
 
     /// A generate `case` picks its arm by identity, and falls through to
