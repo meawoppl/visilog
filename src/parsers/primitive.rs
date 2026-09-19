@@ -533,6 +533,7 @@ pub fn parse_primitive_declaration(input: &str) -> IResult<&str, VerilogModule> 
                 rows,
             })],
             timescale: None,
+            unconnected_drive: None,
         },
     ))
 }

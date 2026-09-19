@@ -35,6 +35,16 @@ pub struct VerilogModule {
     /// by a test therefore carries the default, which is what a design with no
     /// directive in it has.
     pub timescale: Option<Timescale>,
+    /// The `` `unconnected_drive `` in force where this module was written,
+    /// which says what an *unconnected input port* of it reads: `Some(true)`
+    /// for `pull1`, `Some(false)` for `pull0`, and `None` — the default — for
+    /// the `z` a port nothing drives otherwise has.
+    ///
+    /// It is stamped exactly the way [`VerilogModule::timescale`] is, and for
+    /// the same reason: the directive is positional and the grammar never sees
+    /// one. It belongs to the module's *declaration* rather than to the
+    /// instantiation, which is what IEEE 1364-2005 §19.9 asks for.
+    pub unconnected_drive: Option<bool>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -426,6 +436,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             ports,
             statements,
             timescale: None,
+            unconnected_drive: None,
         },
     ))
 }
