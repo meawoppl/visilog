@@ -471,21 +471,36 @@ fn system_function_call(input: &str) -> IResult<&str, Expression> {
     ))
 }
 
-fn fn_call(input: &str) -> IResult<&str, Expression> {
-    let (input, id) = hierarchical_identifier(input)?;
-    let (input, args) = delimited(
-        tag("("),
-        separated_list1(tag(","), ws(verilog_expression)),
-        tag(")"),
-    )(input)?;
-
-    Ok((input, Expression::FunctionCall(id, args)))
+/// A name, and the argument list that would make it a call to one of the
+/// design's own functions.
+///
+/// One parser rather than two alternatives, because a call and a plain name
+/// begin identically: trying `f(a, b)` and then `a` separately reads every
+/// operand's name twice, once to fail at the `(` and once to keep it. That is
+/// also what pays for the widening below.
+///
+/// The name and the `(` are separate tokens, so `f1 ( f1 (1) )` and
+/// `mux ( INIT, {a1, a0})` are calls. It is the same widening a select's `[`
+/// already has, and safe for the same reason: in an operand position a name
+/// followed by a parenthesised list can only be a call, so nothing else can
+/// claim the `(`.
+fn call_or_name(input: &str) -> IResult<&str, Expression> {
+    let (rest, id) = hierarchical_identifier(input)?;
+    let arguments = preceded(
+        ws_and_comments,
+        delimited(
+            tag("("),
+            separated_list1(tag(","), ws(verilog_expression)),
+            tag(")"),
+        ),
+    )(rest);
+    match arguments {
+        Ok((after, args)) => Ok((after, Expression::FunctionCall(id, args))),
+        Err(_) => Ok((rest, Expression::Identifier(id))),
+    }
 }
 
 fn operand(input: &str) -> IResult<&str, Expression> {
-    // NOTE(meawoppl)
-    // fn_call has to go before identifier, as function names
-    // are valid identifiers
     ws(operand_no_ws)(input)
 }
 
@@ -499,18 +514,17 @@ fn operand(input: &str) -> IResult<&str, Expression> {
 //      a & &b (reduction AND of b, then bitwise AND with a)
 
 fn operand_no_ws(input: &str) -> IResult<&str, Expression> {
-    // NOTE(meawoppl)
-    // fn_call has to go before identifier, as function names
-    // are valid identifiers
     alt((
         // A `$name` can start nothing else, so it is unambiguous first.
         system_function_call,
-        fn_call,
         // One parser for every shape of `name[...]`, including the two-bracket
         // `mem[i][3:0]`: the name and the first bracket are common to all of
         // them and are parsed once.
         select,
-        map(hierarchical_identifier, Expression::Identifier),
+        // A call and a plain name are one parser too, which is what keeps a
+        // name from being read twice. It has to come *after* `select`, since
+        // it answers for any name at all and would leave a `[` behind.
+        call_or_name,
         // Before the integer grammar, which would otherwise read `0.9` as the
         // constant `0` and leave `.9` behind.
         real_literal,
@@ -1526,6 +1540,24 @@ mod tests {
             let expr_no_ws = expr.replace(" ", "");
             let result = verilog_expression(&expr_no_ws);
             assert!(result.is_ok(), "Failed to parse expression: {}", expr);
+        }
+    }
+
+    #[test]
+    /// The name and the `(` of a call are separate tokens, exactly as a name
+    /// and the `[` of a select are — `f1 ( f1 (1) )` is a call of a call.
+    #[test]
+    fn test_a_call_may_be_separated_from_its_argument_list() {
+        assert_parses_to(
+            verilog_expression,
+            "f1 (1)",
+            Expression::FunctionCall(
+                Identifier::new("f1".to_string()),
+                vec![Expression::Constant(VerilogConstant::from_int(1))],
+            ),
+        );
+        for source in ["f1 ( f1 (1) )", "mux ( INIT, {a1, a0})", "f/* here */(a)"] {
+            assert_parses(verilog_expression, source);
         }
     }
 

@@ -1958,6 +1958,15 @@ tripwire.
   comments before the `[`. That widening is safe where the unary junction's is not: `[` is
   not an operator, so nothing else can claim it. `operand_no_ws` still refuses whitespace
   between a unary operator and its operand, which is what tells `a && b` from `a & &b`.
+- **A call may be separated from its argument list, and a call and a plain name are one
+  parser.** `f1 ( f1 (1) )` and `mux ( INIT, {a1, a0})` are calls, safe for the reason a
+  separated `[` is: in an operand position a name followed by a parenthesised list can
+  only be a call. Paying for that skip on every operand cost **4% on `bench parse/*`**
+  while `fn_call` was its own `alt` alternative ahead of `identifier`, because a name was
+  then read twice — once to fail at the `(` and once to keep it. `call_or_name` reads it
+  once and comes out 5% *faster* than the arrangement without the widening at all. It
+  therefore sits **after** the selects in `operand_no_ws`, since it answers for any name
+  at all and would otherwise leave their `[` behind.
 - **A based literal is three tokens.** The size, the base designator and the digits are
   separated by whitespace and comments exactly as `#` is from its delay value, so `5'h 0`
   and `5 'h0` parse. The `'` and its base letter are *one* token — `5 ' h0` is not a
