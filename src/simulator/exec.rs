@@ -749,16 +749,34 @@ pub fn apply_drive(state: &mut StateStore, drive: &Drive) -> Result<bool, Simula
 pub fn release_drive(state: &mut StateStore, target: &Expression) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
     remove_drives_over(state, &resolved, DriveLevel::Force)?;
-    // A `release` puts nothing back. A **net** reverts anyway, because its
-    // continuous drivers reach it again on the next pass; a **variable** has no
-    // driver, so it keeps the value the force left. That asymmetry is the whole
-    // of the rule, and it is what iverilog does: releasing a forced `reg` holding
-    // `1010` leaves `1010`, while releasing a forced `wire` returns it to its
-    // assignment.
+    // A `release` puts nothing back. A **variable** therefore keeps the value
+    // the force left it holding: nothing drives it, so nothing can say
+    // otherwise. A **net** has no value of its own at all — only what its
+    // drivers give it — so releasing one *floats* it, and `propagate` then
+    // re-asserts every continuous driver in the same settle round, which
+    // restores a driven net before anything can read the `z`. A net nothing
+    // drives at all really is `z`, which is what iverilog 12.0 answers and
+    // what leaving the forced value standing could not say (corpus
+    // `pr1735836`).
+    if floats_when_released(state, &resolved) {
+        let floating = Register::high_impedance(resolved.width(state));
+        drive_at(state, &resolved, &floating, DriveLevel::Procedural)?;
+    }
     if let Some(assign) = state.drive(resolved.name(), DriveLevel::Assign).cloned() {
         apply_drive(state, &assign)?;
     }
     Ok(())
+}
+
+/// Whether releasing this target leaves it floating: it names a **net**, which
+/// holds only what its drivers give it. A variable keeps what the force left.
+fn floats_when_released(state: &StateStore, target: &ResolvedTarget) -> bool {
+    match target {
+        ResolvedTarget::Whole(name) | ResolvedTarget::Bits { name, .. } => state
+            .get_signal(name)
+            .is_some_and(crate::simulator::state_store::SignalState::is_net),
+        _ => false,
+    }
 }
 
 /// `deassign v;` — drops the procedural continuous assignment on `v`, leaving
