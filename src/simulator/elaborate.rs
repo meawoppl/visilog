@@ -3061,7 +3061,7 @@ impl BodyNames {
             | Instruction::RepeatNext { .. }
             | Instruction::Task(_)
             | Instruction::Delay(_)
-            | Instruction::Disable(_)
+            | Instruction::Disable { .. }
             | Instruction::Fork { .. }
             | Instruction::JoinBranch
             | Instruction::Halt => {}

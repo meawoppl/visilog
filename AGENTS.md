@@ -1337,20 +1337,33 @@ its `fork` field**, so it still reaches its `JoinBranch` and the `fork` complete
 a fresh `ExecutionCursor::new` for it instead gives it `fork: None`, which reaches
 `JoinBranch` as "the compiled layout and the scheduler have parted company" and is reported
 as `FORK_TIMING_UNSUPPORTED` — naming the wrong thing entirely. The question "is this fork
-inside the scope?" is asked of the fork record's *parent* cursor, which is the instruction
-the join sits at (corpus `disable3.6B`; measured against iverilog 12.0, which resumes the
-join at the instant of the `disable` rather than at the instant the cancelled branch would
-have finished).
+inside the scope?" is asked of the `Instruction::Fork` **site**, which `ForkJoin` keeps
+beside the parent cursor: a labelled `fork`'s own scope runs from that instruction up to
+but *not* including the join, so asking the parent — which sits at the join — answers `no`
+for the fork's own label and turns `disable F` into a per-thread cancellation (corpus
+`disable3.6B`, `pr718`; measured against iverilog 12.0, which resumes the join at the
+instant of the `disable` rather than at the instant the cancelled branch would have
+finished).
 
 `join_any` and `join_none` are not implemented, and `block_between` closing on a
 word-boundary `keyword` rather than a bare `tag` is what keeps them out: without it,
 `fork … join_any` would read as a plain `join` with a stray `_any` after it and hand the
-design semantics it did not ask for. They are a parse error instead. A `disable` written
-inside a branch naming a scope the `fork` itself sits in is `Unsupported` by name
-(`Program::check_fork_disables`, a post-pass because the enclosing block's range is not
-recorded until the block around the `fork` has finished compiling): the jump a local
-`disable` compiles to would stop the one thread that ran it and leave the join waiting for
-an arrival that can never come. A branch that genuinely never arrives holds *its own* join
+design semantics it did not ask for. They are a parse error instead.
+
+**A `disable` written inside a branch naming a scope the `fork` itself sits in is the one
+`disable` whose scope contains it and which still cannot be a jump.** The jump would stop
+the one thread that ran it and leave the join waiting for an arrival that can never come,
+so `Program::mark_fork_disables` flags it — `Instruction::Disable::escapes_fork` — and
+`resume` sends it to the driver like a non-local one. It is a post-pass because the
+enclosing block's range is not recorded until the block around the `fork` has finished
+compiling. `cancel_scope` then cancels the whole activation, which is what it already did
+for a scope containing a `fork`, and it now *says so*: it answers whether the block that
+ran the `disable` was one of the blocks it cancelled, and `resume_block` stops that thread
+instead of carrying on from the next instruction — carrying on would give the design two
+threads of one block. Corpus `disable_fork`, `pr540`, `pr718`. Where execution resumes is
+the scope's end and not the join, so `disable blk` for a `begin : blk` *around* the fork
+skips the statement after the `join` as well (measured against iverilog 12.0). A branch
+that genuinely never arrives holds *its own* join
 for ever, which is what the LRM says, and holds nothing else — the other branches still run
 and time still moves.
 
