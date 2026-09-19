@@ -30,8 +30,8 @@ use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::Expression;
 use crate::register::{Register, REAL_WIDTH};
 use crate::simulator::eval::{
-    eval, eval_sized, indexed_select_indices, indexed_select_width, EvalError, MAX_SELECT_WIDTH,
-    SELF_DETERMINED,
+    eval, eval_sized, indexed_select_indices, indexed_select_width, select_index, EvalError,
+    MAX_SELECT_WIDTH, SELF_DETERMINED,
 };
 use crate::simulator::program::{
     resume, Program, Resume, TaskTable, DELAY_UNSUPPORTED, FORK_TIMING_UNSUPPORTED,
@@ -715,9 +715,7 @@ fn drive_word(
 /// The index a select on the left of an assignment names, or `None` when it is
 /// not a known number — which makes the write land nowhere rather than fail.
 fn known_index(state: &StateStore, expr: &Expression) -> Result<Option<i64>, SimulationError> {
-    Ok(eval(expr, state)?
-        .to_u128()
-        .and_then(|value| i64::try_from(value).ok()))
+    Ok(select_index(&eval(expr, state)?)?)
 }
 
 fn drive_bits(

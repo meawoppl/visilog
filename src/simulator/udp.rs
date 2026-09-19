@@ -118,7 +118,7 @@ impl Udp {
 mod tests {
     use crate::parsers::source::parse_verilog_source;
     use crate::register::{Register, ONE, X, Z, ZERO};
-    use crate::simulator::runner::{SimulationError, Simulator};
+    use crate::simulator::runner::Simulator;
 
     /// A one-bit stimulus value.
     fn bit(code: u8) -> Register {

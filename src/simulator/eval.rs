@@ -403,8 +403,9 @@ fn eval_in_context(
             Ok(widened(Register::concatenated(&repeated), width))
         }
         Expression::BitSelect(id, index) => {
-            // An index that is unknown, or too large to be a bit number, selects `x`.
-            let index = numeric(&eval(index, store)?)?.and_then(|value| i64::try_from(value).ok());
+            // An index that is unknown, or too far from zero to be a bit
+            // number, selects `x`.
+            let index = select_index(&eval(index, store)?)?;
             let value = match store.get_signal(&id.name) {
                 // `a[3]` where `a` is a vector: one bit of it.
                 Some(signal) => match index {
@@ -1556,21 +1557,7 @@ pub fn indexed_select_indices(
     upward: bool,
     store: &StateStore,
 ) -> Result<Option<Vec<i64>>, EvalError> {
-    let value = eval(base, store)?;
-    let Some(bits) = numeric(&value)? else {
-        return Ok(None);
-    };
-    // A base is a *position* in a vector rather than a quantity, and a vector
-    // declared `[base+15:base]` for a negative `base` really does have negative
-    // indices — so a signed base has to be read as the negative number it is.
-    // Reading `-2` as `4294967294` selects nothing and answers `xxxx`, where
-    // iverilog straddles the bottom of the vector.
-    let base = if value.is_signed() {
-        i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
-    } else {
-        i64::try_from(bits).ok()
-    };
-    let Some(base) = base else {
+    let Some(base) = select_index(&eval(base, store)?)? else {
         return Ok(None);
     };
     let span = span as i64;
@@ -1719,10 +1706,34 @@ pub(crate) fn string_bits(text: &str) -> Register {
 }
 
 fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError> {
-    let value = numeric(&eval(expr, store)?)?
-        .and_then(|value| i64::try_from(value).ok())
+    let value = select_index(&eval(expr, store)?)?
         .ok_or_else(|| EvalError::NonConstantSelectBound(expr.to_contracted_string()))?;
     Ok(value)
+}
+
+/// A value read as a **position** in a vector or a memory, rather than as a
+/// quantity: `None` when it is not a known number, or is too far from zero to
+/// be an index of anything.
+///
+/// A position may be negative — `reg [3:0] value [-7:7];` and
+/// `reg [base+15:base] big;` for a negative `base` are both ordinary Verilog —
+/// so a *signed* value has to be read as the negative number it is. Reading
+/// `-7` as `18446744073709551609` names no word of any memory, which turns a
+/// write into a silent no-op and a read into `x` (corpus `negative_genvar`,
+/// `signed_net_display`).
+///
+/// This is the one place that rule lives. Every select — a bit, a part, an
+/// indexed part, and a memory word, reading and writing alike — comes through
+/// it, so none of them can disagree about which word a design named.
+pub fn select_index(value: &Register) -> Result<Option<i64>, EvalError> {
+    let Some(bits) = numeric(value)? else {
+        return Ok(None);
+    };
+    Ok(if value.is_signed() {
+        i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
+    } else {
+        i64::try_from(bits).ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,6 +1777,22 @@ fn constant_bits(
     let digits: String = digits.chars().filter(|c| *c != '_').collect();
     if digits.is_empty() {
         return Err(malformed());
+    }
+
+    // A written literal never carries a sign — the grammar reads `-1` as a
+    // unary minus over `1`. `VerilogConstant::from_int` is the one producer
+    // that can hand one over, which is how a genvar counting down reaches
+    // `-1` (corpus `negative_genvar`, `br_gh567`), so the two's complement is
+    // worked out here rather than teaching each base about a sign it cannot
+    // otherwise see.
+    if let Some(magnitude) = digits.strip_prefix('-') {
+        let width = size.unwrap_or(UNSIZED_CONSTANT_WIDTH);
+        let value = decimal_bits(magnitude)
+            .map_err(|_| malformed())?
+            .extend_msb(width)
+            .to_u128()
+            .ok_or_else(malformed)?;
+        return Ok(Register::from_u128(value.wrapping_neg(), width).with_signedness(true));
     }
 
     // These helpers only see the digits, so restate their complaint in terms

@@ -2300,6 +2300,38 @@ mod tests {
         assert_eq!(simulator.get("out").unwrap().to_binary(), "0110");
     }
 
+    /// An index is a **position**, so a negative one names a real word.
+    ///
+    /// `reg [3:0] value [-7:7];` is an ordinary declaration and `value[-7]` is
+    /// its first word. Reading the index unsigned makes `-7` into
+    /// `18446744073709551609`, which names no word of anything — so the write
+    /// is silently discarded and the read answers `x`. An index that really is
+    /// out of range is still ignored, which is what `v[-1]` on a `reg [7:0]`
+    /// asks for. iverilog 12.0 prints `-7 -1 7  v=00000000` for this design
+    /// (corpus `negative_genvar`, `signed_net_display`).
+    #[test]
+    fn test_a_negative_index_names_a_word_rather_than_a_huge_one() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg signed [3:0] value [-7:7];
+                reg [7:0] v;
+                integer j;
+                initial begin
+                    for (j = -7; j <= 7; j = j + 1) value[j] = j;
+                    $write("%0d %0d %0d", value[-7], value[-1], value[7]);
+                    v = 8'b0000_0000;
+                    v[-1] = 1'b1;
+                    $display("  v=%b", v);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "-7 -1 7  v=00000000\n");
+    }
+
     /// A vector declared `[base+15:base]` for a negative `base` really does
     /// have negative bit indices, so an indexed part select whose base is a
     /// *signed* value has to read it as the negative number it is. Reading
@@ -3503,7 +3535,7 @@ mod tests {
     /// just the first — otherwise driving the second one writes nowhere.
     #[test]
     fn test_comma_declared_registers_all_simulate() {
-        let mut simulator = simulator_for(
+        let simulator = simulator_for(
             r#"
             module lists(output wire [3:0] sum);
                 reg [3:0] a, b;

@@ -94,7 +94,10 @@ impl VerilogConstant {
             size: None,
             base_type: VerilogBaseType::Decimal,
             value: value.to_string(),
-            signed: false,
+            // A negative value has to read as one: a genvar counting down
+            // reaches `-1`, and an unsigned `-1` is `4294967295`, which makes
+            // `i >= 0` true for ever and the loop never end.
+            signed: value < 0,
         }
     }
 
