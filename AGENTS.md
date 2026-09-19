@@ -1437,14 +1437,32 @@ loop wires an instance per bit — cannot be aliased, because the port and `bus[
 one store entry. The port keeps a signal of its own and a continuous assignment carries
 it *out* to the bit, which is `Binding::Driving` against `Binding::Driven`'s inward
 direction. An output bound to something that cannot be written at all (a concatenation,
-`a + 1`) is still `UndrivablePort`, and so is an `inout` bound to a select: it is read as
-well as written, and one assignment only runs one way.
+`a + 1`) is still `UndrivablePort`, because there is nowhere for the child's value to go.
+
+**An `inout` bound to a select is *bonded*, which is neither direction of the alias.**
+A port that is read as well as written cannot be carried by an assignment, because one
+assignment only runs one way — and copying the value across is the shape that looks right
+and is wrong for the reason a `tran` is not a copy: once `bus[0]` has been copied into the
+port, a driver letting go leaves the far side holding the stale value. So `Binding::Bonded`
+gives the port a signal of its own and `Elaborator::bond_port` joins each of its bits to
+the matching bit of the connection with a `PassSwitch`, which makes the two **one node** —
+their drivers are pooled and resolved together by the machinery `tran` already needed.
+Both ends go into `resolved_nets` for the reason a switch's terminals do.
+
+`Elaborator::bit_expressions` is how the bits are enumerated, and it goes through
+`resolve_target`, so a name, a select and a concatenation of those (`.T({qh, Q})`) are all
+answered by the production that already decides which bits an assignment writes — the two
+cannot disagree about which bit of `{qh, Q}` is which. Both sides are walked from their
+**least significant** end, so a connection narrower than the port leaves the port's high
+bits joined to nothing, which is what an unconnected bit of a net already is. Corpus
+`inout2`, `inout3`, `inout4`, `br918c`, `br965`, `pr1444055`, `pr1478121`, `pr2219441`,
+`pr3296466b`, `tri2`.
 
 Still not modelled: a generate loop bound that reads a *signal* evaluates it rather than
 refusing — an `x` runs zero iterations where iverilog reports a non-constant bound, and
 `eval` cannot tell a parameter from a net through the store to say otherwise. `generate`
-items written outside `generate`/`endgenerate`, an `inout` bound to a select, and a
-`defparam` whose path indexes something other than a generate block are all unsupported.
+items written outside `generate`/`endgenerate` and a `defparam` whose path indexes
+something other than a generate block are both unsupported.
 **A user-defined primitive is a module with a truth table in it.** `primitive mux (q, sel,
 a, b); … table … endtable endprimitive` is instantiated exactly the way a module is, so
 `parsers/primitive.rs` parses one into a `VerilogModule` whose *single* statement is a
