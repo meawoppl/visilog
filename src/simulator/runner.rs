@@ -46,7 +46,7 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_strength, Gate, PassSwitch, Strength};
+use crate::simulator::gates::{resolve_strength, Driven, Gate, PassSwitch, Strength};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::{bit_position_in, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
@@ -1625,10 +1625,10 @@ impl Simulator {
                 contributions.push(Contribution {
                     target: ResolvedTarget::Whole(pulled.name.clone()),
                     value: Register::from_bits(vec![pulled.code; width]),
-                    strength: DriveStrength {
+                    strength: Driven::Declared(DriveStrength {
                         zero: pulled.strength,
                         one: pulled.strength,
-                    },
+                    }),
                 });
             }
             for (index, assignment) in self.assignments.iter().enumerate() {
@@ -1688,7 +1688,9 @@ impl Simulator {
                     contributions.push(Contribution {
                         target,
                         value,
-                        strength: assignment.strength().unwrap_or(DriveStrength::STRONG),
+                        strength: Driven::Declared(
+                            assignment.strength().unwrap_or(DriveStrength::STRONG),
+                        ),
                     });
                 } else {
                     changed |= drive_resolved(&mut self.state, &target, &value)?;
@@ -1711,7 +1713,7 @@ impl Simulator {
                 ));
             }
             for (index, gate) in self.gates.iter().enumerate() {
-                let code = gate.evaluate(&self.state)?;
+                let (code, driven) = gate.evaluate(&self.state)?;
                 // A delay does not stop a gate being a continuous driver — it
                 // only changes which value it drives, exactly as it does for
                 // an `assign`. The fresh value goes into flight; what comes
@@ -1747,12 +1749,27 @@ impl Simulator {
                         }
                     }
                 };
+                // A **delayed** gate drives at what it declared, not at the
+                // strength its inputs say this instant: the two would be out
+                // of step, since the value in hand is the one that landed
+                // `#n` ago and the strength would be the one for the value
+                // still in flight. A `bufif1` whose enable has just gone away
+                // would then let go of the net at once and keep its turn-off
+                // delay for nothing (corpus `rise_fall_decay2`). The declared
+                // strength beside the landed value is exactly the pairing
+                // every delayed gate had before a strength was modelled at
+                // all; a delayed *switch* consequently drives at `strong`
+                // rather than passing its source's level on.
+                let driven = match self.gate_delays.get(index).and_then(Option::as_ref) {
+                    Some(_) => Driven::Declared(gate.strength),
+                    None => driven,
+                };
                 for output in &gate.outputs {
                     let target = scalar_output(&self.state, resolve_target(&self.state, output)?);
                     contributions.push(Contribution {
                         target,
                         value: value.clone(),
-                        strength: gate.strength,
+                        strength: driven,
                     });
                 }
             }
@@ -1796,7 +1813,7 @@ impl Simulator {
                 contributions.push(Contribution {
                     target,
                     value,
-                    strength: DriveStrength::STRONG,
+                    strength: Driven::Declared(DriveStrength::STRONG),
                 });
             }
             // A `force` or a procedural `assign` on a *resolved* net is a
@@ -1825,7 +1842,7 @@ impl Simulator {
                     contributions.push(Contribution {
                         target,
                         value,
-                        strength: DriveStrength::STRONG,
+                        strength: Driven::Declared(DriveStrength::STRONG),
                     });
                 }
             }
@@ -1948,10 +1965,8 @@ impl Simulator {
                             let Some(position) = signal.bit_position(*index) else {
                                 continue;
                             };
-                            driven[position].push(Strength::driven(
-                                value.get_raw()[offset],
-                                contribution.strength,
-                            ));
+                            driven[position]
+                                .push(contribution.strength.of(value.get_raw()[offset]));
                         }
                     }
                     // Bits of a word are grouped by the same address a whole
@@ -1968,10 +1983,8 @@ impl Simulator {
                             let Some(position) = bit_position_in(memory.range(), *index) else {
                                 continue;
                             };
-                            driven[position].push(Strength::driven(
-                                value.get_raw()[offset],
-                                contribution.strength,
-                            ));
+                            driven[position]
+                                .push(contribution.strength.of(value.get_raw()[offset]));
                         }
                     }
                     // An event holds no value to resolve, and a concatenation
@@ -2018,7 +2031,18 @@ impl Simulator {
             // A memory word has no strength recorded: a name is in the signal
             // map or the memory map and never both, and only the signal map
             // has somewhere to keep one.
+            //
+            // A **strength** that moved counts as a change, because a MOS
+            // switch passes its source's strength on: `pullup (w); bufif1 (w,
+            // 1'b1, g);` leaves `w` at `1` whether `g` is on or not and only
+            // the level moves, and the `pmos` downstream of it has to be
+            // re-evaluated or it carries the stale one for the rest of the run
+            // (corpus `resolv1`).
             if let ResolvedTarget::Whole(name) = &target {
+                changed |= self
+                    .state
+                    .get_signal(name)
+                    .is_some_and(|signal| signal.strengths() != Some(levels.as_slice()));
                 self.state.set_strengths(name, levels);
             }
             changed |= drive_resolved(&mut self.state, &target, &Register::from_bits(bits))?;
@@ -2230,10 +2254,10 @@ impl Nodes {
 
 /// Adds one driver's claim on a whole net — or a whole memory word — to the
 /// per-bit driver lists.
-fn contribute_whole(driven: &mut [Vec<Strength>], value: &Register, strength: DriveStrength) {
+fn contribute_whole(driven: &mut [Vec<Strength>], value: &Register, strength: Driven) {
     let value = value.coerced(driven.len());
     for (offset, slot) in driven.iter_mut().enumerate() {
-        slot.push(Strength::driven(value.get_raw()[offset], strength));
+        slot.push(strength.of(value.get_raw()[offset]));
     }
 }
 
@@ -2241,7 +2265,7 @@ fn contribute_whole(driven: &mut [Vec<Strength>], value: &Register, strength: Dr
 struct Contribution {
     target: ResolvedTarget,
     value: Register,
-    strength: DriveStrength,
+    strength: Driven,
 }
 
 /// A gate terminal is one bit, so an output connected to a vector drives that
