@@ -18,6 +18,9 @@ pub enum NetType {
     Tri1,
     TriAnd,
     TriOr,
+    /// `uwire` — a wire the LRM allows exactly one driver. Nothing here counts
+    /// drivers, so it resolves exactly as a `wire` does.
+    Uwire,
     Wire,
     WireAnd,
     WireOr,
@@ -105,6 +108,7 @@ pub fn net_type(input: &str) -> nom::IResult<&str, NetType> {
     use nom::{branch::alt, bytes::complete::tag, combinator::value};
 
     alt((
+        value(NetType::Uwire, tag("uwire")),
         value(NetType::Wire, tag("wire")),
         value(NetType::WireAnd, tag("wand")),
         value(NetType::WireOr, tag("wor")),
@@ -177,12 +181,27 @@ mod tests {
             ("supply1", NetType::Supply1),
             ("tri0", NetType::Tri0),
             ("tri1", NetType::Tri1),
+            ("uwire", NetType::Uwire),
         ];
         for (input, expected) in tests {
             assert_parses_to(net_type, input, expected);
         }
 
         assert!(net_type("invalid").is_err());
+    }
+
+    #[test]
+    fn test_uwire_declaration() {
+        assert_parses_to(
+            net_declaration,
+            "uwire [31:0] foo;",
+            vec![Net::new(
+                "foo".into(),
+                Range::Constant(31, 0),
+                NetType::Uwire,
+                0,
+            )],
+        );
     }
 
     #[test]
