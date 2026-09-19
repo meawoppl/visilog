@@ -638,6 +638,25 @@ the same thing and its declaration runs after the port's, overwriting the fill, 
 spellings land on `x` with no special case. An array of nets gets the same treatment
 through `Memory::of_nets`.
 
+**A name nothing declares that is *wired to something* is a net, not an error.** That is
+IEEE 1364-2005 §4.5, and `Elaborator::declare_implicit_nets` is where it happens: the
+three places are a module instance's port connection, a gate or primitive terminal, and
+the left hand side of a continuous assignment — `assign w = 1'b1;` with no `wire w;` above
+it declares `w`. The net is one bit wide whatever it is wired to, which is iverilog's
+answer too (it warns about the width and pads), and it is declared under exactly what
+`Scope::resolve` answers for the name, because that is what the build pass asks for a
+moment later. The pass runs *after* every explicit declaration — only the names nothing
+declared are left by then — and *before* the build pass, which is what looks them up.
+
+It reaches inside a connection **expression**, because iverilog does: `.a(yy + 1)` for an
+undeclared `yy` reads `z` rather than refusing to elaborate. What it deliberately does not
+reach is a name under a *select* (`not g (bus[0], a);`), a called function's name, or a
+`$name` — an implicit net is scalar, so standing one in for a missing `wire [7:0]` would
+turn a forgotten declaration into a silent out-of-range read. That is the whole of
+`operand_names`. Worth +7 closure on its own, and the reason `` `default_nettype `` sitting
+in `IGNORED_DIRECTIVES` is now a real gap rather than a harmless one: a file that asks for
+`none` gets implicit nets anyway where iverilog would report the undeclared name.
+
 **`supply0`/`supply1` and `tri0`/`tri1` drive themselves.** They are held as
 `Elaborated::pulled_nets` and seeded as one more `Contribution` on every propagation pass
 — a `supply` at `supply` strength, a `tri0`/`tri1` at `pull` — rather than as a value
