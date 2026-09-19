@@ -706,9 +706,11 @@ pub enum DriveLevel {
 /// only thing a running procedural block is handed is a [`StateStore`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drive {
-    /// The signal the target names, which is the key the precedence rule is
-    /// answered by.
-    name: String,
+    /// The signals the target names, which are the keys the precedence rule is
+    /// answered by. A concatenation target — `assign {a, b} = e;` — names
+    /// several, and the drive holds every one of them, so that a write to any
+    /// of them finds it.
+    names: Vec<String>,
     /// The left hand side, kept unresolved so that the drive re-resolves it the
     /// way a module-level continuous assignment does — a variable index in
     /// `force m[i] = e;` follows `i`.
@@ -719,21 +721,27 @@ pub struct Drive {
 
 impl Drive {
     pub fn new(
-        name: impl Into<String>,
+        names: Vec<String>,
         target: Expression,
         value: Expression,
         level: DriveLevel,
     ) -> Self {
         Drive {
-            name: name.into(),
+            names,
             target,
             value,
             level,
         }
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Whether this drive holds any part of `name`.
+    pub fn covers(&self, name: &str) -> bool {
+        self.names.iter().any(|held| held == name)
+    }
+
+    /// Every signal this drive holds part of.
+    pub fn names(&self) -> &[String] {
+        &self.names
     }
 
     pub fn target(&self) -> &Expression {
@@ -1279,11 +1287,11 @@ impl StateStore {
         Rc::clone(&self.drives)
     }
 
-    /// The drive of `level` installed on `name`, if there is one.
+    /// The drive of `level` holding any part of `name`, if there is one.
     pub fn drive(&self, name: &str, level: DriveLevel) -> Option<&Drive> {
         self.drives
             .iter()
-            .find(|drive| drive.name == name && drive.level == level)
+            .find(|drive| drive.level == level && drive.covers(name))
     }
 
     /// Installs a drive, replacing one of the same strength on the same
@@ -1302,7 +1310,7 @@ impl StateStore {
     pub fn install_drive(&mut self, drive: Drive) {
         let drives = Rc::make_mut(&mut self.drives);
         match drives.iter_mut().find(|existing| {
-            existing.name == drive.name
+            existing.names == drive.names
                 && existing.level == drive.level
                 && existing.target == drive.target
         }) {

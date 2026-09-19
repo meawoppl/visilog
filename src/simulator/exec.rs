@@ -105,6 +105,35 @@ impl ResolvedTarget {
         matches!(self, ResolvedTarget::Parts(_))
     }
 
+    /// Every signal this target writes into, each named once.
+    ///
+    /// A [`ResolvedTarget::Parts`] is the only one that names more than one,
+    /// and it is what a drive installed on a concatenation — `assign {a, b} =
+    /// e;` — has to be found under: the precedence rule is asked per *signal*,
+    /// so a drive has to answer for each of the signals it holds.
+    pub fn names(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        self.push_names(&mut names);
+        names
+    }
+
+    fn push_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        match self {
+            ResolvedTarget::Parts(parts) => {
+                for part in parts {
+                    part.push_names(names);
+                }
+            }
+            ResolvedTarget::Nowhere => {}
+            other => {
+                let name = other.name();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
     /// How many bits the target holds, which is the width context the right
     /// hand side of the assignment is evaluated in.
     ///
@@ -505,20 +534,40 @@ fn held_bits(state: &StateStore, name: &str, level: DriveLevel) -> Result<Held, 
     let drives = state.drives();
     let mut bits: Vec<i64> = Vec::new();
     for drive in drives.iter() {
-        if drive.name() != name || drive.level() <= level {
+        if drive.level() <= level || !drive.covers(name) {
             continue;
         }
-        match resolve_target(state, drive.target())? {
-            ResolvedTarget::Bits { indices, .. } => bits.extend(indices),
-            // A whole signal, a memory word or an event: nothing narrower to
-            // say, so the write is refused outright.
-            _ => return Ok(Held::Everything),
+        if !held_by(&resolve_target(state, drive.target())?, name, &mut bits) {
+            return Ok(Held::Everything);
         }
     }
     if bits.is_empty() {
         Ok(Held::Nothing)
     } else {
         Ok(Held::Bits(bits))
+    }
+}
+
+/// Collects the bits of `name` that `target` holds, reporting `false` when it
+/// holds all of it.
+///
+/// A concatenation is asked part by part, because only the parts that name
+/// this signal say anything about it: `assign {a, b[1]} = e;` holds the whole
+/// of `a` and one bit of `b`.
+fn held_by(target: &ResolvedTarget, name: &str, bits: &mut Vec<i64>) -> bool {
+    match target {
+        ResolvedTarget::Bits {
+            name: held,
+            indices,
+        } if held == name => {
+            bits.extend(indices.iter().copied());
+            true
+        }
+        ResolvedTarget::Bits { .. } | ResolvedTarget::Nowhere => true,
+        ResolvedTarget::Parts(parts) => parts.iter().all(|part| held_by(part, name, bits)),
+        // A whole signal, a memory word or an event: nothing narrower to say,
+        // so the write is refused outright.
+        other => other.name() != name,
     }
 }
 
@@ -659,22 +708,23 @@ pub fn install_drive(
     level: DriveLevel,
 ) -> Result<(), SimulationError> {
     let resolved = resolve_target(state, target)?;
-    // A drive is recorded against one signal name, so a concatenation has no
-    // place to live. Reporting it is better than installing it on the first
-    // part and quietly losing the rest.
-    if resolved.is_multiple() || resolved == ResolvedTarget::Nowhere {
+    // A write to nowhere has no bits to hold, so there is nothing for a drive
+    // on it to do and nothing to record it under.
+    if resolved == ResolvedTarget::Nowhere {
         return Err(SimulationError::UnsupportedTarget(
             target.to_contracted_string(),
         ));
     }
+    // A concatenation holds every signal its parts name, which is what lets
+    // `assign {a, b, c, d} = 4'h2;` be found by a write to any one of them.
+    let names: Vec<String> = resolved
+        .names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect();
     let evaluated = eval_sized(value, state, resolved.width(state))?;
     drive_at(state, &resolved, &evaluated, level)?;
-    state.install_drive(Drive::new(
-        resolved.name(),
-        target.clone(),
-        value.clone(),
-        level,
-    ));
+    state.install_drive(Drive::new(names, target.clone(), value.clone(), level));
     Ok(())
 }
 
@@ -735,33 +785,52 @@ fn remove_drives_over(
     target: &ResolvedTarget,
     level: DriveLevel,
 ) -> Result<(), SimulationError> {
-    let released = match target {
-        ResolvedTarget::Bits { indices, .. } => Some(indices.clone()),
-        _ => None,
-    };
+    let released = target_bits(target);
     let drives = state.drives();
     let mut keep: Vec<bool> = Vec::with_capacity(drives.len());
     for drive in drives.iter() {
-        if drive.name() != target.name() || drive.level() != level {
+        if drive.level() != level || !released.iter().any(|(name, _)| drive.covers(name)) {
             keep.push(true);
             continue;
         }
-        let Some(released) = released.as_deref() else {
-            keep.push(false);
-            continue;
-        };
-        keep.push(match resolve_target(state, drive.target())? {
-            // A drive goes only when the release names every bit it holds, so
-            // a release of part of a wider force leaves that force in place
-            // rather than dropping bits it did not name.
-            ResolvedTarget::Bits { indices, .. } => {
-                !indices.iter().all(|bit| released.contains(bit))
-            }
-            _ => false,
-        });
+        let held = resolve_target(state, drive.target())?;
+        keep.push(!released_covers(&released, &target_bits(&held)));
     }
     state.retain_drives(&keep);
     Ok(())
+}
+
+/// A target flattened to the signals it names, each with the bits it selects —
+/// or `None` where it names the whole of one.
+///
+/// A concatenation names several, which is what a `deassign {a, b, c, d};` has
+/// to be compared bit for bit against the drive its matching `assign` put in.
+fn target_bits(target: &ResolvedTarget) -> Vec<(&str, Option<&[i64]>)> {
+    match target {
+        ResolvedTarget::Bits { name, indices } => vec![(name, Some(indices.as_slice()))],
+        ResolvedTarget::Nowhere => Vec::new(),
+        ResolvedTarget::Parts(parts) => parts.iter().flat_map(target_bits).collect(),
+        other => vec![(other.name(), None)],
+    }
+}
+
+/// Whether a release names every bit a drive holds.
+///
+/// A release of part of a wider force leaves that force in place rather than
+/// dropping bits it did not name. A drive on a *whole* signal has no bits to
+/// compare, so any release naming that signal takes it.
+fn released_covers(released: &[(&str, Option<&[i64]>)], held: &[(&str, Option<&[i64]>)]) -> bool {
+    held.iter().all(|(name, bits)| {
+        let named = released.iter().filter(|(other, _)| other == name);
+        match bits {
+            None => named.count() > 0,
+            Some(bits) => bits.iter().all(|bit| {
+                named
+                    .clone()
+                    .any(|(_, over)| over.is_none_or(|over| over.contains(bit)))
+            }),
+        }
+    })
 }
 
 /// Writes one word of a memory. An address outside the declared range discards
