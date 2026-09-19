@@ -2,15 +2,17 @@ use nom::{
     branch::alt,
     bytes::complete::tag,
     character::complete::char,
-    combinator::{map, opt},
+    combinator::{map, opt, value},
     multi::separated_list0,
     sequence::delimited,
     IResult,
 };
 
+use crate::parsers::constants::VerilogConstant;
 use crate::parsers::expr::{select, verilog_expression, Expression};
 use crate::parsers::gates::{drive_strength, DriveStrength};
 use crate::parsers::identifier::hierarchical_identifier;
+use crate::parsers::operators::BinaryOperator;
 
 use super::{
     behavior::{assignment_timing, EventControl},
@@ -211,22 +213,119 @@ impl ProceduralAssignment {
 /// `x = y;` / `x <= y;`. A leading `#5` is *not* part of an assignment — a
 /// delay prefixes any procedural statement, so `behavior.rs` owns it.
 pub fn parse_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
+    let (input, assignment) = assignment_body(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    Ok((input, assignment))
+}
+
+/// The assignment without its `;`, which is the shape a `for` header writes:
+/// `for (i = 0; i < 4; i = i + 1)`. One production rather than two, so the
+/// header cannot fall behind the statement on what an assignment may be.
+pub fn assignment_body(input: &str) -> IResult<&str, ProceduralAssignment> {
     let (input, lhs) = ws(assignment_lhs)(input)?;
-    let (input, assign_op) = ws(alt((tag("="), tag("<="))))(input)?;
+    // The increment is tried *second*, and only once the operator has failed
+    // outright: `i++` matches none of the assignment operators, while every
+    // ordinary assignment would pay a second whitespace skip to find out it is
+    // not an increment.
+    let Ok((input, assign_op)) = ws(assignment_operator)(input) else {
+        let (input, step) = ws(increment_operator)(input)?;
+        return Ok((input, folded(lhs, step, one())));
+    };
     let (input, timing) = opt(assignment_timing)(input)?;
     let (input, rhs) = verilog_expression(input)?;
-    let (input, _) = ws(char(';'))(input)?;
-
-    let assignment_type = match assign_op {
-        "=" => ProceduralAssignmentType::Blocking,
-        "<=" => ProceduralAssignmentType::NonBlocking,
-        _ => unreachable!(),
-    };
 
     Ok((
         input,
-        ProceduralAssignment::new(lhs, assignment_type, timing, rhs),
+        match assign_op {
+            AssignmentOperator::Plain(assignment_type) => {
+                ProceduralAssignment::new(lhs, assignment_type, timing, rhs)
+            }
+            AssignmentOperator::Folded(operator) => folded(lhs, operator, rhs),
+        },
     ))
+}
+
+/// `a += b` and `a++` stand for `a = a + b` and `a = a + 1`, so the operation
+/// is folded into the right hand side here and nothing downstream learns the
+/// spelling. The target is evaluated twice as a result, which costs nothing
+/// because the only targets the grammar accepts are names and selects of them.
+fn folded(lhs: Expression, operator: BinaryOperator, rhs: Expression) -> ProceduralAssignment {
+    let rhs = Expression::Binary(Box::new(lhs.clone()), operator, Box::new(rhs));
+    ProceduralAssignment::new(lhs, ProceduralAssignmentType::Blocking, None, rhs)
+}
+
+fn one() -> Expression {
+    Expression::Constant(VerilogConstant::from_int(1))
+}
+
+/// What sits between an assignment's target and its right hand side.
+#[derive(Clone)]
+enum AssignmentOperator {
+    /// `=` or `<=`, which assign the right hand side as written.
+    Plain(ProceduralAssignmentType),
+    /// `+=`, `|=`, `>>>=` — an operation folded into the assignment.
+    Folded(BinaryOperator),
+}
+
+/// **The longest spelling has to win, and `<=` is the trap.** A non-blocking
+/// assignment and the shift-assign `<<=` begin alike, so reading `a <<= 1;`
+/// with `<=` first gives a non-blocking assignment of `= 1`, which is a parse
+/// error somewhere that says nothing about the operator — while `a <= 1;` read
+/// the longest-first way round is still a non-blocking assignment, because
+/// `<<=` simply does not match it.
+///
+/// It dispatches on the **first byte** rather than trying fourteen tags in an
+/// `alt`, because every assignment in a design comes through here and nearly
+/// all of them are a plain `=`: the `alt` measured 6–8% on `bench parse/*`
+/// against the two tags this used to have, and answering `=` from one byte
+/// gives that back.
+fn assignment_operator(input: &str) -> IResult<&str, AssignmentOperator> {
+    use BinaryOperator::*;
+    let folded = |operator| AssignmentOperator::Folded(operator);
+    let bytes = input.as_bytes();
+    let (operator, width) = match bytes.first() {
+        Some(b'=') => (
+            AssignmentOperator::Plain(ProceduralAssignmentType::Blocking),
+            1,
+        ),
+        Some(b'<') if bytes.starts_with(b"<<<=") => (folded(ArithmeticShiftLeft), 4),
+        Some(b'<') if bytes.starts_with(b"<<=") => (folded(ShiftLeft), 3),
+        Some(b'<') if bytes.starts_with(b"<=") => (
+            AssignmentOperator::Plain(ProceduralAssignmentType::NonBlocking),
+            2,
+        ),
+        Some(b'>') if bytes.starts_with(b">>>=") => (folded(ArithmeticShiftRight), 4),
+        Some(b'>') if bytes.starts_with(b">>=") => (folded(ShiftRight), 3),
+        Some(first) if bytes.get(1) == Some(&b'=') => match first {
+            b'+' => (folded(Addition), 2),
+            b'-' => (folded(Subtraction), 2),
+            b'*' => (folded(Multiplication), 2),
+            b'/' => (folded(Division), 2),
+            b'%' => (folded(Modulus), 2),
+            b'&' => (folded(BitwiseAnd), 2),
+            b'|' => (folded(BitwiseInclusiveOr), 2),
+            b'^' => (folded(BitwiseXOr), 2),
+            _ => return Err(unmatched(input)),
+        },
+        _ => return Err(unmatched(input)),
+    };
+    Ok((&input[width..], operator))
+}
+
+fn unmatched(input: &str) -> nom::Err<nom::error::Error<&str>> {
+    nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))
+}
+
+/// `++` and `--`, which stand for `+= 1` and `-= 1`.
+///
+/// They are read here rather than as a statement of their own so that a `for`
+/// header's step (`for (i = 0; i < 1000; i++)`, corpus `random`) and a
+/// statement get them from the same place.
+fn increment_operator(input: &str) -> IResult<&str, BinaryOperator> {
+    alt((
+        value(BinaryOperator::Addition, tag("++")),
+        value(BinaryOperator::Subtraction, tag("--")),
+    ))(input)
 }
 
 /// The target of an assignment: a whole signal, a bit or part select of one, or
@@ -265,7 +364,7 @@ mod tests {
     use crate::parsers::constants::VerilogConstant;
     use crate::parsers::expr::Expression;
     use crate::parsers::gates::StrengthLevel;
-    use crate::parsers::helpers::assert_parses_to;
+    use crate::parsers::helpers::{assert_parses, assert_parses_to};
     use crate::parsers::identifier::Identifier;
     use crate::parsers::operators::BinaryOperator;
 
@@ -762,6 +861,81 @@ mod tests {
         assert_eq!(
             assignment.rhs,
             Expression::Identifier(Identifier::new("d".to_string()))
+        );
+    }
+
+    /// `a op= b` stands for `a = a op b`, and the folding happens here so that
+    /// nothing downstream learns the spelling. Corpus `br_gh531` writes
+    /// `tmp[3:0] |= i[3:0];`.
+    #[test]
+    fn test_a_compound_assignment_folds_its_operation_into_the_value() {
+        let assignment = assert_parses(parse_assignment, "a |= b;");
+        assert_eq!(*assignment.lhs(), ident("a"));
+        assert_eq!(
+            *assignment.rhs(),
+            Expression::Binary(
+                Box::new(ident("a")),
+                BinaryOperator::BitwiseInclusiveOr,
+                Box::new(ident("b")),
+            )
+        );
+        assert_eq!(
+            *assignment.assignment_type(),
+            ProceduralAssignmentType::Blocking
+        );
+    }
+
+    /// **`<=` is the trap.** A non-blocking assignment and the shift-assign
+    /// `<<=` begin alike, so the longer spelling has to be tried first — and
+    /// `a <= 1;` read that way round is still a non-blocking assignment,
+    /// because `<<=` simply does not match it.
+    #[test]
+    fn test_a_shift_assign_is_not_read_as_a_non_blocking_assignment() {
+        let shift = assert_parses(parse_assignment, "a <<= 2;");
+        assert_eq!(
+            *shift.rhs(),
+            Expression::Binary(
+                Box::new(ident("a")),
+                BinaryOperator::ShiftLeft,
+                Box::new(Expression::Constant(VerilogConstant::from_int(2))),
+            )
+        );
+
+        let non_blocking = assert_parses(parse_assignment, "a <= 2;");
+        assert_eq!(
+            *non_blocking.assignment_type(),
+            ProceduralAssignmentType::NonBlocking
+        );
+        assert_eq!(
+            *non_blocking.rhs(),
+            Expression::Constant(VerilogConstant::from_int(2))
+        );
+    }
+
+    /// `i++` is `i = i + 1`, and it is read by the same production a `for`
+    /// header's step goes through — corpus `random` writes
+    /// `for (i = 0; i < 1000; i++)`.
+    #[test]
+    fn test_an_increment_stands_for_adding_one() {
+        for (source, operator) in [
+            ("i++;", BinaryOperator::Addition),
+            ("i--;", BinaryOperator::Subtraction),
+        ] {
+            let assignment = assert_parses(parse_assignment, source);
+            assert_eq!(*assignment.lhs(), ident("i"));
+            assert_eq!(
+                *assignment.rhs(),
+                Expression::Binary(
+                    Box::new(ident("i")),
+                    operator,
+                    Box::new(Expression::Constant(VerilogConstant::from_int(1))),
+                )
+            );
+        }
+
+        assert!(
+            assignment_body("i++").is_ok(),
+            "a `for` step carries no `;`"
         );
     }
 }
