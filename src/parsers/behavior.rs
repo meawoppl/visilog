@@ -12,7 +12,8 @@ use crate::parsers::assignment::parse_assignment;
 
 use super::{
     assignment::{
-        assignment_lhs, AssignmentTiming, ProceduralAssignment, ProceduralAssignmentType,
+        assignment_body, assignment_lhs, AssignmentTiming, ProceduralAssignment,
+        ProceduralAssignmentType,
     },
     constants::VerilogConstant,
     delay::{parse_delay, parse_delay_statement, Delay},
@@ -653,23 +654,12 @@ fn keyword<'a>(input: &'a str, word: &str) -> IResult<&'a str, ()> {
     Ok((input, ()))
 }
 
-/// The assignment in a `for` header: `i = 0`, `i = i + 1`. It is not a
+/// The assignment in a `for` header: `i = 0`, `i = i + 1`, `i++`. It is not a
 /// statement and so carries no `;` of its own — the two separators belong to
-/// the header.
+/// the header — which is the whole of the difference from
+/// [`parse_assignment`], and why both go through one production.
 fn for_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
-    let (input, lhs) = ws(assignment_lhs)(input)?;
-    let (input, operator) = ws(alt((tag("<="), tag("="))))(input)?;
-    let (input, rhs) = verilog_expression(input)?;
-
-    let assignment_type = match operator {
-        "<=" => ProceduralAssignmentType::NonBlocking,
-        _ => ProceduralAssignmentType::Blocking,
-    };
-
-    Ok((
-        input,
-        ProceduralAssignment::new(lhs, assignment_type, None, rhs),
-    ))
+    assignment_body(input)
 }
 
 /// `for (i = 0; i < 4; i = i + 1) <statement>`.
