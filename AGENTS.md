@@ -2014,6 +2014,20 @@ tripwire.
   bits, which is legal only inside a wider concatenation and is exactly where it lands; a
   non-constant count is a **named** error, and an absurd one is refused by the same
   `MAX_SELECT_WIDTH` guard a nonsense part select uses.
+- **An index is a *position*, and a signed one may be negative.** `reg [3:0] v [-7:7];`
+  and `reg [base+15:base] big;` for a negative `base` are both ordinary Verilog, so
+  `eval::select_index` reads a signed value as the negative number it is rather than as a
+  very large unsigned one. Reading `-7` as `18446744073709551609` names no word of any
+  memory, which makes a write a silent no-op and a read an `x` — indistinguishable from an
+  index that really is out of range. That is the **one** place the rule lives: every
+  select comes through it — a bit, a part, an indexed part and a memory word, reading and
+  writing alike — so none of them can disagree about which word a design named.
+- **A range is what decides a parameter's signedness**, failing a `signed` qualifier: one
+  written with a range is unsigned unless it says otherwise, and only a *rangeless*
+  parameter keeps the signedness its value arrived with. The trap is that a bare decimal
+  is itself signed, so reading the value's own flag makes `parameter [3:0] DAC = 8;` into
+  `-8`, and a select through it then names a bit nothing has (corpus `pr542`). Measured
+  against iverilog 12.0.
 - **An indexed part select is its own node because only its *width* is constant.**
   `a[base +: width]` and `a[base -: width]` are `Expression::IndexedPartSelect`, not a
   desugared `PartSelect`: the base may be any expression, including one that moves during

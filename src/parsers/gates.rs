@@ -30,7 +30,7 @@ use nom::{
 };
 
 use super::{
-    delay::{parse_gate_delay, Delay, GateDelay},
+    delay::{parse_gate_delay, GateDelay},
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
     simple::{range, ws, ws_and_comments, Range},
@@ -352,6 +352,7 @@ pub fn parse_gate_instantiation(input: &str) -> IResult<&str, Vec<GateInstantiat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsers::delay::Delay;
     use crate::parsers::helpers::assert_parses;
 
     fn one(source: &str) -> GateInstantiation {

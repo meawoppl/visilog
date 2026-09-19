@@ -1250,16 +1250,24 @@ impl<'m> Elaborator<'m> {
                         None => eval(&renamed(&parameter.value, scope), &self.out.state)?,
                     };
                     let name = scope.qualified(local);
-                    // A `signed` qualifier (or an `integer` type) overrides
-                    // whatever signedness the value arrived with; an
-                    // unqualified parameter keeps its value's own.
+                    // A `signed` qualifier (or an `integer` type) makes the
+                    // parameter signed. Failing that, **a range is what
+                    // decides**: a parameter written with one is unsigned
+                    // unless it says otherwise, and only a rangeless one keeps
+                    // the signedness its value arrived with. That is IEEE
+                    // 1364-2005 and it is what iverilog 12.0 does —
+                    // `parameter [3:0] DAC = 8;` is 8, where reading the bare
+                    // decimal's own signedness makes it -8 and
+                    // `pm_next_st[DAC]` selects a bit nothing has (corpus
+                    // `pr542`).
                     //
                     // The flag is applied on both sides of `coerced`
                     // deliberately: it is read *before*, to widen by sign
                     // extension rather than zero extension, and rebuilding a
                     // register does not carry it, so it has to be restated
                     // *after* or the stored parameter reads unsigned.
-                    let signed = parameter.signed || value.is_signed();
+                    let signed =
+                        parameter.signed || (parameter.range.is_none() && value.is_signed());
                     // A `real` parameter holds a double whatever its value was
                     // written as, so `parameter real HALF = 1;` is `1.0` and
                     // not one bit. It is the declaration that says so, exactly
@@ -3773,6 +3781,37 @@ mod tests {
         // And the floating value propagates the way any other would.
         simulator.run().unwrap();
         assert_eq!(simulator.get("out").unwrap().to_binary(), "zzzz");
+    }
+
+    /// **A range is what decides a parameter's signedness**, failing a
+    /// `signed` qualifier: one written with a range is unsigned unless it says
+    /// otherwise, and only a rangeless parameter keeps the signedness its
+    /// value arrived with.
+    ///
+    /// The trap is that a bare decimal is itself signed, so reading the
+    /// value's own flag makes `parameter [3:0] DAC = 8;` into `-8` — and a
+    /// select through it then names a bit nothing has. iverilog 12.0 prints
+    /// `8 0 / -3 1 / -8 1` for this design (corpus `pr542`).
+    #[test]
+    fn test_a_range_decides_a_parameters_signedness() {
+        let mut simulator = simulator_for(
+            &[r#"
+            module t();
+                parameter [3:0] ranged = 8;
+                parameter bare = -3;
+                parameter signed [3:0] qualified = 8;
+                initial begin
+                    $display("%0d %0b", ranged, ranged < 0);
+                    $display("%0d %0b", bare, bare < 0);
+                    $display("%0d %0b", qualified, qualified < 0);
+                end
+            endmodule
+        "#],
+            "t",
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "8 0\n-3 1\n-8 1\n");
     }
 
     /// A `signed` qualifier on a parameter has to survive being stored, which
