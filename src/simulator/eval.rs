@@ -320,12 +320,28 @@ fn eval_in_context(
             let (mut left_width, mut right_width) = operand_widths(rule, width);
             // An operation with a real operand has no width, so a context
             // cannot reach its operands: `w = (a + b) + 1.0;` adds `a` and `b`
-            // at their own width and converts the sum, however wide `w` is.
-            // The two cheap questions are asked first — most operations are
-            // self-determined, and most designs have no real at all.
-            if width != SELF_DETERMINED && store.any_real() && either_is_real(lhs, rhs, store) {
+            // at their own width and converts the sum, however wide `w` is. The
+            // cheap question is asked first — most designs have no real in them
+            // and `any_real` answers for those without walking anything.
+            let declared_real = store.any_real() && either_is_real(lhs, rhs, store);
+            if declared_real {
                 left_width = SELF_DETERMINED;
                 right_width = SELF_DETERMINED;
+            }
+            // `+ - * / % & | ^ ~^` size their two operands against *each other*
+            // as well as against the context: the operation happens at the
+            // widest of the three, and the context is only a lower bound on
+            // that. `c & ~(1'b1 << 0)` for a four bit `c` has to invert four
+            // bits rather than one and then pad with zeros.
+            let mutually_sized = !declared_real && matches!(rule, OperandRule::Shared);
+            if mutually_sized && sized_within(lhs) {
+                // Only an operand that is `sized_within` can tell being widened
+                // before from being widened after, and an operand comes back at
+                // least as wide as it is on its own whatever it was asked for —
+                // so measuring an operand *for itself* would change nothing,
+                // and one that is not `sized_within` needs no measurement taken
+                // for it either. `count + 1` therefore measures nothing at all.
+                left_width = width.max(other_operand_width(rhs, store));
             }
             if matches!(rule, OperandRule::Compared) && (sized_within(lhs) || sized_within(rhs)) {
                 let (signed, common) = compared_operands(lhs, rhs, store);
@@ -334,9 +350,20 @@ fn eval_in_context(
                 left_width = common;
                 right_width = common;
             }
+            let left_value = eval_in_context(lhs, store, left, left_width)?;
+            // The right operand's share of the mutual context is read off the
+            // left one *after* it has been evaluated rather than measured
+            // before, because by then the answer is free: the left value is
+            // already as wide as the widest of the context, itself and the
+            // right operand. Measuring it instead would walk the same subtree
+            // the evaluator just walked, which is the whole of what a
+            // context-determined operation would otherwise cost.
+            if mutually_sized && sized_within(rhs) && !left_value.is_real() {
+                right_width = right_width.max(left_value.width());
+            }
             let value = eval_binary(
                 op,
-                &eval_in_context(lhs, store, left, left_width)?,
+                &left_value,
                 &eval_in_context(rhs, store, right, right_width)?,
             );
             // Every context-determined rule hands the width on to an operand
@@ -939,14 +966,25 @@ fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
         // A real has no bits to select from, so a select out of one is not
         // itself real.
         Expression::WordSelect { .. } => false,
-        Expression::Identifier(id) => store
-            .get_signal(&id.name)
-            .is_some_and(|signal| signal.is_real()),
+        // The store's hint first, the way [`expression_is_signed`] asks it:
+        // `declare_real` and `declare_real_memory` are the only two things that
+        // set the flag, so `false` means no *declaration* is real and the name
+        // need not be hashed. A real **literal** is not covered by it, which is
+        // why the flag cannot stand in for this walk at the callers.
+        Expression::Identifier(id) => {
+            store.any_real()
+                && store
+                    .get_signal(&id.name)
+                    .is_some_and(|signal| signal.is_real())
+        }
         // A word of an array of reals is one, and the array is the only place
         // the declaration is recorded.
-        Expression::BitSelect(id, _) => store
-            .memory(&id.name)
-            .is_some_and(|memory| memory.is_real()),
+        Expression::BitSelect(id, _) => {
+            store.any_real()
+                && store
+                    .memory(&id.name)
+                    .is_some_and(|memory| memory.is_real())
+        }
         Expression::Parenthetical(inner) => expression_is_real(inner, store),
         // `~` and the reductions are refused for a real rather than made real,
         // so every unary operator that survives one hands it on.
@@ -1010,6 +1048,34 @@ fn compared_operands(lhs: &Expression, rhs: &Expression, store: &StateStore) -> 
     }
     let width = expression_width(lhs, store).max(expression_width(rhs, store));
     (signed, width)
+}
+
+/// How wide an operand makes the operand *beside* it, which is what a
+/// context-determined binary operator sizes its two operands against each other
+/// with.
+///
+/// It is [`expression_width`] with one exception: a **real** operand has no
+/// width to share, so it reports [`SELF_DETERMINED`] and leaves the integer
+/// beside it at its own size. `-180 + bits * (360.0/63.0)` has to add at the
+/// integer's width and convert, where widening it to the real's sixty-four
+/// bits reads `-180` as a twenty-digit unsigned number (corpus `pr1574175`).
+///
+/// The question is asked here rather than through [`StateStore::any_real`]
+/// because that flag answers for *declarations*, and this expression has a real
+/// in it with nothing declared.
+///
+/// The measurement comes first and the realness walk only runs when it answered
+/// [`REAL_WIDTH`], which is what keeps it off the hot path: a real literal, a
+/// real signal, a real function's result and any operation over one all measure
+/// sixty-four bits, and an operand that measures fewer than that cannot widen
+/// the one beside it past a width it would have reached anyway.
+fn other_operand_width(expr: &Expression, store: &StateStore) -> usize {
+    let measured = expression_width(expr, store);
+    if measured == REAL_WIDTH && expression_is_real(expr, store) {
+        SELF_DETERMINED
+    } else {
+        measured
+    }
 }
 
 /// Whether widening `expr` *before* it is evaluated can give different bits
@@ -2600,6 +2666,94 @@ mod tests {
         store.set_ranged("a", Register::from_binary("10100110"), (7, 0));
         store.set_ranged("b", Register::from_binary("0011"), (3, 0));
         store
+    }
+
+    /// A context-determined operator sizes its two operands against *each
+    /// other* as well as against the context it was given, so an operation
+    /// nested inside one is carried out at the widest of the three rather than
+    /// at its own width and padded afterwards.
+    ///
+    /// Every number here was measured against iverilog 12.0:
+    ///
+    /// ```verilog
+    /// reg [3:0] c, b;  c = 4'b1111; b = 4'b1111;
+    /// $display("%b", (c & ~(1'b1 << 9'h00)) & b);   // 1110   (corpus pr2985542)
+    ///
+    /// reg [15:0] a, bb, answer;  a = 16'h8000; bb = 16'h8000;
+    /// answer = (a + bb + 0) >> 1;                   // 16'h8000 (corpus pr1570635b)
+    ///
+    /// reg [7:0] x, y;  x = 8'hA6; y = 8'h3C;
+    /// $display("%0d", ((x + y) * 2) - (x & y));     // 416, $bits is 32
+    /// ```
+    ///
+    /// The last is `benches/simulation.rs`'s `eval/nested_arithmetic`: the
+    /// unsized `2` makes the whole expression thirty-two bits, so the benchmark
+    /// went from eight bit arithmetic that answered 160 to thirty-two bit
+    /// arithmetic that answers 416.
+    #[test]
+    fn test_an_operation_is_sized_against_the_operand_beside_it() {
+        let mut store = StateStore::new();
+        store.set_ranged("c", Register::from_binary("1111"), (3, 0));
+        store.set_ranged("b", Register::from_binary("1111"), (3, 0));
+        // `~` has to invert four bits, not one bit padded with zeros.
+        assert_eq!(bits_in("(c & ~(1'b1 << 9'h00)) & b", &store), "1110");
+        assert_eq!(value_in("|((c & ~(1'b1 << 9'h00)) & b)", &store), 1);
+
+        // The unsized `0` is thirty-two bits, so the addition does not wrap at
+        // the sixteen bit target's width — `eval_sized` is a lower bound.
+        let mut wide = StateStore::new();
+        wide.set_ranged("a", Register::from_u128(0x8000, 16), (15, 0));
+        wide.set_ranged("d", Register::from_u128(0x8000, 16), (15, 0));
+        let answer = eval_sized(&parse("(a + d + 0) >> 1"), &wide, 16).expect("should evaluate");
+        assert_eq!(answer.to_u128(), Some(0x8000));
+
+        // An eight bit pair beside an unsized literal: the whole expression is
+        // thirty-two bits and the product does not wrap.
+        let mut bench = StateStore::new();
+        bench.set_ranged("x", Register::from_u128(0xA6, 8), (7, 0));
+        bench.set_ranged("y", Register::from_u128(0x3C, 8), (7, 0));
+        assert_eq!(value_in("((x + y) * 2) - (x & y)", &bench), 416);
+    }
+
+    /// A **real** operand has no width to share, so nothing beside it is
+    /// widened to the real's sixty-four bits — and the question cannot be
+    /// answered from `StateStore::any_real`, which reports *declarations*.
+    ///
+    /// Corpus `pr1574175` is the case, and iverilog 12.0 prints
+    /// `Both of these should be the same (3):   3,   3` for:
+    ///
+    /// ```verilog
+    /// integer correct, incorrect;  reg [5:0] bits;  bits = 32;
+    /// incorrect = -180 + bits*(360.0/63.0);
+    /// correct   = bits*(360.0/63.0) - 180;
+    /// ```
+    /// Both sides are real sums, and they agree only once the integer written
+    /// into them wraps at thirty-two bits: `bits` is unsigned, so the whole
+    /// addition is, and `-180` is `2**32 - 180`. That is what makes this a
+    /// sharp test — widening the integer to the real's sixty-four bits instead
+    /// gives `2**64 - 180`, which no longer lands on 3 when it is written.
+    #[test]
+    fn test_an_undeclared_real_still_shares_no_width() {
+        let mut store = StateStore::new();
+        store.set_ranged("bits", Register::from_u128(32, 6), (5, 0));
+
+        let at_32_bits = 4294967296.0 - 180.0 + 360.0 / 63.0 * 32.0;
+        let sum = eval_sized(&parse("-180 + bits * (360.0 / 63.0)"), &store, 32)
+            .expect("should evaluate");
+        assert!(
+            (sum.to_f64() - at_32_bits).abs() < 1e-6,
+            "expected {}, got {}",
+            at_32_bits,
+            sum.to_f64()
+        );
+
+        // The other order needs no wrap at all, and the two agree once each is
+        // written into a thirty-two bit `integer`.
+        let difference =
+            eval_sized(&parse("bits * (360.0 / 63.0) - 180"), &store, 32).expect("should evaluate");
+        assert!((difference.to_f64() - (360.0 / 63.0 * 32.0 - 180.0)).abs() < 1e-6);
+        assert_eq!(sum.to_f64().round() as u64 as u32, 3);
+        assert_eq!(difference.to_f64().round() as u32, 3);
     }
 
     // -- reals -------------------------------------------------------------
