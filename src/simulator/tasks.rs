@@ -271,6 +271,18 @@ pub struct TaskCall {
 }
 
 impl TaskCall {
+    /// Every expression among this call's arguments. A string argument is held
+    /// as text rather than as an expression, so it carries none.
+    pub fn expressions(&self) -> Vec<&Expression> {
+        self.arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                TaskArgument::Value(expression) => Some(expression),
+                TaskArgument::Text(_) => None,
+            })
+            .collect()
+    }
+
     /// Whether this call prints where it stands, rather than deferring to the
     /// end of a timestep or reaching for state of its own. It is the one
     /// question a function body's analysis asks of a task.

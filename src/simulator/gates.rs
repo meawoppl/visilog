@@ -761,9 +761,9 @@ fn resolve_levels(x: i8, y: i8) -> Strength {
 /// driving `z` or because that half of its strength is `highz`. Of the rest,
 /// the strongest wins outright; drivers tied at the strongest level agree on a
 /// value or the net is `x`. A net every driver has let go of is `z`.
-pub fn resolve_strength(drivers: &[Strength]) -> Strength {
+pub fn resolve_strength(drivers: impl IntoIterator<Item = Strength>) -> Strength {
     let mut resolved = Strength::HIGHZ;
-    for &driver in drivers {
+    for driver in drivers {
         resolved = resolve_pair(resolved, driver);
     }
     resolved
@@ -772,7 +772,7 @@ pub fn resolve_strength(drivers: &[Strength]) -> Strength {
 /// The four-state bit several drivers settle on — [`resolve_strength`] read as
 /// a value.
 pub fn resolve_bit(drivers: &[Strength]) -> u8 {
-    resolve_strength(drivers).value()
+    resolve_strength(drivers.iter().copied()).value()
 }
 
 #[cfg(test)]
@@ -990,22 +990,22 @@ mod tests {
             one: StrengthLevel::Pull,
         };
         assert_eq!(
-            resolve_strength(&[Strength::driven(ONE, open_drain)]).bounds(),
+            resolve_strength([Strength::driven(ONE, open_drain)]).bounds(),
             (5, 5)
         );
         assert_eq!(
-            resolve_strength(&[Strength::driven(ZERO, open_drain)]).bounds(),
+            resolve_strength([Strength::driven(ZERO, open_drain)]).bounds(),
             (-6, -6)
         );
         // A `pullup` under a driven `strong` keeps the strong level, and holds
         // the net at `pull` once that driver lets go.
         let pull_up = Strength::driven(ONE, DriveStrength::PULL);
         assert_eq!(
-            resolve_strength(&[pull_up, Strength::STRONG_ZERO]).bounds(),
+            resolve_strength([pull_up, Strength::STRONG_ZERO]).bounds(),
             (-6, -6)
         );
         assert_eq!(
-            resolve_strength(&[pull_up, Strength::HIGHZ]).bounds(),
+            resolve_strength([pull_up, Strength::HIGHZ]).bounds(),
             (5, 5)
         );
     }
@@ -1022,21 +1022,21 @@ mod tests {
         // A buffer at `pull` whose control is unknown: it drives 0, or floats.
         let maybe_pull_zero = Strength::span(-5, 0);
         assert_eq!(
-            resolve_strength(&[maybe_pull_zero, Strength::HIGHZ]).bounds(),
+            resolve_strength([maybe_pull_zero, Strength::HIGHZ]).bounds(),
             (-5, 0)
         );
-        assert_eq!(resolve_strength(&[maybe_pull_zero]).value(), X);
+        assert_eq!(resolve_strength([maybe_pull_zero]).value(), X);
         // `65X`: a strong 0-or-z beside a pull x.
         let maybe_strong_zero = Strength::span(-6, 0);
         let pull_unknown = Strength::span(-5, 5);
         assert_eq!(
-            resolve_strength(&[pull_unknown, maybe_strong_zero]).bounds(),
+            resolve_strength([pull_unknown, maybe_strong_zero]).bounds(),
             (-6, 5)
         );
         // `650`: a strong 0-or-z beside a definite pull 0 is a definite 0,
         // somewhere between the two levels.
         let pull_zero = Strength::span(-5, -5);
-        let resolved = resolve_strength(&[pull_zero, maybe_strong_zero]);
+        let resolved = resolve_strength([pull_zero, maybe_strong_zero]);
         assert_eq!(resolved.bounds(), (-6, -5));
         assert_eq!(resolved.value(), ZERO);
     }

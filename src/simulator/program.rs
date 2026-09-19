@@ -326,6 +326,80 @@ pub enum WaitReason {
     Event(EventControl),
 }
 
+/// Every expression one instruction holds, flat.
+///
+/// Deliberately *flat* — it draws no line between a target and a read, which
+/// is exactly why it is not what `elaborate::BodyNames` walks with: that one
+/// needs the distinction and this one must not lose an expression to it.
+fn instruction_expressions(instruction: &Instruction) -> Vec<&Expression> {
+    match instruction {
+        Instruction::Blocking { target, value }
+        | Instruction::NonBlocking { target, value }
+        | Instruction::Assign { target, value }
+        | Instruction::Force { target, value }
+        | Instruction::Hold { target, value, .. } => vec![target, value],
+        Instruction::Deassign(target)
+        | Instruction::Release(target)
+        | Instruction::WriteHeld { target, .. } => vec![target],
+        Instruction::JumpIfFalse { condition, .. } | Instruction::Wait(condition) => {
+            vec![condition]
+        }
+        Instruction::CaseSubject(subject) => vec![subject],
+        Instruction::JumpIfMatch { label, .. } => vec![label],
+        Instruction::RepeatInit { count, .. } => vec![count],
+        Instruction::Task(call) => call.expressions(),
+        Instruction::EventWait(control) => match control {
+            EventControl::Events(events) => events.iter().map(|event| &event.expression).collect(),
+            _ => Vec::new(),
+        },
+        Instruction::ScheduleWrite {
+            target,
+            value,
+            delay,
+        } => {
+            let mut all = vec![target, value];
+            all.extend(delay.expressions());
+            all
+        }
+        Instruction::Delay(delay) => delay.expressions().to_vec(),
+        Instruction::Jump(_)
+        | Instruction::RepeatNext { .. }
+        | Instruction::Disable(_)
+        | Instruction::Fork { .. }
+        | Instruction::JoinBranch
+        | Instruction::Halt => Vec::new(),
+    }
+}
+
+/// Whether an expression, or anything nested in it, calls the named system
+/// function.
+fn calls(expression: &Expression, name: &str) -> bool {
+    let nested = |all: &[Expression]| all.iter().any(|inner| calls(inner, name));
+    match expression {
+        Expression::SystemFunctionCall(called, arguments) => called == name || nested(arguments),
+        Expression::Constant(_)
+        | Expression::RealLiteral(_)
+        | Expression::Identifier(_)
+        | Expression::StringLiteral(_) => false,
+        Expression::Unary(_, inner) | Expression::Parenthetical(inner) => calls(inner, name),
+        Expression::Binary(left, _, right) => calls(left, name) || calls(right, name),
+        Expression::Conditional(condition, yes, no) => {
+            calls(condition, name) || calls(yes, name) || calls(no, name)
+        }
+        Expression::Concatenation(parts) => nested(parts),
+        Expression::Replication(count, parts) => calls(count, name) || nested(parts),
+        Expression::IndexedPartSelect { base, width, .. } => {
+            calls(base, name) || calls(width, name)
+        }
+        Expression::FunctionCall(_, arguments) => nested(arguments),
+        Expression::BitSelect(_, index) => calls(index, name),
+        Expression::PartSelect(_, first, second) => calls(first, name) || calls(second, name),
+        Expression::WordSelect { index, select, .. } => {
+            calls(index, name) || select.expressions().iter().any(|inner| calls(inner, name))
+        }
+    }
+}
+
 /// Rewrites every name one instruction uses through `resolve`.
 fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> String) {
     match instruction {
@@ -531,6 +605,21 @@ impl Program {
     /// The compiled instructions, in program order.
     pub fn instructions(&self) -> &[Instruction] {
         &self.instructions
+    }
+
+    /// Whether any expression in the program calls the named system function —
+    /// the name without its `$`.
+    ///
+    /// Asked once, when the design is elaborated, by the one feature that has
+    /// to know *before* it runs whether a design will ask: `$countdrivers`
+    /// reports what reached a net, which means the net has to be resolved
+    /// between its drivers rather than simply written, and that is decided
+    /// when the simulator is set up.
+    pub fn calls_system_function(&self, name: &str) -> bool {
+        self.instructions
+            .iter()
+            .flat_map(instruction_expressions)
+            .any(|expression| calls(expression, name))
     }
 
     /// Rewrites every signal the program names through `resolve`.
