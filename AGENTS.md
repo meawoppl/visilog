@@ -1284,6 +1284,19 @@ what makes a range bound written inside a loop work — `reg [i:0] r;` reaches
 `GenerateLoopBound` after `MAX_GENERATE_ITERATIONS`: every iteration is a real copy of
 the body, so it is an allocation nothing survives rather than a hang.
 
+**A module may instantiate itself, and a `generate` condition is what has to stop it.**
+IEEE 1364-2005 allows recursive instantiation, which is how a design writes a tree or a
+chain of a parameterised depth — `sum #(n/2, width)` beside `sum #(n-n/2, width)` under an
+`if (n == 1)` (corpus `pr2728812a`). So "this module is already on the path from the top"
+is not the question and was the wrong one to ask: the question is whether the recursion
+*terminates*, and two bounds answer it without evaluating the generate conditions twice.
+`MAX_INSTANTIATION_DEPTH` counts repeats of one module on the path — deliberately small,
+because `walk` recurses on the host's own stack and a generous bound is a stack overflow
+rather than an error — and `MAX_INSTANCES` counts the instances a design elaborates to at
+all, which is what bounds a recursion that *branches*: one that terminates at depth twenty
+and instantiates itself twice is 2²⁰ real instances. Either is
+`SimulationError::RecursiveInstantiation` naming the module.
+
 **`defparam` is collected before the build pass and applied where the instance is
 made.** The path it names — `dut.WIDTH`, `mid.leaf.WIDTH`, `stage[0].u.WIDTH` — is
 already the flat spelling the parameter ends up under, so the two meet with no
