@@ -1890,7 +1890,7 @@ impl Simulator {
         for contribution in &contributions {
             let net = (
                 contribution.target.name(),
-                word_address(&contribution.target),
+                contribution.target.word_address(),
             );
             if !nets.contains(&net) {
                 nets.push(net);
@@ -1932,7 +1932,7 @@ impl Simulator {
             let mut driven: Vec<Vec<(u8, StrengthLevel)>> = vec![Vec::new(); width];
             for contribution in &contributions {
                 if contribution.target.name() != name
-                    || word_address(&contribution.target) != address
+                    || contribution.target.word_address() != address
                 {
                     continue;
                 }
@@ -2211,17 +2211,6 @@ impl Nodes {
         if first != second {
             self.parent[second] = first;
         }
-    }
-}
-
-/// The memory address a target names, if it is a word of one.
-///
-/// It is the second half of a driver list's identity: two drivers of `foo[0]`
-/// resolve against each other, and neither says anything about `foo[1]`.
-fn word_address(target: &ResolvedTarget) -> Option<i64> {
-    match target {
-        ResolvedTarget::Word { index, .. } | ResolvedTarget::WordBits { index, .. } => Some(*index),
-        _ => None,
     }
 }
 
@@ -7567,6 +7556,46 @@ mod tests {
         // The forced bit does not.
         simulator.advance(5).expect("time should advance");
         assert_eq!(simulator.get("r").unwrap().to_binary(), "1111");
+    }
+
+    /// And per **word** as well, for an array. `force array[2] = …` says
+    /// nothing at all about `array[1]`, so a word released while another word
+    /// is still forced goes back to its driver.
+    ///
+    /// Measured against iverilog 12.0, which prints `forced 0 1 / f2 1 0 /
+    /// f3 2 0` for the design below. Holding the array by its *name* leaves
+    /// `array1[1]` stuck at `1` for the rest of the run, because the force on
+    /// `array1[2]` makes every word of the array unwritable — the released
+    /// word never reverts and the continuous assignment beneath it never gets
+    /// through (corpus `array_lval_select4a`).
+    #[test]
+    fn test_a_force_on_one_memory_word_holds_only_that_word() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                wire [1:0] array1[2:1];
+                reg [1:0] var1;
+                assign array1[1] = 2'd0;
+                assign array1[2] = 2'd0;
+                initial begin
+                    force array1[1] = 2'd1;
+                    #1 $display("forced   %h %h", array1[2], array1[1]);
+                    release array1[1];
+                    force array1[2] = var1;
+                    var1 = 2'd1;
+                    #1 $display("f2       %h %h", array1[2], array1[1]);
+                    var1 = 2'd2;
+                    #1 $display("f3       %h %h", array1[2], array1[1]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "forced   0 1\nf2       1 0\nf3       2 0\n"
+        );
     }
 
     /// Two forces may hold different parts of one vector at once, and a

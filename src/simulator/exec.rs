@@ -134,6 +134,22 @@ impl ResolvedTarget {
         }
     }
 
+    /// The memory address this target names, if it is a word of one.
+    ///
+    /// It is the second half of a memory target's identity: `foo[0]` and
+    /// `foo[1]` share a *name* and are two different places, so anything that
+    /// asks "is this the same target?" has to ask this as well. Two drivers of
+    /// one word resolve against each other and a `force` on one word holds
+    /// nothing about the other.
+    pub fn word_address(&self) -> Option<i64> {
+        match self {
+            ResolvedTarget::Word { index, .. } | ResolvedTarget::WordBits { index, .. } => {
+                Some(*index)
+            }
+            _ => None,
+        }
+    }
+
     /// How many bits the target holds, which is the width context the right
     /// hand side of the assignment is evaluated in.
     ///
@@ -525,7 +541,12 @@ enum Held {
     Everything,
 }
 
-fn held_bits(state: &StateStore, name: &str, level: DriveLevel) -> Result<Held, SimulationError> {
+fn held_bits(
+    state: &StateStore,
+    name: &str,
+    word: Option<i64>,
+    level: DriveLevel,
+) -> Result<Held, SimulationError> {
     // The overwhelmingly common case is a design that forces nothing, and it
     // costs one length compare.
     if !state.has_drives() {
@@ -537,7 +558,12 @@ fn held_bits(state: &StateStore, name: &str, level: DriveLevel) -> Result<Held, 
         if drive.level() <= level || !drive.covers(name) {
             continue;
         }
-        if !held_by(&resolve_target(state, drive.target())?, name, &mut bits) {
+        if !held_by(
+            &resolve_target(state, drive.target())?,
+            name,
+            word,
+            &mut bits,
+        ) {
             return Ok(Held::Everything);
         }
     }
@@ -554,7 +580,7 @@ fn held_bits(state: &StateStore, name: &str, level: DriveLevel) -> Result<Held, 
 /// A concatenation is asked part by part, because only the parts that name
 /// this signal say anything about it: `assign {a, b[1]} = e;` holds the whole
 /// of `a` and one bit of `b`.
-fn held_by(target: &ResolvedTarget, name: &str, bits: &mut Vec<i64>) -> bool {
+fn held_by(target: &ResolvedTarget, name: &str, word: Option<i64>, bits: &mut Vec<i64>) -> bool {
     match target {
         ResolvedTarget::Bits {
             name: held,
@@ -564,10 +590,19 @@ fn held_by(target: &ResolvedTarget, name: &str, bits: &mut Vec<i64>) -> bool {
             true
         }
         ResolvedTarget::Bits { .. } | ResolvedTarget::Nowhere => true,
-        ResolvedTarget::Parts(parts) => parts.iter().all(|part| held_by(part, name, bits)),
+        // Asked per *part*, so a drive installed on a concatenation is judged
+        // one signal — and one word — at a time.
+        ResolvedTarget::Parts(parts) => parts.iter().all(|part| held_by(part, name, word, bits)),
         // A whole signal, a memory word or an event: nothing narrower to say,
         // so the write is refused outright.
-        other => other.name() != name,
+        //
+        // A name is not the whole of a memory target's identity, though:
+        // `force array[2] = …` says nothing at all about `array[1]`, and
+        // holding the array by its name alone makes every other word
+        // unwritable for the rest of the run — so a released word never
+        // reverts (corpus `array_lval_select4a`). This is the same rule the
+        // driver lists already follow.
+        other => other.name() != name || other.word_address() != word,
     }
 }
 
@@ -618,7 +653,7 @@ pub fn drive_at(
         }
         return Ok(changed);
     }
-    let held = held_bits(state, target.name(), level)?;
+    let held = held_bits(state, target.name(), target.word_address(), level)?;
     if matches!(held, Held::Everything) {
         return Ok(false);
     }

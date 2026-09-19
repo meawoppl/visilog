@@ -981,6 +981,16 @@ leaves the rest writable, so a whole-signal write over a partly forced signal is
 losing all of it. `held_bits` resolves a drive's target to bits — which is why it needs
 the store — and only does so when a drive is actually installed.
 
+**And per *word*, for an array**, which is the same rule the driver lists already follow:
+a name is not the whole of a memory target's identity, so `held_bits` is asked the
+`ResolvedTarget::word_address` beside the name and skips a drive on a different word.
+`force array[2] = …` says nothing at all about `array[1]`, and holding the array by its
+name makes every other word of it unwritable for the rest of the run — a released word
+never reverts, because the continuous assignment beneath it cannot get through (corpus
+`array_lval_select4a`). `word_address` is a method on `ResolvedTarget` for that reason:
+`resolve_contributions` and `held_bits` are two places asking the same question and they
+must not answer it differently.
+
 The drives live on the store because a running procedural block is handed nothing else,
 and they are re-evaluated by `Simulator::propagate` alongside the module's own `assign`
 statements — one fixpoint, not two, which is what makes a forced signal *follow* its
