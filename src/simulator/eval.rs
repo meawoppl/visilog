@@ -60,7 +60,7 @@ use crate::simulator::exec::{range_width, resolve_target};
 use crate::simulator::plusargs;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::scan::{self, Slot, END_OF_FILE};
-use crate::simulator::state_store::{NotReadable, StateStore, MAX_CALL_DEPTH};
+use crate::simulator::state_store::{self, NotReadable, StateStore, MAX_CALL_DEPTH};
 use crate::simulator::tasks::ascii;
 
 /// Width given to a literal written without an explicit size (`42`, `'hFF`).
@@ -1548,22 +1548,48 @@ fn eval_system_function_bits(
             arity("exactly one argument", &[1])?;
             eval(&arguments[0], store)
         }
-        // `$random` and `$random(seed)`. The seed restarts the stream; see
-        // [`StateStore::seed_random`].
+        // `$random` and `$random(seed)`, over IEEE 1364-2005's own generator —
+        // see [`state_store::random_from`].
+        //
+        // The seed argument is an `inout`: a draw reads the variable, and the
+        // seed it leaves behind is written *back* into it, which is what makes
+        // `x = $random(s);` in a loop advance rather than repeat. The write
+        // goes through the same fill queue `$sscanf` uses, since `eval` is
+        // handed a `&StateStore` and cannot write one itself. A seed argument
+        // that is not a variable — a constant, an expression — has nowhere to
+        // write back to, so the shared stream is moved to it instead and the
+        // next draw carries on from there.
         "random" => {
             arity("no arguments, or a seed", &[0, 1])?;
-            if let Some(seed) = arguments.first() {
-                match numeric(&eval(seed, store)?)? {
-                    Some(value) => store.seed_random(value as u64),
-                    // An unknown seed leaves the stream where it is; there is
-                    // no number to restart it from.
-                    None => {}
-                }
+            let Some(argument) = arguments.first() else {
+                return Ok(signed_result(i64::from(store.next_random())));
+            };
+            // Two draws in one expression — `{$random(s), $random(s)}` — have
+            // nothing between them to drain the fill queue, so the second one
+            // reads the seed the first *owes* rather than the one still in the
+            // store. That is the same seam a function's side effect already
+            // goes through, and corpus `concat3` is what asks for both.
+            let held = match argument {
+                Expression::Identifier(id) => store.pending_fill(&id.name),
+                _ => None,
+            };
+            let current = match held {
+                Some(value) => value,
+                None => eval(argument, store)?,
+            };
+            // An unknown seed reads as zero, which is what iverilog's own
+            // `vpi_get_value` of one gives it.
+            let seed = numeric(&current)?.unwrap_or(0) as i32;
+            let (value, next) = state_store::random_from(seed);
+            match resolve_target(store, argument) {
+                Ok(target) => store.owe_fill(
+                    target,
+                    Register::from_u128(i128::from(next) as u128, SYSTEM_FUNCTION_WIDTH)
+                        .with_signedness(true),
+                ),
+                Err(_) => store.seed_random(next),
             }
-            Ok(Register::from_u128(
-                store.next_random() as u128,
-                SYSTEM_FUNCTION_WIDTH,
-            ))
+            Ok(signed_result(i64::from(value)))
         }
         // The width of the operand, which every value here knows about itself.
         "bits" => {
@@ -3249,22 +3275,65 @@ mod tests {
         assert!(eval(&parse("$clog2(u)"), &store).unwrap().has_unknown());
     }
 
+    /// The stream is IEEE 1364-2005 §17.9.3's own generator from a seed of
+    /// zero, which is the one iverilog runs — so a design drawing random
+    /// stimulus draws the *same* stimulus in both.
+    ///
+    /// iverilog 12.0 prints these four for `$display("%0d", $random)`:
+    ///
+    /// ```text
+    /// 303379748
+    /// -1064739199
+    /// -2071669239
+    /// -1309649309
+    /// ```
     #[test]
-    fn test_random_is_reproducible_from_the_default_seed() {
-        // Every store starts the stream from the same seed, so two runs of the
-        // same design draw the same numbers in the same order.
-        let draw = || {
-            let store = StateStore::new();
-            (0..4)
-                .map(|_| value_in("$random", &store))
-                .collect::<Vec<_>>()
-        };
-        let first = draw();
-        assert_eq!(first, draw());
-        // Within one run the numbers advance rather than repeating.
-        assert!(first.windows(2).all(|pair| pair[0] != pair[1]));
+    fn test_random_draws_the_standards_own_stream() {
+        let store = StateStore::new();
+        let drawn: Vec<i32> = (0..4)
+            .map(|_| value_in("$random", &store) as u32 as i32)
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![303379748, -1064739199, -2071669239, -1309649309]
+        );
+
+        // Every store starts from the same seed, so two runs of one design
+        // draw the same numbers in the same order.
+        let again = StateStore::new();
+        assert_eq!(value_in("$random", &again) as u32 as i32, 303379748);
         // `$random` is Verilog's 32 bit integer.
         assert_eq!(bits_in("$random", &StateStore::new()).len(), 32);
+    }
+
+    /// `$random(seed)` reads the seed *variable* and writes the seed it
+    /// leaves behind back through it, so a loop over one advances. The write
+    /// goes on the fill queue and a second draw in the same expression reads
+    /// what the first one owes — which is why `{$random(s), $random(s)}` is
+    /// two different numbers and not one twice (corpus `concat3`).
+    ///
+    /// iverilog 12.0, drawing four times from a seed variable starting at 0,
+    /// gives the same four as the unseeded stream.
+    #[test]
+    fn test_a_seed_variable_advances_between_draws() {
+        let mut store = StateStore::new();
+        store.set_ranged("s", Register::from_u128(0, 32), (31, 0));
+
+        let mut drawn = Vec::new();
+        for _ in 0..4 {
+            drawn.push(value_in("$random(s)", &store) as u32 as i32);
+            // What the draw owes its seed variable, applied the way
+            // `program::resume` applies it at the next instruction boundary.
+            let fills = store.take_fills();
+            for (target, value) in fills {
+                crate::simulator::exec::drive_resolved(&mut store, &target, &value)
+                    .expect("the seed is writable");
+            }
+        }
+        assert_eq!(
+            drawn,
+            vec![303379748, -1064739199, -2071669239, -1309649309]
+        );
     }
 
     #[test]

@@ -6,9 +6,6 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
-
 use crate::parsers::expr::Expression;
 use crate::register::{Register, REAL_WIDTH, X};
 use crate::simulator::exec::ResolvedTarget;
@@ -17,12 +14,12 @@ use crate::simulator::tasks::Output;
 
 /// What the `$random` stream starts from.
 ///
-/// IEEE 1364 leaves an unseeded `$random` implementation defined, so the choice
-/// is ours; a fixed constant is the one that makes a design's output the same
-/// on every run, which is what a self-checking test that prints random stimulus
-/// needs. A simulation gets a fresh [`StateStore`], so the stream restarts at
-/// this seed every time a design is set up.
-const DEFAULT_RANDOM_SEED: u64 = 0;
+/// IEEE 1364 leaves an unseeded `$random` implementation defined, and zero is
+/// what iverilog starts its own static seed at — which, with the standard's
+/// generator below, makes visilog draw the *same* stimulus iverilog draws. A
+/// simulation gets a fresh [`StateStore`], so the stream restarts here every
+/// time a design is set up.
+const DEFAULT_RANDOM_SEED: i32 = 0;
 
 /// How deep calls to a design's own functions may nest.
 ///
@@ -45,15 +42,48 @@ pub const MAX_CALL_DEPTH: usize = 32;
 /// [`eval`](crate::simulator::eval::eval) is handed a `&StateStore` and nothing
 /// else, so the one system function that is not a pure function of its
 /// arguments has to advance its state through a shared reference — hence the
-/// [`RefCell`]. Cloning a store clones the stream's position with it, so a
+/// [`Cell`]. Cloning a store clones the stream's position with it, so a
 /// snapshot replays the same numbers.
+///
+/// The whole of the state is a thirty-two bit seed, because the generator is
+/// IEEE 1364-2005 §17.9.3's own — see [`random_from`].
 #[derive(Clone, Debug)]
-pub struct RandomStream(RefCell<StdRng>);
+pub struct RandomStream(Cell<i32>);
 
 impl Default for RandomStream {
     fn default() -> Self {
-        RandomStream(RefCell::new(StdRng::seed_from_u64(DEFAULT_RANDOM_SEED)))
+        RandomStream(Cell::new(DEFAULT_RANDOM_SEED))
     }
+}
+
+/// One draw of `$random`: the number it answers and the seed it leaves behind.
+///
+/// This is the generator printed in IEEE 1364-2005 §17.9.3, transcribed from
+/// the standard's C rather than approximated — which matters, because it is
+/// also the generator iverilog runs, so a design drawing random stimulus draws
+/// the *same* stimulus in both. `$random` with seed 0 gives 303379748,
+/// -1064739199, -2071669239, … in both, measured against iverilog 12.0.
+///
+/// Two details are the standard's and look like mistakes otherwise. A seed of
+/// zero is replaced by 259341593 — so the stream that "starts at 0" really
+/// starts there. And the `c + c*d` step, for `d` of exactly 2⁻²³, widens the
+/// fraction by one part in eight million; without it every answer is a few
+/// hundred short.
+pub fn random_from(seed: i32) -> (i32, i32) {
+    /// 2⁻²³ — the standard's `d`, and the quantum of the thirty-two bit seed's
+    /// top twenty-three bits.
+    const D: f64 = 1.0 / 8_388_608.0;
+
+    let old = if seed == 0 { 259_341_593 } else { seed as u32 };
+    let next = 69_069u32.wrapping_mul(old).wrapping_add(1);
+    let mut c = 1.0 + f64::from(next >> 9) * D;
+    c += c * D;
+    // `rtl_dist_uniform(seed, INT32_MIN, INT32_MAX)` over that fraction. The
+    // standard spells it as a scale into `[start, end]` and then a rescale,
+    // which cancels down to this.
+    let r = (c - 1.0) * 4_294_967_296.0 - 2_147_483_648.0;
+    let value = if r >= 0.0 { r as i32 } else { (r - 1.0) as i32 };
+    (value, next as i32)
 }
 
 /// Bit 31 of a descriptor marks a *file* descriptor rather than a
@@ -1315,16 +1345,16 @@ impl StateStore {
     }
 
     /// The next number in the `$random` stream, as Verilog's 32 bit integer.
-    pub fn next_random(&self) -> u32 {
-        self.random.0.borrow_mut().next_u32()
+    pub fn next_random(&self) -> i32 {
+        let (value, next) = random_from(self.random.0.get());
+        self.random.0.set(next);
+        value
     }
 
-    /// Restarts the `$random` stream from `seed`, which is what `$random(seed)`
-    /// does. Verilog's seed argument is an `inout` the simulator writes back
-    /// through; nothing here writes back, so a design that re-seeds from a
-    /// variable it never changes draws the same number every time.
-    pub fn seed_random(&self, seed: u64) {
-        *self.random.0.borrow_mut() = StdRng::seed_from_u64(seed);
+    /// Restarts the `$random` stream from `seed`, which is what a `$random`
+    /// whose seed argument cannot be written back through leaves behind.
+    pub fn seed_random(&self, seed: i32) {
+        self.random.0.set(seed);
     }
 
     /// Notes the value `name` holds right now, so that a write about to land on
