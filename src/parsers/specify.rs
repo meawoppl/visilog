@@ -402,6 +402,26 @@ fn specify_item(input: &str) -> IResult<&str, SpecifyItem> {
     ))(input)
 }
 
+/// A `specparam` written at module level rather than inside a `specify`
+/// block, which IEEE 1364-2005's `module_or_generate_item_declaration` allows.
+///
+/// It comes back as a block holding nothing else, because a `specparam` is a
+/// constant the whole module may name either way and that is already the only
+/// thing elaboration reads out of one — a second declaration form could only
+/// disagree with the first about what a `specparam` means. Corpus `br_gh732`
+/// writes one beside the `assign #Delay` that names it.
+pub fn parse_module_specparam(input: &str) -> IResult<&str, SpecifyBlock> {
+    let (input, specparams) = specparam_declaration(input)?;
+    Ok((
+        input,
+        SpecifyBlock {
+            specparams,
+            paths: Vec::new(),
+            checks: Vec::new(),
+        },
+    ))
+}
+
 /// Parses `specify … endspecify`.
 pub fn parse_specify_block(input: &str) -> IResult<&str, SpecifyBlock> {
     let (input, _) = ws(keyword("specify"))(input)?;
@@ -502,6 +522,36 @@ mod tests {
         assert_eq!(parsed.paths[3].edge, Some(EventTriggers::PosEdge));
         assert!(parsed.paths[3].data_source.is_some());
         assert_eq!(parsed.paths[4].edge, Some(EventTriggers::NegEdge));
+    }
+
+    /// A `specparam` is legal at module level as well as inside a `specify`
+    /// block — IEEE 1364-2005's `module_or_generate_item_declaration` — and is
+    /// the same constant either way. Corpus `br_gh732` writes one beside the
+    /// `assign #Delay` that names it.
+    #[test]
+    fn test_a_specparam_is_legal_outside_a_specify_block() {
+        let parsed = assert_parses(parse_module_specparam, "specparam Delay = 0.1, Wide = 8;");
+        assert_eq!(parsed.specparams.len(), 2);
+        assert_eq!(parsed.specparams[0].name, "Delay".into());
+        assert_eq!(
+            parsed.specparams[0].value,
+            SpecParamValue::Real("0.1".to_string())
+        );
+        assert!(parsed.paths.is_empty() && parsed.checks.is_empty());
+
+        let module = crate::parsers::helpers::assert_parses(
+            crate::parsers::modules::parse_module_declaration,
+            "module m(output Y, input A);
+               specparam Delay = 0.1;
+               assign #Delay Y = A;
+             endmodule",
+        );
+        assert!(module.statements.iter().any(|statement| {
+            matches!(
+                statement,
+                crate::parsers::statements::ModuleStatement::SpecifyBlock(_)
+            )
+        }));
     }
 
     /// A `specparam` declaration is a list, and a real value is kept as it was
