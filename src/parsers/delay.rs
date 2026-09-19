@@ -1,16 +1,17 @@
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    combinator::{map, opt},
+    combinator::{map, map_res, opt},
     multi::separated_list1,
     sequence::delimited,
     IResult,
 };
 
 use super::{
-    constants::{verilog_const, VerilogConstant},
+    constants::VerilogConstant,
     expr::{real_literal, verilog_expression, Expression},
     identifier::hierarchical_identifier,
+    numbers::unsigned_number,
     simple::{ws, ws_and_comments},
 };
 use crate::register::{Register, ONE, Z, ZERO};
@@ -318,9 +319,29 @@ fn delay_term(input: &str) -> IResult<&str, Delay> {
 pub(super) fn delay_operand(input: &str) -> IResult<&str, Expression> {
     alt((
         real_literal,
-        map(verilog_const, Expression::Constant),
+        unsigned_delay,
         map(hierarchical_identifier, Expression::Identifier),
     ))(input)
+}
+
+/// The integer an unparenthesised delay may be: IEEE 1364-2005's
+/// `unsigned_number`, which is a run of decimal digits and **not** a based
+/// literal.
+///
+/// The size, the base designator and the digits of a based literal may be
+/// separated by whitespace, so a general constant parser here reads the whole
+/// of `#1 'h00010203` as one sized value and leaves the statement with nothing
+/// to assign — corpus `const` and `const4`, which calls these the "potential
+/// ambiguities" and expects `i = # 9_7 'D 3;` to wait 97 and assign `'d3`.
+/// The LRM resolves it the same way: a based literal is legal in a delay only
+/// inside parentheses, where a closing `)` says where it ends.
+fn unsigned_delay(input: &str) -> IResult<&str, Expression> {
+    map_res(unsigned_number, |digits: &str| {
+        digits
+            .replace('_', "")
+            .parse::<i64>()
+            .map(|value| Expression::Constant(VerilogConstant::from_int(value)))
+    })(input)
 }
 
 /// `(2:10:17)`, `(10)` or `(period / 2)` — the parenthesised form, which is
@@ -487,6 +508,20 @@ mod tests {
         assert_eq!(parse_delay_statement("#0;"), Ok(("", Delay::new(0))));
         assert!(parse_delay_statement("#10").is_err());
         assert!(parse_delay_statement("10;").is_err());
+    }
+
+    /// An unparenthesised delay is IEEE 1364-2005's `unsigned_number`, not a
+    /// general constant. A based literal's size, base and digits may be
+    /// separated by whitespace, so a constant parser here reads the whole of
+    /// `#1 'h123` as one sized value and leaves the statement nothing to
+    /// assign — corpus `const` and `const4`.
+    #[test]
+    fn test_an_unparenthesised_delay_stops_before_a_base_designator() {
+        assert_eq!(parse_delay("#1 'h123"), Ok(("'h123", Delay::new(1))));
+        assert_eq!(parse_delay("# 9_7 'D 3"), Ok(("'D 3", Delay::new(97))));
+        // Inside parentheses a `)` says where the value ends, so the sized
+        // literal is legal there and is the whole delay.
+        assert!(parse_delay("#(5 'D 3)").is_ok());
     }
 
     #[test]
