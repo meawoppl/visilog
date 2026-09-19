@@ -884,6 +884,22 @@ resolves each drive's target and drops the ones whose bits the release names, wh
 why the decision is made in `exec` and applied by `StateStore::retain_drives` — resolving
 a target needs the evaluator, and the store has no evaluator.
 
+**A concatenation is a drive target like any other, and the drive holds every signal it
+names.** `assign {a, b, c, d} = 4'h2;` written inside a block is one drive under four
+names (`Drive::names` / `Drive::covers`), because the precedence rule is asked *per
+signal* — a write to `b` has to find it. Installing it on the first part and losing the
+rest is the wrong answer that the old named error was there to avoid; `ResolvedTarget::Parts`
+already split the value, so the only thing missing was somewhere for the drive to live.
+`exec::held_by` is the per-part half of `held_bits` and `exec::target_bits` /
+`released_covers` the per-part half of the release rule, so `deassign {a, b, c, d};` takes
+the drive its `assign` put in and a release of one part of a wider one still leaves it
+standing. Corpus `assign3.2D`, `assign3.2E`, measured against iverilog 12.0.
+
+A concatenation is also a target inside a **function** body — `{swap[3:0], swap[7:4]} =
+{hi, lo};` over the function's own result variable is corpus `constfunc14` — so
+`elaborate::assigned_names` asks each part for the signal it writes where `assigned_name`
+asked the target for one.
+
 **A `release` puts nothing back**, and the asymmetry that follows is the whole rule: a
 **net** reverts because its continuous drivers reach it again on the next pass, while a
 **variable** has no driver and so keeps the value the force left it holding. "On the next
@@ -942,7 +958,7 @@ new, so a task may enable one declared further down the file.
 
 Still unsupported: a hierarchical enable (`instance.task(…)`); a task enabled from inside a
 `function`, which is rejected by the function body analysis rather than by a check of its
-own; and concatenation as an assignment target. `signals.rs` is built but still unwired.
+own. `signals.rs` is built but still unwired.
 
 **A `disable` is a jump when it can be, and a cancellation when it cannot.** A named block
 and an inlined task body each occupy a *range* of the compiled instruction list, and

@@ -2372,17 +2372,19 @@ fn analyse_function_body(
     let mut outside: BTreeSet<String> = BTreeSet::new();
     for instruction in program.instructions() {
         match instruction {
-            Instruction::Blocking { target, .. } => match assigned_name(target) {
-                Some(name) if own.contains(name) => {}
-                Some(name) => {
-                    outside.insert(name.to_string());
-                }
-                None => {
+            Instruction::Blocking { target, .. } => {
+                let mut names = Vec::new();
+                if !assigned_names(target, &mut names) {
                     return Err(SimulationError::UnsupportedTarget(
                         target.to_contracted_string(),
-                    ))
+                    ));
                 }
-            },
+                for name in names {
+                    if !own.contains(name) {
+                        outside.insert(name.to_string());
+                    }
+                }
+            }
             // A scheduled write is a non-blocking assignment with a delay on
             // it, so it fails for both reasons at once; the non-blocking one
             // is the more specific.
@@ -2489,6 +2491,27 @@ fn assigned_name(target: &Expression) -> Option<&str> {
         | Expression::WordSelect { id, .. } => Some(&id.name),
         Expression::Parenthetical(inner) => assigned_name(inner),
         _ => None,
+    }
+}
+
+/// Every signal an assignment target writes, collected into `names`, reporting
+/// whether the whole target names signals at all.
+///
+/// A concatenation names one per part — `{tmp1, tmp2} = v;` is an ordinary
+/// Verilog target that `ResolvedTarget::Parts` already writes — and a part that
+/// names nothing fails the whole target the way a bare one does (corpus
+/// `constfunc14`).
+fn assigned_names<'a>(target: &'a Expression, names: &mut Vec<&'a str>) -> bool {
+    match target {
+        Expression::Concatenation(parts) => parts.iter().all(|part| assigned_names(part, names)),
+        Expression::Parenthetical(inner) => assigned_names(inner, names),
+        other => match assigned_name(other) {
+            Some(name) => {
+                names.push(name);
+                true
+            }
+            None => false,
+        },
     }
 }
 
