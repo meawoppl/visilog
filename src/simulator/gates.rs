@@ -413,6 +413,53 @@ pub fn resolve_bit(drivers: &[(u8, StrengthLevel)]) -> u8 {
     winner
 }
 
+/// The two *wired* net kinds, whose drivers combine by a logic function rather
+/// than by strength.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WiredKind {
+    /// `wand` / `triand` — a driver at `0` pulls the net down.
+    And,
+    /// `wor` / `trior` — a driver at `1` pulls the net up.
+    Or,
+}
+
+/// What a `wand`/`wor` net carries when several drivers reach it.
+///
+/// A wired net is the one place the strongest driver does **not** simply win:
+/// a `wand` is `0` when any driver is `0` however the others are driving, which
+/// is the whole point of the net kind. A driver that is floating still
+/// contributes nothing, so a net every driver has let go of is `z`, and the
+/// dominant level is looked for before `x` so that `wand(0, x)` is `0` rather
+/// than unknown — measured against iverilog 12.0 through corpus `triand` and
+/// `trior`, whose tables are the ten combinations of two drivers.
+///
+/// Strength is deliberately not read here. Modelling it would mean the LRM's
+/// wired *strength* table beside the value one, and every corpus design that
+/// uses a wired net drives it at `strong`.
+pub fn resolve_wired(kind: WiredKind, drivers: &[(u8, StrengthLevel)]) -> u8 {
+    let dominant = match kind {
+        WiredKind::And => ZERO,
+        WiredKind::Or => ONE,
+    };
+    let mut seen = false;
+    let mut unknown = false;
+    for &(code, strength) in drivers {
+        if code == Z || strength == StrengthLevel::Highz {
+            continue;
+        }
+        if code == dominant {
+            return dominant;
+        }
+        seen = true;
+        unknown |= code == X;
+    }
+    match (seen, unknown) {
+        (false, _) => Z,
+        (true, true) => X,
+        (true, false) => invert(dominant),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +645,56 @@ mod tests {
         );
         assert_eq!(
             resolve_bit(&[(ONE, StrengthLevel::Supply), (ZERO, strong)]),
+            ONE
+        );
+    }
+
+    /// A wired net combines its drivers by a logic function, which is the one
+    /// place the strongest driver does not simply win: `wand(0, 1)` is `0`
+    /// where an ordinary net gives `x`.
+    ///
+    /// This is the whole of corpus `triand`'s and `trior`'s own tables — the
+    /// ten combinations of two drivers, which those designs assert against
+    /// iverilog's answers.
+    #[test]
+    fn test_wired_nets_resolve_by_a_logic_function() {
+        let strong = StrengthLevel::Strong;
+        let wired = |kind, codes: &[u8]| {
+            let drivers: Vec<(u8, StrengthLevel)> =
+                codes.iter().map(|code| (*code, strong)).collect();
+            shown(resolve_wired(kind, &drivers))
+        };
+
+        let and = |codes: &[u8]| wired(WiredKind::And, codes);
+        assert_eq!(and(&[ZERO, ZERO]), '0');
+        assert_eq!(and(&[ZERO, ONE]), '0');
+        assert_eq!(and(&[ZERO, X]), '0');
+        assert_eq!(and(&[ZERO, Z]), '0');
+        assert_eq!(and(&[ONE, ONE]), '1');
+        assert_eq!(and(&[ONE, X]), 'x');
+        assert_eq!(and(&[ONE, Z]), '1');
+        assert_eq!(and(&[X, X]), 'x');
+        assert_eq!(and(&[X, Z]), 'x');
+        assert_eq!(and(&[Z, Z]), 'z');
+
+        let or = |codes: &[u8]| wired(WiredKind::Or, codes);
+        assert_eq!(or(&[ZERO, ZERO]), '0');
+        assert_eq!(or(&[ZERO, ONE]), '1');
+        assert_eq!(or(&[ZERO, X]), 'x');
+        assert_eq!(or(&[ZERO, Z]), '0');
+        assert_eq!(or(&[ONE, ONE]), '1');
+        assert_eq!(or(&[ONE, X]), '1');
+        assert_eq!(or(&[ONE, Z]), '1');
+        assert_eq!(or(&[X, X]), 'x');
+        assert_eq!(or(&[X, Z]), 'x');
+        assert_eq!(or(&[Z, Z]), 'z');
+
+        // A `highz` half drives nothing, exactly as it does for a plain net.
+        assert_eq!(
+            resolve_wired(
+                WiredKind::And,
+                &[(ZERO, StrengthLevel::Highz), (ONE, strong)]
+            ),
             ONE
         );
     }

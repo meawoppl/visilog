@@ -1188,6 +1188,19 @@ on pass through, the ones they do not are `x`. The count has to be taken at the 
 rather than per push, because one driver may be an instance's `Binding::Driving` and the
 other the parent's own `assign`.
 
+**A `wand`/`wor` net is the one place the strongest driver does not simply win.**
+`wand`/`triand` and `wor`/`trior` combine their drivers by a logic *function* instead — a
+`wand` is `0` when any driver is `0` however the others are driving, which is the whole
+point of the net kind — so `gates::resolve_wired` sits beside `resolve_bit` and
+`Elaborated::wired_nets` says which nets take it. A floating driver still contributes
+nothing, so a wired net every driver has let go of is `z`, and the dominant level is
+looked for before `x`: `wand(0, x)` is `0` and `wand(1, x)` is `x`. Corpus `triand` and
+`trior` are the ten two-driver combinations of each, asserted against iverilog's answers,
+and they are what the table was measured from. Strength is deliberately not read — that
+would mean the LRM's wired *strength* table beside the value one, and every corpus design
+using a wired net drives it at `strong`. A design that declares none answers
+`HashMap::is_empty` once per net per pass.
+
 **`assign #10 a = b;` is a real delay, and the trick is that it changes *which* value the
 driver asserts, not whether it asserts one.** A delayed assignment is still a continuous
 driver on the same `propagate` fixpoint as every other one — it just contributes the value

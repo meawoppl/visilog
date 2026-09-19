@@ -49,7 +49,7 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_bit, Gate, PassSwitch};
+use crate::simulator::gates::{resolve_bit, resolve_wired, Gate, PassSwitch, WiredKind};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::{bit_position_in, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
@@ -446,6 +446,9 @@ pub struct Simulator {
     resolved_nets: HashSet<String>,
     /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
     pulled_nets: Vec<PulledNet>,
+    /// The `wand`/`wor` nets, whose drivers combine by a logic function rather
+    /// than by strength. Empty for a design that declares none.
+    wired_nets: HashMap<String, WiredKind>,
     blocks: Vec<TimedBlock>,
     /// The blocks suspended on something other than the clock: a `wait` on a
     /// value, or an event control waiting for an edge.
@@ -521,6 +524,7 @@ impl Simulator {
             pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
+            wired_nets: HashMap::new(),
             blocks: Vec::new(),
             waiting: Vec::new(),
             forks: Vec::new(),
@@ -557,6 +561,7 @@ impl Simulator {
         self.scheduled.clear();
         self.settled_once = false;
         self.pulled_nets.clear();
+        self.wired_nets.clear();
         self.blocks.clear();
         self.waiting.clear();
         self.forks.clear();
@@ -612,6 +617,7 @@ impl Simulator {
         self.pass_switches = elaborated.pass_switches;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
+        self.wired_nets = elaborated.wired_nets;
         self.blocks = elaborated.blocks;
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
@@ -1850,9 +1856,20 @@ impl Simulator {
         let mut changed = false;
         for net in resolving {
             let mut bits = net.bits;
+            // A `wand`/`wor` net combines its drivers by a logic function
+            // instead of by strength, and it is the *net* that says so. A
+            // design that declares none answers without hashing a name.
+            let wired = if self.wired_nets.is_empty() {
+                None
+            } else {
+                self.wired_nets.get(net.name.as_str()).copied()
+            };
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
-                    bits[position] = resolve_bit(drivers);
+                    bits[position] = match wired {
+                        Some(kind) => resolve_wired(kind, drivers),
+                        None => resolve_bit(drivers),
+                    };
                 }
             }
             let target = match net.address {
@@ -3717,6 +3734,39 @@ mod tests {
         simulator.advance(1).expect("time should advance");
         assert_eq!(simulator.get("blend").unwrap().to_binary(), "x");
         assert_eq!(simulator.get("agree").unwrap().to_binary(), "1");
+    }
+
+    /// A `wand`/`wor` net combines its drivers by a logic function rather than
+    /// by strength, so a single `0` pulls a `wand` down where an ordinary net
+    /// would be `x`.
+    ///
+    /// Corpus `pr3437290a` and `pr3437290c` are these two designs, and they
+    /// assert exactly these answers against iverilog's.
+    #[test]
+    fn test_wired_nets_are_pulled_by_their_dominant_driver() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg a, b, c;
+                wand down;
+                wor up;
+                assign down = a;
+                assign down = b;
+                assign down = c;
+                assign up = a;
+                assign up = b;
+                assign up = c;
+                initial begin
+                    a = 1'b1;
+                    b = 1'b0;
+                    c = 1'b1;
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.get("down").unwrap().to_binary(), "0");
+        assert_eq!(simulator.get("up").unwrap().to_binary(), "1");
     }
 
     #[test]
