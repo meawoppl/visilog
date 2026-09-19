@@ -1176,6 +1176,18 @@ where writing the net directly would put the `0`s straight through. `None` on a
 write at `strong` exactly as it always was, so a design that declares no strength anywhere
 still pays the `HashSet::is_empty`.
 
+**So is a net more than one continuous assignment drives, and that one is not an
+improvement but a *termination* rule.** Two plain `assign`s written onto one net used to
+be two ordinary writes, and two writes of different values do not settle: each pass undoes
+the one before it until `propagate` runs out of passes, so the design fails with
+`NoConvergence` rather than with an answer — `assign blend = foo; assign blend = bar;` is
+corpus `pr1701921` and six more. `elaborate::resolve_multiply_driven_nets` counts the
+assignments by target name once the whole hierarchy has been walked and marks any name
+with two, after which `resolve_bit` gives what iverilog gives: the bits the drivers agree
+on pass through, the ones they do not are `x`. The count has to be taken at the **end**
+rather than per push, because one driver may be an instance's `Binding::Driving` and the
+other the parent's own `assign`.
+
 **`assign #10 a = b;` is a real delay, and the trick is that it changes *which* value the
 driver asserts, not whether it asserts one.** A delayed assignment is still a continuous
 driver on the same `propagate` fixpoint as every other one — it just contributes the value
