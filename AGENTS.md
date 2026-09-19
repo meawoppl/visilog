@@ -733,6 +733,44 @@ reach a shift's right operand, a `?:` condition, or anything inside a concatenat
 `c = { a**b };` is the four bit power, `c = a**b;` is the sixteen bit one (corpus
 `pr2823711`).
 
+**But a context-determined operator sizes its two operands against *each other* as well,
+and the context is only the third number in that maximum.** `+ - * / % & | ^ ~^` are
+carried out at the widest of the context, the left operand and the right one, so a *narrow*
+operand nested beside a wide one has to be widened before it runs rather than padded
+afterwards: `(c & ~(1'b1 << 0)) & b` for four bit `c` and `b` is `1110`, because the `~`
+inverts four bits — inverting one and padding with zeros gives `0000` (corpus
+`pr2985542`). `(a + b + 0) >> 1` for two sixteen bit `a` and `b` is the same rule in the
+other direction: the unsized `0` is thirty-two bits, so the addition does not wrap at
+sixteen and `16'h8000 + 16'h8000` survives to be shifted (corpus `pr1570635b`,
+`pr3098439a`, `pr1913937`).
+
+Both halves of how that is asked are load-bearing for the hot path. **An operand is only
+measured for the one beside it**, never for itself, and only when it is `sized_within` —
+an operand comes back at least as wide as it is on its own whatever it was asked for, so
+measuring it for itself would change nothing, and one that is not `sized_within` is padded
+the same way whichever end the padding happens at. And **the right operand reads its share
+off the left one's *evaluated* width** rather than measuring it, because by then the answer
+is free: the left value is already as wide as the widest of the three. So `count + 1`
+measures nothing at all and an expression of two plain operands costs one branch. Measuring
+both sides instead doubled `bench eval/nested_arithmetic`.
+
+`other_operand_width` is the one seam, and the one thing it adds to `expression_width` is
+that a **real** operand reports `SELF_DETERMINED`: a real has no width to share, and
+widening the integer beside it to sixty-four bits reads `-180` as a twenty-digit unsigned
+number (corpus `pr1574175`, where `-180 + bits*(360.0/63.0)` and `bits*(360.0/63.0) - 180`
+agree only once each has wrapped at the target's thirty-two). That question cannot go
+through `StateStore::any_real` — that flag answers for *declarations* and this expression
+has no real declared anywhere — so it is asked of the expression, after the measurement and
+only when the measurement came back `REAL_WIDTH`.
+
+`benches/simulation.rs`'s `eval/nested_arithmetic` is `((a + b) * 2) - (a & b)` over two
+eight bit signals, and the unsized `2` makes the whole expression **thirty-two bits** —
+iverilog answers 416 with `$bits` of 32, where evaluating it in eight bits answers 160. The
+benchmark is therefore permanently slower than it was by about the ratio of the two widths,
+doing four times the bit work on a one-byte-per-bit `Register`. Read a move in that number
+as a change in the *width* the expression settles on before reading it as a change in
+speed.
+
 **A comparison is the exception that needs measuring.** Its answer is one unsigned bit
 whatever the context, but its two operands are context-determined *with respect to each
 other*: sized to the wider of the two and read signed only when both are. `assign wide =
@@ -754,8 +792,10 @@ actually reaches the operator that limit is *reported* rather than quietly ignor
 used to compute a wrong answer in 32 bits (corpus `pr2352834`).
 
 Still not modelled: a `?:` whose arms disagree about signedness takes the "signed only if
-both" rule, where iverilog reads `1 ? ~a >>> 5 : 0` as signed (corpus `br_gh37`,
-`pr1913937`). The widths in that expression are right; only the sign is not.
+both" rule, where iverilog reads `1 ? ~a >>> 5 : 0` as signed (corpus `br_gh37`). The
+widths in that expression are right; only the sign is not. A `?:` also does not yet size
+its two *arms* against each other the way a `Shared` binary now sizes its operands — the
+arms both get the context and nothing measures the one beside.
 
 **A design's own functions are compiled at elaboration and called from `eval`.**
 `function [7:0] f; input [7:0] a; f = a + 1; endfunction` parses in both the 1995 form
@@ -2095,8 +2135,12 @@ tripwire.
   `eval_sized` the only way a target's width gets in. Keeping the padding cheap is
   deliberate: `widened` is `#[inline(always)]` over a `#[cold] pad`, `widened_result` hands
   a `Result` straight back rather than unwrapping and rewrapping a 70-odd byte `Register`,
-  and `sized_within` stops a comparison of two plain signals from measuring anything.
+  and `sized_within` stops a comparison — or a `Shared` operation — of two plain signals
+  from measuring anything.
   Undoing any of those costs 5–10% on `bench eval` on its own.
+  **A `Shared` operation's mutual sizing measures one operand and reads the other off the
+  evaluated left value**, which is what keeps it to a single walk of a single subtree per
+  node; measuring both sides instead doubled `bench eval/nested_arithmetic`.
 - **A comparison sizes and signs its two operands against *each other*.** It is
   self-determined as far as the expression around it goes — one unsigned bit, always — but
   `a/b` beside a sixteen bit net divides in sixteen bits, and a signed operand beside an
