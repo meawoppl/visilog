@@ -80,6 +80,12 @@ pub(crate) const EMPTY_IMPLICIT_EVENT_UNSUPPORTED: SimulationError =
 pub(crate) const FORK_TIMING_UNSUPPORTED: SimulationError =
     SimulationError::Unsupported("a `fork`/`join` branch that consumes time");
 
+/// What an enable of a `task automatic` reports where there is no driver
+/// behind the caller to start an activation on — the same two places a
+/// time-consuming `fork` cannot run.
+pub(crate) const ACTIVATION_UNSUPPORTED: SimulationError =
+    SimulationError::Unsupported("an enable of an automatic task");
+
 /// What a function body that could consume time reports. A function returns a
 /// value into the expression that called it, and an expression is evaluated at
 /// one instant, so there is no later for it to resume at.
@@ -263,6 +269,23 @@ pub enum Instruction {
         path: String,
         arguments: Vec<Expression>,
     },
+    /// `t(a, b);` for a `task automatic` — start an *activation* of it and
+    /// hold this thread until the activation returns.
+    ///
+    /// An automatic task has storage per enable, and an enable of one may
+    /// recurse, so its body cannot be spliced where it is written: there is no
+    /// static depth to splice to, and a spliced body has only the one set of
+    /// names. The driver runs it instead, as a thread over a copy of the body
+    /// renamed into storage of its own — see
+    /// [`Simulator`](super::runner::Simulator). `task` is the flat path the
+    /// design-wide table of automatic tasks is keyed by, settled where the
+    /// enable was compiled, and `arguments` are the caller's own expressions:
+    /// the driver copies them in and out, because the storage they are copied
+    /// to does not exist until the enable runs.
+    AutomaticEnable {
+        task: String,
+        arguments: Vec<Expression>,
+    },
     /// The end of the block.
     Halt,
 }
@@ -361,6 +384,14 @@ pub enum Resume {
     /// Reached the end of one `fork` branch. The thread is over; the block it
     /// is a branch of carries on once its siblings are over too.
     BranchDone { pending: Vec<PendingUpdate> },
+    /// Hit an enable of a `task automatic`. Start an activation of the task
+    /// the [`Instruction::AutomaticEnable`] at `site` names, and hold this
+    /// thread at `pc` until the activation returns.
+    Enabled {
+        site: usize,
+        pc: usize,
+        pending: Vec<PendingUpdate>,
+    },
 }
 
 /// What a suspended block is waiting for, which is what decides how the driver
@@ -400,7 +431,8 @@ fn instruction_expressions(instruction: &Instruction) -> Vec<&Expression> {
         Instruction::Task(call) => call.expressions(),
         // Its arguments are expressions like any other; its *path* is not —
         // that names a task and travels with the scope table instead.
-        Instruction::HierarchicalEnable { arguments, .. } => arguments.iter().collect(),
+        Instruction::HierarchicalEnable { arguments, .. }
+        | Instruction::AutomaticEnable { arguments, .. } => arguments.iter().collect(),
         Instruction::EventWait(control) => match control {
             EventControl::Events(events) => events.iter().map(|event| &event.expression).collect(),
             _ => Vec::new(),
@@ -539,8 +571,11 @@ fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> S
         // The arguments of a hierarchical enable are the *caller's*
         // expressions, so they are renamed here like any others. Its path is
         // not: it names a task rather than a signal, and travels with the
-        // scope table — see [`Program::rename_scopes`].
-        Instruction::HierarchicalEnable { arguments, .. } => {
+        // scope table — see [`Program::rename_scopes`]. An automatic enable's
+        // task is already the flat path it was settled to, so only its
+        // arguments move.
+        Instruction::HierarchicalEnable { arguments, .. }
+        | Instruction::AutomaticEnable { arguments, .. } => {
             for argument in arguments {
                 rename_expression(argument, resolve);
             }
@@ -621,7 +656,8 @@ fn substitute_instruction(instruction: &mut Instruction, replace: &dyn Fn(&mut E
         }
         // A generate loop may index the argument of an enable it writes:
         // `u[i].load(data[i]);`.
-        Instruction::HierarchicalEnable { arguments, .. } => {
+        Instruction::HierarchicalEnable { arguments, .. }
+        | Instruction::AutomaticEnable { arguments, .. } => {
             for argument in arguments {
                 replace(argument);
             }
@@ -955,6 +991,28 @@ impl Program {
     /// *not* skipped — its loops belong to this block as much as the rest.
     pub fn tag_slots(&mut self, tag: usize) {
         tag_slots_in(&mut self.instructions, tag);
+    }
+
+    /// One activation of a `task automatic` whose body this is: a block of its
+    /// own, with every name `resolve` answers for re-pointed at the
+    /// activation's storage and its hidden slots tagged with `tag`, the
+    /// block's number.
+    ///
+    /// The whole body is the scope `task` names, so a `disable` of the task
+    /// from inside it is the early return it is in a spliced body — a jump to
+    /// the `Halt` that ends the activation.
+    pub fn activation(&self, task: &str, resolve: &dyn Fn(&str) -> String, tag: usize) -> Program {
+        let mut program = self.clone();
+        program.rename(resolve);
+        program.tag_slots(tag);
+        let end = program.emit(Instruction::Halt);
+        program.scopes.push(ScopeRange {
+            name: task.to_string(),
+            start: 0,
+            end,
+        });
+        program.mark_fork_disables();
+        program
     }
 
     /// Rewrites the names this program's *own* statements use, leaving the
@@ -1629,6 +1687,22 @@ impl Program {
         // wrote its `output` arguments back either.
         let start = self.next();
 
+        // An automatic task's copies are the driver's to make, into storage
+        // the activation is given when it starts — so the whole enable is one
+        // instruction, and the scope covers the point the caller waits at.
+        if let Some(task) = &definition.automatic {
+            self.emit(Instruction::AutomaticEnable {
+                task: task.clone(),
+                arguments: arguments.to_vec(),
+            });
+            self.scopes.push(ScopeRange {
+                name: name.name.clone(),
+                start,
+                end: self.next(),
+            });
+            return Ok(());
+        }
+
         for (argument, connection) in definition.arguments.iter().zip(arguments) {
             if argument.direction.copies_in() {
                 self.emit(Instruction::Blocking {
@@ -1708,6 +1782,17 @@ impl Program {
                     expected: definition.arguments.len(),
                     found: arguments.len(),
                 });
+            }
+            // Another instance's automatic task is started where the enable
+            // stands, exactly as a local one is: there is no body to splice.
+            if let Some(task) = definition.automatic {
+                self.instructions[site] = Instruction::AutomaticEnable { task, arguments };
+                self.scopes.push(ScopeRange {
+                    name: path,
+                    start: site,
+                    end: site + 1,
+                });
+                continue;
             }
 
             let start = self.next();
@@ -1802,12 +1887,22 @@ impl Program {
 /// all. It also gives a task the static storage the LRM asks for — the
 /// argument and local variables live in the store, one set per task, shared by
 /// every enable.
+///
+/// A `task automatic` is the exception, and for it this is only the *shape* of
+/// an enable: `automatic` names the design-wide entry an
+/// [`Instruction::AutomaticEnable`] starts an activation of, and `program` is
+/// the body that entry is made from. It is in the table from before anything
+/// is compiled, which is what lets its own body — or a body it enables —
+/// enable it again.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskDefinition {
     /// The arguments, in call order, with the names the body already uses.
     pub arguments: Vec<TaskParameter>,
     /// The body, with no `Halt`: it is spliced into the middle of a block.
     pub program: Program,
+    /// The flat path of a `task automatic` — `dut.load` — and `None` for a
+    /// static task, whose body is spliced.
+    pub automatic: Option<String>,
 }
 
 /// One task argument: the store entry the body reads and writes, plus which
@@ -1984,6 +2079,7 @@ impl FunctionDefinition {
             Resume::Forked { .. } | Resume::BranchDone { .. } => {
                 return Err(FORK_TIMING_UNSUPPORTED)
             }
+            Resume::Enabled { .. } => return Err(ACTIVATION_UNSUPPORTED),
         }
 
         // What the body wrote to a *design* signal is owed to the design. It
@@ -2259,6 +2355,15 @@ pub fn resume(
             Instruction::HierarchicalEnable { path, .. } => {
                 return Err(SimulationError::UnknownTask(path.clone()))
             }
+            // An activation needs storage made for it and a thread to run on,
+            // both of which are the driver's.
+            Instruction::AutomaticEnable { .. } => {
+                return Ok(Resume::Enabled {
+                    site: pc,
+                    pc: pc + 1,
+                    pending,
+                })
+            }
             Instruction::Halt => return Ok(Resume::Halted { pending }),
         }
     }
@@ -2326,6 +2431,16 @@ fn instruction_suspends(instruction: &Instruction) -> bool {
             // driver, so a `fork` written inside another one makes the outer
             // one time-consuming as well.
             | Instruction::Fork { .. }
+            // An automatic task runs as a thread of its own, and its body is
+            // not in hand where the enable is compiled — it may be the very
+            // task being compiled — so an enable of one is taken to consume
+            // time. Branches that each enable one therefore run concurrently,
+            // which is the whole point of giving each enable its own storage.
+            | Instruction::AutomaticEnable { .. }
+            // Another instance's task is linked in only once the hierarchy has
+            // been walked, long after the `fork` around its enable was laid
+            // out, so whether its body waits cannot be asked here either.
+            | Instruction::HierarchicalEnable { .. }
     )
 }
 
@@ -2408,6 +2523,7 @@ mod tests {
             Resume::Waiting { pending, .. }
             | Resume::Disabled { pending, .. }
             | Resume::Forked { pending, .. }
+            | Resume::Enabled { pending, .. }
             | Resume::BranchDone { pending } => {
                 commit_updates(pending, store).unwrap();
                 None
