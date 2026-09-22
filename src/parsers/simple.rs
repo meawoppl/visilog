@@ -403,12 +403,12 @@ mod tests {
 
     #[test]
     fn test_attribute_before_a_port_connection() {
-        let instantiation = assert_parses(
+        let instances = assert_parses(
             parse_module_instantiation_statement,
             "foo f ((* c *) .a(b));",
         );
-        assert_eq!(instantiation.module_name.name, "foo");
-        assert_eq!(instantiation.instance_name.name, "f");
+        assert_eq!(instances[0].module_name.name, "foo");
+        assert_eq!(instances[0].instance_name, Some("f".into()));
     }
 
     #[test]

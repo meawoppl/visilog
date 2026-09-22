@@ -78,6 +78,9 @@ pub enum SimulationError {
     SystemTask(String),
     /// An instantiation, or a top-level name, that no supplied module defines.
     UnknownModule(String),
+    /// `child (o, i);` for a `child` that is a module rather than a
+    /// user-defined primitive: only a primitive's instance name is optional.
+    UnnamedInstance(String),
     /// A named port connection for a port the instantiated module does not have.
     UnknownPort { module: String, port: String },
     /// A `#(...)` override for a parameter the instantiated module does not
@@ -181,6 +184,9 @@ impl fmt::Display for SimulationError {
             }
             SimulationError::SystemTask(problem) => write!(f, "{}", problem),
             SimulationError::UnknownModule(name) => write!(f, "no module named `{}`", name),
+            SimulationError::UnnamedInstance(name) => {
+                write!(f, "an instance of module `{}` needs a name", name)
+            }
             SimulationError::UnknownTask(name) => write!(f, "no task named `{}`", name),
             SimulationError::TaskArity {
                 name,
@@ -10315,6 +10321,69 @@ mod tests {
         assert_eq!(
             simulator.output().text(),
             "0 out=x\n2 out=0\n26 out=1\n42 out=0\n"
+        );
+    }
+
+    /// `passthrough (o1, i);` — an unnamed instance of a user-defined
+    /// primitive, which IEEE 1364-2005 allows, several in one scope and one in
+    /// a list, each its own driver. The `!i` connection is bound to an
+    /// expression and so takes a store entry of its own, which is what the
+    /// generated name has to keep apart (corpus `pr3587570`; iverilog 12.0
+    /// prints `0 1 1 0`).
+    #[test]
+    fn test_an_unnamed_primitive_instance_drives() {
+        let source = r#"
+            primitive passthrough (o, i);
+                output o;
+                input i;
+                table
+                    1 : 1;
+                    0 : 0;
+                endtable
+            endprimitive
+
+            module main;
+                reg i;
+                wire a, b, c, d;
+                passthrough (a, i);
+                passthrough (b, !i), (c, ~i);
+                passthrough named (d, i);
+                initial begin
+                    i = 1'b0;
+                    #1 $display("%b %b %b %b", a, b, c, d);
+                end
+            endmodule
+        "#;
+        let (rest, modules) =
+            crate::parsers::source::parse_verilog_source(source).expect("design should parse");
+        assert!(rest.trim().is_empty(), "unparsed input: {}", rest);
+        let mut simulator = Simulator::with_modules(modules, "main");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0 1 1 0\n");
+    }
+
+    /// Only a primitive's instance name is optional: `child (o, i);` for a
+    /// module is refused by name, which is where iverilog 12.0 stops too
+    /// ("Instantiation of module child requires an instance name").
+    #[test]
+    fn test_an_unnamed_module_instance_is_refused() {
+        let source = r#"
+            module child (output o, input i);
+                assign o = i;
+            endmodule
+            module main;
+                reg i;
+                wire o;
+                child (o, i);
+            endmodule
+        "#;
+        let (_, modules) =
+            crate::parsers::source::parse_verilog_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(modules, "main");
+        assert_eq!(
+            simulator.setup().unwrap_err(),
+            SimulationError::UnnamedInstance("child".to_string())
         );
     }
 

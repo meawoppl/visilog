@@ -280,6 +280,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
         walked: 0,
         defparams: BTreeMap::new(),
         blocks_generated: 0,
+        unnamed_instances: 0,
         hierarchical_tasks: HashMap::new(),
     };
     elaborator.walk(top, &mut Scope::root(&modules[top].identifier.name))?;
@@ -464,6 +465,9 @@ struct Elaborator<'m> {
     /// A block with no label still needs a scope — two iterations of an
     /// unnamed loop body would otherwise declare the same names twice.
     blocks_generated: usize,
+    /// How many unnamed primitive instances have been given a name, which is
+    /// what keeps two `p (q, d);` in one scope from sharing store entries.
+    unnamed_instances: usize,
     /// Every task in the design under the flat path a hierarchical enable
     /// resolves to — `j.set`, `main.test1` — with its body already renamed
     /// into the names of the instance that declares it.
@@ -1949,19 +1953,23 @@ impl<'m> Elaborator<'m> {
                     }
                 }
             }
-            ModuleStatement::ModuleInstantiation(instantiation) => match &instantiation.arguments {
-                ModuleInitArguments::NoArgs => {}
-                ModuleInitArguments::Positional(connections) => {
-                    for connection in connections.iter().flatten() {
-                        operand_names(connection, &mut names);
+            ModuleStatement::ModuleInstantiation(instances) => {
+                for instantiation in instances {
+                    match &instantiation.arguments {
+                        ModuleInitArguments::NoArgs => {}
+                        ModuleInitArguments::Positional(connections) => {
+                            for connection in connections.iter().flatten() {
+                                operand_names(connection, &mut names);
+                            }
+                        }
+                        ModuleInitArguments::Keyword(connections) => {
+                            for connection in connections.values() {
+                                operand_names(connection, &mut names);
+                            }
+                        }
                     }
                 }
-                ModuleInitArguments::Keyword(connections) => {
-                    for connection in connections.values() {
-                        operand_names(connection, &mut names);
-                    }
-                }
-            },
+            }
             _ => {}
         }
         for local in names {
@@ -2747,8 +2755,10 @@ impl<'m> Elaborator<'m> {
                     program,
                 });
             }
-            ModuleStatement::ModuleInstantiation(instantiation) => {
-                self.instantiate_each(instantiation, scope)?
+            ModuleStatement::ModuleInstantiation(instances) => {
+                for instantiation in instances {
+                    self.instantiate_each(instantiation, scope)?
+                }
             }
             _ => {}
         }
@@ -2767,6 +2777,14 @@ impl<'m> Elaborator<'m> {
         instantiation: &ModuleInstantiation,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
+        let named;
+        let instantiation = match instantiation.instance_name {
+            Some(_) => instantiation,
+            None => {
+                named = self.named_primitive_instance(instantiation)?;
+                &named
+            }
+        };
         let Some(range) = &instantiation.range else {
             return self.instantiate(instantiation, scope);
         };
@@ -2833,10 +2851,11 @@ impl<'m> Elaborator<'m> {
             };
             let element = ModuleInstantiation {
                 module_name: instantiation.module_name.clone(),
-                instance_name: Identifier::new(format!(
+                instance_name: Some(Identifier::new(format!(
                     "{}[{}]",
-                    instantiation.instance_name.name, index
-                )),
+                    instance_name(instantiation),
+                    index
+                ))),
                 range: None,
                 parameters: instantiation.parameters.clone(),
                 arguments,
@@ -2880,7 +2899,7 @@ impl<'m> Elaborator<'m> {
             return Ok(connection.clone());
         }
         let mismatch = || SimulationError::ArrayConnectionWidth {
-            instance: instantiation.instance_name.name.clone(),
+            instance: instance_name(instantiation).to_string(),
             port: port.identifier.name.clone(),
             port_width,
             count,
@@ -2915,6 +2934,34 @@ impl<'m> Elaborator<'m> {
         })
     }
 
+    /// Names `p (q, d);`, which IEEE 1364-2005 allows for a user-defined
+    /// primitive and not for a module — so the module being instantiated is
+    /// asked, and an unnamed module instance is refused rather than invented a
+    /// name, which is iverilog 12.0's answer as well. The name begins with a
+    /// `$`, which no design identifier can, so it cannot meet one.
+    fn named_primitive_instance(
+        &mut self,
+        instantiation: &ModuleInstantiation,
+    ) -> Result<ModuleInstantiation, SimulationError> {
+        let wanted = &instantiation.module_name.name;
+        let child = self
+            .modules
+            .iter()
+            .find(|module| &module.identifier.name == wanted)
+            .ok_or_else(|| SimulationError::UnknownModule(wanted.clone()))?;
+        if primitive_table(child).is_none() {
+            return Err(SimulationError::UnnamedInstance(wanted.clone()));
+        }
+        self.unnamed_instances += 1;
+        Ok(ModuleInstantiation {
+            instance_name: Some(Identifier::new(format!(
+                "${}{}",
+                wanted, self.unnamed_instances
+            ))),
+            ..instantiation.clone()
+        })
+    }
+
     fn instantiate(
         &mut self,
         instantiation: &ModuleInstantiation,
@@ -2931,13 +2978,13 @@ impl<'m> Elaborator<'m> {
         // A module cannot see out of itself, so the instance's prefix is the
         // whole of what a name inside it resolves to — the generate block it
         // may stand in is already part of the prefix it was created under.
-        let prefix = format!("{}{}.", scope.prefix, instantiation.instance_name.name);
+        let prefix = format!("{}{}.", scope.prefix, instance_name(instantiation));
         // The hierarchical name a design writes this instance under, which is
         // the store prefix with the top module's own name in front: the top is
         // the root of the flat name space and carries no prefix, but a design
         // still calls it `top`.
         self.out.instances.push((
-            scope.hierarchy(&instantiation.instance_name.name),
+            scope.hierarchy(instance_name(instantiation)),
             child.timescale,
         ));
         // `BUFG #5 bg(out, in);` reads as a parameter override, because that
@@ -3006,7 +3053,7 @@ impl<'m> Elaborator<'m> {
                 }
                 None => {
                     return Err(SimulationError::UndrivablePort {
-                        instance: instantiation.instance_name.name.clone(),
+                        instance: instance_name(instantiation).to_string(),
                         port: local.clone(),
                         connection: connection.to_contracted_string(),
                     })
@@ -3317,6 +3364,15 @@ fn is_drivable(expression: &Expression) -> bool {
         Expression::Concatenation(parts) => parts.iter().all(is_drivable),
         _ => false,
     }
+}
+
+/// The name of an instance `instantiate_each` has already named.
+fn instance_name(instantiation: &ModuleInstantiation) -> &str {
+    &instantiation
+        .instance_name
+        .as_ref()
+        .expect("an unnamed instance is named before it is instantiated")
+        .name
 }
 
 /// Whether a port names a variable rather than a net.
@@ -3974,9 +4030,14 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
         ModuleStatement::ParameterDeclaration(parameters) => {
             names.extend(parameters.iter().map(|it| it.name.name.clone()))
         }
-        ModuleStatement::ModuleInstantiation(instantiation) => {
-            names.push(instantiation.instance_name.name.clone())
-        }
+        // An unnamed primitive instance cannot be named, so it declares
+        // nothing a reference could reach.
+        ModuleStatement::ModuleInstantiation(instances) => names.extend(
+            instances
+                .iter()
+                .filter_map(|instance| instance.instance_name.as_ref())
+                .map(|name| name.name.clone()),
+        ),
         // A function declared inside a generate block is stored under the
         // block's prefix, so a call written inside the block has to resolve
         // through it — without the name here, `funfun(select)` beside the

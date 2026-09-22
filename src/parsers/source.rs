@@ -368,9 +368,9 @@ mod tests {
         assert_eq!(top.identifier, "top".into());
         assert_eq!(top.statements.len(), 1);
         match &top.statements[0] {
-            ModuleStatement::ModuleInstantiation(instantiation) => {
-                assert_eq!(instantiation.module_name, "counter".into());
-                assert_eq!(instantiation.instance_name, "c0".into());
+            ModuleStatement::ModuleInstantiation(instances) => {
+                assert_eq!(instances[0].module_name, "counter".into());
+                assert_eq!(instances[0].instance_name, Some("c0".into()));
             }
             other => panic!("Expected a module instantiation, got {:?}", other),
         }
