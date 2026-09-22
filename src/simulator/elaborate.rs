@@ -1823,13 +1823,16 @@ impl<'m> Elaborator<'m> {
                     if range_width(addresses) > MAX_MEMORY_DEPTH {
                         return Err(MEMORY_TOO_LARGE);
                     }
+                    // A local declares one dimension, where a module-level
+                    // array may declare several.
                     match real {
-                        true => self.out.state.declare_real_memory(name, addresses),
-                        false => {
-                            self.out
-                                .state
-                                .declare_memory(name, addresses, range, variable.signed)
-                        }
+                        true => self.out.state.declare_real_memory(name, vec![addresses]),
+                        false => self.out.state.declare_memory(
+                            name,
+                            vec![addresses],
+                            range,
+                            variable.signed,
+                        ),
                     }
                 }
                 // A `real` is declared as one, so a value copied into it is

@@ -1924,11 +1924,11 @@ impl FunctionDefinition {
             // the whole of what tells `tmp[1]` a word from `tmp[1]` a bit.
             match (variable.dimensions, variable.real) {
                 (Some(addresses), true) => {
-                    frame.declare_real_memory(variable.name.clone(), addresses)
+                    frame.declare_real_memory(variable.name.clone(), vec![addresses])
                 }
                 (Some(addresses), false) => frame.declare_memory(
                     variable.name.clone(),
-                    addresses,
+                    vec![addresses],
                     variable.range,
                     variable.signed,
                 ),
