@@ -1322,6 +1322,9 @@ pub struct TaskArgument {
 #[derive(Debug, PartialEq)]
 pub struct TaskDeclaration {
     pub name: Identifier,
+    /// `task automatic` — every enable gets storage of its own, rather than
+    /// sharing the one set of variables a static task has.
+    pub automatic: bool,
     pub arguments: Vec<TaskArgument>,
     /// Body-local `reg`, `integer` and memory declarations.
     pub locals: Vec<FunctionVariable>,
@@ -1417,7 +1420,7 @@ fn ansi_task_arguments(input: &str) -> IResult<&str, Vec<TaskArgument>> {
 /// direction introduced.
 pub fn parse_task_declaration(input: &str) -> IResult<&str, TaskDeclaration> {
     let (input, _) = keyword(input, "task")?;
-    let (input, _) = opt(|i| keyword(i, "automatic"))(input)?;
+    let (input, automatic) = opt(|i| keyword(i, "automatic"))(input)?;
     let (input, name) = ws(identifier)(input)?;
     let (input, ansi) = opt(ansi_task_arguments)(input)?;
     let (input, _) = ws(char(';'))(input)?;
@@ -1467,6 +1470,7 @@ pub fn parse_task_declaration(input: &str) -> IResult<&str, TaskDeclaration> {
         input,
         TaskDeclaration {
             name,
+            automatic: automatic.is_some(),
             arguments,
             locals,
             parameters,
@@ -2385,6 +2389,20 @@ mod tests {
         assert!(task.arguments.is_empty());
         assert!(task.locals.is_empty());
         assert!(task.statements.is_empty());
+        assert!(!task.automatic);
+    }
+
+    /// `task automatic` asks for storage per enable, which is a different
+    /// execution shape from a static task's, so the keyword is kept.
+    #[test]
+    fn test_parse_task_automatic_is_recorded() {
+        let task = assert_parses(
+            parse_task_declaration,
+            "task automatic f(input integer n); f(n - 1); endtask",
+        );
+
+        assert!(task.automatic);
+        assert_eq!(task.arguments.len(), 1);
     }
 
     /// The 1995 form may spell an argument's data type out separately, which

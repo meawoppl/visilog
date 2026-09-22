@@ -1253,11 +1253,13 @@ ordinary `Instruction::Blocking`s, so a copy is sized and signed by its target t
 every other assignment is, and an argument the caller passes as a constant fails as an
 `UnsupportedTarget` only if the task tries to write it back.
 
-**A task's variables are static, and are ordinary store entries under a dotted name.**
+**A static task's variables are ordinary store entries under a dotted name.**
 `elaborate::declare_tasks` puts the arguments and locals of task `load` in the store as
 `load.a`, `load.b` — qualified per instance like anything else, so two instances of a
 module count separately, and shared between two enables of one task exactly as the LRM
-says a non-`automatic` task's storage is. That is also what tells a task local apart from
+says a non-`automatic` task's storage is. A `task automatic` is declared the same way, but
+those entries are only the *prototype* each activation's storage is copied from — see
+"An automatic task is started, not spliced" below. That is also what tells a task local apart from
 a design signal of the same name: `compile_task` renames the body through the task's own
 names *only*, and `Program::rename_local` skips the ranges already spliced in from a
 nested enable — renaming a body twice would re-point a signal the inner task read at a
@@ -1271,11 +1273,62 @@ signed by the store entry, and a second copy of the width here could only disagr
 the first.
 
 Three things about an enable are named errors rather than silent no-ops: a task the module
-does not declare (`UnknownTask`), the wrong number of arguments (`TaskArity`), and a task
-that enables itself directly or around a cycle (`RecursiveTask`) — inlining does not
-terminate on one, and a static task's storage means real Verilog cannot recurse either.
-`declare_tasks` compiles in dependency order by repeating until a pass compiles nothing
-new, so a task may enable one declared further down the file.
+does not declare (`UnknownTask`), the wrong number of arguments (`TaskArity`), and a
+*static* task that enables itself directly or around a cycle (`RecursiveTask`) — inlining
+does not terminate on one, and a static task's storage means real Verilog cannot recurse
+either. `declare_tasks` compiles in dependency order by repeating until a pass compiles
+nothing new, so a task may enable one declared further down the file.
+
+**An automatic task is started, not spliced, and each enable of it is an *activation* with
+storage of its own.** A spliced body has one set of names and a static depth, so it cannot
+give two concurrent enables separate variables (corpus `automatic_events`, `real_events`,
+`pr2169870`, `automatic_task`) and cannot recurse at all (`recursive_task`) — and a
+function's frame will not do either, because a task may consume time and a frame runs to
+completion with no driver behind it. So an automatic task is a third execution shape:
+
+- **At elaboration** its variables are declared like a static task's, as a *prototype*,
+  and its compiled body goes into `Elaborated::automatic_tasks` under the flat path
+  `scope.qualified(name)` — `load`, `dut.load`. The task table holds a *marker* for it
+  (`TaskDefinition::automatic`, the same path) from before the first compile pass, which is
+  what lets its own body enable it. An enable compiles to one `Instruction::AutomaticEnable`
+  holding that path and the caller's argument expressions, inside a one-instruction
+  `ScopeRange` under the task's name; a hierarchical enable of one is converted into the
+  same instruction by `Program::link_hierarchical_enables`.
+- **At run time** `resume` hands it back as `Resume::Enabled` and
+  `Simulator::start_activation` takes a free *slot* of the task, or makes one: a block of its
+  own (`BlockKind::Initial`, never queued at time zero, never offered an edge) whose program
+  is the body renamed by `Program::activation` from `load.x` into `load.$3.x`. The slot's
+  storage is laid down fresh from the prototype (`StateStore::scope_storage`, taken once at
+  setup, and `install_scope`), the `input`/`inout` arguments are copied in, sized by the
+  activation's own variables, and the activation runs as a thread whose join is a
+  `ForkJoin` of one branch carrying `activation: Some((task, slot))`. Its `Halt` is the
+  return: `branch_arrived` copies the `output`/`inout` arguments back and frees the slot.
+  A slot is reused, so the number made is the most ever live at once, not the number of
+  enables. `.$` names are left out of a waveform dump, like the other hidden slots.
+- **Control passes without a queue round trip**, both ways, because iverilog 12.0 runs the
+  task's first statements before any other block due at that instant and resumes the caller
+  the moment the task returns (`task done`, `A after`, then `B`). `Simulator::resume_block` is
+  therefore a *trampoline*: `resume_thread` hands back the thread that carries on at once,
+  and the loop takes it. That is also why **recursion is unbounded**: a recursion that
+  consumes no time does not grow the host's stack (`sum(500)` and `fib(15)` run in the
+  debug build). `MAX_ACTIVATIONS` (1024) live activations of one task is the named error
+  `ActivationLimit` for a recursion that never reaches its base case.
+
+Three consequences. A `fork` branch holding an automatic enable is taken to consume time
+(`instruction_suspends`), since the body is not in hand where the `fork` is compiled — and
+so is one holding a `HierarchicalEnable`, whose body is linked long after, which is what
+lets `fork a.tick(3, x); b.tick(2, y); join` run the two concurrently. A `disable` of the
+task cuts the activation short but it still *returns* and copies its outputs back — iverilog
+12.0 leaves `z` at 1 after `slow(z)` wrote `o = 1` and was disabled — so `cancel_scope`
+re-queues an activation's block at its `Halt` under its own join record
+(`activation_fork`); an activation whose *enabling* thread is cancelled has nobody to return
+to and is dropped with its slot freed. And a design with no automatic task pays nothing: the
+tables are empty and nothing on a hot path asks about them.
+
+Still not modelled: an `@(*)` block that enables an automatic task does not take what the
+body reads into its sensitivity list, as a spliced one does; a `function automatic` is not
+distinguished from a static one, because every call already runs against a fresh frame; and
+`$countdrivers` is not asked of an activation's program when the design is set up.
 
 **An enable of *another instance's* task is linked after the walk, not spliced where it is
 written.** `j.set(1'bz)`, `top.main.test1` and `test.foo` — the top module naming itself —
@@ -1445,6 +1498,15 @@ by the time anything could look for it, so `EventWatch` snapshots the signals th
 names *at the moment the wait is armed* and asks on each round whether they have moved
 since.
 
+**A memory word has no value under its name, so a wait on one watches the evaluated
+select.** `@(mem[0])` names the memory `mem`, which the name snapshot reads as nothing at
+all and so never saw move. `EventWatch::words` is one slot per entry, holding what an
+entry that is a select of a *memory* evaluated to when the wait was armed, and
+`EventWatch::fires` hands the list to `events::events_fire` — the machinery a sensitivity
+entry that is an expression already used — so a write to another word does not wake it
+(corpus `automatic_task2`, `automatic_task3`; measured against iverilog 12.0). A control
+naming no memory word keeps an empty list and pays one `is_empty`.
+
 That snapshot is the whole reason the arming moment means anything. A settle round sees
 everything the timestep moved, including what the waiting block itself wrote on its way to
 the wait — `clk = 0; @(negedge clk) …` would otherwise be woken by its own write (corpus
@@ -1494,10 +1556,8 @@ is a `FrameVariable` whose `dimensions` make `FunctionDefinition::call` declare 
 *frame's* memory map (corpus `constfunc15`, `br_gh674`), while the function's constants and
 events are ordinary store entries under `f.p` — a constant outlives every call, so it is
 left out of the frame's own names and copied in with the rest of what the body reads.
-`task automatic` still parses to static storage (#217, #285), so two concurrent enables of
-one task share its memory — corpus `automatic_task` is that gap, and `automatic_task2`
-additionally needs a mid-block `@(array[0])` on a memory word to wake, which it does not
-yet do even for a module-level memory.
+A `task automatic`'s memory and events are part of the prototype its activations copy, so
+two concurrent enables each have their own (corpus `automatic_task`).
 
 **`fork`/`join` is one thread per branch, and the join resumes at the *maximum* of their
 finish times.** `Instruction::Fork { branches, join }` names the instruction each branch
@@ -2318,10 +2378,10 @@ telling apart.
 | `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which carries one net's resolution to another — reduced, by `carry` — instead of driving one, or a port bond when `port` is set; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
-| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
+| `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Instruction::AutomaticEnable` / `Program::activation`, which start a `task automatic` as a thread over a renamed copy of its body instead, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `AutomaticTask` / `start_activation()` / `return_from_activation()`, the activations of a `task automatic`, and `resume_thread()`, the turn of the trampoline `resume_block()` runs them on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
-| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
+| `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, the `scope_storage` / `install_scope` pair that gives each activation of a `task automatic` storage of its own, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |

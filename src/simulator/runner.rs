@@ -34,6 +34,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::parsers::expr::Expression;
+use crate::parsers::identifier::Identifier;
 use crate::parsers::{
     assignment::ContinuousAssignment, behavior::EventControl, gates::DriveStrength,
     modules::VerilogModule,
@@ -51,9 +52,11 @@ use crate::simulator::exec::{
 use crate::simulator::gates::{
     resolve_strength, resolve_wired, Conducting, Driven, Gate, PassSwitch, Strength, WiredKind,
 };
-use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
+use crate::simulator::program::{
+    self, Instruction, Resume, TaskDefinition, WaitReason, FORK_TIMING_UNSUPPORTED,
+};
 use crate::simulator::state_store::DriverTally;
-use crate::simulator::state_store::{bit_position_in, StateStore};
+use crate::simulator::state_store::{bit_position_in, ScopeStorage, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
 use std::rc::Rc;
@@ -66,6 +69,12 @@ const MAX_DELTA_CYCLES: usize = 100;
 /// `always` block with no delay in it restarts forever without time moving;
 /// this turns that into an error rather than a hang.
 const MAX_RESUMPTIONS_PER_TIME: usize = 10_000;
+
+/// Ceiling on the activations of one `task automatic` that may be live at
+/// once. Each is a block and a copy of the task's storage, so a recursion that
+/// never reaches its base case would otherwise be an allocation nothing
+/// survives rather than an error.
+const MAX_ACTIVATIONS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimulationError {
@@ -117,9 +126,14 @@ pub enum SimulationError {
         expected: usize,
         found: usize,
     },
-    /// A task that enables itself, directly or around a cycle. A body is
-    /// inlined where it is enabled, and inlining a cycle does not terminate.
+    /// A *static* task that enables itself, directly or around a cycle. A body
+    /// is inlined where it is enabled, and inlining a cycle does not
+    /// terminate — nor could a static task's one set of variables serve two
+    /// enables at once. A `task automatic` may recurse, and does.
     RecursiveTask(String),
+    /// A `task automatic` with more than [`MAX_ACTIVATIONS`] activations live
+    /// at once — a recursion that never reached its base case.
+    ActivationLimit(String),
     /// An `assign` whose left hand side is not something that can be driven.
     UnsupportedTarget(String),
     /// A gate primitive instantiated with a terminal count its type cannot
@@ -204,6 +218,11 @@ impl fmt::Display for SimulationError {
             SimulationError::RecursiveTask(name) => {
                 write!(f, "task `{}` enables itself", name)
             }
+            SimulationError::ActivationLimit(name) => write!(
+                f,
+                "automatic task `{}` has more than {} activations at once",
+                name, MAX_ACTIVATIONS
+            ),
             SimulationError::UnknownPort { module, port } => {
                 write!(f, "module `{}` has no port `{}`", module, port)
             }
@@ -336,6 +355,15 @@ struct EventWatch {
     /// named event is — an event has no value, and is matched by its trigger
     /// instead.
     snapshot: Vec<(String, Option<Register>)>,
+    /// One slot per entry of the control, holding what an entry naming a
+    /// *memory word* evaluated to at the last look, in the shape
+    /// [`events::events_fire`] reads — and empty when no entry names one.
+    ///
+    /// A memory has no value under its name, so the name snapshot above can
+    /// never see `@(array[0])` move: the word is only reached by evaluating
+    /// the select. Empty for every control that names no memory word, so an
+    /// ordinary wait pays one `is_empty`.
+    words: Vec<Option<Register>>,
 }
 
 impl EventWatch {
@@ -347,7 +375,23 @@ impl EventWatch {
                 (name, value)
             })
             .collect();
-        EventWatch { control, snapshot }
+        let words = memory_word_values(&control, state);
+        EventWatch {
+            control,
+            snapshot,
+            words,
+        }
+    }
+
+    /// Whether the edges of this round — `edges`, the watched signals' own
+    /// edges plus the round's triggers — satisfy the control.
+    fn fires(&mut self, edges: &[SignalEdge], state: &StateStore) -> bool {
+        match &self.control {
+            EventControl::Events(events) if !self.words.is_empty() => {
+                events::events_fire(events, edges, state, &mut self.words)
+            }
+            control => events::control_fires(control, edges, &BTreeSet::new(), state),
+        }
     }
 
     /// The edges the watched signals have taken since the last look, which is
@@ -366,6 +410,38 @@ impl EventWatch {
         }
         edges
     }
+}
+
+/// What each entry of `control` that names a word of a memory evaluates to
+/// now, one slot per entry — or nothing at all when no entry names one.
+///
+/// `@(array[0])` in the middle of a block waits for that word to move (corpus
+/// `automatic_task2`, `automatic_task3`), and a word is only reached by
+/// evaluating the select: the memory has no value under its name for the
+/// name snapshot to compare.
+fn memory_word_values(control: &EventControl, state: &StateStore) -> Vec<Option<Register>> {
+    let EventControl::Events(events) = control else {
+        return Vec::new();
+    };
+    let names_word = |expression: &Expression| match expression {
+        Expression::BitSelect(id, _) | Expression::WordSelect { id, .. } => {
+            state.memory(&id.name).is_some()
+        }
+        _ => false,
+    };
+    if !state.any_memory() || !events.iter().any(|event| names_word(&event.expression)) {
+        return Vec::new();
+    }
+    events
+        .iter()
+        .map(|event| {
+            if names_word(&event.expression) {
+                eval(&event.expression, state).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// The starting value of every *non-plain* entry in a sensitivity list, which
@@ -450,6 +526,58 @@ struct ForkJoin {
     site: usize,
     /// Branches that have not reached their `join` yet.
     outstanding: usize,
+    /// For the join an *activation* of a `task automatic` is held at, which
+    /// task — an index into [`Simulator::automatic`] — and which of its slots.
+    ///
+    /// An activation is a thread of its own that the enabling thread waits
+    /// for, which is a `fork` of one branch in every respect but two: its
+    /// `output` arguments are copied back when it arrives, and the enabling
+    /// thread carries on at once rather than queueing, since that is where a
+    /// spliced body would have left it. `site` is then the enable, which is
+    /// inside the scope a `disable` of the task names where the join is not.
+    activation: Option<(usize, usize)>,
+}
+
+/// One `task automatic`, and the activations of it made so far.
+///
+/// An activation is a *block* — the task's body renamed into storage of its
+/// own and appended to [`Simulator::blocks`] — started as a thread when an
+/// enable runs and held for reuse once it returns. A slot is only ever handed
+/// to one live activation, so the number made is the most that were ever live
+/// at once rather than the number of enables.
+struct AutomaticTask {
+    /// The flat path the task is enabled by, which is also the prefix its
+    /// prototype storage is declared under.
+    name: String,
+    /// The arguments and the body every activation's program is made from.
+    definition: TaskDefinition,
+    /// The prototype, taken before anything ran.
+    storage: ScopeStorage,
+    /// The block each slot made so far runs as.
+    slots: Vec<usize>,
+    /// Slots whose activation has returned.
+    free: Vec<usize>,
+}
+
+impl AutomaticTask {
+    /// Where slot `slot`'s storage lives: `load.$3.` for the task `load`. A
+    /// design identifier cannot begin with `$`, so no name it writes can reach
+    /// one, and a waveform dump already leaves anything under a `.$` out.
+    fn prefix(&self, slot: usize) -> String {
+        format!("{}.${}.", self.name, slot)
+    }
+
+    /// `name` re-pointed from the prototype into slot `slot`'s storage, or as
+    /// it stands when it is not one of the task's own.
+    fn renamed(&self, name: &str, slot: usize) -> String {
+        match name
+            .strip_prefix(&self.name)
+            .and_then(|rest| rest.strip_prefix('.'))
+        {
+            Some(rest) => format!("{}{}", self.prefix(slot), rest),
+            None => name.to_string(),
+        }
+    }
 }
 
 /// A parsed design, elaborated into signals and runnable blocks.
@@ -552,6 +680,11 @@ pub struct Simulator {
     /// design whose forks all finish in zero time, which are compiled as plain
     /// blocks and never reach here.
     forks: Vec<Option<ForkJoin>>,
+    /// Every `task automatic` in the design, with the activations of each
+    /// made so far, and the index of each by the flat path an enable names it
+    /// with. Both empty for a design with no automatic task.
+    automatic: Vec<AutomaticTask>,
+    automatic_index: HashMap<String, usize>,
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
     aliases: HashMap<String, String>,
@@ -617,6 +750,8 @@ impl Simulator {
             event_values: Vec::new(),
             expression_events: false,
             forks: Vec::new(),
+            automatic: Vec::new(),
+            automatic_index: HashMap::new(),
             aliases: HashMap::new(),
             queue: EventQueue::new(),
             now: 0,
@@ -655,6 +790,8 @@ impl Simulator {
         self.blocks.clear();
         self.waiting.clear();
         self.forks.clear();
+        self.automatic.clear();
+        self.automatic_index.clear();
         self.aliases.clear();
         self.queue = EventQueue::new();
         self.now = 0;
@@ -718,6 +855,26 @@ impl Simulator {
         self.pulled_nets = elaborated.pulled_nets;
         self.wired_nets = elaborated.wired_nets;
         self.blocks = elaborated.blocks;
+        // An automatic task's variables were declared once, as a prototype;
+        // what they hold now — before anything has run — is what every
+        // activation starts from.
+        self.automatic = elaborated
+            .automatic_tasks
+            .into_iter()
+            .map(|(name, definition)| AutomaticTask {
+                storage: self.state.scope_storage(&format!("{}.", name)),
+                name,
+                definition,
+                slots: Vec::new(),
+                free: Vec::new(),
+            })
+            .collect();
+        self.automatic_index = self
+            .automatic
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (task.name.clone(), index))
+            .collect();
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
         self.event_values = self
@@ -1092,7 +1249,6 @@ impl Simulator {
             return Ok(pending);
         }
 
-        let implicit = BTreeSet::new();
         let mut still_waiting = Vec::new();
         let mut woken = Vec::new();
         for mut waiting in std::mem::take(&mut self.waiting) {
@@ -1101,7 +1257,7 @@ impl Simulator {
                 Some(watch) => {
                     let mut edges = watch.edges_since(&self.state);
                     edges.extend(triggers.iter().cloned());
-                    events::control_fires(&watch.control, &edges, &implicit, &self.state)
+                    watch.fires(&edges, &self.state)
                 }
             };
             if wake {
@@ -1486,10 +1642,41 @@ impl Simulator {
 
     /// Resumes one block, queueing its continuation if it hits a delay. Returns
     /// its deferred updates and whether it ran to the end.
+    ///
+    /// An enable of a `task automatic` hands control to the activation it
+    /// starts, and the activation's return hands it back to the enabling
+    /// thread, both at the same instant — so this is a trampoline rather than
+    /// a single resumption. Taking the next thread in a loop rather than
+    /// recursing is what keeps a recursion that consumes no time off the
+    /// host's stack.
     fn resume_block(
         &mut self,
-        cursor: ExecutionCursor,
+        mut cursor: ExecutionCursor,
     ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
+        let mut carried = Vec::new();
+        loop {
+            let (updates, halted, next) = self.resume_thread(cursor)?;
+            carried.extend(updates);
+            match next {
+                Some(next) => cursor = next,
+                None => {
+                    // A scheduled write leaves the block here and waits on the
+                    // time wheel instead of committing with this delta cycle's
+                    // updates. Filtering at the one place updates leave a
+                    // block means no caller has to know the difference.
+                    return Ok((self.hold_scheduled(carried), halted));
+                }
+            }
+        }
+    }
+
+    /// One turn of [`resume_block`](Simulator::resume_block): runs `cursor`
+    /// until it stops, and hands back the thread that carries on at this same
+    /// instant, if one does.
+    fn resume_thread(
+        &mut self,
+        cursor: ExecutionCursor,
+    ) -> Result<(Vec<PendingUpdate>, bool, Option<ExecutionCursor>), SimulationError> {
         let id = cursor.block;
         // Whatever this run writes, it writes while the block is *not* parked
         // at its event control — so none of it can wake the block. The flag is
@@ -1516,14 +1703,9 @@ impl Simulator {
                 pending,
             } = outcome
             else {
-                let (mut updates, halted) = self.settled_resume(cursor, outcome)?;
+                let (mut updates, halted, next) = self.settled_resume(cursor, outcome)?;
                 carried.append(&mut updates);
-                // A scheduled write leaves the block here and waits on the
-                // time wheel instead of committing with this delta cycle's
-                // updates. Filtering at the one place updates leave a block
-                // means no caller has to know the difference.
-                let carried = self.hold_scheduled(carried);
-                return Ok((carried, halted));
+                return Ok((carried, halted, next));
             };
             carried.extend(pending);
             // A `disable` that named a scope *this* thread is inside cancels
@@ -1534,8 +1716,7 @@ impl Simulator {
             // `fork`: the jump a local one compiles to cannot reach the
             // siblings, so it comes here instead.
             if self.cancel_scope(&scope, id)? {
-                let carried = self.hold_scheduled(carried);
-                return Ok((carried, true));
+                return Ok((carried, true, None));
             }
             pc = next;
         }
@@ -1548,17 +1729,156 @@ impl Simulator {
     /// makes the join resume at the **maximum** of the branch finish times:
     /// each branch arrives at whatever instant its own delays took it to, and
     /// the one that arrives last is by definition the latest.
-    fn branch_arrived(&mut self, fork: usize) {
+    ///
+    /// The join an activation of a `task automatic` is held at is the one
+    /// exception: its `output` arguments are copied back, its slot is freed,
+    /// and the enabling thread is handed back to carry on *now* — at the point
+    /// a spliced body would have left it, ahead of anything else due at this
+    /// instant (iverilog 12.0 prints a caller's next line before another
+    /// block's line due at the same time).
+    fn branch_arrived(&mut self, fork: usize) -> Result<Option<ExecutionCursor>, SimulationError> {
         let Some(Some(record)) = self.forks.get_mut(fork) else {
-            return;
+            return Ok(None);
         };
         record.outstanding -= 1;
         if record.outstanding > 0 {
-            return;
+            return Ok(None);
         }
-        let parent = record.parent;
+        let record = *record;
         self.forks[fork] = None;
-        self.queue.insert(self.now, parent);
+        match record.activation {
+            None => {
+                self.queue.insert(self.now, record.parent);
+                Ok(None)
+            }
+            Some((task, slot)) => {
+                self.return_from_activation(task, slot, record.parent, record.site)?;
+                Ok((!self.finished()).then_some(record.parent))
+            }
+        }
+    }
+
+    /// Starts an activation of the `task automatic` the enable at `site` of
+    /// `cursor`'s block names, and hands back the thread that runs it.
+    ///
+    /// A free slot is reused and a new one is made only when every slot is in
+    /// use, so a task enabled over and over in sequence runs in one block. The
+    /// activation's storage is laid down fresh from the prototype — every
+    /// variable starts where its declaration puts it, which is what an
+    /// automatic variable does on entry — and the `input` and `inout`
+    /// arguments are then copied in, sized and signed by the activation's own
+    /// variables exactly as a spliced body's copies are.
+    fn start_activation(
+        &mut self,
+        cursor: ExecutionCursor,
+        site: usize,
+        pc: usize,
+    ) -> Result<ExecutionCursor, SimulationError> {
+        let Instruction::AutomaticEnable { task: name, .. } =
+            &self.blocks[cursor.block].program.instructions()[site]
+        else {
+            unreachable!("an activation is only started at an automatic enable")
+        };
+        let task = *self
+            .automatic_index
+            .get(name)
+            .ok_or_else(|| SimulationError::UnknownTask(name.clone()))?;
+
+        let slot = match self.automatic[task].free.pop() {
+            Some(slot) => slot,
+            None => self.make_activation(task)?,
+        };
+        let automatic = &self.automatic[task];
+        self.state
+            .install_scope(&automatic.storage, &automatic.prefix(slot));
+
+        let Instruction::AutomaticEnable { arguments, .. } =
+            &self.blocks[cursor.block].program.instructions()[site]
+        else {
+            unreachable!("the site was matched above")
+        };
+        for (parameter, connection) in automatic.definition.arguments.iter().zip(arguments) {
+            if !parameter.direction.copies_in() {
+                continue;
+            }
+            let variable = Identifier::new(automatic.renamed(&parameter.name, slot));
+            let target = resolve_target(&self.state, &Expression::Identifier(variable))?;
+            let value = eval_sized(connection, &self.state, target.width(&self.state))?;
+            drive_resolved(&mut self.state, &target, &value)?;
+        }
+
+        let block = automatic.slots[slot];
+        let fork = self.open_fork(ForkJoin {
+            parent: ExecutionCursor { pc, ..cursor },
+            site,
+            outstanding: 1,
+            activation: Some((task, slot)),
+        });
+        Ok(ExecutionCursor::branch(block, 0, fork))
+    }
+
+    /// Makes a new slot for `task`: a block running the task's body renamed
+    /// into the slot's own storage.
+    fn make_activation(&mut self, task: usize) -> Result<usize, SimulationError> {
+        let automatic = &self.automatic[task];
+        let slot = automatic.slots.len();
+        if slot >= MAX_ACTIVATIONS {
+            return Err(SimulationError::ActivationLimit(automatic.name.clone()));
+        }
+        let block = self.blocks.len();
+        let program = automatic.definition.program.activation(
+            &automatic.name,
+            &|name| automatic.renamed(name, slot),
+            block,
+        );
+        // Started by an enable and by nothing else: an `initial` block that
+        // is never queued at time zero, which `settle` never offers an edge.
+        self.blocks.push(TimedBlock {
+            kind: BlockKind::Initial,
+            free_running: false,
+            control: EventControl::None,
+            implicit_reads: BTreeSet::new(),
+            writes: BTreeSet::new(),
+            program,
+        });
+        self.ran_before.push(false);
+        self.ran_now.push(false);
+        self.event_values.push(Vec::new());
+        self.automatic[task].slots.push(block);
+        Ok(slot)
+    }
+
+    /// Copies an activation's `output` and `inout` arguments back to the
+    /// connections the enable at `site` of `caller`'s block wrote, and frees
+    /// its slot.
+    fn return_from_activation(
+        &mut self,
+        task: usize,
+        slot: usize,
+        caller: ExecutionCursor,
+        site: usize,
+    ) -> Result<(), SimulationError> {
+        let automatic = &self.automatic[task];
+        let Instruction::AutomaticEnable { arguments, .. } =
+            &self.blocks[caller.block].program.instructions()[site]
+        else {
+            unreachable!("an activation is only started at an automatic enable")
+        };
+        for (parameter, connection) in automatic.definition.arguments.iter().zip(arguments) {
+            if !parameter.direction.copies_back() {
+                continue;
+            }
+            let variable = Identifier::new(automatic.renamed(&parameter.name, slot));
+            let target = resolve_target(&self.state, connection)?;
+            let value = eval_sized(
+                &Expression::Identifier(variable),
+                &self.state,
+                target.width(&self.state),
+            )?;
+            drive_resolved(&mut self.state, &target, &value)?;
+        }
+        self.automatic[task].free.push(slot);
+        Ok(())
     }
 
     /// Takes a slot for a new `fork`, reusing one a finished fork gave back.
@@ -1658,7 +1978,27 @@ impl Simulator {
         if whole.is_empty() && threads.is_empty() {
             return Ok(false);
         }
-        let doomed: Vec<usize> = whole.iter().map(|(block, _)| *block).collect();
+        let mut doomed: Vec<usize> = whole.iter().map(|(block, _)| *block).collect();
+        // An activation of an automatic task whose *enabling* thread is going
+        // has nobody left to return to, so it goes too — and so does anything
+        // it enabled in turn. It is dropped rather than re-queued, and its
+        // slot is freed below with the record that held it.
+        loop {
+            let orphans: Vec<usize> = self
+                .forks
+                .iter()
+                .flatten()
+                .filter(|record| doomed.contains(&record.parent.block))
+                .filter_map(|record| record.activation)
+                .map(|(task, slot)| self.automatic[task].slots[slot])
+                .filter(|block| !doomed.contains(block))
+                .collect();
+            if orphans.is_empty() {
+                break;
+            }
+            whole.retain(|(block, _)| !orphans.contains(block));
+            doomed.extend(orphans);
+        }
         // A block whose whole activation is going takes its branch threads
         // with it, so a thread of one is not re-queued a second time.
         threads.retain(|(cursor, _)| !doomed.contains(&cursor.block));
@@ -1671,14 +2011,32 @@ impl Simulator {
             !doomed.contains(&waiting.cursor.block) && !cancelled.contains(&waiting.cursor)
         });
         for record in self.forks.iter_mut() {
-            if record.is_some_and(|it| doomed.contains(&it.parent.block)) {
+            let Some(held) = record else {
+                continue;
+            };
+            if doomed.contains(&held.parent.block) {
+                if let Some((task, slot)) = held.activation {
+                    self.automatic[task].free.push(slot);
+                }
                 *record = None;
             }
         }
 
+        // An activation cut short still *returns*: it carries on at the end of
+        // the scope as the thread its enable is waiting for, so it reaches its
+        // `Halt`, copies its `output` arguments back and hands the enabling
+        // thread on. iverilog 12.0 does copy them — `slow(z)` disabled after
+        // writing `o = 1` leaves `z` at 1.
         for (block, end) in whole {
-            self.queue
-                .insert(self.now, ExecutionCursor::new(block, end));
+            let fork = self.activation_fork(block);
+            self.queue.insert(
+                self.now,
+                ExecutionCursor {
+                    block,
+                    pc: end,
+                    fork,
+                },
+            );
         }
         // A cancelled branch keeps its `fork`, so it still reaches its
         // `JoinBranch` and the join it belongs to still completes.
@@ -1693,6 +2051,16 @@ impl Simulator {
             );
         }
         Ok(doomed.contains(&running))
+    }
+
+    /// The join record the enable of the activation running as `block` waits
+    /// at, or `None` for a block that is not a live activation.
+    fn activation_fork(&self, block: usize) -> Option<usize> {
+        self.forks.iter().position(|record| {
+            record
+                .and_then(|record| record.activation)
+                .is_some_and(|(task, slot)| self.automatic[task].slots[slot] == block)
+        })
     }
 
     /// Whether `cursor` is a `fork` branch whose own `fork` sits *outside*
@@ -1722,12 +2090,13 @@ impl Simulator {
 
     /// What the driver does with a [`Resume`] that is not a
     /// [`Resume::Disabled`]: queue a delay, arm a wait, or restart a
-    /// free-running block that ran off its end.
+    /// free-running block that ran off its end — and, for an automatic task's
+    /// enable and return, hand back the thread that carries on at once.
     fn settled_resume(
         &mut self,
         cursor: ExecutionCursor,
         outcome: Resume,
-    ) -> Result<(Vec<PendingUpdate>, bool), SimulationError> {
+    ) -> Result<(Vec<PendingUpdate>, bool, Option<ExecutionCursor>), SimulationError> {
         let id = cursor.block;
         // A `$finish` ends the simulation at the end of *this* timestep, so
         // nothing is scheduled past one: a free-running block that halts does
@@ -1744,28 +2113,31 @@ impl Simulator {
             // `always value = @(ev) 5;` waits for the event again after the
             // one it was woken by. A *branch* running off the end of the block
             // is that thread ending, never the block restarting.
+            // An activation of a `task automatic` running off the end of its
+            // block is the task returning, which is a branch arriving.
             Resume::Halted { pending } => {
-                match cursor.fork {
-                    Some(fork) => self.branch_arrived(fork),
+                let next = match cursor.fork {
+                    Some(fork) => self.branch_arrived(fork)?,
                     None if self.blocks[id].free_running && !finished => {
                         self.queue.insert(self.now, ExecutionCursor::new(id, 0));
+                        None
                     }
-                    None => {}
-                }
-                Ok((pending, true))
+                    None => None,
+                };
+                Ok((pending, true, next))
             }
             Resume::Suspended { pc, delay, pending } => {
                 if !finished {
                     self.queue
                         .insert(self.now + delay, ExecutionCursor { pc, ..cursor });
                 }
-                Ok((pending, false))
+                Ok((pending, false, None))
             }
             // Nothing schedules this one: it goes on the waiting list and
             // `settle` offers it every round of edges until one satisfies it.
             Resume::Waiting { pc, wait, pending } => {
                 if finished {
-                    return Ok((pending, false));
+                    return Ok((pending, false, None));
                 }
                 let watch = match wait {
                     WaitReason::Condition => None,
@@ -1775,7 +2147,7 @@ impl Simulator {
                     cursor: ExecutionCursor { pc, ..cursor },
                     watch,
                 });
-                Ok((pending, false))
+                Ok((pending, false, None))
             }
             // One thread per branch, each queued at this instant so they all
             // get their turn before time moves. The block itself is held in
@@ -1788,28 +2160,39 @@ impl Simulator {
                 pending,
             } => {
                 if finished {
-                    return Ok((pending, false));
+                    return Ok((pending, false, None));
                 }
                 let fork = self.open_fork(ForkJoin {
                     parent: ExecutionCursor { pc, ..cursor },
                     site,
                     outstanding: branches.len(),
+                    activation: None,
                 });
                 for branch in branches {
                     self.queue
                         .insert(self.now, ExecutionCursor::branch(id, branch, fork));
                 }
-                Ok((pending, false))
+                Ok((pending, false, None))
             }
             Resume::BranchDone { pending } => {
-                match cursor.fork {
-                    Some(fork) => self.branch_arrived(fork),
+                let next = match cursor.fork {
+                    Some(fork) => self.branch_arrived(fork)?,
                     // A `JoinBranch` is only ever reached by a thread the
                     // driver started, so a cursor without a fork here means the
                     // compiled layout and the scheduler have parted company.
                     None => return Err(FORK_TIMING_UNSUPPORTED),
+                };
+                Ok((pending, true, next))
+            }
+            // The activation runs straight away, where a spliced body would
+            // have: iverilog 12.0 runs a task's first statements before any
+            // other block due at the same instant.
+            Resume::Enabled { site, pc, pending } => {
+                if finished {
+                    return Ok((pending, false, None));
                 }
-                Ok((pending, true))
+                let next = self.start_activation(cursor, site, pc)?;
+                Ok((pending, false, Some(next)))
             }
             // `resume_block` takes this one before it gets here.
             Resume::Disabled { scope, .. } => Err(SimulationError::UnknownScope(scope)),
@@ -11108,5 +11491,265 @@ mod tests {
         simulator.advance(2).expect("time should advance");
         assert_eq!(simulator.get("x").unwrap().to_binary(), "1");
         assert_eq!(simulator.get("y").unwrap().to_binary(), "0");
+    }
+
+    /// Runs a design of several modules from `top` for `time` and hands back
+    /// what it printed, or the error it stopped with.
+    fn run_modules(source: &str, top: &str, time: i64) -> Result<Vec<String>, SimulationError> {
+        let (remaining, modules) =
+            crate::parsers::source::parse_verilog_source(source).expect("design should parse");
+        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
+        let mut simulator = Simulator::with_modules(modules, top);
+        simulator.setup()?;
+        simulator.advance(time)?;
+        Ok(simulator.output().lines())
+    }
+
+    /// Two enables of one `task automatic` that are live at once each have
+    /// storage of their own, so neither tramples the other's `n`. iverilog
+    /// 12.0 prints:
+    ///
+    /// ```text
+    /// task 1 at 1
+    /// task 2 at 2
+    /// task 1 again at 11
+    /// task 2 again at 12
+    /// joined at 12
+    /// ```
+    ///
+    /// A static task shares one `n`, and the second enable's copy-in lands
+    /// on the first's (corpus `automatic_events`, `pr2169870`).
+    #[test]
+    fn test_concurrent_enables_of_an_automatic_task_do_not_share_storage() {
+        let lines = run_modules(
+            r#"
+            module t;
+              task automatic r(input integer n);
+                begin
+                  #n $display("task %0d at %0t", n, $time);
+                  #10 $display("task %0d again at %0t", n, $time);
+                end
+              endtask
+              initial begin
+                fork
+                  r(1);
+                  r(2);
+                join
+                $display("joined at %0t", $time);
+              end
+            endmodule
+        "#,
+            "t",
+            100,
+        )
+        .expect("design should run");
+        assert_eq!(
+            lines,
+            vec![
+                "task 1 at 1",
+                "task 2 at 2",
+                "task 1 again at 11",
+                "task 2 again at 12",
+                "joined at 12",
+            ]
+        );
+    }
+
+    /// An automatic task may enable itself, to any depth: each activation is
+    /// a thread of its own and the driver hands control between them in a
+    /// loop, so a recursion that consumes no time does not grow the host's
+    /// stack. iverilog 12.0 prints `sum 500 = 125250` and `fib 15 = 610`.
+    #[test]
+    fn test_an_automatic_task_recurses_without_bound() {
+        let lines = run_modules(
+            r#"
+            module t;
+              task automatic sum(input integer n, output integer s);
+                integer rest;
+                begin
+                  if (n == 0) s = 0;
+                  else begin
+                    sum(n - 1, rest);
+                    s = n + rest;
+                  end
+                end
+              endtask
+              task automatic fib(input integer n, output integer f);
+                integer a, b;
+                begin
+                  if (n < 2) f = n;
+                  else begin
+                    fib(n - 1, a);
+                    fib(n - 2, b);
+                    f = a + b;
+                  end
+                end
+              endtask
+              integer r;
+              initial begin
+                sum(500, r);
+                $display("sum 500 = %0d", r);
+                fib(15, r);
+                $display("fib 15 = %0d", r);
+              end
+            endmodule
+        "#,
+            "t",
+            1,
+        )
+        .expect("design should run");
+        assert_eq!(lines, vec!["sum 500 = 125250", "fib 15 = 610"]);
+    }
+
+    /// A recursion that never reaches its base case is a named error rather
+    /// than an allocation nothing survives.
+    #[test]
+    fn test_runaway_automatic_recursion_is_reported() {
+        let error = run_modules(
+            r#"
+            module t;
+              task automatic down(input integer n);
+                down(n + 1);
+              endtask
+              initial down(0);
+            endmodule
+        "#,
+            "t",
+            1,
+        )
+        .expect_err("the recursion never ends");
+        assert_eq!(error, SimulationError::ActivationLimit("down".to_string()));
+    }
+
+    /// A *static* task still may not enable itself: its one set of variables
+    /// cannot serve two enables, and inlining it would never end.
+    #[test]
+    fn test_a_static_task_still_may_not_recurse() {
+        let error = run_modules(
+            r#"
+            module t;
+              task down(input integer n);
+                down(n + 1);
+              endtask
+              initial down(0);
+            endmodule
+        "#,
+            "t",
+            1,
+        )
+        .expect_err("a static task cannot recurse");
+        assert_eq!(error, SimulationError::RecursiveTask("down".to_string()));
+    }
+
+    /// The thread that enabled an automatic task carries on the moment the
+    /// task returns, ahead of another block due at the same instant — where a
+    /// spliced body would have left it. iverilog 12.0 prints `task done`,
+    /// `A after`, `B`.
+    #[test]
+    fn test_an_automatic_task_returns_to_its_caller_at_once() {
+        let lines = run_modules(
+            r#"
+            module t;
+              task automatic w;
+                #1 $display("task done");
+              endtask
+              initial begin w; $display("A after"); end
+              initial #1 $display("B");
+            endmodule
+        "#,
+            "t",
+            5,
+        )
+        .expect("design should run");
+        assert_eq!(lines, vec!["task done", "A after", "B"]);
+    }
+
+    /// Another instance's automatic task is started where its enable stands,
+    /// so two of them in a `fork` run concurrently — and a `disable` of one
+    /// cut short still returns, copying its `output` back. iverilog 12.0
+    /// prints:
+    ///
+    /// ```text
+    /// t.b.tick tick 2 at 2
+    /// t.a.tick tick 3 at 3
+    /// x=30 y=20 at 3
+    /// z=1 at 8
+    /// ```
+    #[test]
+    fn test_hierarchical_and_disabled_automatic_enables() {
+        let lines = run_modules(
+            r#"
+            module sub;
+              task automatic tick(input integer n, output integer o);
+                begin
+                  #n o = n * 10;
+                  $display("%m tick %0d at %0t", n, $time);
+                end
+              endtask
+            endmodule
+            module t;
+              sub a();
+              sub b();
+              integer x, y, z;
+              task automatic slow(output integer o);
+                begin
+                  o = 1;
+                  #10 o = 2;
+                  $display("slow finished at %0t", $time);
+                end
+              endtask
+              initial begin
+                fork
+                  a.tick(3, x);
+                  b.tick(2, y);
+                join
+                $display("x=%0d y=%0d at %0t", x, y, $time);
+                z = 0;
+                fork
+                  slow(z);
+                  #5 disable slow;
+                join
+                $display("z=%0d at %0t", z, $time);
+              end
+            endmodule
+        "#,
+            "t",
+            100,
+        )
+        .expect("design should run");
+        assert_eq!(
+            lines,
+            vec![
+                "t.b.tick tick 2 at 2",
+                "t.a.tick tick 3 at 3",
+                "x=30 y=20 at 3",
+                "z=1 at 8",
+            ]
+        );
+    }
+
+    /// `@(mem[0])` in the middle of a block waits for that *word* to move: a
+    /// memory has no value under its name, so the word is watched by
+    /// evaluating the select. A write to another word does not wake it.
+    /// iverilog 12.0 prints `mem[0] moved to 3 at 10` (corpus
+    /// `automatic_task2`, `automatic_task3`).
+    #[test]
+    fn test_a_mid_block_wait_on_a_memory_word_wakes() {
+        let lines = run_modules(
+            r#"
+            module t;
+              reg [7:0] mem [0:3];
+              initial begin
+                #5 mem[1] = 7;
+                #5 mem[0] = 3;
+              end
+              initial @(mem[0]) $display("mem[0] moved to %0d at %0t", mem[0], $time);
+            endmodule
+        "#,
+            "t",
+            20,
+        )
+        .expect("design should run");
+        assert_eq!(lines, vec!["mem[0] moved to 3 at 10"]);
     }
 }

@@ -253,6 +253,13 @@ pub struct Elaborated {
     /// came from. The top module is the root and carries the name it was
     /// declared with, where its store entries carry no prefix at all.
     pub instances: Vec<(String, Option<Timescale>)>,
+    /// Every `task automatic` in the design, by the flat path an
+    /// [`Instruction::AutomaticEnable`] names it with — `load`, `dut.load` —
+    /// with its arguments and body resolved into the declaring instance's
+    /// names. The driver makes one program per activation out of each.
+    /// Empty for a design with no automatic task, which is all that design
+    /// pays.
+    pub automatic_tasks: HashMap<String, TaskDefinition>,
 }
 
 /// A net that drives itself, and the bit and strength it drives at.
@@ -330,6 +337,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             inputs: Vec::new(),
             aliases: HashMap::new(),
             instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
+            automatic_tasks: HashMap::new(),
         },
         stack: Vec::new(),
         walked: 0,
@@ -1299,6 +1307,14 @@ impl<'m> Elaborator<'m> {
     /// A task may enable one declared further down the file, so this repeats
     /// until a pass compiles nothing new. A pass that makes no progress at all
     /// is a cycle in the enable graph, which inlining cannot terminate on.
+    ///
+    /// A `task automatic` is the exception to all three. Its variables are
+    /// declared the same way, but only as the *prototype* every activation's
+    /// storage is copied from; its body is not spliced but started, as a
+    /// thread of its own, by an [`Instruction::AutomaticEnable`]; and because
+    /// an enable of it needs nothing compiled, it is in the table before the
+    /// first pass — so it may enable itself, and a cycle through it is not a
+    /// cycle the passes can get stuck on.
     fn declare_tasks(
         &mut self,
         module: &VerilogModule,
@@ -1317,7 +1333,18 @@ impl<'m> Elaborator<'m> {
             .map(|task| task.name.name.as_str())
             .collect();
 
+        // An automatic task is enabled through a marker rather than a spliced
+        // body, so every one of them is in the table before anything is
+        // compiled — which is what lets one enable itself, or be enabled by a
+        // task it enables. Its own compiled body is kept apart, in `bodies`.
         let mut tasks = TaskTable::new();
+        for task in declarations.iter().filter(|task| task.automatic) {
+            tasks.insert(
+                task.name.name.clone(),
+                automatic_marker(task, scope.qualified(&task.name.name)),
+            );
+        }
+        let mut bodies = TaskTable::new();
         let mut pending = declarations.clone();
         while !pending.is_empty() {
             let waiting = pending.len();
@@ -1331,7 +1358,11 @@ impl<'m> Elaborator<'m> {
                         definition
                             .program
                             .qualify_scopes(&|block| scope.hierarchy(block));
-                        tasks.insert(task.name.name.clone(), definition);
+                        if task.automatic {
+                            bodies.insert(task.name.name.clone(), definition);
+                        } else {
+                            tasks.insert(task.name.name.clone(), definition);
+                        }
                     }
                     // The task it enables may be one this pass has not reached
                     // yet. A name this module never declares is a real error
@@ -1351,7 +1382,10 @@ impl<'m> Elaborator<'m> {
         }
 
         for task in &declarations {
-            self.register_task(task, &tasks[&task.name.name], scope)?;
+            let definition = bodies
+                .get(&task.name.name)
+                .unwrap_or(&tasks[&task.name.name]);
+            self.register_task(task, definition, scope)?;
         }
 
         Ok(tasks)
@@ -1397,8 +1431,20 @@ impl<'m> Elaborator<'m> {
         for argument in &mut qualified.arguments {
             argument.name = scope.resolve(&argument.name);
         }
-        self.hierarchical_tasks
-            .insert(scope.qualified(&task.name.name), qualified);
+        let key = scope.qualified(&task.name.name);
+        // An automatic task's variables declared above are the *prototype*
+        // each activation's storage is copied from, and its body is the one
+        // each activation's program is made from. A hierarchical enable of one
+        // needs only the marker, since it is started rather than spliced — and
+        // a marker with no body puts no false edge in the enable graph.
+        if task.automatic {
+            self.hierarchical_tasks
+                .insert(key.clone(), automatic_marker(task, key.clone()));
+            qualified.automatic = Some(key.clone());
+            self.out.automatic_tasks.insert(key, qualified);
+            return Ok(());
+        }
+        self.hierarchical_tasks.insert(key, qualified);
         Ok(())
     }
 
@@ -1428,6 +1474,12 @@ impl<'m> Elaborator<'m> {
             let table = tables
                 .entry(inner.prefix.clone())
                 .or_insert_with(|| tasks.clone());
+            if task.automatic {
+                table.insert(
+                    task.name.name.clone(),
+                    automatic_marker(task, inner.qualified(&task.name.name)),
+                );
+            }
             let mut definition = compile_task(task, table)?;
             definition
                 .program
@@ -1440,7 +1492,9 @@ impl<'m> Elaborator<'m> {
                     .program
                     .substitute(&|expression| substitute_genvars(expression, &inner.genvars));
             }
-            table.insert(task.name.name.clone(), definition.clone());
+            if !task.automatic {
+                table.insert(task.name.name.clone(), definition.clone());
+            }
             self.register_task(task, &definition, inner)?;
         }
         Ok(tables)
@@ -1460,12 +1514,24 @@ impl<'m> Elaborator<'m> {
             .out
             .blocks
             .iter()
-            .all(|block| first_hierarchical_enable(&block.program).is_none())
+            .map(|block| &block.program)
+            .chain(self.out.automatic_tasks.values().map(|task| &task.program))
+            .all(|program| first_hierarchical_enable(program).is_none())
         {
             return Ok(());
         }
         if let Some(name) = recursive_enable(&self.hierarchical_tasks) {
             return Err(SimulationError::RecursiveTask(name));
+        }
+        // An automatic task's body is the source of a block made at run time,
+        // which is tagged with its own number when it is made — so the tag
+        // given here only has to be one the block's number will be put in
+        // front of.
+        for task in self.out.automatic_tasks.values_mut() {
+            while task
+                .program
+                .link_hierarchical_enables(&self.hierarchical_tasks, 0)?
+            {}
         }
         for block in 0..self.out.blocks.len() {
             let mut linked = false;
@@ -2451,6 +2517,11 @@ impl<'m> Elaborator<'m> {
             definition.program.rename(&resolve);
             rename_names(&mut definition.reads);
             rename_names(&mut definition.writes);
+        }
+        // An automatic task's body becomes a block of its own each time it is
+        // enabled, so it is renamed like one.
+        for definition in self.out.automatic_tasks.values_mut() {
+            definition.program.rename(&resolve);
         }
     }
 
@@ -3500,7 +3571,9 @@ fn analyse_function_body(
             // the body then does; one naming another instance is still standing
             // here, and naming it is better than the "assigning a signal
             // outside itself" the linked body would have reported.
-            Instruction::HierarchicalEnable { .. } => return Err(FUNCTION_ENABLE_UNSUPPORTED),
+            Instruction::HierarchicalEnable { .. } | Instruction::AutomaticEnable { .. } => {
+                return Err(FUNCTION_ENABLE_UNSUPPORTED)
+            }
             // A `wait` and an event control are both suspensions, and a call
             // happens at one instant: there is no later for the body to come
             // back at. `Hold` and `WriteHeld` are the halves of one, so they
@@ -3771,7 +3844,8 @@ impl BodyNames {
             }
             // The arguments of an enable of another instance's task are read
             // where the enable is written, which is inside this body.
-            Instruction::HierarchicalEnable { arguments, .. } => {
+            Instruction::HierarchicalEnable { arguments, .. }
+            | Instruction::AutomaticEnable { arguments, .. } => {
                 for argument in arguments {
                     self.expression(argument);
                 }
@@ -3991,16 +4065,34 @@ fn compile_task(
     });
 
     Ok(TaskDefinition {
-        arguments: task
-            .arguments
-            .iter()
-            .map(|argument| TaskParameter {
-                name: task_variable(&task.name.name, &argument.variable.name.name),
-                direction: argument.direction,
-            })
-            .collect(),
+        arguments: task_parameters(task),
         program,
+        automatic: None,
     })
+}
+
+/// A task's arguments, in call order, under the names its body spells them.
+fn task_parameters(task: &TaskDeclaration) -> Vec<TaskParameter> {
+    task.arguments
+        .iter()
+        .map(|argument| TaskParameter {
+            name: task_variable(&task.name.name, &argument.variable.name.name),
+            direction: argument.direction,
+        })
+        .collect()
+}
+
+/// What the task table holds for a `task automatic` before anything is
+/// compiled: the arguments an enable is checked against and copied through,
+/// and the flat path `key` of the entry the enable starts an activation of.
+/// Its body is compiled against a table that already holds this, which is
+/// what lets it enable itself.
+fn automatic_marker(task: &TaskDeclaration, key: String) -> TaskDefinition {
+    TaskDefinition {
+        arguments: task_parameters(task),
+        program: Program::default(),
+        automatic: Some(key),
+    }
 }
 
 /// Adds to every function's read and write sets those of the functions it

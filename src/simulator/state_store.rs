@@ -882,6 +882,14 @@ pub struct MemoryChange {
 /// The store also carries the simulation context an expression can read but no
 /// signal holds — the current time and the `$random` stream — because a
 /// `&StateStore` is all [`eval`](crate::simulator::eval::eval) is given.
+/// The declarations one scope made, as [`StateStore::scope_storage`] took them.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeStorage {
+    signals: Vec<(String, SignalState)>,
+    memories: Vec<(String, Memory)>,
+    events: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
     name_to_signal: HashMap<String, SignalState>,
@@ -1778,6 +1786,51 @@ impl StateStore {
     pub fn adopt_memory(&mut self, name: impl Into<String>, memory: Memory) {
         let signed = memory.is_signed();
         self.insert_memory(name, memory, signed);
+    }
+
+    /// Everything declared under `prefix` — its signals, its memories and its
+    /// events — as it stands now, keyed by what follows the prefix.
+    ///
+    /// This is the prototype of a `task automatic`'s storage: taken once,
+    /// before the design has run, and laid down again under a fresh prefix by
+    /// [`install_scope`](StateStore::install_scope) for every activation, so
+    /// each one starts with the declarations — widths, signedness, realness,
+    /// memory shapes — and the untouched values of its own.
+    pub fn scope_storage(&self, prefix: &str) -> ScopeStorage {
+        let inside = |name: &String| name.strip_prefix(prefix).map(str::to_string);
+        ScopeStorage {
+            signals: self
+                .name_to_signal
+                .iter()
+                .filter_map(|(name, signal)| Some((inside(name)?, signal.clone())))
+                .collect(),
+            memories: self
+                .name_to_memory
+                .iter()
+                .filter_map(|(name, memory)| Some((inside(name)?, memory.clone())))
+                .collect(),
+            events: self.events.iter().filter_map(inside).collect(),
+        }
+    }
+
+    /// Lays `storage` down under `prefix`, replacing whatever an earlier
+    /// activation left there.
+    ///
+    /// Nothing is journalled: the names are fresh storage rather than values
+    /// that moved, and the only thing that reads them is the activation about
+    /// to start.
+    pub fn install_scope(&mut self, storage: &ScopeStorage, prefix: &str) {
+        for (name, signal) in &storage.signals {
+            self.name_to_signal
+                .insert(format!("{}{}", prefix, name), signal.clone());
+        }
+        for (name, memory) in &storage.memories {
+            self.name_to_memory
+                .insert(format!("{}{}", prefix, name), memory.clone());
+        }
+        for name in &storage.events {
+            self.events.insert(format!("{}{}", prefix, name));
+        }
     }
 
     /// Whether the design declares any memory. `false` is exact.
