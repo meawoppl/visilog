@@ -528,8 +528,16 @@ pub fn parse_arguments(input: &str) -> IResult<&str, ModuleInitArguments> {
 /// positional: (1,2,3)
 ///
 /// keyword: (.a(1),.b(2),.c(3))
+///
+/// An empty block may hold whitespace and comments — `my_module ( );` is
+/// how corpus `pr985` writes one — which no argument claims, so the closing
+/// parenthesis skips them itself.
 fn argument_block(input: &str) -> IResult<&str, ModuleInitArguments> {
-    delimited(tag("("), parse_arguments, tag(")"))(input)
+    delimited(
+        tag("("),
+        parse_arguments,
+        preceded(ws_and_comments, tag(")")),
+    )(input)
 }
 
 /// The `#` an instantiation may carry: `#(.WIDTH(8))`, `#(8)` or a bare `#8`.
@@ -1461,6 +1469,26 @@ mod tests {
             Err(PortReconciliationError::MixedStyles)
         );
         assert!(parse_module_declaration("module m(input a); input a; endmodule").is_err());
+    }
+
+    /// An empty argument list may be written with whitespace or a comment
+    /// inside it, for an instance's ports and for a parameter override alike.
+    #[test]
+    fn test_an_empty_argument_list_may_hold_whitespace() {
+        for source in [
+            "child_module my_module ( );",
+            "child_module my_module (\n);",
+            "child_module #( ) my_module (/* none */);",
+            "child_module #(8, 8 'h10) my_module ( );",
+        ] {
+            let instantiation = assert_parses(parse_module_instantiation_statement, source);
+            assert_eq!(
+                instantiation.arguments,
+                ModuleInitArguments::NoArgs,
+                "{}",
+                source
+            );
+        }
     }
 
     /// `inv u[3:0] (o, i);` — a range after the instance name makes an array
