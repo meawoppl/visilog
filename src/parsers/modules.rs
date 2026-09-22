@@ -14,6 +14,7 @@ use super::{
     delay::delay_operand,
     expr::{verilog_expression, Expression},
     identifier::{identifier, identifier_list, Identifier},
+    keywords::is_reserved_word,
     parameter::parse_parameter_port_list,
     preprocessor::Timescale,
     simple::{range, signedness, ws, ws_and_comments, Range},
@@ -554,10 +555,16 @@ fn param_block(input: &str) -> IResult<&str, ModuleInitArguments> {
     ))(input)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ModuleInstantiation {
     pub module_name: Identifier,
-    pub instance_name: Identifier,
+    /// `None` for `p (q, d);` — legal for a user-defined primitive, whose
+    /// instance name IEEE 1364-2005 makes optional, and not for a module.
+    /// Only the module being instantiated can say which it is, so the parser
+    /// accepts both and `elaborate` names the one and refuses the other, which
+    /// is where iverilog 12.0 draws the line too ("Instantiation of module
+    /// child requires an instance name").
+    pub instance_name: Option<Identifier>,
     /// `inv u[3:0] (o, i);` — an array of instances, one per index. `None` for
     /// an ordinary instantiation.
     pub range: Option<Range>,
@@ -565,12 +572,32 @@ pub struct ModuleInstantiation {
     pub arguments: ModuleInitArguments,
 }
 
-pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, ModuleInstantiation> {
-    // vdff #(.size(10),.delay(15)) mod_a (.out(out_a),.in(in_a),.clk(clk));
-    // vdff mod_b (.out(out_b),.in(in_b),.clk(clk));
-    // vdff #(.delay(12)) mod_c (.out(out_c),.in(in_c),.clk(clk));
-    // vdff #(.delay( ),.size(10) ) mod_d (.out(out_d),.in(in_d),.clk(clk));
+/// One instance of an instantiation list: an optional name, the array range
+/// that only a named instance may carry, and the connections.
+fn module_instance(
+    input: &str,
+) -> IResult<&str, (Option<Identifier>, Option<Range>, ModuleInitArguments)> {
+    let (input, named) = opt(|input| {
+        let (input, name) = identifier(input)?;
+        let (input, _) = ws_and_comments(input)?;
+        let (input, range) = opt(range)(input)?;
+        let (input, _) = ws_and_comments(input)?;
+        Ok((input, (name, range)))
+    })(input)?;
+    let (input, arguments) = argument_block(input)?;
+    let (instance_name, range) = match named {
+        Some((name, range)) => (Some(name), range),
+        None => (None, None),
+    };
+    Ok((input, (instance_name, range, arguments)))
+}
 
+/// `vdff #(.size(10)) mod_a (.out(a), …), mod_b (.out(b), …);` — one module
+/// name and one parameter block shared by a list of instances, the way one
+/// `reg [4:0]` is shared by every name in its list.
+pub fn parse_module_instantiation_statement(
+    input: &str,
+) -> IResult<&str, Vec<ModuleInstantiation>> {
     let (input, module_name) = identifier(input)?;
     let (input, _) = ws_and_comments(input)?;
 
@@ -579,24 +606,32 @@ pub fn parse_module_instantiation_statement(input: &str) -> IResult<&str, Module
     })(input)?;
     let (input, _) = ws_and_comments(input)?;
 
-    let (input, instance_name) = identifier(input)?;
-    let (input, _) = ws_and_comments(input)?;
-    let (input, range) = opt(range)(input)?;
-    let (input, _) = ws_and_comments(input)?;
-
-    let (input, arguments) = argument_block(input)?;
+    let (input, instances) =
+        separated_list1(ws(char(',')), terminated(module_instance, ws_and_comments))(input)?;
+    // Without an instance name the statement is only a name and an argument
+    // block, which is also the shape of a keyword-led form the grammar does
+    // not know — so a reserved word is never taken for the module.
+    if instances[0].0.is_none() && is_reserved_word(&module_name.name) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
 
     let (input, _) = ws(tag(";"))(input)?;
 
     Ok((
         input,
-        ModuleInstantiation {
-            module_name,
-            instance_name,
-            range,
-            parameters,
-            arguments,
-        },
+        instances
+            .into_iter()
+            .map(|(instance_name, range, arguments)| ModuleInstantiation {
+                module_name: module_name.clone(),
+                instance_name,
+                range,
+                parameters: parameters.clone(),
+                arguments,
+            })
+            .collect(),
     ))
 }
 
@@ -605,6 +640,13 @@ mod tests {
     use super::*;
     use crate::parsers::helpers::{assert_parses, assert_parses_to};
     use std::fs;
+
+    /// The single instance a one-instance statement declares.
+    fn one_instance(source: &str) -> ModuleInstantiation {
+        let mut instances = assert_parses(parse_module_instantiation_statement, source);
+        assert_eq!(instances.len(), 1, "{}", source);
+        instances.remove(0)
+    }
 
     #[test]
     fn test_parse_port_direction() {
@@ -966,12 +1008,11 @@ mod tests {
     /// parameter block, the instance name and the argument list.
     #[test]
     fn test_comments_in_a_module_instantiation() {
-        let instantiation = assert_parses(
-            parse_module_instantiation_statement,
+        let instantiation = one_instance(
             "counter /* the module */ dut /* the instance */ ( .clk(clk), .q(q) ) ; // done",
         );
         assert_eq!(instantiation.module_name, "counter".into());
-        assert_eq!(instantiation.instance_name, "dut".into());
+        assert_eq!(instantiation.instance_name, Some("dut".into()));
     }
 
     /// `bar #345 bar1();` is the unparenthesised `#`, which is a *delay value*
@@ -980,9 +1021,9 @@ mod tests {
     /// exactly how iverilog reads it (corpus `pr3194155`).
     #[test]
     fn test_an_unparenthesised_hash_is_one_positional_parameter() {
-        let instantiation = assert_parses(parse_module_instantiation_statement, "bar #345 bar1();");
+        let instantiation = one_instance("bar #345 bar1();");
         assert_eq!(instantiation.module_name, "bar".into());
-        assert_eq!(instantiation.instance_name, "bar1".into());
+        assert_eq!(instantiation.instance_name, Some("bar1".into()));
         assert_eq!(
             instantiation.parameters,
             ModuleInitArguments::Positional(vec![Some(
@@ -993,14 +1034,14 @@ mod tests {
         );
 
         // A name is a delay value too, and `#` is its own token.
-        let named = assert_parses(parse_module_instantiation_statement, "bar # tPD u (o, i);");
+        let named = one_instance("bar # tPD u (o, i);");
         assert_eq!(
             named.parameters,
             ModuleInitArguments::Positional(vec![Some(Expression::Identifier("tPD".into()))])
         );
 
         // The parenthesised forms are unchanged.
-        let block = assert_parses(parse_module_instantiation_statement, "bar #(456) bar2();");
+        let block = one_instance("bar #(456) bar2();");
         assert_eq!(
             block.parameters,
             ModuleInitArguments::Positional(vec![Some(
@@ -1079,7 +1120,7 @@ mod tests {
             ),
             ("two Ui (w3,w4);", vec![Some(w3()), Some(w4())]),
         ] {
-            let instantiation = assert_parses(parse_module_instantiation_statement, source);
+            let instantiation = one_instance(source);
             assert_eq!(
                 instantiation.arguments,
                 ModuleInitArguments::Positional(expected),
@@ -1090,7 +1131,7 @@ mod tests {
 
         // An empty block is still `NoArgs` — one blank is no argument list at
         // all, not a one-element list with a gap in it.
-        let none = assert_parses(parse_module_instantiation_statement, "two Uj ();");
+        let none = one_instance("two Uj ();");
         assert_eq!(none.arguments, ModuleInitArguments::NoArgs);
     }
 
@@ -1233,9 +1274,9 @@ mod tests {
         ];
 
         for input in test_statements {
-            let res = assert_parses(parse_module_instantiation_statement, input);
+            let res = one_instance(input);
             assert_eq!(res.module_name, "adder".into());
-            assert_eq!(res.instance_name, "my_adder".into());
+            assert_eq!(res.instance_name, Some("my_adder".into()));
         }
     }
 
@@ -1463,18 +1504,58 @@ mod tests {
         assert!(parse_module_declaration("module m(input a); input a; endmodule").is_err());
     }
 
+    /// `p (Q, D);` — a user-defined primitive's instance name is optional, so
+    /// the parser takes a missing one for any instantiation and leaves the
+    /// module-or-primitive question to elaboration (corpus `pr298`,
+    /// `pr3587570`).
+    #[test]
+    fn test_an_instance_name_may_be_missing() {
+        let unnamed = one_instance("passthrough (o1, !i);");
+        assert_eq!(unnamed.module_name, "passthrough".into());
+        assert_eq!(unnamed.instance_name, None);
+        assert!(unnamed.range.is_none());
+        let delayed = one_instance("BUFG #(6, 2) (o, i);");
+        assert_eq!(delayed.instance_name, None);
+        assert_ne!(delayed.parameters, ModuleInitArguments::NoArgs);
+    }
+
+    /// Without an instance name a statement is only a name and an argument
+    /// block, so a reserved word is never read as the module it instantiates.
+    #[test]
+    fn test_an_unnamed_instance_is_not_a_keyword() {
+        assert!(parse_module_instantiation_statement("wait (a);").is_err());
+        assert!(parse_module_instantiation_statement("initial (a);").is_err());
+    }
+
+    /// `u_dff ff0(q0, d, c), ff1(q1, d, q0);` — one statement, several
+    /// instances sharing the module name and the parameter block (corpus
+    /// `udp_sched`).
+    #[test]
+    fn test_an_instantiation_is_a_list() {
+        let instances = assert_parses(
+            parse_module_instantiation_statement,
+            "u_dff #(1) ff0(q0, 1'b1, clk), ff1 (q1, 1'b1, q0) , (q2, 1'b1, q1);",
+        );
+        let names: Vec<_> = instances
+            .iter()
+            .map(|instance| instance.instance_name.clone())
+            .collect();
+        assert_eq!(names, vec![Some("ff0".into()), Some("ff1".into()), None]);
+        assert!(instances
+            .iter()
+            .all(|instance| instance.module_name == "u_dff".into()
+                && instance.parameters == instances[0].parameters));
+    }
+
     /// `inv u[3:0] (o, i);` — a range after the instance name makes an array
     /// of instances; without one it is an ordinary instantiation.
     #[test]
     fn test_instance_arrays_parse() {
-        let arrayed = assert_parses(parse_module_instantiation_statement, "inv u[3:0] (o, i);");
+        let arrayed = one_instance("inv u[3:0] (o, i);");
         assert!(arrayed.range.is_some());
-        let spaced = assert_parses(
-            parse_module_instantiation_statement,
-            "prim U [wid-1:0] (Q, D, C);",
-        );
+        let spaced = one_instance("prim U [wid-1:0] (Q, D, C);");
         assert!(spaced.range.is_some());
-        let single = assert_parses(parse_module_instantiation_statement, "inv u (o, i);");
+        let single = one_instance("inv u (o, i);");
         assert!(single.range.is_none());
     }
 }

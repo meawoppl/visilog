@@ -1918,13 +1918,31 @@ three terms, and a delay a design wrote and the simulator dropped is a wrong ans
 right values.
 
 A **sequential** UDP — one whose output is a `reg`, whose rows carry a current-state field,
-and whose input columns may name an edge (`(01)`, `r`, `*`) — parses and is then
-`SimulationError::SequentialPrimitive`, naming it. Its rows ask about the *previous* value
-of an input, and a continuous driver is handed only the present ones; a driver that quietly
-answered from the levels alone would be a wrong answer wearing a working simulator's
-clothes. A UDP instance also still needs an instance *name*: `p(Q, D);` — legal, and how a
-UDP is often written — is a parse error, because a module instantiation's name is not
-optional (corpus `pr298`, `pr3587570`).
+and whose input columns may name an edge (`(01)`, `r`, `*`) — is still a continuous driver:
+`udp::UdpMemory` keeps the inputs as they stood at the last lookup and the state the
+primitive holds, on the instance, so an edge row can be asked about what an input *was*
+without the settle loop learning that one exists (`UdpTable::sequential_output`; corpus
+`pr298`, `udp_sched`).
+
+**A UDP instance's name is optional and a module instance's is not, and only elaboration
+can tell the two apart.** `p (Q, D);` is how a UDP is often written (corpus `pr298`,
+`pr3587570`), and the grammar cannot know `p` is a primitive, so
+`parse_module_instantiation_statement` takes a missing name for any instantiation —
+`ModuleInstantiation::instance_name` is an `Option` — and `instantiate_each` asks the
+module: a primitive is named `$<module><n>` from a counter on the `Elaborator` (a `$`
+cannot begin a design identifier, so the name meets nothing), and a module is
+`SimulationError::UnnamedInstance`. That split is iverilog 12.0's too: it parses the
+unnamed module instance and then stops with "Instantiation of module child requires an
+instance name". The name matters because a port bound to an expression (`(b, !i)`) takes a
+store entry under the instance's prefix. Without a name the statement is only an
+identifier and an argument block, so a **reserved word** is never read as the module it
+instantiates — the same guard the task enable and the bare event control carry.
+
+**An instantiation is a list**, like every declaration: `u_dff ff0(…), ff1(…);` shares
+one module name and one parameter block across its instances, so the statement is
+`ModuleStatement::ModuleInstantiation(Vec<ModuleInstantiation>)` — one full instance
+apiece — and nothing past the parser learns it was written as a list (corpus
+`udp_sched`).
 
 **A `specify` block records and does not simulate, and that is the one place a no-op is the
 honest reading.** A module path delay (`(A => Z) = (0.1, 0.2);`) changes only *when* a value

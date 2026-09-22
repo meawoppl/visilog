@@ -389,9 +389,10 @@ fn top_module(modules: &[VerilogModule]) -> Option<String> {
         .iter()
         .flat_map(|module| &module.statements)
         .filter_map(|statement| match statement {
-            ModuleStatement::ModuleInstantiation(instance) => {
-                Some(instance.module_name.name.as_str())
-            }
+            // Every instance in one statement names the same module.
+            ModuleStatement::ModuleInstantiation(instances) => instances
+                .first()
+                .map(|instance| instance.module_name.name.as_str()),
             _ => None,
         })
         .collect();
