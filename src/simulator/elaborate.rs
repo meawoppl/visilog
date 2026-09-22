@@ -51,7 +51,7 @@ use crate::parsers::{
     },
     constants::VerilogConstant,
     delay::{Delay, GateDelay},
-    expr::Expression,
+    expr::{verilog_expression, Expression},
     gates::{DriveStrength, GateInstantiation, GateKind, StrengthLevel},
     generate::{DefparamAssignment, GenerateBlock, GenerateItem, GenerateLoop},
     identifier::Identifier,
@@ -68,7 +68,7 @@ use crate::parsers::{
     statements::ModuleStatement,
 };
 use crate::register::{Register, ONE, ZERO};
-use crate::simulator::eval::{eval, expression_width};
+use crate::simulator::eval::{eval, expression_width, select_index};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width, resolve_target, ResolvedTarget};
 use crate::simulator::gates::{Gate, PassSwitch};
@@ -411,6 +411,11 @@ impl Scope {
     /// connections collapses to the single signal at the top of it. Everything
     /// else is local to the module and takes the instance's prefix.
     fn resolve(&self, local: &str) -> String {
+        if local.contains("[ ") {
+            if let Some(indexed) = computed_path_indices(local, &self.genvars) {
+                return self.resolve(&indexed);
+            }
+        }
         if !self.locals.is_empty() {
             let head = match local.find(|c| c == '.' || c == '[') {
                 Some(at) => &local[..at],
@@ -3911,6 +3916,41 @@ fn renamed(expression: &Expression, scope: &Scope) -> Expression {
     copy
 }
 
+/// A hierarchical name with every *computed* generate index in it evaluated:
+/// `U[ (i+1)%4 ].x` for a genvar `i` bound to 1 is `U[2].x`.
+///
+/// The parser keeps an index that is not a literal as the text it was written
+/// as, between `[ ` and ` ]` (see `identifier::path_index`), because a genvar
+/// has no value until its loop is unrolled — and a hierarchical name is one
+/// string by then, with no expression node for [`substitute_genvars`] to reach.
+/// So the index is read back here, the genvars in scope are substituted into
+/// it, and what is left has to be a constant.
+///
+/// `None` when the name holds no computed index **or one of them does not
+/// evaluate** — a parameter, a signal, an `x`. The name is then left as it was
+/// written, which is a key nothing in the store has: the design stops at an
+/// unknown name that spells out the index, rather than at a guess about which
+/// iteration was meant.
+fn computed_path_indices(name: &str, genvars: &HashMap<String, i64>) -> Option<String> {
+    let constants = StateStore::new();
+    let mut resolved = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(at) = rest.find("[ ") {
+        resolved.push_str(&rest[..at + 1]);
+        let (after, mut index) = verilog_expression(&rest[at + 2..]).ok()?;
+        rest = after.trim_start().strip_prefix(']')?;
+        substitute_genvars(&mut index, genvars);
+        let value = eval(&index, &constants).ok()?;
+        resolved.push_str(&select_index(&value).ok()??.to_string());
+        resolved.push(']');
+    }
+    if resolved.is_empty() {
+        return None;
+    }
+    resolved.push_str(rest);
+    Some(resolved)
+}
+
 /// Replaces every genvar an expression names with the integer it is bound to.
 ///
 /// A genvar is an elaboration-time integer: nothing of it survives into the
@@ -4934,6 +4974,107 @@ mod tests {
         assert!(matches!(
             setup_error(&[source], "top"),
             SimulationError::UnresolvedGenerate { .. }
+        ));
+    }
+
+    /// A generate index in a hierarchical path may be computed from a genvar,
+    /// which is how one loop reaches into a *sibling* iteration of another.
+    /// The index has no value until the loop is unrolled, so it is evaluated
+    /// against the genvars before the name is resolved. iverilog 12.0 prints
+    /// `7 5 6`: iteration `i` of `peer` writes `i + 5` into `stage[(i+1)%3]`.
+    #[test]
+    fn test_a_computed_generate_index_reaches_a_sibling_iteration() {
+        let source = r#"
+            module top;
+                genvar i;
+                generate
+                    for (i = 0; i < 3; i = i + 1) begin : stage
+                        reg [3:0] v;
+                    end
+                    for (i = 0; i < 3; i = i + 1) begin : peer
+                        initial stage[(i + 1) % 3].v = i + 4'd5;
+                    end
+                endgenerate
+                initial #1 $display("%0d %0d %0d", stage[0].v, stage[1].v, stage[2].v);
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(2).expect("the design should run");
+        assert_eq!(simulator.output().text(), "7 5 6\n");
+    }
+
+    /// A `defparam` path takes a computed index too (corpus `pr3557493`), and
+    /// so does one written from the top module by name. iverilog 12.0 prints
+    /// `3 4 5 6`.
+    #[test]
+    fn test_a_defparam_path_takes_a_computed_generate_index() {
+        let source = r#"
+            module top;
+                genvar i;
+                generate
+                    for (i = 2; i < 4; i = i + 1) begin : a
+                        leaf m();
+                        defparam a[i].m.p = 1 + i;
+                    end
+                    for (i = 4; i < 6; i = i + 1) begin : b
+                        leaf m();
+                        defparam top.b[i].m.p = 1 + i;
+                    end
+                endgenerate
+                initial $display("%0d %0d %0d %0d", a[2].m.p, a[3].m.p, b[4].m.p, b[5].m.p);
+            endmodule
+        "#;
+        let leaf = "module leaf; parameter p = 0; endmodule";
+        let mut simulator = simulator_for(&[source, leaf], "top");
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "3 4 5 6\n");
+    }
+
+    /// The dot of a hierarchical name is a token of its own, so whitespace on
+    /// either side of it still names the instance's signal (corpus
+    /// `hierspace`). iverilog 12.0 prints `1 1` and then `0`.
+    #[test]
+    fn test_whitespace_around_a_hierarchical_dot_names_the_same_signal() {
+        let source = r#"
+            module top;
+                wire b;
+                m inst (b);
+                initial begin
+                    inst . x = 1'b1;
+                    #1 $display("%b %b", b, inst .x);
+                    inst. x = 1'b0;
+                    #1 $display("%b", b);
+                end
+            endmodule
+        "#;
+        let child = "module m (output reg x); endmodule";
+        let mut simulator = simulator_for(&[source, child], "top");
+        simulator.advance(3).expect("the design should run");
+        assert_eq!(simulator.output().text(), "1 1\n0\n");
+    }
+
+    /// A computed index that is not made of genvars is not guessed at. iverilog
+    /// 12.0 accepts `stage[P].v` for a parameter `P`, but the index is
+    /// evaluated where only the genvars are to hand, so the name is left as it
+    /// was written — a key the store does not have — and elaboration stops at
+    /// a name that spells the index out rather than writing some iteration.
+    #[test]
+    fn test_a_computed_index_that_is_not_a_genvar_is_named() {
+        let source = r#"
+            module top;
+                parameter P = 1;
+                genvar i;
+                generate
+                    for (i = 0; i < 2; i = i + 1) begin : stage
+                        reg v;
+                    end
+                endgenerate
+                initial stage[P].v = 1;
+            endmodule
+        "#;
+        assert!(matches!(
+            setup_error(&[source], "top"),
+            SimulationError::UnknownSignal(name) if name == "stage[ P ].v"
         ));
     }
 
