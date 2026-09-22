@@ -596,12 +596,10 @@ fn eval_in_context(
             }
             let word = memory.word(known.then_some(address.as_slice()));
             let value = match select {
-                WordSelectKind::Bit(bit) => {
-                    match numeric(&eval(bit, store)?)?.and_then(|v| i64::try_from(v).ok()) {
-                        Some(bit) => logic_bit(memory.bit_of(&word, bit)),
-                        None => Register::unknown(1),
-                    }
-                }
+                WordSelectKind::Bit(bit) => match select_index(&eval(bit, store)?)? {
+                    Some(bit) => logic_bit(memory.bit_of(&word, bit)),
+                    None => Register::unknown(1),
+                },
                 WordSelectKind::Part(first, second) => {
                     let first = select_bound(first, store)?;
                     let second = select_bound(second, store)?;

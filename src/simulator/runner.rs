@@ -3701,6 +3701,36 @@ mod tests {
         assert_eq!(simulator.output().text(), "1001 1 | 1001 | xxxx x | 0110\n");
     }
 
+    /// A bit select out of a memory *word* reads a signed index as the negative
+    /// number it is, like every other select: bit `-1` of a `[7:0]` word names
+    /// nothing and reads `x`, where reading the two bit `-1` unsigned names bit
+    /// 3. A write through it is dropped.
+    ///
+    /// iverilog 12.0 prints `0000000x 00000001` for this design (corpus
+    /// `array_select`).
+    #[test]
+    fn test_a_bit_of_a_word_reads_a_signed_index_as_negative() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg signed [7:0] arr [0:7];
+                reg signed [1:0] idx;
+                reg [7:0] res;
+                initial begin
+                    arr[0] = 8'sd1;
+                    idx = -1;
+                    res = arr[0][idx];
+                    arr[0][idx] = 1'b1;
+                    $display("%b %b", res, arr[0]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0000000x 00000001\n");
+    }
+
     /// A vector declared `[base+15:base]` for a negative `base` really does
     /// have negative bit indices, so an indexed part select whose base is a
     /// *signed* value has to read it as the negative number it is. Reading
