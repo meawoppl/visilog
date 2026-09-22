@@ -46,7 +46,9 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_strength, Driven, Gate, PassSwitch, Strength};
+use crate::simulator::gates::{
+    resolve_strength, resolve_wired, Conducting, Driven, Gate, PassSwitch, Strength, WiredKind,
+};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::DriverTally;
 use crate::simulator::state_store::{bit_position_in, StateStore};
@@ -503,6 +505,9 @@ pub struct Simulator {
     resolved_nets: HashSet<String>,
     /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
     pulled_nets: Vec<PulledNet>,
+    /// The `wand`/`wor` nets, whose drivers combine by a logic function rather
+    /// than by strength. Empty for a design that declares none.
+    wired_nets: HashMap<String, WiredKind>,
     blocks: Vec<TimedBlock>,
     /// The blocks suspended on something other than the clock: a `wait` on a
     /// value, or an event control waiting for an edge.
@@ -607,6 +612,7 @@ impl Simulator {
             pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
+            wired_nets: HashMap::new(),
             blocks: Vec::new(),
             waiting: Vec::new(),
             ran_before: Vec::new(),
@@ -649,6 +655,7 @@ impl Simulator {
         self.round.clear();
         self.settled_once = false;
         self.pulled_nets.clear();
+        self.wired_nets.clear();
         self.blocks.clear();
         self.waiting.clear();
         self.forks.clear();
@@ -712,6 +719,7 @@ impl Simulator {
         self.pass_switches = elaborated.pass_switches;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
+        self.wired_nets = elaborated.wired_nets;
         self.blocks = elaborated.blocks;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
@@ -2280,11 +2288,12 @@ impl Simulator {
                 address: address.map(<[i64]>::to_vec),
                 bits,
                 driven,
+                through: Vec::new(),
             });
         }
         // A design with no `tran` in it pays one `is_empty` for the question.
         if !switches.is_empty() {
-            bond_nodes(&mut resolving, switches);
+            bond_nodes(&mut resolving, switches, &self.pass_switches);
         }
         let mut changed = false;
         for net in resolving {
@@ -2294,9 +2303,21 @@ impl Simulator {
             // keeps the strength it was last resolved at, exactly as it keeps
             // its value.
             let mut levels = self.state.strengths_of(&net.name, bits.len());
+            // A `wand`/`wor` net combines its drivers by a logic function
+            // instead of by strength, and it is the *net* that says so. A
+            // design that declares none answers without hashing a name.
+            let wired = if self.wired_nets.is_empty() || net.address.is_some() {
+                None
+            } else {
+                self.wired_nets.get(net.name.as_str()).copied()
+            };
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
-                    let resolved = resolve_strength(drivers.iter().map(|d| d.strength));
+                    let strengths = drivers.iter().map(|d| d.strength);
+                    let resolved = match wired {
+                        Some(kind) => resolve_wired(kind, strengths),
+                        None => resolve_strength(strengths),
+                    };
                     bits[position] = resolved.value();
                     levels[position] = resolved;
                 }
@@ -2325,12 +2346,13 @@ impl Simulator {
                     .is_some_and(|signal| signal.strengths() != Some(levels.as_slice()));
                 self.state.set_strengths(name, levels);
                 // The driver *tally* is what `$countdrivers` reports, and it
-                // is taken after `bond_nodes` has pooled — a bit joined to
-                // another by a `tran`, which is what an `inout` port bound to
-                // a select is, has the node's drivers and not its own (corpus
-                // `countdrivers3`). A design that never asks builds none.
+                // is taken after `bond_nodes` has run — a bit bonded to
+                // another as an `inout` port bound to a select has the node's
+                // drivers and not its own (corpus `countdrivers3`), and each
+                // conducting switch is one more driver (`countdrivers5`). A
+                // design that never asks builds none.
                 if self.state.counts_drivers() {
-                    let counts = net
+                    let mut counts: Vec<DriverTally> = net
                         .driven
                         .iter()
                         .map(|drivers| {
@@ -2341,6 +2363,9 @@ impl Simulator {
                             tally
                         })
                         .collect();
+                    for (position, code) in &net.through {
+                        counts[*position].count(*code);
+                    }
                     self.state.set_driver_counts(name, counts);
                 }
             }
@@ -2360,7 +2385,7 @@ impl Simulator {
             return Ok(Vec::new());
         }
         let mut bits = Vec::with_capacity(self.pass_switches.len());
-        for switch in &self.pass_switches {
+        for (index, switch) in self.pass_switches.iter().enumerate() {
             let (Some(first), Some(second)) = (
                 self.terminal_bit(&switch.terminals[0])?,
                 self.terminal_bit(&switch.terminals[1])?,
@@ -2371,6 +2396,7 @@ impl Simulator {
             };
             bits.push(SwitchBits {
                 ends: [first, second],
+                switch: index,
                 conducting: switch.conducts(&self.state)?,
             });
         }
@@ -2424,7 +2450,9 @@ struct TerminalBit {
 /// One pass switch measured against the design as it stands this pass.
 struct SwitchBits {
     ends: [TerminalBit; 2],
-    conducting: bool,
+    /// Which of `Simulator::pass_switches` it is.
+    switch: usize,
+    conducting: Conducting,
 }
 
 /// One net's per-bit driver lists, before they are resolved.
@@ -2435,18 +2463,32 @@ struct NetDrivers {
     bits: Vec<u8>,
     /// The drivers of each bit, most significant first.
     driven: Vec<Vec<BitDriver>>,
+    /// The conducting switches `$countdrivers` counts as drivers of a bit, each
+    /// as the bit's position and the code the far terminal resolved to. Empty
+    /// for a net no switch reaches.
+    through: Vec<(usize, u8)>,
 }
 
-/// Pools the driver lists of every bit a conducting pass switch joins.
+/// Settles every bit a pass switch reaches: each one is its own drivers
+/// resolved against what every switch on it carries across from the far side.
 ///
-/// A `tran` makes its two terminals one **node**, and a node's value is what
-/// every driver of every net in it resolves to *together* — the same
-/// [`resolve_bit`] every other contention already goes through. So the whole of
-/// the model is that the bits in one node share one driver list, and nothing
-/// about the value rule changed. Copying a value from one terminal to the other
-/// instead latches: a driver letting go of `a` would leave `b` holding the
-/// stale value, which copies straight back, and the net would never float
-/// again.
+/// Two kinds of edge meet here and are treated differently on purpose. A
+/// **port bond** is one net under two names, so its ends are pooled into one
+/// node whose driver lists are shared — nothing is reduced across it. A
+/// **switch** is directional: what crosses it is what the far side resolved to
+/// *leaving out what came from this side over the same switch*, reduced by the
+/// switch (`PassSwitch::carry`). That is a message per direction per switch,
+/// relaxed until nothing moves; on a tree of switches it is exactly "every
+/// driver reaches every node, reduced once per switch on the path", and it
+/// resolves before it reduces, which is what iverilog 12.0 does — `supply1`
+/// against `strong0` on one side of an `rtran` is `Su1` there and `Pu1` on the
+/// other, where reducing each driver first would give `PuX`.
+///
+/// Nothing crossing a switch is ever read off what a net *held*. The messages
+/// start from high impedance on every propagation pass and are built from each
+/// side's own drivers alone, which is what keeps a switch from latching: a
+/// driver letting go of `a` leaves nothing behind to be carried back to it, so
+/// a loop of `tran`s whose one driver floats floats with it (measured).
 ///
 /// The partition is by **bit** rather than by net, because `tran (a[0], a[1]);`
 /// joins two bits of one vector (corpus `pr3296466a`).
@@ -2457,7 +2499,13 @@ struct NetDrivers {
 /// value it held. Measured against iverilog 12.0, `assign p = a;
 /// tranif1 (p, q, en);` gives `p=1 q=1` while `en` is high and `p=1 q=z` once
 /// it goes low.
-fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
+///
+/// `$countdrivers` counts each switch that definitely conducts as one more
+/// driver of the bit, carrying the code the far terminal resolved to — not the
+/// message, so a far side that disagrees with this one counts as `x` (corpus
+/// `countdrivers5`). A port bond is not counted, a far side at `z` is not, and
+/// neither is a switch whose control is unknown (measured).
+fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits], kinds: &[PassSwitch]) {
     // Which net each terminal belongs to, worked out while `nets` is only
     // borrowed for reading. A switch whose terminal names no net in the list
     // has nothing to join — `resolve_contributions` puts every terminal in the
@@ -2491,15 +2539,15 @@ fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
             }
         }
     }
+    // Every terminal is a cell, and a port bond makes its two cells one node.
     let mut node = Nodes::default();
     for (switch, ends) in switches.iter().zip(&cells) {
         let Some(ends) = ends else { continue };
-        if !switch.conducting {
-            continue;
-        }
         let first = node.cell(ends[0]);
         let second = node.cell(ends[1]);
-        node.join(first, second);
+        if kinds[switch.switch].port {
+            node.join(first, second);
+        }
     }
     let mut pooled: HashMap<usize, Vec<BitDriver>> = HashMap::new();
     for id in 0..node.cells.len() {
@@ -2508,12 +2556,131 @@ fn bond_nodes(nets: &mut [NetDrivers], switches: &[SwitchBits]) {
         let drivers = nets[net].driven.get(position).cloned().unwrap_or_default();
         pooled.entry(root).or_default().extend(drivers);
     }
+    // The switches between nodes that carry anything this pass. One whose ends
+    // are already one node carries nothing a pooled list does not have.
+    let mut edges: Vec<SwitchEdge> = Vec::new();
+    for (switch, ends) in switches.iter().zip(&cells) {
+        let Some(ends) = ends else { continue };
+        if kinds[switch.switch].port || switch.conducting == Conducting::No {
+            continue;
+        }
+        let first = node.cell(ends[0]);
+        let second = node.cell(ends[1]);
+        let nodes = [node.root(first), node.root(second)];
+        if nodes[0] != nodes[1] {
+            edges.push(SwitchEdge {
+                nodes,
+                switch: &kinds[switch.switch],
+                conducting: switch.conducting,
+            });
+        }
+    }
+    let mut through: HashMap<usize, Vec<u8>> = HashMap::new();
+    if !edges.is_empty() {
+        relax_switches(&edges, &mut pooled, &mut through);
+    }
     for id in 0..node.cells.len() {
         let (net, position) = node.cells[id];
         let root = node.root(id);
         if let (Some(slot), Some(drivers)) = (nets[net].driven.get_mut(position), pooled.get(&root))
         {
             *slot = drivers.clone();
+        }
+        if let Some(codes) = through.get(&root) {
+            nets[net]
+                .through
+                .extend(codes.iter().map(|code| (position, *code)));
+        }
+    }
+}
+
+/// One switch between two nodes that carries something this pass.
+struct SwitchEdge<'s> {
+    /// The node at each terminal, in the switch's own order.
+    nodes: [usize; 2],
+    switch: &'s PassSwitch,
+    conducting: Conducting,
+}
+
+/// Relaxes the messages every switch carries until none of them moves, then
+/// adds what reached each node to its driver list.
+///
+/// Message `2 * i + d` crosses switch `i` from `nodes[d]` to `nodes[1 - d]`,
+/// and is that switch's carriage of what its source resolves to leaving out
+/// the message coming the other way over the same switch. Every message starts
+/// at high impedance, which is the one strength that resolves against anything
+/// as though it were not there.
+///
+/// On a tree of switches a round per switch on the longest path settles it; a
+/// loop settles too, since what crosses a switch is never stronger than what
+/// reached it, and the bound is there so that a loop that does not is a stale
+/// strength rather than a hang.
+fn relax_switches(
+    edges: &[SwitchEdge],
+    pooled: &mut HashMap<usize, Vec<BitDriver>>,
+    through: &mut HashMap<usize, Vec<u8>>,
+) {
+    let own: HashMap<usize, Strength> = pooled
+        .iter()
+        .map(|(root, drivers)| (*root, resolve_strength(drivers.iter().map(|d| d.strength))))
+        .collect();
+    // The messages arriving at each node, by index.
+    let mut arriving: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, edge) in edges.iter().enumerate() {
+        arriving.entry(edge.nodes[1]).or_default().push(2 * index);
+        arriving
+            .entry(edge.nodes[0])
+            .or_default()
+            .push(2 * index + 1);
+    }
+    let mut messages = vec![Strength::HIGHZ; 2 * edges.len()];
+    for _ in 0..=messages.len() {
+        let mut moved = false;
+        for (index, edge) in edges.iter().enumerate() {
+            for direction in 0..2 {
+                let source = edge.nodes[direction];
+                let returning = 2 * index + 1 - direction;
+                let resolved = resolve_strength(
+                    std::iter::once(own[&source]).chain(
+                        arriving[&source]
+                            .iter()
+                            .filter(|message| **message != returning)
+                            .map(|message| messages[*message]),
+                    ),
+                );
+                let carried = edge.switch.carry(resolved, edge.conducting);
+                if messages[2 * index + direction] != carried {
+                    messages[2 * index + direction] = carried;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    // What each node resolves to with everything that reached it, which is what
+    // a switch reports to `$countdrivers` about its far side.
+    let settled: HashMap<usize, Strength> = arriving
+        .iter()
+        .map(|(root, arrived)| {
+            let strength = resolve_strength(
+                std::iter::once(own[root]).chain(arrived.iter().map(|m| messages[*m])),
+            );
+            (*root, strength)
+        })
+        .collect();
+    for (index, edge) in edges.iter().enumerate() {
+        for direction in 0..2 {
+            let sink = edge.nodes[1 - direction];
+            pooled.entry(sink).or_default().push(BitDriver {
+                strength: messages[2 * index + direction],
+                counted: false,
+            });
+            if edge.conducting == Conducting::Yes {
+                let far = settled[&edge.nodes[direction]].value();
+                through.entry(sink).or_default().push(far);
+            }
         }
     }
 }
@@ -3269,6 +3436,58 @@ mod tests {
         assert_eq!(simulator.get("c").unwrap().to_binary(), "1");
         simulator.poke("d", zero()).unwrap();
         assert_eq!(simulator.get("c").unwrap().to_binary(), "0");
+    }
+
+    /// A `wand`/`wor` net combines its drivers by a logic function, so one `0`
+    /// pulls a `wand` down where an ordinary net would be `x` — and the answer
+    /// is `strong` whatever the drivers declared.
+    ///
+    /// Measured against iverilog 12.0, which prints
+    /// `down=St0 up=St1 weak=St0 pulled=St0 alone=St1 vec=0x01` for this design:
+    /// a `pull0` against a `weak1` on a `wand` is `St0`, and a `pullup` on a
+    /// `wand` is a driving `1` like any other — `St0` beside a `0`, `St1`
+    /// alone. Corpus `pr3437290a`/`c` are the first two nets, and `pr3437290b`
+    /// the per-bit vector.
+    #[test]
+    fn test_wired_nets_are_pulled_by_their_dominant_driver() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg a, b, c;
+                wand down;
+                wor up;
+                triand weak;
+                wand pulled;
+                wand alone;
+                trior [3:0] vec;
+                assign down = a;
+                assign down = b;
+                assign down = c;
+                assign up = a;
+                assign up = b;
+                assign up = c;
+                assign (pull0, pull1) weak = b;
+                assign (weak0, weak1) weak = a;
+                pullup (pulled);
+                assign pulled = b;
+                pullup (alone);
+                assign vec = 4'b0z01;
+                assign vec = 4'b0x00;
+                initial begin
+                    a = 1'b1;
+                    b = 1'b0;
+                    c = 1'b1;
+                    #1 $display("down=%v up=%v weak=%v pulled=%v alone=%v vec=%b",
+                        down, up, weak, pulled, alone, vec);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "down=St0 up=St1 weak=St0 pulled=St0 alone=St1 vec=0x01\n"
+        );
     }
 
     /// An array of nets is a memory in the store, exactly as a `reg` array is,
@@ -4288,6 +4507,50 @@ mod tests {
             simulator.output().text(),
             "1 0 6 2 3 1
 "
+        );
+    }
+
+    /// A conducting `tran` is one more driver of each terminal, driving what
+    /// the *far* terminal resolved to — while one whose control is unknown is
+    /// not counted, and neither is a far side at `z`.
+    ///
+    /// Measured against iverilog 12.0 (`multi countD count0 count1 countX`):
+    /// with `a` at 1 and `b` at 0 through a `tran`, both ends answer
+    /// `1 2 0 1 1` / `1 2 1 0 1` — the far side is `x` — and with `en`
+    /// unknown on a `tranif1` from `p = 1`, `p` answers `0 1 0 1 0` and `q`
+    /// `0 0 0 0 0`. Corpus `countdrivers5` is the three-way case.
+    #[test]
+    fn test_countdrivers_counts_a_conducting_switch_as_a_driver() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+                reg a, b, en;
+                wire n1, n2, p, q;
+                assign n1 = a;
+                assign n2 = b;
+                tran (n1, n2);
+                assign p = a;
+                tranif1 (p, q, en);
+                reg [15:0] multi, forced, all, zero, one, unknown;
+                initial begin
+                    a = 1; b = 0; en = 1'bx;
+                    #1;
+                    multi = $countdrivers(n1, forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d", multi, all, zero, one, unknown);
+                    multi = $countdrivers(n2, forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d", multi, all, zero, one, unknown);
+                    multi = $countdrivers(p, forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d", multi, all, zero, one, unknown);
+                    multi = $countdrivers(q, forced, all, zero, one, unknown);
+                    $display("%0d %0d %0d %0d %0d", multi, all, zero, one, unknown);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(2).unwrap();
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["1 2 0 1 1", "1 2 1 0 1", "0 1 0 1 0", "0 0 0 0 0"]
         );
     }
 
@@ -8867,9 +9130,9 @@ mod tests {
     /// at elaboration.
     ///
     /// iverilog 12.0 on this design prints `en=1 p=1 q=1`, `en=0 p=1 q=z` and
-    /// `en=x p=1 q=x`. The unknown control is the one departure: this takes the
-    /// switch not to conduct, so `q` is `z` where iverilog gives `x` — saying
-    /// "unknown" there needs a strength that is a range rather than a level.
+    /// `en=x p=1 q=x`. An unknown control conducts at an ambiguous strength —
+    /// `p`'s `St1` or nothing, which is `StH` on `q` and an `x` as a value —
+    /// while `p` keeps its own driver's answer.
     #[test]
     fn test_a_tranif_joins_only_while_its_control_says_so() {
         let mut simulator = simulator_for(
@@ -8901,12 +9164,111 @@ mod tests {
 
         simulator.advance(2).unwrap();
         assert_eq!(level(&simulator, "p"), "1");
-        assert_eq!(level(&simulator, "q"), "z");
+        assert_eq!(level(&simulator, "q"), "x");
+    }
+
+    /// What crosses a bidirectional switch is reduced on the way, per switch,
+    /// and resolved *before* it is reduced; a port bond is one net and reduces
+    /// nothing; and nothing is carried back once the driver lets go.
+    ///
+    /// iverilog 12.0 prints, for this design,
+    /// `t=Su1 St1 St1 r=Su1 Pu1 We1 Me1 m=Su1 Pu1 l=St1 St1 St1 bus=Su1 p=Su1`
+    /// and then every net `HiZ` once `a` and `b` float: a `tran` drops `supply`
+    /// to `strong` and leaves `strong` alone, each `rtran` weakens a level,
+    /// `supply1` against `strong0` behind an `rtran` is `Pu1` (reducing each
+    /// driver first would give `PuX`), and a loop of `tran`s holds nothing up
+    /// on its own.
+    #[test]
+    fn test_a_bidirectional_switch_reduces_what_it_carries() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module child(inout p);
+            endmodule
+            module top;
+              reg a, b;
+              wire t1, t2, t3;
+              assign (supply1, supply0) t1 = a;
+              tran (t1, t2);
+              tran (t2, t3);
+              wire r1, r2, r3, r4;
+              assign (supply1, supply0) r1 = a;
+              rtran (r1, r2);
+              rtran (r2, r3);
+              rtran (r3, r4);
+              wire m1, m2;
+              assign (supply1, highz0) m1 = a;
+              assign (highz1, strong0) m1 = b;
+              rtran (m1, m2);
+              wire l1, l2, l3;
+              assign l1 = a;
+              tran (l1, l2);
+              tran (l2, l3);
+              tran (l3, l1);
+              wire [1:0] bus;
+              assign (supply1, supply0) bus[0] = a;
+              child u (bus[0]);
+              initial begin
+                a = 1; b = 0;
+                #1 $display("t=%v %v %v r=%v %v %v %v m=%v %v l=%v %v %v bus=%v p=%v",
+                    t1, t2, t3, r1, r2, r3, r4, m1, m2, l1, l2, l3, bus[0], u.p);
+                a = 1'bz; b = 1'bz;
+                #1 $display("t=%v %v %v r=%v %v %v %v m=%v %v l=%v %v %v bus=%v p=%v",
+                    t1, t2, t3, r1, r2, r3, r4, m1, m2, l1, l2, l3, bus[0], u.p);
+              end
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(3).expect("advance should succeed");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "t=Su1 St1 St1 r=Su1 Pu1 We1 Me1 m=Su1 Pu1 l=St1 St1 St1 bus=Su1 p=Su1",
+                "t=HiZ HiZ HiZ r=HiZ HiZ HiZ HiZ m=HiZ HiZ l=HiZ HiZ HiZ bus=HiZ p=HiZ",
+            ]
+        );
+    }
+
+    /// A `tranif` whose control is unknown carries what it would carry, *or
+    /// nothing*: the far side sees an ambiguous strength rather than no driver.
+    ///
+    /// iverilog 12.0 prints `c1=St1 c2=56X c3=St1 c4=StH` with `en` unknown —
+    /// `c2`'s own `Pu0` against `St1`-or-nothing — and `c1=PuH c2=Pu1` once `a`
+    /// floats, where the carriage runs the other way.
+    #[test]
+    fn test_an_unknown_control_carries_an_ambiguous_strength() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+              reg a, b, en;
+              wire c1, c2, c3, c4;
+              assign c1 = a;
+              assign (pull1, pull0) c2 = b;
+              tranif1 (c1, c2, en);
+              assign c3 = a;
+              tranif1 (c3, c4, en);
+              initial begin
+                a = 1; b = 0; en = 1'bx;
+                #1 $display("c1=%v c2=%v c3=%v c4=%v", c1, c2, c3, c4);
+                a = 1'bz; b = 1;
+                #1 $display("c1=%v c2=%v c3=%v c4=%v", c1, c2, c3, c4);
+              end
+            endmodule
+        "#,
+        );
+        simulator.advance(3).expect("advance should succeed");
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["c1=St1 c2=56X c3=St1 c4=StH", "c1=PuH c2=Pu1 c3=HiZ c4=HiZ"]
+        );
     }
 
     /// Two drivers that meet through a `tran` resolve against each other, since
-    /// the switch pools them into one driver list rather than copying either
-    /// one across.
+    /// each side resolves its own driver against what the switch carries from
+    /// the other rather than having either value copied across.
     ///
     /// iverilog 12.0 on this design prints `disagree p=x q=x`, `one side z p=1
     /// q=1` and `both z p=z q=z`.

@@ -33,11 +33,7 @@
 //! opens or closes rather than a value — is parsed and ignored, and a
 //! **delayed** gate drives at its declared strength rather than at the one its
 //! inputs say this instant: the value in hand is the one that landed `#n` ago
-//! and the two would otherwise be out of step. A `tranif` whose control is `x`
-//! or `z` is taken **not** to conduct, where iverilog conducts at an ambiguous
-//! strength and gives the far side an `x`; see [`PassSwitch::conducts`]. And
-//! nothing reduces a strength across a *bidirectional* switch, so a `tran`
-//! carries a `supply` through where iverilog drops it to `strong`.
+//! and the two would otherwise be out of step.
 
 use crate::parsers::delay::GateDelay;
 use crate::parsers::expr::Expression;
@@ -231,7 +227,7 @@ impl Driven {
 /// Whether a control-led primitive is passing its data, blocking it, or
 /// cannot say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Conducting {
+pub enum Conducting {
     Yes,
     No,
     Maybe,
@@ -378,16 +374,19 @@ fn reduced(kind: GateKind, strength: Strength) -> Strength {
 /// One elaborated **bidirectional** pass switch.
 ///
 /// A `tran` has no output terminal, so it is deliberately not a [`Gate`]: it
-/// does not *drive* anything, it makes its two terminals **one node**. A node's
-/// value is what every driver of every net in it resolves to *together*, which
-/// is the same [`resolve_bit`] every other contention already goes through — so
-/// the switch changes which contributions are pooled and nothing about the
-/// value rule.
+/// does not drive anything of its own. What it does is carry what one terminal
+/// resolved to across to the other, **reduced** on the way — a `tran` drops a
+/// `supply` to `strong`, an `rtran` weakens every level — and each terminal is
+/// then its own drivers resolved against what came across. The carrying is
+/// directional because the reduction is: `supply1` through one `tran` is `St1`
+/// on the far side while the near side stays `Su1`.
 ///
-/// Copying a value from one terminal to the other instead is the shape that
+/// Copying a *value* from one terminal to the other instead is the shape that
 /// looks right and is wrong: once `a` has been copied to `b`, a driver on `a`
 /// letting go leaves `b` holding the stale value, which copies straight back.
-/// A three-state bus wired through a `tran` would never float again.
+/// What crosses is therefore worked out afresh every propagation pass from each
+/// side's own drivers and never from what a net held — see
+/// `runner::bond_nodes`.
 pub struct PassSwitch {
     pub kind: GateKind,
     /// The two nets it joins. Each is read as one bit, the way every other
@@ -396,6 +395,13 @@ pub struct PassSwitch {
     /// A `tranif`'s control terminal and the level that makes it conduct.
     /// `None` for `tran`/`rtran`, which always do.
     pub control: Option<(Expression, u8)>,
+    /// Whether this is a **port connection** rather than a switch the design
+    /// wrote: an `inout` port bound to a select is bonded bit by bit with one
+    /// of these. A port is one net under two names, so its two ends are pooled
+    /// into one node — nothing is reduced across it (iverilog 12.0 keeps a
+    /// `supply1` driver `Su1` on both sides of one) and it is not counted as a
+    /// driver by `$countdrivers`.
+    pub port: bool,
 }
 
 impl PassSwitch {
@@ -426,7 +432,19 @@ impl PassSwitch {
             kind,
             terminals: [first, second],
             control,
+            port: false,
         })
+    }
+
+    /// The bond between one bit of an `inout` port and the bit of the
+    /// connection it is bound to.
+    pub fn port(inside: Expression, outside: Expression) -> PassSwitch {
+        PassSwitch {
+            kind: GateKind::Tran,
+            terminals: [inside, outside],
+            control: None,
+            port: true,
+        }
     }
 
     /// Whether the switch joins its two terminals as things stand.
@@ -437,17 +455,31 @@ impl PassSwitch {
     /// A union-find built once would be right for `tran` and silently wrong for
     /// the four `if` forms.
     ///
-    /// A control that is `x` or `z` is taken not to conduct. iverilog conducts
-    /// at an *ambiguous* strength instead, which gives the far side an `x`
-    /// while leaving the driven side alone: measured against iverilog 12.0,
-    /// `assign p = 1; tranif1 (p, q, en);` with `en` unknown gives `p=1 q=x`,
-    /// where this gives `p=1 q=z`. Saying the far side is unknown needs a
-    /// strength that is a *range* rather than a level, which
-    /// [`resolve_bit`] has no shape for.
-    pub fn conducts(&self, state: &StateStore) -> Result<bool, SimulationError> {
+    /// A control that is `x` or `z` is [`Conducting::Maybe`]: the switch
+    /// either carries or does not, and what it carries is stretched to high
+    /// impedance by [`PassSwitch::carry`].
+    pub fn conducts(&self, state: &StateStore) -> Result<Conducting, SimulationError> {
         match &self.control {
-            None => Ok(true),
-            Some((control, active)) => Ok(least_significant_bit(&eval(control, state)?) == *active),
+            None => Ok(Conducting::Yes),
+            Some((control, active)) => Ok(level_conducts(
+                least_significant_bit(&eval(control, state)?),
+                *active,
+            )),
+        }
+    }
+
+    /// What reaches one terminal when the other has resolved to `strength`.
+    ///
+    /// IEEE 1364-2005 Table 7-8's reduction — a `tran` drops `supply` to
+    /// `strong`, an `rtran` weakens every level — and, for a switch whose
+    /// control is unknown, the same drive *or nothing*. Measured against
+    /// iverilog 12.0: `assign p = 1; tranif1 (p, q, en);` with `en` unknown
+    /// gives `q` as `StH`, and a `pull0` on `q` beside it gives `56X`.
+    pub fn carry(&self, strength: Strength, conducting: Conducting) -> Strength {
+        let carried = reduced(self.kind, strength);
+        match conducting {
+            Conducting::Maybe => carried.or_floating(),
+            _ => carried,
         }
     }
 }
@@ -775,6 +807,53 @@ pub fn resolve_bit(drivers: &[Strength]) -> u8 {
     resolve_strength(drivers.iter().copied()).value()
 }
 
+/// The two *wired* net kinds, whose drivers combine by a logic function rather
+/// than by strength.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WiredKind {
+    /// `wand` / `triand` — a driver at `0` pulls the net down.
+    And,
+    /// `wor` / `trior` — a driver at `1` pulls the net up.
+    Or,
+}
+
+/// What one bit of a `wand`/`wor` net carries when several drivers reach it.
+///
+/// A wired net is the one place the strongest driver does **not** simply win:
+/// a `wand` is `0` when any driver is `0` however the others are driving,
+/// which is the whole point of the net kind. Each driver is read as the
+/// *value* its strength stands for, so one that is floating contributes
+/// nothing and a net every driver has let go of is `z`; the dominant level is
+/// looked for before `x`, so `wand(0, x)` is `0` rather than unknown.
+///
+/// Strength plays no part in the answer and the answer is always `strong`,
+/// which was measured rather than assumed: iverilog 12.0 prints `St0` for a
+/// `wand` driven `strong0` against `pull1`, for one driven `pull0` against
+/// `weak1`, and for one whose only driver is a `pull0` — and a `pullup` on a
+/// `wand` is a `1` like any other driver, `St1` alone and `St0` beside a `0`.
+/// A driver whose own strength is ambiguous (a `bufif1` with an unknown
+/// enable, `StL`) is an `x` as a value and is combined as one.
+pub fn resolve_wired(kind: WiredKind, drivers: impl IntoIterator<Item = Strength>) -> Strength {
+    let dominant = match kind {
+        WiredKind::And => ZERO,
+        WiredKind::Or => ONE,
+    };
+    let mut resolved = Z;
+    for driver in drivers {
+        match driver.value() {
+            Z => {}
+            code if code == dominant => {
+                resolved = dominant;
+                break;
+            }
+            X => resolved = X,
+            code if resolved == Z => resolved = code,
+            _ => {}
+        }
+    }
+    Strength::driven(resolved, DriveStrength::STRONG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1053,74 @@ mod tests {
         assert_eq!(
             resolve_bit(&[at(ONE, StrengthLevel::Supply), at(ZERO, strong)]),
             ONE
+        );
+    }
+
+    /// A wired net combines its drivers by a logic function, the one place the
+    /// strongest driver does not simply win: `wand(0, 1)` is `0` where an
+    /// ordinary net gives `x`.
+    ///
+    /// The value tables are corpus `triand`'s and `trior`'s — the ten
+    /// combinations of two drivers, asserted there against iverilog's answers.
+    /// The strengths were measured against iverilog 12.0 with `%v`: the answer
+    /// is `St` whatever the drivers declared — `(strong0) & (pull1)` is `St0`,
+    /// a lone `pull0` is `St0` and `(pull0) | (weak1)` is `St1` — while a
+    /// `highz0` half still drives nothing (`wand(z, highz0-driven 0)` is
+    /// `HiZ`).
+    #[test]
+    fn test_wired_nets_resolve_by_a_logic_function() {
+        let strong = StrengthLevel::Strong;
+        let wired = |kind, codes: &[u8]| {
+            shown(resolve_wired(kind, codes.iter().map(|code| at(*code, strong))).value())
+        };
+
+        let and = |codes: &[u8]| wired(WiredKind::And, codes);
+        assert_eq!(and(&[ZERO, ZERO]), '0');
+        assert_eq!(and(&[ZERO, ONE]), '0');
+        assert_eq!(and(&[ZERO, X]), '0');
+        assert_eq!(and(&[X, ZERO]), '0');
+        assert_eq!(and(&[ZERO, Z]), '0');
+        assert_eq!(and(&[ONE, ONE]), '1');
+        assert_eq!(and(&[ONE, X]), 'x');
+        assert_eq!(and(&[ONE, Z]), '1');
+        assert_eq!(and(&[X, X]), 'x');
+        assert_eq!(and(&[X, Z]), 'x');
+        assert_eq!(and(&[Z, Z]), 'z');
+        assert_eq!(and(&[]), 'z');
+
+        let or = |codes: &[u8]| wired(WiredKind::Or, codes);
+        assert_eq!(or(&[ZERO, ZERO]), '0');
+        assert_eq!(or(&[ZERO, ONE]), '1');
+        assert_eq!(or(&[ZERO, X]), 'x');
+        assert_eq!(or(&[ZERO, Z]), '0');
+        assert_eq!(or(&[ONE, ONE]), '1');
+        assert_eq!(or(&[ONE, X]), '1');
+        assert_eq!(or(&[X, ONE]), '1');
+        assert_eq!(or(&[ONE, Z]), '1');
+        assert_eq!(or(&[X, X]), 'x');
+        assert_eq!(or(&[X, Z]), 'x');
+        assert_eq!(or(&[Z, Z]), 'z');
+
+        let pull = StrengthLevel::Pull;
+        let weak = StrengthLevel::Weak;
+        assert_eq!(
+            resolve_wired(WiredKind::And, [at(ZERO, strong), at(ONE, pull)]),
+            Strength::STRONG_ZERO
+        );
+        assert_eq!(
+            resolve_wired(WiredKind::And, [at(ZERO, pull)]),
+            Strength::STRONG_ZERO
+        );
+        assert_eq!(
+            resolve_wired(WiredKind::Or, [at(ZERO, pull), at(ONE, weak)]),
+            Strength::STRONG_ONE
+        );
+        assert_eq!(
+            resolve_wired(
+                WiredKind::And,
+                [at(ZERO, StrengthLevel::Highz), at(Z, strong)]
+            ),
+            Strength::HIGHZ
         );
     }
 

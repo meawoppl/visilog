@@ -71,7 +71,7 @@ use crate::register::{Register, ONE, ZERO};
 use crate::simulator::eval::{eval, expression_width, select_index};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width, resolve_target, ResolvedTarget};
-use crate::simulator::gates::{Gate, PassSwitch};
+use crate::simulator::gates::{Gate, PassSwitch, WiredKind};
 use crate::simulator::program::{
     block_scope, FrameVariable, FunctionDefinition, Instruction, Program, TaskDefinition,
     TaskParameter, TaskTable, FUNCTION_DELAY_UNSUPPORTED, FUNCTION_EVENT_UNSUPPORTED,
@@ -232,6 +232,11 @@ pub struct Elaborated {
     /// it is what lets `resolve_bit` decide between them and everything else
     /// without a second rule.
     pub pulled_nets: Vec<PulledNet>,
+    /// The `wand`/`triand` and `wor`/`trior` nets, whose drivers combine by a
+    /// logic function rather than by strength. Empty for a design that
+    /// declares none, which is what keeps the question off the resolution hot
+    /// path.
+    pub wired_nets: HashMap<String, WiredKind>,
     pub blocks: Vec<TimedBlock>,
     /// The *top* module's input ports, the only ones a testbench may drive.
     pub inputs: Vec<String>,
@@ -271,6 +276,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
+            wired_nets: HashMap::new(),
             blocks: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
@@ -320,8 +326,8 @@ enum Binding {
     /// Neither direction of the alias will do: the port is read *and* written,
     /// and a continuous assignment only runs one way. The port gets a signal
     /// of its own and each of its bits is **bonded** to the matching bit of
-    /// the connection, which is the node model a `tran` already has — so the
-    /// two are not copied into each other, their drivers are pooled.
+    /// the connection with a port bond (`PassSwitch::port`) — so the two are
+    /// not copied into each other, their drivers are pooled.
     Bonded(Expression),
 }
 
@@ -2286,6 +2292,10 @@ impl<'m> Elaborator<'m> {
         for net in &mut self.out.pulled_nets {
             net.name = resolve(&net.name);
         }
+        self.out.wired_nets = std::mem::take(&mut self.out.wired_nets)
+            .into_iter()
+            .map(|(name, kind)| (resolve(&name), kind))
+            .collect();
         self.out.resolved_nets = std::mem::take(&mut self.out.resolved_nets)
             .into_iter()
             .map(|name| resolve(&name))
@@ -2332,7 +2342,30 @@ impl<'m> Elaborator<'m> {
     /// A pulled net is one more contribution, so it also has to be *resolved*
     /// rather than written: `tri0 c; assign c = d;` is `0` when `d` is `z` and
     /// `1` when `d` is `1`, which only `resolve_bit` can say.
+    ///
+    /// A `wand`/`wor` net drives nothing of its own, but it changes how its
+    /// drivers combine, and both questions are asked of the same declaration.
+    /// It is resolved even with a single driver, because the answer is always
+    /// `strong` whatever that driver declared.
     fn record_pull(&mut self, local: &str, net_type: WireKind, scope: &Scope) {
+        // A net that is also a port bound to a parent signal has no entry of
+        // its own, so what is recorded belongs on the entry it aliases —
+        // otherwise it names a signal the store does not have and setup fails.
+        let name = || match scope.bindings.get(local) {
+            Some(Binding::Alias(target)) => target.clone(),
+            _ => scope.qualified(local),
+        };
+        let wired = match net_type {
+            WireKind::WireAnd | WireKind::TriAnd => Some(WiredKind::And),
+            WireKind::WireOr | WireKind::TriOr => Some(WiredKind::Or),
+            _ => None,
+        };
+        if let Some(kind) = wired {
+            let name = name();
+            self.out.resolved_nets.insert(name.clone());
+            self.out.wired_nets.insert(name, kind);
+            return;
+        }
         let (code, strength) = match net_type {
             WireKind::Supply0 => (ZERO, StrengthLevel::Supply),
             WireKind::Supply1 => (ONE, StrengthLevel::Supply),
@@ -2340,13 +2373,7 @@ impl<'m> Elaborator<'m> {
             WireKind::Tri1 => (ONE, StrengthLevel::Pull),
             _ => return,
         };
-        // A net that is also a port bound to a parent signal has no entry of
-        // its own, so the pull belongs on the entry it aliases — otherwise it
-        // names a signal the store does not have and setup fails.
-        let name = match scope.bindings.get(local) {
-            Some(Binding::Alias(target)) => target.clone(),
-            _ => scope.qualified(local),
-        };
+        let name = name();
         self.out.resolved_nets.insert(name.clone());
         self.out.pulled_nets.push(PulledNet {
             name,
@@ -2403,10 +2430,11 @@ impl<'m> Elaborator<'m> {
     /// and `bus[0]` are not one entry. An **output** bound to one is carried
     /// out by a continuous assignment, but an `inout` is read as well as
     /// written and one assignment only runs one way. So the port keeps a
-    /// signal of its own and the two are made **one node**, bit by bit, which
-    /// is exactly what a `tran` between them would mean: the drivers of both
-    /// are pooled and resolved together, rather than either side's value being
-    /// copied into the other. Copying is the shape that looks right and is
+    /// signal of its own and the two are made **one node**, bit by bit, by a
+    /// port bond: the drivers of both are pooled and resolved together, rather
+    /// than either side's value being copied into the other. It is not a `tran`
+    /// — a `tran` would drop a `supply` driver to `strong` on the far side,
+    /// where iverilog 12.0 keeps it `Su1` on both. Copying is the shape that looks right and is
     /// wrong for the reason [`PassSwitch`] gives — once the value has been
     /// copied, a driver letting go leaves the far side holding it.
     ///
@@ -2418,7 +2446,7 @@ impl<'m> Elaborator<'m> {
         let inner =
             self.bit_expressions(&Expression::Identifier(Identifier::new(name.to_string())))?;
         for (port_bit, outer_bit) in inner.into_iter().rev().zip(outer.into_iter().rev()) {
-            let switch = PassSwitch::new(GateKind::Tran, vec![port_bit, outer_bit])?;
+            let switch = PassSwitch::port(port_bit, outer_bit);
             // Both terminals are resolved nets, for the reason a `tran`'s are:
             // every driver of either one has to reach the node's pool rather
             // than write the store.
