@@ -1637,6 +1637,21 @@ on pass through, the ones they do not are `x`. The count has to be taken at the 
 rather than per push, because one driver may be an instance's `Binding::Driving` and the
 other the parent's own `assign`.
 
+**A `wand`/`triand` or `wor`/`trior` net resolves by a logic function, and strength plays
+no part in it.** `Elaborated::wired_nets` names them — recorded by `record_pull`, beside
+the self-driving nets, since both are questions about the net's declared kind — and
+`resolve_contributions` hands such a net's drivers to `gates::resolve_wired` in place of
+`resolve_strength`. Each driver is read as the *value* its strength interval stands for: a
+floating one contributes nothing, the dominant level wins outright (`0` for a `wand`, `1`
+for a `wor`), then `x`, so `wand(0, x)` is `0` and `wand(1, x)` is `x`. **The answer is
+always `strong`**, which was measured rather than assumed — iverilog 12.0 prints `St0` for
+`(strong0) & (pull1)`, for `(pull0) & (weak1)` and for a lone `pull0`, and a `pullup` on a
+`wand` is simply a driving `1`: `St1` alone, `St0` beside a `0`. A driver whose own
+strength is ambiguous (`StL`) is an `x` as a value and combines as one. The net is
+resolved even with one driver, because that driver's declared strength does not survive.
+A design that declares none pays a `HashMap::is_empty` per resolved net (corpus `triand`,
+`trior`, `pr3437290a`/`b`/`c`).
+
 **`assign #10 a = b;` is a real delay, and the trick is that it changes *which* value the
 driver asserts, not whether it asserts one.** A delayed assignment is still a continuous
 driver on the same `propagate` fixpoint as every other one — it just contributes the value
