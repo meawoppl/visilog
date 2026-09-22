@@ -454,6 +454,28 @@ fn calls(expression: &Expression, name: &str) -> bool {
 }
 
 /// Rewrites every name one instruction uses through `resolve`.
+/// Every name a named block declares, mapped to the store entry it takes.
+///
+/// A block's variables, its constants and its named events are all its own
+/// names, so all three are renamed through the block's prefix together — a
+/// `parameter` left bare would resolve outwards to the module and read
+/// whatever the module happens to declare under that spelling.
+fn block_declared_names<'b>(block: &'b BlockStatement, inner: &str) -> HashMap<&'b str, String> {
+    block
+        .locals
+        .iter()
+        .map(|local| local.name.name.as_str())
+        .chain(
+            block
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.name.as_str()),
+        )
+        .chain(block.events.iter().map(|event| event.name.as_str()))
+        .map(|local| (local, format!("{}{}", inner, local)))
+        .collect()
+}
+
 fn rename_instruction(instruction: &mut Instruction, resolve: &dyn Fn(&str) -> String) {
     match instruction {
         Instruction::Blocking { target, value }
@@ -1244,19 +1266,10 @@ impl Program {
             end,
         });
 
-        if block.locals.is_empty() {
+        let locals = block_declared_names(block, &inner);
+        if locals.is_empty() {
             return Ok(());
         }
-        let locals: HashMap<&str, String> = block
-            .locals
-            .iter()
-            .map(|local| {
-                (
-                    local.name.name.as_str(),
-                    format!("{}{}", inner, local.name.name),
-                )
-            })
-            .collect();
         self.rename_range(start, end, &|name| match locals.get(name) {
             Some(qualified) => qualified.clone(),
             None => name.to_string(),
@@ -1354,19 +1367,10 @@ impl Program {
             start,
             end: join,
         });
-        if block.locals.is_empty() {
+        let locals = block_declared_names(block, &inner);
+        if locals.is_empty() {
             return Ok(());
         }
-        let locals: HashMap<&str, String> = block
-            .locals
-            .iter()
-            .map(|local| {
-                (
-                    local.name.name.as_str(),
-                    format!("{}{}", inner, local.name.name),
-                )
-            })
-            .collect();
         self.rename_range(start, join, &|name| match locals.get(name) {
             Some(qualified) => qualified.clone(),
             None => name.to_string(),
@@ -1812,6 +1816,11 @@ pub struct FrameVariable {
     /// The qualified name the frame holds it under: `dut.parity.a`.
     pub name: String,
     pub range: (i64, i64),
+    /// The address range of a **memory** local — `reg [31:0] tmp [1:2];`
+    /// written inside a function body — which the frame declares in its memory
+    /// map rather than its signal map, because a name is in one or the other
+    /// and never both.
+    pub dimensions: Option<(i64, i64)>,
     pub signed: bool,
     /// Whether it was declared `real`, which is what makes the frame declare
     /// it as a double rather than as sixty-four bits of integer.
@@ -1908,11 +1917,22 @@ impl FunctionDefinition {
         {
             // A `real` frame variable starts at `0.0` like any other real; the
             // rest start unknown. It is the same split `declare` makes in the
-            // design's own store.
-            if variable.real {
-                frame.declare_real(variable.name.clone());
-            } else {
-                frame.declare_signed(variable.name.clone(), variable.range, variable.signed);
+            // design's own store — and so is the address dimension, which is
+            // the whole of what tells `tmp[1]` a word from `tmp[1]` a bit.
+            match (variable.dimensions, variable.real) {
+                (Some(addresses), true) => {
+                    frame.declare_real_memory(variable.name.clone(), addresses)
+                }
+                (Some(addresses), false) => frame.declare_memory(
+                    variable.name.clone(),
+                    addresses,
+                    variable.range,
+                    variable.signed,
+                ),
+                (None, true) => frame.declare_real(variable.name.clone()),
+                (None, false) => {
+                    frame.declare_signed(variable.name.clone(), variable.range, variable.signed)
+                }
             }
         }
         for (variable, value) in self.arguments.iter().zip(arguments) {

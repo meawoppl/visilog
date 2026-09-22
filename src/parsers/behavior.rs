@@ -18,8 +18,10 @@ use super::{
     constants::VerilogConstant,
     delay::{parse_delay, parse_delay_statement, Delay},
     expr::{system_name, verilog_expression, Expression},
-    identifier::{hierarchical_identifier, identifier, identifier_list, Identifier},
+    identifier::{hierarchical_identifier, identifier, Identifier},
+    integer::parse_event_declaration,
     keywords::is_reserved_word,
+    parameter::{parse_parameter_declaration, ParameterDeclaration},
     simple::{range, signedness, ws, ws_and_comments, Range},
     string::parse_verilog_string,
 };
@@ -163,6 +165,11 @@ pub struct BlockStatement {
     pub name: Option<Identifier>,
     /// The variables the block declares, which only a named block may have.
     pub locals: Vec<FunctionVariable>,
+    /// The constants it declares, in the order they were written: a later one
+    /// may be made of an earlier one.
+    pub parameters: Vec<ParameterDeclaration>,
+    /// The named events it declares.
+    pub events: Vec<Identifier>,
     /// The statements: run in order for a `begin`, one branch each for a
     /// `fork`.
     pub statements: Vec<ProceduralStatements>,
@@ -873,13 +880,17 @@ fn block_between<'a>(
 ) -> IResult<&'a str, BlockStatement> {
     let (input, _) = keyword(input, open)?;
     let (input, name) = opt(preceded(ws(char(':')), ws(identifier)))(input)?;
-    // Only a named block is a scope, and only a scope may declare variables.
-    let (input, locals) = match &name {
-        Some(_) => map(many0(block_item), |items| {
-            items.into_iter().flatten().collect()
-        })(input)?,
+    // Only a named block is a scope, and only a scope may declare anything.
+    let (input, items) = match &name {
+        Some(_) => many0(block_item)(input)?,
         None => (input, Vec::new()),
     };
+    let mut locals = Vec::new();
+    let mut parameters = Vec::new();
+    let mut events = Vec::new();
+    for item in items {
+        item.sort_into(&mut locals, &mut parameters, &mut events);
+    }
     let (input, statements) = statement_run(input)?;
     let (input, _) = keyword(input, close).map_err(|error: nom::Err<_>| match error {
         nom::Err::Error(inner) => nom::Err::Failure(inner),
@@ -892,39 +903,89 @@ fn block_between<'a>(
         BlockStatement {
             name,
             locals,
+            parameters,
+            events,
             statements,
         },
     ))
 }
 
-/// One variable declaration inside a named block: `reg [7:0] tmp;`,
-/// `integer i, j;`.
+/// One declaration inside a named block: `reg [7:0] tmp;`, `integer i, j;`,
+/// `reg [7:0] array [3:0];`, `parameter p = 0;`, `event trigger;`.
 ///
-/// Like [`function_item`] it gives up unless it saw a type, which is what lets
-/// `many0` stop at the first statement of the block.
-fn block_item(input: &str) -> IResult<&str, Vec<FunctionVariable>> {
+/// Like [`function_item`] it gives up unless it saw a type or one of the two
+/// declaration keywords, which is what lets `many0` stop at the first statement
+/// of the block.
+fn block_item(input: &str) -> IResult<&str, LocalDeclaration> {
     let (input, declared) = declared_type(input)?;
     if !declared.explicit {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )));
+        // Neither a width nor a storage keyword. A `parameter` and an `event`
+        // name neither, so they are still the two things this may be.
+        return constant_or_event(input);
     }
-    let (input, names) = identifier_list(input)?;
-    let (input, _) = ws(char(';'))(input)?;
+    let (rest, names) = local_names(input)?;
+    let (rest, _) = ws(char(';'))(rest)?;
+    Ok((rest, declared.variables(names)))
+}
 
-    Ok((
-        input,
-        names
-            .into_iter()
-            .map(|name| FunctionVariable {
-                name,
-                range: declared.range.clone(),
-                signed: declared.signed,
-                real: declared.real,
-            })
-            .collect(),
-    ))
+/// What one declaration written inside a `function`, a `task` or a named block
+/// brings into existence.
+///
+/// A subprogram and a named block are both scopes, and a scope declares three
+/// different kinds of thing: variables — a vector or a memory — constants, and
+/// named events. Only a variable can be an argument, which is why a direction
+/// rides beside this rather than inside it.
+#[derive(Debug, PartialEq)]
+pub enum LocalDeclaration {
+    Variables(Vec<FunctionVariable>),
+    Parameters(Vec<ParameterDeclaration>),
+    Events(Vec<Identifier>),
+}
+
+impl LocalDeclaration {
+    /// Files this declaration into the three lists a scope keeps.
+    fn sort_into(
+        self,
+        variables: &mut Vec<FunctionVariable>,
+        parameters: &mut Vec<ParameterDeclaration>,
+        events: &mut Vec<Identifier>,
+    ) {
+        match self {
+            LocalDeclaration::Variables(declared) => variables.extend(declared),
+            LocalDeclaration::Parameters(declared) => parameters.extend(declared),
+            LocalDeclaration::Events(declared) => events.extend(declared),
+        }
+    }
+}
+
+/// The two declarations inside a scope that name no width: `parameter p = 0;`,
+/// `localparam l = p + 1;` and `event trigger;`.
+///
+/// They are tried only once [`declared_type`] has come back with nothing, so an
+/// ordinary `reg` or `integer` never reaches them.
+fn constant_or_event(input: &str) -> IResult<&str, LocalDeclaration> {
+    alt((
+        map(parse_parameter_declaration, LocalDeclaration::Parameters),
+        map(parse_event_declaration, |events| {
+            LocalDeclaration::Events(events.into_iter().map(|event| event.name).collect())
+        }),
+    ))(input)
+}
+
+/// One declared name inside a scope, with the optional address dimension that
+/// makes it a memory: `tmp`, `array [3:0]`.
+///
+/// The dimension belongs to the *name* rather than to the declaration, exactly
+/// as it does at module level, so `reg [7:0] a, mem [0:15];` declares a vector
+/// and a memory under one width.
+fn local_name(input: &str) -> IResult<&str, (Identifier, Option<Range>)> {
+    let (input, name) = identifier(input)?;
+    let (input, dimensions) = opt(preceded(ws_and_comments, range))(input)?;
+    Ok((input, (name, dimensions)))
+}
+
+fn local_names(input: &str) -> IResult<&str, Vec<(Identifier, Option<Range>)>> {
+    separated_list1(ws(char(',')), ws(local_name))(input)
 }
 
 /// `wait (expr) statement`, including `wait (expr);` with no statement at all.
@@ -984,6 +1045,10 @@ fn event_timing(input: &str) -> IResult<&str, AssignmentTiming> {
 pub struct FunctionVariable {
     pub name: Identifier,
     pub range: Range,
+    /// The address dimension that makes the name a *memory* — `reg [7:0] mem
+    /// [0:15];` written inside a task — rather than a vector. It is the only
+    /// thing that tells the two apart, here as at module level.
+    pub dimensions: Option<Range>,
     pub signed: bool,
     /// Whether it was declared `real`, which is what makes its sixty-four bits
     /// a double rather than an integer.
@@ -1006,8 +1071,12 @@ pub struct FunctionDeclaration {
     /// Whether the function returns a `real`: `function real half;`.
     pub real: bool,
     pub arguments: Vec<FunctionVariable>,
-    /// Body-local `reg` and `integer` declarations.
+    /// Body-local `reg`, `integer` and memory declarations.
     pub locals: Vec<FunctionVariable>,
+    /// Body-local constants, in the order they were written.
+    pub parameters: Vec<ParameterDeclaration>,
+    /// Body-local named events.
+    pub events: Vec<Identifier>,
     pub statements: Vec<ProceduralStatements>,
 }
 
@@ -1026,6 +1095,25 @@ struct DeclaredType {
     range: Range,
     signed: bool,
     explicit: bool,
+}
+
+impl DeclaredType {
+    /// This type applied to each name in a declaration list, which is what
+    /// makes `reg [4:0] a, mem [0:3];` one width over two names.
+    fn variables(&self, names: Vec<(Identifier, Option<Range>)>) -> LocalDeclaration {
+        LocalDeclaration::Variables(
+            names
+                .into_iter()
+                .map(|(name, dimensions)| FunctionVariable {
+                    name,
+                    range: self.range.clone(),
+                    dimensions,
+                    signed: self.signed,
+                    real: self.real,
+                })
+                .collect(),
+        )
+    }
 }
 
 impl Default for DeclaredType {
@@ -1095,35 +1183,20 @@ fn function_input(input: &str) -> IResult<&str, ()> {
 }
 
 /// One item inside a function body: `input [7:0] a;`, `reg [3:0] tmp;`,
-/// `integer i;`. The `bool` is whether it is an argument.
-fn function_item(input: &str) -> IResult<&str, (bool, Vec<FunctionVariable>)> {
+/// `integer i;`, `reg [3:0] tmp [1:2];`, `parameter p = 0;`, `event e;`. The
+/// `bool` is whether it is an argument.
+fn function_item(input: &str) -> IResult<&str, (bool, LocalDeclaration)> {
     let (input, argument) = opt(function_input)(input)?;
     let (input, declared) = declared_type(input)?;
-    // Neither a direction nor a type: this is a statement, not a declaration.
+    // Neither a direction nor a type: a statement, or one of the two
+    // declarations that name no width.
     if argument.is_none() && !declared.explicit {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )));
+        return map(constant_or_event, |declaration| (false, declaration))(input);
     }
-    let (input, names) = identifier_list(input)?;
+    let (input, names) = local_names(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
-    Ok((
-        input,
-        (
-            argument.is_some(),
-            names
-                .into_iter()
-                .map(|name| FunctionVariable {
-                    name,
-                    range: declared.range.clone(),
-                    signed: declared.signed,
-                    real: declared.real,
-                })
-                .collect(),
-        ),
-    ))
+    Ok((input, (argument.is_some(), declared.variables(names))))
 }
 
 /// One element of a 2001 argument list: `input [7:0] a`, or a bare `b` that
@@ -1154,6 +1227,7 @@ fn ansi_function_arguments(input: &str) -> IResult<&str, Vec<FunctionVariable>> 
         arguments.push(FunctionVariable {
             name,
             range: inherited.range.clone(),
+            dimensions: None,
             signed: inherited.signed,
             real: inherited.real,
         });
@@ -1183,11 +1257,12 @@ pub fn parse_function_declaration(input: &str) -> IResult<&str, FunctionDeclarat
 
     let mut arguments = ansi.unwrap_or_default();
     let mut locals = Vec::new();
-    for (is_argument, variables) in items {
-        if is_argument {
-            arguments.extend(variables);
-        } else {
-            locals.extend(variables);
+    let mut parameters = Vec::new();
+    let mut events = Vec::new();
+    for (is_argument, declaration) in items {
+        match declaration {
+            LocalDeclaration::Variables(variables) if is_argument => arguments.extend(variables),
+            other => other.sort_into(&mut locals, &mut parameters, &mut events),
         }
     }
 
@@ -1200,6 +1275,8 @@ pub fn parse_function_declaration(input: &str) -> IResult<&str, FunctionDeclarat
             real: returns.real,
             arguments,
             locals,
+            parameters,
+            events,
             statements,
         },
     ))
@@ -1246,8 +1323,12 @@ pub struct TaskArgument {
 pub struct TaskDeclaration {
     pub name: Identifier,
     pub arguments: Vec<TaskArgument>,
-    /// Body-local `reg` and `integer` declarations.
+    /// Body-local `reg`, `integer` and memory declarations.
     pub locals: Vec<FunctionVariable>,
+    /// Body-local constants, in the order they were written.
+    pub parameters: Vec<ParameterDeclaration>,
+    /// Body-local named events.
+    pub events: Vec<Identifier>,
     pub statements: Vec<ProceduralStatements>,
 }
 
@@ -1260,38 +1341,23 @@ fn task_direction(input: &str) -> IResult<&str, TaskDirection> {
     ))(input)
 }
 
-/// One item inside a task body: `input [7:0] a;`, `reg [3:0] tmp;`. The
-/// direction is `None` for a body-local.
+/// One item inside a task body: `input [7:0] a;`, `reg [3:0] tmp;`,
+/// `reg [7:0] mem [0:15];`, `parameter p = 0;`, `event e;`. The direction is
+/// `None` for a body-local.
 ///
-/// Like [`function_item`] this gives up unless it saw a direction or a type,
-/// which is what lets `many0` stop at the first statement of the body.
-fn task_item(input: &str) -> IResult<&str, (Option<TaskDirection>, Vec<FunctionVariable>)> {
+/// Like [`function_item`] this gives up unless it saw a direction, a type or
+/// one of the two declaration keywords, which is what lets `many0` stop at the
+/// first statement of the body.
+fn task_item(input: &str) -> IResult<&str, (Option<TaskDirection>, LocalDeclaration)> {
     let (input, direction) = opt(task_direction)(input)?;
     let (input, declared) = declared_type(input)?;
     if direction.is_none() && !declared.explicit {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )));
+        return map(constant_or_event, |declaration| (None, declaration))(input);
     }
-    let (input, names) = identifier_list(input)?;
+    let (input, names) = local_names(input)?;
     let (input, _) = ws(char(';'))(input)?;
 
-    Ok((
-        input,
-        (
-            direction,
-            names
-                .into_iter()
-                .map(|name| FunctionVariable {
-                    name,
-                    range: declared.range.clone(),
-                    signed: declared.signed,
-                    real: declared.real,
-                })
-                .collect(),
-        ),
-    ))
+    Ok((input, (direction, declared.variables(names))))
 }
 
 /// One element of a 2001 task argument list: `output [7:0] b`, or a bare `c`
@@ -1334,6 +1400,7 @@ fn ansi_task_arguments(input: &str) -> IResult<&str, Vec<TaskArgument>> {
             variable: FunctionVariable {
                 name,
                 range: inherited.range.clone(),
+                dimensions: None,
                 signed: inherited.signed,
                 real: inherited.real,
             },
@@ -1360,7 +1427,16 @@ pub fn parse_task_declaration(input: &str) -> IResult<&str, TaskDeclaration> {
 
     let mut arguments = ansi.unwrap_or_default();
     let mut locals: Vec<FunctionVariable> = Vec::new();
-    for (direction, variables) in items {
+    let mut parameters = Vec::new();
+    let mut events = Vec::new();
+    for (direction, declaration) in items {
+        let variables = match declaration {
+            LocalDeclaration::Variables(variables) => variables,
+            other => {
+                other.sort_into(&mut locals, &mut parameters, &mut events);
+                continue;
+            }
+        };
         for variable in variables {
             let declared = arguments
                 .iter()
@@ -1393,6 +1469,8 @@ pub fn parse_task_declaration(input: &str) -> IResult<&str, TaskDeclaration> {
             name,
             arguments,
             locals,
+            parameters,
+            events,
             statements,
         },
     ))
@@ -2515,6 +2593,66 @@ mod tests {
         assert_eq!(block.locals[1].range, Range::Constant(31, 0));
         assert!(block.locals[1].signed);
         assert_eq!(block.statements.len(), 1);
+    }
+
+    /// A named block may declare a memory, a constant and an event as well as
+    /// a plain variable — corpus `pr2533175` and `scoped_events`. The address
+    /// dimension is kept on the name, since it is the only thing that tells a
+    /// memory from a vector downstream.
+    #[test]
+    fn test_named_block_declares_a_memory_a_parameter_and_an_event() {
+        let statements = assert_parses(
+            parse_block,
+            "begin : blk parameter p = 0; localparam l = p + 1; \
+             reg [7:0] a, array [3:0]; event trigger; @trigger a = l; end",
+        );
+
+        let [ProceduralStatements::Block(block)] = statements.as_slice() else {
+            panic!("expected one named block, got {:?}", statements);
+        };
+        assert_eq!(
+            block
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ["p", "l"]
+        );
+        assert_eq!(block.locals[0].dimensions, None);
+        assert_eq!(block.locals[1].name, "array".into());
+        assert_eq!(block.locals[1].dimensions, Some(Range::Constant(3, 0)));
+        assert_eq!(block.events, vec![Identifier::from("trigger")]);
+        assert_eq!(block.statements.len(), 1);
+    }
+
+    /// A task and a function may declare a memory, a constant and an event
+    /// among their items; none of them is mistaken for an argument, and the
+    /// first statement still ends the item list.
+    #[test]
+    fn test_subprogram_items_declare_a_memory_a_parameter_and_an_event() {
+        let task = assert_parses(
+            parse_task_declaration,
+            "task t; input [7:0] v; parameter depth = 16; \
+             reg [7:0] mem [depth-1:0]; event step; mem[0] = v; endtask",
+        );
+        assert_eq!(task.arguments.len(), 1);
+        assert_eq!(task.parameters[0].name, "depth".into());
+        assert_eq!(task.locals[0].name, "mem".into());
+        assert!(matches!(
+            task.locals[0].dimensions,
+            Some(Range::Expressions(_, _))
+        ));
+        assert_eq!(task.events, vec![Identifier::from("step")]);
+        assert_eq!(task.statements.len(), 1);
+
+        let function = assert_parses(
+            parse_function_declaration,
+            "function [7:0] f(input [7:0] v); reg [3:0] tmp [1:2]; \
+             localparam k = 2; begin f = v; end endfunction",
+        );
+        assert_eq!(function.arguments.len(), 1);
+        assert_eq!(function.locals[0].dimensions, Some(Range::Constant(1, 2)));
+        assert_eq!(function.parameters[0].name, "k".into());
     }
 
     /// An unnamed block is grouping and nothing else, so it leaves no node

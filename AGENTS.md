@@ -1364,6 +1364,36 @@ division of labour `declare_tasks` and `compile_task` already had. An **unnamed*
 grouping and nothing else, so `parse_block` flattens it into the statements it holds and
 nothing downstream learns it was written.
 
+**A task, a function and a named block each declare three kinds of thing, and all three
+take the scope's dotted name.** `behavior.rs::LocalDeclaration` is the one shape the three
+item parsers (`function_item`, `task_item`, `block_item`) produce: **variables** — a
+vector, or a *memory* when the name carries an address dimension
+(`FunctionVariable::dimensions`) — **constants** (`parameter` / `localparam`) and **named
+events**. `Elaborator::declare_scope` declares all three for a task and a named block, in
+that order: the constants first, because `parameter width = 8; reg [width-1:0] mem
+[depth-1:0];` has no width until `width` has a value (corpus `pr2132552`), which is why a
+bound written in a scope goes through `resolve_scoped_range` — a constant the scope
+declares takes the scope's prefix, anything else resolves outwards to the module. A
+**memory lands in the memory map** under `load.mem` exactly as a module-level one does;
+that is load-bearing, since a memory declared as a scalar would make `mem[i] = i;` write a
+*bit* and look like a working simulator (corpus `task_mem`, `pr2533175`). A **`defparam`**
+naming one of those constants (`sub.my_block.p`, `sub.my_task.p`) is taken out of
+`Elaborator::defparams` where the constant is declared, because the path it writes is
+already the flat spelling (corpus `scoped_events`). `compile_task` and
+`Program::compile_block` rename all three kinds of name through the scope, since a
+`parameter` left bare would resolve outwards to whatever the module declares under that
+spelling.
+
+A **function** is the one that differs, because a call runs against a frame: a memory local
+is a `FrameVariable` whose `dimensions` make `FunctionDefinition::call` declare it in the
+*frame's* memory map (corpus `constfunc15`, `br_gh674`), while the function's constants and
+events are ordinary store entries under `f.p` — a constant outlives every call, so it is
+left out of the frame's own names and copied in with the rest of what the body reads.
+`task automatic` still parses to static storage (#217, #285), so two concurrent enables of
+one task share its memory — corpus `automatic_task` is that gap, and `automatic_task2`
+additionally needs a mid-block `@(array[0])` on a memory word to wake, which it does not
+yet do even for a module-level memory.
+
 **`fork`/`join` is one thread per branch, and the join resumes at the *maximum* of their
 finish times.** `Instruction::Fork { branches, join }` names the instruction each branch
 starts at and the one the block carries on at, and the branch bodies are laid out between
@@ -2613,8 +2643,11 @@ tripwire.
   about it or a function will stop seeing what it reads.
 - **A function item is told from a statement by whether it declares a type.**
   `behavior.rs::function_item` gives up unless it saw a direction or a storage keyword —
-  `input`, `reg`, `wire`, `integer`, `time`, `signed`, or a range — which is what lets
-  `many0` stop at the first statement of the body. A body is then a `begin`…`end` block or
+  `input`, `reg`, `wire`, `integer`, `time`, `signed`, or a range — or, failing those, a
+  `parameter`, `localparam` or `event` (`constant_or_event`, tried only once
+  `declared_type` came back empty, so an ordinary `reg` never pays for it) — which is what
+  lets `many0` stop at the first statement of the body. `task_item` and `block_item` follow
+  the same rule. A body is then a `begin`…`end` block or
   a bare list of statements, the same `alt` `initial` uses. A function's range is a
   `simple.rs::range` like any other, so `function [W-1:0] f;` is sized from a parameter
   exactly as a `reg` is.
@@ -2802,8 +2835,9 @@ tripwire.
   `Vec<ProceduralStatements>` either way, so `always`/`initial`/`if` bodies are
   unchanged, but a `begin : name` comes back as a single
   `ProceduralStatements::Block` because its name is a scope the simulator has to
-  know about. Only a named block may declare variables, which is why `block_item`
-  is only tried after a `: name` was read.
+  know about. Only a named block may declare anything — a variable, a memory, a
+  `parameter` / `localparam` or an `event` — which is why `block_item` is only tried
+  after a `: name` was read.
 - **`Program::rename_range` must skip an inlined task body, and a named block's
   rename goes through it.** A block local called `count` and a design signal called
   `count` are different variables, and a task body spliced inside the block has
