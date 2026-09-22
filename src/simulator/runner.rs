@@ -46,7 +46,9 @@ use crate::simulator::events::{self, SignalEdge};
 use crate::simulator::exec::{
     apply_drive, commit_updates, drive_resolved, resolve_target, PendingUpdate, ResolvedTarget,
 };
-use crate::simulator::gates::{resolve_strength, Driven, Gate, PassSwitch, Strength};
+use crate::simulator::gates::{
+    resolve_strength, resolve_wired, Driven, Gate, PassSwitch, Strength, WiredKind,
+};
 use crate::simulator::program::{self, Resume, WaitReason, FORK_TIMING_UNSUPPORTED};
 use crate::simulator::state_store::DriverTally;
 use crate::simulator::state_store::{bit_position_in, StateStore};
@@ -503,6 +505,9 @@ pub struct Simulator {
     resolved_nets: HashSet<String>,
     /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
     pulled_nets: Vec<PulledNet>,
+    /// The `wand`/`wor` nets, whose drivers combine by a logic function rather
+    /// than by strength. Empty for a design that declares none.
+    wired_nets: HashMap<String, WiredKind>,
     blocks: Vec<TimedBlock>,
     /// The blocks suspended on something other than the clock: a `wait` on a
     /// value, or an event control waiting for an edge.
@@ -607,6 +612,7 @@ impl Simulator {
             pass_switches: Vec::new(),
             resolved_nets: HashSet::new(),
             pulled_nets: Vec::new(),
+            wired_nets: HashMap::new(),
             blocks: Vec::new(),
             waiting: Vec::new(),
             ran_before: Vec::new(),
@@ -649,6 +655,7 @@ impl Simulator {
         self.round.clear();
         self.settled_once = false;
         self.pulled_nets.clear();
+        self.wired_nets.clear();
         self.blocks.clear();
         self.waiting.clear();
         self.forks.clear();
@@ -712,6 +719,7 @@ impl Simulator {
         self.pass_switches = elaborated.pass_switches;
         self.resolved_nets = elaborated.resolved_nets;
         self.pulled_nets = elaborated.pulled_nets;
+        self.wired_nets = elaborated.wired_nets;
         self.blocks = elaborated.blocks;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
@@ -2294,9 +2302,21 @@ impl Simulator {
             // keeps the strength it was last resolved at, exactly as it keeps
             // its value.
             let mut levels = self.state.strengths_of(&net.name, bits.len());
+            // A `wand`/`wor` net combines its drivers by a logic function
+            // instead of by strength, and it is the *net* that says so. A
+            // design that declares none answers without hashing a name.
+            let wired = if self.wired_nets.is_empty() || net.address.is_some() {
+                None
+            } else {
+                self.wired_nets.get(net.name.as_str()).copied()
+            };
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
-                    let resolved = resolve_strength(drivers.iter().map(|d| d.strength));
+                    let strengths = drivers.iter().map(|d| d.strength);
+                    let resolved = match wired {
+                        Some(kind) => resolve_wired(kind, strengths),
+                        None => resolve_strength(strengths),
+                    };
                     bits[position] = resolved.value();
                     levels[position] = resolved;
                 }
@@ -3269,6 +3289,58 @@ mod tests {
         assert_eq!(simulator.get("c").unwrap().to_binary(), "1");
         simulator.poke("d", zero()).unwrap();
         assert_eq!(simulator.get("c").unwrap().to_binary(), "0");
+    }
+
+    /// A `wand`/`wor` net combines its drivers by a logic function, so one `0`
+    /// pulls a `wand` down where an ordinary net would be `x` — and the answer
+    /// is `strong` whatever the drivers declared.
+    ///
+    /// Measured against iverilog 12.0, which prints
+    /// `down=St0 up=St1 weak=St0 pulled=St0 alone=St1 vec=0x01` for this design:
+    /// a `pull0` against a `weak1` on a `wand` is `St0`, and a `pullup` on a
+    /// `wand` is a driving `1` like any other — `St0` beside a `0`, `St1`
+    /// alone. Corpus `pr3437290a`/`c` are the first two nets, and `pr3437290b`
+    /// the per-bit vector.
+    #[test]
+    fn test_wired_nets_are_pulled_by_their_dominant_driver() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg a, b, c;
+                wand down;
+                wor up;
+                triand weak;
+                wand pulled;
+                wand alone;
+                trior [3:0] vec;
+                assign down = a;
+                assign down = b;
+                assign down = c;
+                assign up = a;
+                assign up = b;
+                assign up = c;
+                assign (pull0, pull1) weak = b;
+                assign (weak0, weak1) weak = a;
+                pullup (pulled);
+                assign pulled = b;
+                pullup (alone);
+                assign vec = 4'b0z01;
+                assign vec = 4'b0x00;
+                initial begin
+                    a = 1'b1;
+                    b = 1'b0;
+                    c = 1'b1;
+                    #1 $display("down=%v up=%v weak=%v pulled=%v alone=%v vec=%b",
+                        down, up, weak, pulled, alone, vec);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(
+            simulator.output().text(),
+            "down=St0 up=St1 weak=St0 pulled=St0 alone=St1 vec=0x01\n"
+        );
     }
 
     /// An array of nets is a memory in the store, exactly as a `reg` array is,

@@ -775,6 +775,53 @@ pub fn resolve_bit(drivers: &[Strength]) -> u8 {
     resolve_strength(drivers.iter().copied()).value()
 }
 
+/// The two *wired* net kinds, whose drivers combine by a logic function rather
+/// than by strength.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WiredKind {
+    /// `wand` / `triand` — a driver at `0` pulls the net down.
+    And,
+    /// `wor` / `trior` — a driver at `1` pulls the net up.
+    Or,
+}
+
+/// What one bit of a `wand`/`wor` net carries when several drivers reach it.
+///
+/// A wired net is the one place the strongest driver does **not** simply win:
+/// a `wand` is `0` when any driver is `0` however the others are driving,
+/// which is the whole point of the net kind. Each driver is read as the
+/// *value* its strength stands for, so one that is floating contributes
+/// nothing and a net every driver has let go of is `z`; the dominant level is
+/// looked for before `x`, so `wand(0, x)` is `0` rather than unknown.
+///
+/// Strength plays no part in the answer and the answer is always `strong`,
+/// which was measured rather than assumed: iverilog 12.0 prints `St0` for a
+/// `wand` driven `strong0` against `pull1`, for one driven `pull0` against
+/// `weak1`, and for one whose only driver is a `pull0` — and a `pullup` on a
+/// `wand` is a `1` like any other driver, `St1` alone and `St0` beside a `0`.
+/// A driver whose own strength is ambiguous (a `bufif1` with an unknown
+/// enable, `StL`) is an `x` as a value and is combined as one.
+pub fn resolve_wired(kind: WiredKind, drivers: impl IntoIterator<Item = Strength>) -> Strength {
+    let dominant = match kind {
+        WiredKind::And => ZERO,
+        WiredKind::Or => ONE,
+    };
+    let mut resolved = Z;
+    for driver in drivers {
+        match driver.value() {
+            Z => {}
+            code if code == dominant => {
+                resolved = dominant;
+                break;
+            }
+            X => resolved = X,
+            code if resolved == Z => resolved = code,
+            _ => {}
+        }
+    }
+    Strength::driven(resolved, DriveStrength::STRONG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1021,74 @@ mod tests {
         assert_eq!(
             resolve_bit(&[at(ONE, StrengthLevel::Supply), at(ZERO, strong)]),
             ONE
+        );
+    }
+
+    /// A wired net combines its drivers by a logic function, the one place the
+    /// strongest driver does not simply win: `wand(0, 1)` is `0` where an
+    /// ordinary net gives `x`.
+    ///
+    /// The value tables are corpus `triand`'s and `trior`'s — the ten
+    /// combinations of two drivers, asserted there against iverilog's answers.
+    /// The strengths were measured against iverilog 12.0 with `%v`: the answer
+    /// is `St` whatever the drivers declared — `(strong0) & (pull1)` is `St0`,
+    /// a lone `pull0` is `St0` and `(pull0) | (weak1)` is `St1` — while a
+    /// `highz0` half still drives nothing (`wand(z, highz0-driven 0)` is
+    /// `HiZ`).
+    #[test]
+    fn test_wired_nets_resolve_by_a_logic_function() {
+        let strong = StrengthLevel::Strong;
+        let wired = |kind, codes: &[u8]| {
+            shown(resolve_wired(kind, codes.iter().map(|code| at(*code, strong))).value())
+        };
+
+        let and = |codes: &[u8]| wired(WiredKind::And, codes);
+        assert_eq!(and(&[ZERO, ZERO]), '0');
+        assert_eq!(and(&[ZERO, ONE]), '0');
+        assert_eq!(and(&[ZERO, X]), '0');
+        assert_eq!(and(&[X, ZERO]), '0');
+        assert_eq!(and(&[ZERO, Z]), '0');
+        assert_eq!(and(&[ONE, ONE]), '1');
+        assert_eq!(and(&[ONE, X]), 'x');
+        assert_eq!(and(&[ONE, Z]), '1');
+        assert_eq!(and(&[X, X]), 'x');
+        assert_eq!(and(&[X, Z]), 'x');
+        assert_eq!(and(&[Z, Z]), 'z');
+        assert_eq!(and(&[]), 'z');
+
+        let or = |codes: &[u8]| wired(WiredKind::Or, codes);
+        assert_eq!(or(&[ZERO, ZERO]), '0');
+        assert_eq!(or(&[ZERO, ONE]), '1');
+        assert_eq!(or(&[ZERO, X]), 'x');
+        assert_eq!(or(&[ZERO, Z]), '0');
+        assert_eq!(or(&[ONE, ONE]), '1');
+        assert_eq!(or(&[ONE, X]), '1');
+        assert_eq!(or(&[X, ONE]), '1');
+        assert_eq!(or(&[ONE, Z]), '1');
+        assert_eq!(or(&[X, X]), 'x');
+        assert_eq!(or(&[X, Z]), 'x');
+        assert_eq!(or(&[Z, Z]), 'z');
+
+        let pull = StrengthLevel::Pull;
+        let weak = StrengthLevel::Weak;
+        assert_eq!(
+            resolve_wired(WiredKind::And, [at(ZERO, strong), at(ONE, pull)]),
+            Strength::STRONG_ZERO
+        );
+        assert_eq!(
+            resolve_wired(WiredKind::And, [at(ZERO, pull)]),
+            Strength::STRONG_ZERO
+        );
+        assert_eq!(
+            resolve_wired(WiredKind::Or, [at(ZERO, pull), at(ONE, weak)]),
+            Strength::STRONG_ONE
+        );
+        assert_eq!(
+            resolve_wired(
+                WiredKind::And,
+                [at(ZERO, StrengthLevel::Highz), at(Z, strong)]
+            ),
+            Strength::HIGHZ
         );
     }
 
