@@ -2332,17 +2332,38 @@ impl<'m> Elaborator<'m> {
             // `wire a = expr;` is a declaration plus a continuous assignment,
             // so the initialiser joins the same list an explicit `assign`
             // uses and settles through the same fixpoint. The net follows its
-            // operands for the whole simulation.
+            // operands for the whole simulation. Its strength and its delay
+            // are the assignment's, exactly as an `assign`'s are.
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
-                    if let Some(init) = net.init() {
-                        let target = Expression::Identifier(Identifier::new(
-                            scope.resolve(&net.identifier().name),
-                        ));
-                        self.out
-                            .assignments
-                            .push(ContinuousAssignment::new(target, renamed(init, scope)));
-                    }
+                    let Some(init) = net.init() else {
+                        // `wire #5 w;` delays *every* driver of `w`, which is
+                        // a property of the net rather than of one driver and
+                        // is not modelled; dropping it would run the design
+                        // at the wrong edge times.
+                        if net.delay().is_some() {
+                            return Err(SimulationError::Unsupported(
+                                "a net delay on a net declared without an assignment",
+                            ));
+                        }
+                        continue;
+                    };
+                    let target = Expression::Identifier(Identifier::new(
+                        scope.resolve(&net.identifier().name),
+                    ));
+                    let delay = net.delay().map(|delay| {
+                        let mut delay = delay.clone();
+                        for expression in delay.expressions_mut() {
+                            *expression = renamed(expression, scope);
+                        }
+                        delay
+                    });
+                    self.push_assignment(ContinuousAssignment::with_timing(
+                        target,
+                        renamed(init, scope),
+                        net.strength(),
+                        delay,
+                    ));
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -5984,6 +6005,77 @@ mod tests {
         // one-shot starting value would not do.
         simulator.poke("a", Register::from_u128(5, 4)).unwrap();
         assert_eq!(simulator.get("doubled").unwrap().to_u128(), Some(10));
+    }
+
+    /// `wire #(period/3) trace = drive;` is `assign #(period/3)`: the delay is
+    /// the declaration assignment's, and it is an expression evaluated when a
+    /// transaction is scheduled, so a `period` that moves changes the next
+    /// one (corpus `delay5`, which iverilog 12.0 passes).
+    #[test]
+    fn test_net_declaration_delay_is_scheduled() {
+        let source = r#"
+            module main;
+                time period;
+                reg drive;
+                wire #(period/3) trace = drive;
+                initial begin
+                    period = 24;
+                    #1 drive = 1;
+                    #7 $display("%b", trace);
+                    #2 $display("%b", trace);
+                    period = 18;
+                    drive = 0;
+                    #5 $display("%b", trace);
+                    #2 $display("%b", trace);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "main");
+        simulator.advance(20).unwrap();
+        // Times 8, 10, 15 and 17 — measured against iverilog 12.0.
+        assert_eq!(simulator.output().text(), "x\n1\n1\n0\n");
+    }
+
+    /// `wire (weak0, weak1) value = pullval;` drives at `weak`, so a gate's
+    /// `strong` output overrides it and it holds the net once the gate floats
+    /// (corpus `drive_strength1`).
+    #[test]
+    fn test_net_declaration_strength_resolves() {
+        let source = r#"
+            module main;
+                reg pullval, en;
+                wire (weak0, weak1) value = pullval;
+                bufif1 (value, 1'b0, en);
+                initial begin
+                    en = 0; pullval = 1;
+                    #1 $display("%b", value);
+                    en = 1;
+                    #1 $display("%b", value);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "main");
+        simulator.advance(5).unwrap();
+        assert_eq!(simulator.output().text(), "1\n0\n");
+    }
+
+    /// A delay on a net with no declaration assignment is a property of every
+    /// driver of the net, which is not modelled — so it is refused by name
+    /// rather than dropped.
+    #[test]
+    fn test_a_bare_net_delay_is_refused() {
+        let source = r#"
+            module main;
+                reg a;
+                wire #5 w;
+                assign w = a;
+            endmodule
+        "#;
+        let error = setup_error(&[source], "main");
+        assert!(
+            matches!(error, SimulationError::Unsupported(_)),
+            "{error:?}"
+        );
     }
 
     /// `reg a = expr;` is a starting value, not a driver: a procedural write
