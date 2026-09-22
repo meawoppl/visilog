@@ -326,8 +326,8 @@ enum Binding {
     /// Neither direction of the alias will do: the port is read *and* written,
     /// and a continuous assignment only runs one way. The port gets a signal
     /// of its own and each of its bits is **bonded** to the matching bit of
-    /// the connection, which is the node model a `tran` already has — so the
-    /// two are not copied into each other, their drivers are pooled.
+    /// the connection with a port bond (`PassSwitch::port`) — so the two are
+    /// not copied into each other, their drivers are pooled.
     Bonded(Expression),
 }
 
@@ -2430,10 +2430,11 @@ impl<'m> Elaborator<'m> {
     /// and `bus[0]` are not one entry. An **output** bound to one is carried
     /// out by a continuous assignment, but an `inout` is read as well as
     /// written and one assignment only runs one way. So the port keeps a
-    /// signal of its own and the two are made **one node**, bit by bit, which
-    /// is exactly what a `tran` between them would mean: the drivers of both
-    /// are pooled and resolved together, rather than either side's value being
-    /// copied into the other. Copying is the shape that looks right and is
+    /// signal of its own and the two are made **one node**, bit by bit, by a
+    /// port bond: the drivers of both are pooled and resolved together, rather
+    /// than either side's value being copied into the other. It is not a `tran`
+    /// — a `tran` would drop a `supply` driver to `strong` on the far side,
+    /// where iverilog 12.0 keeps it `Su1` on both. Copying is the shape that looks right and is
     /// wrong for the reason [`PassSwitch`] gives — once the value has been
     /// copied, a driver letting go leaves the far side holding it.
     ///
@@ -2445,7 +2446,7 @@ impl<'m> Elaborator<'m> {
         let inner =
             self.bit_expressions(&Expression::Identifier(Identifier::new(name.to_string())))?;
         for (port_bit, outer_bit) in inner.into_iter().rev().zip(outer.into_iter().rev()) {
-            let switch = PassSwitch::new(GateKind::Tran, vec![port_bit, outer_bit])?;
+            let switch = PassSwitch::port(port_bit, outer_bit);
             // Both terminals are resolved nets, for the reason a `tran`'s are:
             // every driver of either one has to reach the node's pool rather
             // than write the store.

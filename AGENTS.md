@@ -770,7 +770,7 @@ Three things make it work, and each is a seam rather than machinery of its own:
   `Simulator::resolve_every_driven_net` is the answer. Resolving a single `strong` driver
   gives exactly what writing it gave, so no value moves; a design that never asks pays one
   walk of its blocks at setup and nothing per pass.
-- **The tally is taken after `bond_nodes` has pooled**, so a bit joined to another — which
+- **The tally is taken after `bond_nodes` has run**, so a bit *bonded* to another — which
   is what an `inout` port bound to a select is — reports the *node's* drivers and not its
   own. That is what makes `$countdrivers(pad1.pad)` and `$countdrivers(bus[0])` agree
   (corpus `countdrivers3`), and `StateStore::unalias` is the other half: a port bound to a
@@ -779,11 +779,13 @@ Three things make it work, and each is a seam rather than machinery of its own:
 - **A `force` contends but is not counted.** `Contribution::counted` is that distinction: a
   drive is contributed so it resolves against the far side of a `tran` like any other
   driver, and left out of the tally.
-
-Where it falls short is `countdrivers5`: iverilog counts **each `tran` as a driver** of the
-net it reaches, carrying what the other side resolved to, where this pools the node and
-reports the same total for every net in it. That is the same directional model the
-strength *reduction* across a bidirectional switch wants, and the two should land together.
+- **A conducting switch is one more driver of each terminal**, carrying the code the *far*
+  terminal settled on — the far net's whole answer, not what the switch carried, so a far
+  side that disagrees with this one counts as `x` (corpus `countdrivers5`).
+  `NetDrivers::through` holds those, apart from the driver lists, because they are counted
+  and never resolved. A switch whose control is unknown is not counted even though it
+  carries an ambiguous strength, a far side at `z` is not, and a port bond is not a switch
+  at all (all measured against iverilog 12.0).
 
 **`$stime` is unsigned, like the `$time` beside it**, because `time` is an unsigned type
 — and that is the field `%d` gives it: iverilog 12.0 prints `$display($stime)` in ten
@@ -1736,25 +1738,49 @@ strength resolution, three-state buses or the change journal had to learn about 
 design whose gates name no delay keeps an empty vector and the loop asks nothing per
 pass, the same shape the assignment delays use.
 
-**A bidirectional switch is not a driver at all — it makes its two terminals one node.**
-`tran`, `rtran`, `tranif0`, `tranif1`, `rtranif0` and `rtranif1` conduct both ways and have
-no output terminal, so they elaborate to a `gates::PassSwitch` rather than to a `Gate`:
-`GateKind::is_bidirectional` is the one question `elaborate::push_primitive` asks, and both
-terminals go into `resolved_nets` so that every driver of either one reaches
-`resolve_contributions` instead of writing the store. A node's value is then what every
-driver of every net in it resolves to *together* — the same `resolve_bit`, over a pooled
-driver list — so the switch changes which contributions are pooled and **nothing about the
-value rule**.
+**A bidirectional switch drives nothing of its own — it carries what one terminal resolved
+to across to the other, reduced.** `tran`, `rtran`, `tranif0`, `tranif1`, `rtranif0` and
+`rtranif1` conduct both ways and have no output terminal, so they elaborate to a
+`gates::PassSwitch` rather than to a `Gate`: `GateKind::is_bidirectional` is the one
+question `elaborate::push_primitive` asks, and both terminals go into `resolved_nets` so
+that every driver of either one reaches `resolve_contributions` instead of writing the
+store. Each terminal is then its own drivers resolved against what every switch on it
+carries — `PassSwitch::carry`, IEEE 1364-2005 Table 7-8's reduction: a `tran` drops
+`supply` to `strong`, an `rtran` weakens every level. The value rule is still `resolve_bit`'s;
+the switch only decides which strengths reach which net.
 
-Copying a value from one terminal to the other is the shape that looks right and is wrong,
+**What crosses a switch is directional, and it is a message rather than a pool.**
+`runner::relax_switches` keeps one message per direction per switch: what the source node
+resolves to *leaving out the message coming back over the same switch*, reduced by it. The
+messages are relaxed until none moves, and on a tree of switches that is exactly "every
+driver reaches every node, reduced once per switch on its path". **It resolves before it
+reduces**, which was measured: `supply1` against `strong0` behind an `rtran` is `Su1` on the
+near side and `Pu1` on the far one, where reducing each driver first gives `PuX`. A chain of
+six `tran`s from a `supply` is `Su St St St St St St`, and of `rtran`s
+`Su Pu We Me Sm Sm Sm` (corpus `tran`, `rtran`). Pooling a node's drivers into one list —
+the model this replaced — is symmetric by construction and could say none of that.
+
+Copying a *value* from one terminal to the other is the shape that looks right and is wrong,
 and it is why this was left undone for so long: once `a` has been copied to `b`, a driver on
 `a` letting go leaves `b` holding the stale value, which copies straight back, and the net
-never floats again. `runner::bond_nodes` is the node model instead, and two things make it
-work. A terminal is **seeded with `z`** before anything is merged, so a net a `tranif` has
-just let go of has no live driver rather than the value it held — without the seed, "a bit
-no driver reaches keeps what it held" *is* the latch. And the partition is over **bits**
-rather than nets, because `tran (a[0], a[1]);` joins two bits of one vector (corpus
-`pr3296466a`).
+never floats again. A message is safe where a copy is not because **every message starts
+from high impedance on every propagation pass** and is built from each side's own drivers
+alone — nothing is ever read off what a net held — so a loop of `tran`s whose one driver lets
+go floats with it (measured). Two more things make it work. A terminal is **seeded with
+`z`**, so a net a `tranif` has just let go of has no live driver rather than the value it
+held — without the seed, "a bit no driver reaches keeps what it held" *is* the latch. And
+the partition is over **bits** rather than nets, because `tran (a[0], a[1]);` joins two bits
+of one vector (corpus `pr3296466a`).
+
+**A port bond is not a switch, and is pooled.** An `inout` bound to a select is joined to
+it bit by bit with `PassSwitch::port`, and a port is one net under two names: iverilog 12.0
+keeps a `supply1` driver `Su1` on both sides of one, where a `tran` would show `St1`. So
+`bond_nodes` first joins the two ends of every port bond into one node with a shared driver
+list — the old pooled model, kept exactly where it is right — and only then relaxes the
+messages of the real switches *between* nodes. A port bond is not counted by
+`$countdrivers` either. The **header** spelling of an `inout` port expression
+(`module m(.a(b[0]))`) is still carried by a `tran` array built at parse time, so a `supply`
+through one is reduced to `strong`; no corpus design drives one at `supply`.
 
 **Connectivity is recomputed every propagation pass, not partitioned once at
 elaboration.** A union-find built at elaboration is right for `tran`/`rtran` and silently
@@ -1771,25 +1797,17 @@ either way — `exec::held_bits` discards the resolved write over a held bit —
 tran (x, y); force x = 0;` with `a` at 1 as `x=0 y=x` (corpus `pr2937417b`, `pr2937417c`).
 Outside a node the contribution changes nothing, since the bit it lands on is discarded.
 
-Three things about a switch are **not** modelled, and each is measured rather than guessed:
+**A `tranif` whose control is `x` or `z` conducts at an ambiguous strength**
+(`Conducting::Maybe`): it carries what it would carry *or nothing*, which is
+`Strength::or_floating` on the message. `assign p = 1; tranif1 (p, q, en);` with `en`
+unknown is `p=St1 q=StH`, and a `pull0` on `q` beside it gives `56X` — the driven side keeps
+its own answer while the far side learns it might be driven (measured; corpus
+`switch_primitives`, `tranif0`/`1`, `rtranif0`/`1`).
 
-- **A control that is `x` or `z` is taken not to conduct.** iverilog conducts at an
-  *ambiguous* strength instead, which gives the far side an `x` while leaving the driven
-  side alone: `assign p = a; tranif1 (p, q, en);` with `a` at 1 and `en` unknown is
-  `p=1 q=x` there and `p=1 q=z` here. `Strength` now has the range shape that would take —
-  it is the pooling in `bond_nodes` that has nowhere to put a *directional* answer, since a
-  node is symmetric by construction (corpus `switch_primitives`).
-- **A switch delay changes nothing.** `tranif0 #(100) sw(gnd, net1, gnd);` delays the moment
-  the switch opens or closes rather than a value, which is not the `DelayedDrive` machinery
-  an `assign` or a gate uses. Corpus `pr3499807` is exactly that and fails honestly.
-- **Strength reduction across a bidirectional switch is still absent.** A *unidirectional*
-  one carries its input's strength through and the `r`-prefixed forms weaken it (see
-  `Gate::driving`), but `bond_nodes` pools the driver lists of a node and a pool is
-  symmetric, where a reduction is directional: a `tran` therefore passes a `supply` on
-  unchanged where iverilog drops it to `strong`, and an `rtran` chain does not weaken by a
-  level per switch. That is what the seven `%v` gold files (`tran`, `tranif0`, `tranif1`,
-  `rtran`, `rtranif0`, `rtranif1`, `switch_primitives`) are blocked on; they run and
-  mismatch rather than failing to elaborate.
+**A switch delay changes nothing**, and that is the one thing about a switch still not
+modelled. `tranif0 #(100) sw(gnd, net1, gnd);` delays the moment the switch opens or closes
+rather than a value, which is not the `DelayedDrive` machinery an `assign` or a gate uses.
+Corpus `pr3499807` is exactly that and fails honestly.
 
 **A `generate` region is unrolled at elaboration, which is the same thing
 flattening an instance is, one level down.** `parsers/generate.rs` captures the
@@ -1962,8 +1980,9 @@ assignment only runs one way — and copying the value across is the shape that 
 and is wrong for the reason a `tran` is not a copy: once `bus[0]` has been copied into the
 port, a driver letting go leaves the far side holding the stale value. So `Binding::Bonded`
 gives the port a signal of its own and `Elaborator::bond_port` joins each of its bits to
-the matching bit of the connection with a `PassSwitch`, which makes the two **one node** —
-their drivers are pooled and resolved together by the machinery `tran` already needed.
+the matching bit of the connection with a port bond (`PassSwitch::port`), which makes the
+two **one node** — their drivers are pooled and resolved together, and unlike a `tran`
+nothing is reduced across it.
 Both ends go into `resolved_nets` for the reason a switch's terminals do.
 
 `Elaborator::bit_expressions` is how the bits are enumerated, and it goes through
@@ -2230,13 +2249,10 @@ Still missing: a **delayed** gate drives at its declared strength rather than at
 inputs say this instant, because the value in hand is the one that landed `#n` ago and the
 two would otherwise be out of step — a `bufif1` whose enable has just gone away would let go
 of the net at once and keep its turn-off delay for nothing (corpus `rise_fall_decay2`), and
-a delayed *switch* consequently drives at `strong`. And nothing reduces a strength across a
-**bidirectional** switch: `bond_nodes` pools driver lists, which is symmetric, where a
-reduction is directional — so a `tran` carries a `supply` through where iverilog drops it to
-`strong`, and the `r`-prefixed forms do not weaken at all. That is what the seven `%v` gold
-files of the switch family (`tran`, `tranif0`, `tranif1`, `rtran`, `rtranif0`, `rtranif1`,
-`switch_primitives`) are still waiting on, together with a `tranif` whose control is unknown
-conducting at an ambiguous strength rather than not at all.
+a delayed *switch* consequently drives at `strong`. Across a **bidirectional** switch the
+reduction is modelled — see "What crosses a switch is directional" — and so is a `tranif`
+whose control is unknown; what is left there is a switch's *delay*, which moves the instant
+it opens or closes rather than a value.
 
 **A string is a value wherever a number is wanted.** `$display("%d", "A")` is 65:
 `TaskArgument::Text` reaches a numeric format as its own bytes, eight bits a character.
@@ -2250,11 +2266,11 @@ telling apart.
 | `plusargs.rs` | `test` / `value` — the `+name=value` words the simulation was started with, and the conversions `$value$plusargs` reads them with |
 | `scan.rs` | `scan` — the reading half of a format string, over a `Source` that is a string (`Text`) or a file's `Reader`; `Slot`, where one conversion's value goes; `END_OF_FILE` |
 | `events.rs` | `edges_between` / `edges_from_changes` / `memory_edges` / `trigger_edges` / `control_fires` / `always_block_fires` / `signals_read` / `narrowed` — edge detection and sensitivity matching, including the bits a *select* in a sensitivity list names; and `events_fire` / `is_plain_event_expression`, the edge an entry that is an *expression* has of its own |
-| `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which joins two nets instead of driving one; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
+| `gates.rs` | `Gate` — one elaborated primitive, its terminals split into outputs and inputs; `PassSwitch`, a bidirectional switch, which carries one net's resolution to another — reduced, by `carry` — instead of driving one, or a port bond when `port` is set; `gate_output`, the four-state truth tables; and `Strength` / `resolve_strength` / `resolve_bit`, the signed strength interval one bit of a net resolves to and the value it reads as |
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()`, which pool the drivers of every net a `tran` joins, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
