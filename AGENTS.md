@@ -2511,6 +2511,14 @@ relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
 `judge(source: &str)` signature so the control tests exercise exactly the corpus
 path; `judge_with` is the one that takes the configured preprocessor and the gold text.
 
+**The harness picks one top, and a module is a root only if *nothing* instantiates it —
+including from inside a `generate` region.** `top_module` walks every region, loop, branch
+and case arm (`instantiated_modules`), because a ripple adder written as `for (…) begin :
+addbit add1 bit(…); end` otherwise leaves its cell looking like a root, and the cell is
+last in the file, which is the tie-break. The design then runs its leaf and prints nothing
+(corpus `pr1676071`, `pr1758122`). A file with two *genuine* roots still runs only one of
+them, where iverilog elaborates both (corpus `resetall2`).
+
 **`VISILOG_ONLY=<name>` runs one design and shows what it printed.** The closure report
 names the files that got a wrong answer but cannot say *what* they got — printing 1514
 designs' output would bury the number the report exists for — so triage used to mean

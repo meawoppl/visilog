@@ -28,6 +28,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use visilog::parsers::generate::GenerateItem;
 use visilog::parsers::modules::VerilogModule;
 use visilog::parsers::preprocessor::{Preprocessor, Timescale};
 use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
@@ -398,18 +399,17 @@ fn time_budget(simulator: &Simulator) -> i64 {
 /// of the instantiation graph. Ties are broken by the conventional names, then
 /// by source order, which matters because picking a leaf module would elaborate
 /// a design with no stimulus and score it as silent.
+///
+/// An instantiation inside a `generate` region counts as much as one written
+/// in the body: `for (…) begin : addbit add1 bit(…); end` is how a ripple
+/// adder instantiates its cells, and missing it made the *cell* a root — and,
+/// being last in the file, the one elaborated (corpus `pr1676071`,
+/// `pr1758122`, which then ran their leaf and printed nothing).
 fn top_module(modules: &[VerilogModule]) -> Option<String> {
-    let instantiated: Vec<&str> = modules
-        .iter()
-        .flat_map(|module| &module.statements)
-        .filter_map(|statement| match statement {
-            // Every instance in one statement names the same module.
-            ModuleStatement::ModuleInstantiation(instances) => instances
-                .first()
-                .map(|instance| instance.module_name.name.as_str()),
-            _ => None,
-        })
-        .collect();
+    let mut instantiated: Vec<&str> = Vec::new();
+    for module in modules {
+        instantiated_modules(&module.statements, &mut instantiated);
+    }
 
     let roots: Vec<&str> = modules
         .iter()
@@ -426,6 +426,47 @@ fn top_module(modules: &[VerilogModule]) -> Option<String> {
         .last()
         .map(|name| name.to_string())
         .or_else(|| modules.last().map(|m| m.identifier.name.clone()))
+}
+
+/// Every module `statements` instantiate, reaching into `generate` regions.
+fn instantiated_modules<'a>(statements: &'a [ModuleStatement], found: &mut Vec<&'a str>) {
+    for statement in statements {
+        match statement {
+            // Every instance in one statement names the same module.
+            ModuleStatement::ModuleInstantiation(instances) => found.extend(
+                instances
+                    .first()
+                    .map(|instance| instance.module_name.name.as_str()),
+            ),
+            ModuleStatement::GenerateRegion(items) => generated_modules(items, found),
+            _ => {}
+        }
+    }
+}
+
+fn generated_modules<'a>(items: &'a [GenerateItem], found: &mut Vec<&'a str>) {
+    for item in items {
+        match item {
+            GenerateItem::Item(statement) => {
+                instantiated_modules(std::slice::from_ref(statement), found)
+            }
+            GenerateItem::Block(block) => generated_modules(&block.items, found),
+            GenerateItem::Loop(generate_loop) => {
+                generated_modules(&generate_loop.body.items, found)
+            }
+            GenerateItem::If(generate_if) => {
+                generated_modules(&generate_if.then_block.items, found);
+                if let Some(block) = &generate_if.else_block {
+                    generated_modules(&block.items, found);
+                }
+            }
+            GenerateItem::Case(generate_case) => {
+                for arm in &generate_case.items {
+                    generated_modules(&arm.block.items, found);
+                }
+            }
+        }
+    }
 }
 
 /// What became of one corpus file.
@@ -874,6 +915,38 @@ fn harness_reaches_passed_on_a_self_checking_design() {
             end
         endmodule
     "#;
+    assert_eq!(judge(source), Outcome::Passed);
+}
+
+/// A module instantiated only from inside a `generate` loop is not a root, so
+/// the testbench above it is the design that runs. Picking the cell instead —
+/// it is last in the file, which is the tie-break — elaborates a design with
+/// no stimulus that prints nothing (corpus `pr1676071`, `pr1758122`).
+#[test]
+fn harness_finds_the_top_past_an_instance_in_a_generate_loop() {
+    let source = r#"
+        module bench;
+            wire [1:0] y;
+            reg [1:0] a;
+            row r (a, y);
+            initial begin
+                a = 2'b01;
+                #1 if (y === 2'b10) $display("PASSED");
+                else $display("FAILED");
+            end
+        endmodule
+        module row (input [1:0] a, output [1:0] y);
+            genvar i;
+            generate for (i = 0; i < 2; i = i + 1) begin : cells
+                cell c (a[i], y[i]);
+            end endgenerate
+        endmodule
+        module cell (input a, output y);
+            assign y = ~a;
+        endmodule
+    "#;
+    let modules = parse_verilog_source(source).expect("parses").1;
+    assert_eq!(top_module(&modules).as_deref(), Some("bench"));
     assert_eq!(judge(source), Outcome::Passed);
 }
 
