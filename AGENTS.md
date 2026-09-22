@@ -204,6 +204,26 @@ are queued at time zero; edge-triggered blocks are woken by `settle` instead, so
 deliberately skipped in the time wheel (`EventControl::None` reports as firing on *every*
 edge, so a free-running block must not also be edge-driven).
 
+**An edge-triggered block starts listening at its turn in the time-zero round, and the
+turns have an order.** iverilog gives every process a first turn at time zero, and an
+`always` block spends its turn arming its event control — so `initial begin clk = 0; … end`
+written *above* `always @(negedge clk)` does not wake it, where the same block written
+above the `initial` is woken (corpus `pr1662508`, whose monitor printed a line for time
+zero that iverilog does not, and `pr3064375`). The order is `Elaborated::start_order`: an
+instance's blocks before the module that creates it, then the module's own in source
+order, which `walk` builds by appending a module's own blocks only once its children have
+appended theirs. `setup` queues the blocks in that order, an edge-triggered block among
+them flagged `unarmed`; its turn in the round is `Simulator::arm`, which parks it on the
+waiting list with an `EventWatch` snapshotted *then* — the machinery a `@` part way
+through a block already had — and a `Waiting::arming` entry not woken by the end of the
+timestep is dropped, after which `settle` wakes the block exactly as before. **Which
+blocks is measured, not reasoned**: a list naming a `posedge` or `negedge` anywhere, or a
+named event, misses the earlier write; a list of plain signals (`@(b)`, `@(c or d)`) and
+`@*` hear it whichever side of the `initial` they are written (`armed_at_its_turn`). A
+trigger fired before the turn is skipped by count, since a trigger has no value to
+snapshot. Among blocks woken at the same instant iverilog's order still differs from
+ours.
+
 **A `#0` yields to the blocks the design just woke, and not to their non-blocking
 updates.** It re-queues a block at the same instant, in what IEEE 1364-2005 calls the
 *inactive* region — which drains only after the blocks the active region's writes woke
