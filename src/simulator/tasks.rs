@@ -28,7 +28,7 @@ use std::rc::Rc;
 use crate::parsers::behavior::{SystemTaskArgument, SystemTaskCall};
 use crate::parsers::expr::Expression;
 use crate::parsers::gates::DriveStrength;
-use crate::parsers::preprocessor::Timescale;
+use crate::parsers::preprocessor::{TimeSpec, Timescale};
 use crate::register::{Register, ONE, REAL_WIDTH, X, Z, ZERO};
 use crate::simulator::elaborate::rename_expression;
 use crate::simulator::eval::{eval, string_bits, SYSTEM_FUNCTIONS};
@@ -699,11 +699,13 @@ pub struct TaskContext {
     /// argument is resolved against and the outermost `$scope` in the header.
     /// The flat store carries no prefix for it, so it has to be told.
     top: String,
-    /// The `` `timescale `` the front end recorded, which is what `$timescale`
-    /// says. It belongs to the *source* rather than to an elaboration, and
+    /// One tick of the simulation clock — the finest precision any module
+    /// declared — which is what `$timescale` says and what `%t` prints in when
+    /// `$timeformat` has named nothing.
     /// [`Simulator::setup`](crate::simulator::runner::Simulator::setup) hands
-    /// it over again after every [`TaskContext::reset`].
-    timescale: Option<Timescale>,
+    /// it over again after every [`TaskContext::reset`]; `None` is a context
+    /// nothing described, whose clock counts seconds.
+    clock: Option<TimeSpec>,
     /// Qualified port name → the store entry it was aliased onto, which is the
     /// only record that an instance's port has a name of its own.
     aliases: HashMap<String, String>,
@@ -752,9 +754,9 @@ impl TaskContext {
 
     /// Records what the design is called and what a tick of its clock is —
     /// the two things a waveform header states that no task argument carries.
-    pub fn describe_design(&mut self, top: impl Into<String>, timescale: Option<Timescale>) {
+    pub fn describe_design(&mut self, top: impl Into<String>, clock: TimeSpec) {
         self.top = top.into();
-        self.timescale = timescale;
+        self.clock = Some(clock);
     }
 
     /// The ports that are another signal under a second name, which a
@@ -890,8 +892,8 @@ impl TaskContext {
 
     /// The design's dump, started if this is the first task to ask for one.
     fn dump_state(&mut self) -> &mut VcdDump {
-        let timescale = self.timescale;
-        self.dump.get_or_insert_with(|| VcdDump::new(timescale))
+        let clock = self.clock;
+        self.dump.get_or_insert_with(|| VcdDump::new(clock))
     }
 
     /// `$dumpvars`, `$dumpvars(levels)` and `$dumpvars(levels, scope, …)`.
@@ -1100,33 +1102,38 @@ impl TaskContext {
         }
     }
 
-    /// What one tick of the clock is worth, in femtoseconds, where a call was
-    /// written: the `` `timescale `` **unit** of the module the scope belongs
-    /// to. A scope that names no module, or a module that declared no
-    /// directive, falls back to the design's own scale and then to one second
-    /// — the `1s / 1s` the LRM gives a module with no `` `timescale ``.
+    /// What one unit of a time value is worth, in femtoseconds, where a call
+    /// was written: the `` `timescale `` **unit** of the module the scope
+    /// belongs to, because that is the unit `$time` and `$realtime` report in
+    /// there. A scope that names no module, or a module that declared no
+    /// directive, is at one second — the `1s / 1s` the LRM gives a module with
+    /// no `` `timescale ``.
     fn tick_fs(&self, scope: &str) -> u128 {
         self.scale_of(scope)
             .flatten()
-            .or(self.timescale)
             .map_or(DEFAULT_SCALE_FS, |scale| {
                 u128::from(scale.unit.femtoseconds())
             })
     }
 
+    /// How many decimals a bare `$realtime` written in `scope` prints with:
+    /// the number of powers of ten its module's precision is finer than its
+    /// unit, so none at all for a module that declared no `` `timescale ``.
+    fn realtime_digits(&self, scope: &str) -> usize {
+        self.scale_of(scope).flatten().map_or(0, |scale| {
+            let steps = scale.unit.femtoseconds() / scale.precision.femtoseconds();
+            steps.ilog10() as usize
+        })
+    }
+
     /// The unit `%t` prints in when `$timeformat` has named none: the finest
-    /// **precision** any `` `timescale `` in the design declared, which is what
-    /// the LRM asks for. `` `timescale 1ns/100ps `` with no `$timeformat` at
-    /// all therefore prints `#5` as `50`, measured against iverilog 12.0.
+    /// **precision** any `` `timescale `` in the design declared, which is the
+    /// clock's own tick and what the LRM asks for. `` `timescale 1ns/100ps ``
+    /// with no `$timeformat` at all therefore prints `#5` as `50`, measured
+    /// against iverilog 12.0.
     fn default_time_units(&self) -> u128 {
-        self.instances
-            .iter()
-            .chain(self.module_scales.iter())
-            .filter_map(|(_, scale)| *scale)
-            .chain(self.timescale)
-            .map(|scale| u128::from(scale.precision.femtoseconds()))
-            .min()
-            .unwrap_or(DEFAULT_SCALE_FS)
+        self.clock
+            .map_or(DEFAULT_SCALE_FS, |clock| u128::from(clock.femtoseconds()))
     }
 
     /// The instance a call sits in: its `%m` scope with any named block or
@@ -1347,8 +1354,19 @@ impl TaskContext {
                     // whatever base the task's name asked for: there is no
                     // number of bits to show, and iverilog renders one to six
                     // significant digits — `$display(1.5)` is `1.50000`.
+                    //
+                    // A bare `$realtime` is the exception: it prints with as
+                    // many decimals as its module's precision is finer than its
+                    // unit, so `1.23` under `` `timescale 1ns/10ps `` and `5`
+                    // with no `` `timescale `` at all, where `$realtime + 1.0`
+                    // beside it is `2.23000` (iverilog 12.0).
                     if value.is_real() {
-                        text.push_str(&real_text(value.to_f64(), RealFormat::Bare, None));
+                        let rendered = if is_realtime_call(argument) {
+                            format!("{:.*}", self.realtime_digits(scope), value.to_f64())
+                        } else {
+                            real_text(value.to_f64(), RealFormat::Bare, None)
+                        };
+                        text.push_str(&rendered);
                         index += 1;
                         continue;
                     }
@@ -2532,6 +2550,15 @@ pub(crate) fn ascii(register: &Register) -> String {
         .skip_while(|character| *character == '\0')
         .map(|character| if character == '\0' { ' ' } else { character })
         .collect()
+}
+
+/// Whether an argument is a bare `$realtime`, which prints at its module's
+/// precision rather than as any other real does.
+fn is_realtime_call(argument: &TaskArgument) -> bool {
+    matches!(
+        argument,
+        TaskArgument::Value(Expression::SystemFunctionCall(name, _)) if name == "realtime"
+    )
 }
 
 /// Whether an argument is the simulated clock rather than something the design

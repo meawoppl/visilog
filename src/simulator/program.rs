@@ -29,12 +29,12 @@ use crate::parsers::behavior::{
     ForStatement, IfStatement, ProceduralStatements, RepeatStatement, TaskDirection, WaitStatement,
     WhileStatement,
 };
-use crate::parsers::delay::Delay;
+use crate::parsers::delay::{Delay, DelayScale};
 use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::register::Register;
 use crate::simulator::elaborate::{rename_event_control, rename_expression};
-use crate::simulator::eval::{eval, eval_sized};
+use crate::simulator::eval::{eval, eval_sized, stamp_system_time};
 use crate::simulator::events::signals_read;
 use crate::simulator::exec::{
     deassign_drive, drive_resolved, install_drive, release_drive, resolve_target, PendingUpdate,
@@ -883,6 +883,28 @@ impl Program {
     pub fn substitute(&mut self, replace: &dyn Fn(&mut Expression)) {
         for instruction in &mut self.instructions {
             substitute_instruction(instruction, replace);
+        }
+    }
+
+    /// Records the `` `timescale `` of the module this program was written in
+    /// on every delay it waits on and every `$time` it reads, leaving alone
+    /// the ones that already carry a scale.
+    ///
+    /// A spliced task body is deliberately *not* skipped: a local task belongs
+    /// to the module that enables it, and a body linked in from another
+    /// instance was stamped where that instance declared it, so it already
+    /// carries a scale and is passed over for that reason instead.
+    pub fn stamp_timescale(&mut self, scale: DelayScale) {
+        let ticks_per_unit = scale.ticks_per_unit();
+        for instruction in &mut self.instructions {
+            if let Instruction::Delay(delay) | Instruction::ScheduleWrite { delay, .. } =
+                instruction
+            {
+                delay.stamp(scale);
+            }
+            substitute_instruction(instruction, &|expression| {
+                stamp_system_time(expression, ticks_per_unit)
+            });
         }
     }
 

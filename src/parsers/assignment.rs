@@ -81,6 +81,12 @@ impl ContinuousAssignment {
         &self.rhs
     }
 
+    /// The driving expression, for the pass that stamps a module's
+    /// `` `timescale `` on the `$time` calls in it.
+    pub fn rhs_mut(&mut self) -> &mut Expression {
+        &mut self.rhs
+    }
+
     /// The declared drive strengths, e.g. the `(strong1, highz0)` of
     /// `assign (strong1, highz0) x = y;`. `None` is an assignment that named
     /// none, which drives at `strong` like any other.

@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::parsers::preprocessor::Timescale;
+use crate::parsers::preprocessor::TimeSpec;
 use crate::register::{Register, ONE, X, Z, ZERO};
 use crate::simulator::state_store::StateStore;
 
@@ -193,11 +193,14 @@ pub struct VcdDump {
 
 impl VcdDump {
     /// A dump that has been asked for but has recorded nothing yet.
-    pub fn new(timescale: Option<Timescale>) -> Self {
+    ///
+    /// `clock` is one tick of the simulation clock, which is what every
+    /// `#<time>` in the file counts — so it is what `$timescale` states.
+    pub fn new(clock: Option<TimeSpec>) -> Self {
         VcdDump {
             enabled: true,
-            timescale: match timescale {
-                Some(scale) => scale.unit.to_string(),
+            timescale: match clock {
+                Some(clock) => clock.to_string(),
                 None => DEFAULT_TIMESCALE.to_string(),
             },
             ..VcdDump::default()
@@ -896,11 +899,9 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("scratch directory");
 
         let parsed = parse_source(source).expect("source should parse");
-        let timescale = parsed.timescale;
         let top = parsed.modules[0].identifier.name.clone();
         let mut simulator = Simulator::with_modules(parsed.modules, top);
         simulator.set_output_directory(directory.clone());
-        simulator.set_timescale(timescale);
         simulator.setup().expect("design should elaborate");
         simulator.advance(run_for).expect("design should run");
 
@@ -917,7 +918,9 @@ mod tests {
 
     /// The format itself, pinned as text: a header, a scope tree, an opening
     /// `$dumpvars` block and then one section per timestep that moved
-    /// something.
+    /// something. The clock counts the finest precision declared, so
+    /// `` `timescale 1ns / 1ps `` is `$timescale 1ps` and `#5` is `#5000`,
+    /// which is what iverilog 12.0 writes for the same design.
     #[test]
     fn test_a_design_writes_a_readable_value_change_dump() {
         let (printed, dump) = dump_of(
@@ -946,7 +949,7 @@ module sub (input a);
   initial b = 1;
 endmodule
 "#,
-            100,
+            100_000,
         );
 
         assert_eq!(printed, "VCD info: dumpfile wave.vcd opened for output.\n");
@@ -960,7 +963,7 @@ $version
 \tvisilog
 $end
 $timescale
-\t1ns
+\t1ps
 $end
 $scope module wave $end
 $var reg 1 ! clk $end
@@ -979,13 +982,13 @@ b11 \"
 b110 #
 1$
 $end
-#5
+#5000
 1!
-#10
+#10000
 0!
 bx01 \"
 bx010 #
-#15
+#15000
 "
         );
     }
