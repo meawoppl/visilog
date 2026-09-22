@@ -259,10 +259,26 @@ say nothing about rows. Corpus `array7`, `br_gh33`, `pr3582052`,
 `real_array_multi_dim`.
 
 A memory write **is** journalled, in a list of its own: `always @(bus[index[0]])`
-has to wake when `index[0]` moves. The journal keeps one before/after pair per
-memory *name* rather than per word, which over-approximates in the direction
-`event_fires` already does — a block may wake more often than it should, never
-less.
+has to wake when `index[0]` moves. The journal is kept **per word** —
+`StateStore::take_memory_changes` hands back one `MemoryChange` per address the round
+moved, merged from an append-only list so that a loop filling a memory is not quadratic,
+and with a word written and put back dropped. A word is keyed by its **flat position**
+(`Memory::word_position` of the full address), not by the indices it was written with:
+one number names one word of an array of any number of dimensions, and a journalled write
+allocates nothing. A sensitivity entry naming one word of a one-dimensional memory by a
+constant index (`@(dummy[m])` with `m` a genvar) is asked about that word through
+`StateStore::round_word`, which takes the full address and maps it the same way. A word of
+an array of more dimensions (`@(g[1][m])`) needs no such lookup: it is an
+`Expression::WordSelect`, which is not a *plain* entry, so it has an edge of its own
+measured against what it evaluates to — one word's. So a write to `dummy[0]` wakes only
+the block watching it
+(corpus `pr2815398a_std`, which then fails only on its `__ICARUS__`-gated index 7, #304;
+measured against iverilog 12.0). Anything else that names the memory — an `@(*)` read
+set, an index that is not a constant — still matches on the name, and a memory's *edge*
+is still one per name: the per-word answer lives on the store beside the edge list rather
+than on `SignalEdge`, because widening every edge by an address cost a design with no
+memory in it about 4.5% on `bench tick/counter_4bit`, and `events::word_fires` is asked
+only when `StateStore::any_memory` says there is one to ask about.
 
 **`$readmemh` writes a memory, which is why `TaskContext::run` takes a `&mut
 StateStore`.** A system task used to be an output and nothing else; loading a

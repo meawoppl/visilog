@@ -42,7 +42,7 @@ use crate::parsers::behavior::{
 use crate::parsers::expr::Expression;
 use crate::register::{Register, ONE, X, Z, ZERO};
 use crate::simulator::eval::{eval, select_index, MAX_SELECT_WIDTH};
-use crate::simulator::state_store::{bit_position_in, StateStore};
+use crate::simulator::state_store::{bit_position_in, MemoryChange, StateStore};
 
 /// One signal's transition across a time step.
 ///
@@ -153,22 +153,24 @@ pub fn edges_from_changes(changes: Vec<(String, Register)>, after: &StateStore) 
         .collect()
 }
 
-/// The edges a round's memory writes produce.
+/// The edges a round's memory writes produce: one per memory, from the first
+/// word the round displaced to the last word it wrote.
 ///
-/// A memory is journalled per name rather than per word — see
-/// [`StateStore::set_word`](crate::simulator::state_store::StateStore::set_word)
-/// — so an edge here says "a word of this memory moved, from that value to this
-/// one" rather than naming the address. That is enough for a sensitivity list,
-/// which matches on the name.
-pub fn memory_edges(changes: Vec<(String, Register, Register)>) -> Vec<SignalEdge> {
-    changes
-        .into_iter()
-        .map(|(name, before, after)| SignalEdge {
-            name,
-            before,
-            after,
-        })
-        .collect()
+/// That is enough for everything that names the memory as a whole — an
+/// `@(*)` read set, or an index that is not a constant — and it keeps a
+/// memory's edge the same shape as a signal's. An entry naming **one** word
+/// is asked about that word instead, out of
+/// [`StateStore::round_word`](crate::simulator::state_store::StateStore::round_word);
+/// see [`word_fires`].
+pub fn memory_edges(changes: Vec<MemoryChange>) -> Vec<SignalEdge> {
+    let mut edges: Vec<SignalEdge> = Vec::new();
+    for change in changes {
+        match edges.last_mut() {
+            Some(last) if last.name == change.name => last.after = change.after,
+            _ => edges.push(SignalEdge::new(change.name, change.before, change.after)),
+        }
+    }
+    edges
 }
 
 /// The edges a round's event triggers produce.
@@ -302,9 +304,47 @@ fn event_fires(event: &Event, edges: &[SignalEdge], state: &StateStore) -> bool 
         }
         match narrowed(&event.expression, edge, state) {
             Some(narrowed) => narrowed.matches(&event.trigger),
+            // A design with no memory skips the word question on a flag.
+            None if state.any_memory() => {
+                word_fires(event, edge, state).unwrap_or_else(|| edge.matches(&event.trigger))
+            }
             None => edge.matches(&event.trigger),
         }
     })
+}
+
+/// Whether an entry naming **one word** of a memory fires, or `None` when the
+/// entry is not a constant word select of the memory `edge` belongs to.
+///
+/// A memory's edge is per name, so `@(dummy[1])` offered a write to
+/// `dummy[0]` would wake on the name alone — which is one block per index
+/// waking for every index in a generate loop (corpus `pr2815398a_std`). The
+/// word's own before and after are what the round journalled for it, and a
+/// word the round did not move is no edge at all. An index that is not a
+/// number where the store is asked keeps the name-level answer.
+///
+/// A bit select is the only shape that reaches here, and on a memory it names a
+/// word of a one-dimensional one: a word of an array of more dimensions is
+/// written `a[i][j]`, an `Expression::WordSelect`, which
+/// [`is_plain_event_expression`] does not count as plain — so it has an edge of
+/// its own, measured against what it evaluates to, and that is already one
+/// word's.
+fn word_fires(event: &Event, edge: &SignalEdge, state: &StateStore) -> Option<bool> {
+    let Expression::BitSelect(id, index) = &event.expression else {
+        return None;
+    };
+    if id.name != edge.name || state.memory(&id.name).is_none() {
+        return None;
+    }
+    let address = constant_index(index, state)?;
+    Some(
+        state
+            .round_word(&id.name, &[address])
+            .is_some_and(|change| {
+                SignalEdge::new(String::new(), change.before.clone(), change.after.clone())
+                    .matches(&event.trigger)
+            }),
+    )
 }
 
 /// The same edge over just the bits a **select** in the sensitivity list

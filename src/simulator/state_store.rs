@@ -856,6 +856,20 @@ impl Drive {
     }
 }
 
+/// One word of a memory that moved since the last marker: which memory, which
+/// word, what the round first displaced and what it last wrote.
+///
+/// The word is its flat position in the memory — [`Memory::word_position`] of
+/// the address it was written at — so an array of any number of dimensions
+/// keys one word by one number.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryChange {
+    pub name: String,
+    pub position: usize,
+    pub before: Register,
+    pub after: Register,
+}
+
 /// Name to value map for every signal in a simulation, together with a journal
 /// of everything written since the last marker.
 ///
@@ -888,14 +902,21 @@ pub struct StateStore {
     /// the other, so an ordinary select still costs one hash and only a miss
     /// looks here.
     name_to_memory: HashMap<String, Memory>,
-    /// For every memory written since the last marker, the first word the round
-    /// displaced and the last word written into it. See
-    /// [`set_word`](StateStore::set_word).
+    /// Every memory word written since the last marker, in the order written.
+    /// See [`set_word`](StateStore::set_word).
     ///
-    /// A list rather than a map: a design has a handful of memories at most, so
-    /// a linear scan beats hashing a name, and taking an empty one costs
-    /// nothing — which matters because every delta cycle asks.
-    memory_journal: Vec<(String, Register, Register)>,
+    /// A list that is only appended to, and merged per word when it is taken:
+    /// a loop that fills a memory writes one entry per word, and looking each
+    /// one up on the way in would make that loop quadratic. Taking an empty
+    /// one costs nothing — which matters because every delta cycle asks.
+    memory_journal: Vec<MemoryChange>,
+    /// The words the settle round now running took out of `memory_journal`,
+    /// which is where a sensitivity entry naming *one* word looks — see
+    /// [`round_word`](StateStore::round_word). Kept here rather than on the
+    /// edge list because an edge is a signal's, and widening every one of them
+    /// by an address costs a design with no memory in it ~4.5% on
+    /// `bench tick/counter_4bit`.
+    round_words: Vec<MemoryChange>,
     /// For every signal written since the last marker, the value it held at
     /// that marker. `None` records a name that did not exist yet, which makes
     /// the write a declaration rather than a change.
@@ -1034,6 +1055,7 @@ impl StateStore {
             aliases: Rc::clone(&self.aliases),
             name_to_memory: HashMap::new(),
             memory_journal: Vec::new(),
+            round_words: Vec::new(),
             journal: HashMap::new(),
             time: self.time,
             random: RandomStream::default(),
@@ -1771,12 +1793,15 @@ impl StateStore {
     /// Writes one word of a memory, reporting whether the stored value moved —
     /// or `None` when `name` is not a memory at all.
     ///
-    /// The write is journalled, because a block may be sensitive to a memory
-    /// (`always @(vco_tap[index])` wakes when `index` is a memory word that
-    /// moves). It is journalled *per name* rather than per word: the pair kept
-    /// is the first word displaced this round and the last word written, which
-    /// over-approximates in exactly the direction `event_fires` already does —
-    /// a block may be woken more often than it should, never less.
+    /// The write is journalled **per word**, because a block may be sensitive
+    /// to one word and not to its neighbours: `always @(dummy[m])` in a
+    /// generate loop is one block per index, and a write to `dummy[0]` must
+    /// wake only the first (corpus `pr2815398a_std`). A repeat write of the
+    /// word written last is folded in here, which keeps a loop hammering one
+    /// word from growing the journal; everything else is merged when it is
+    /// taken. A word is keyed by its flat position in the memory rather than
+    /// by the indices it was written with, which names one word in any number
+    /// of dimensions and costs a journalled write no allocation.
     pub fn set_word(&mut self, name: &str, address: &[i64], value: &Register) -> Option<bool> {
         let memory = self.name_to_memory.get_mut(name)?;
         let before = memory.word(Some(address));
@@ -1784,13 +1809,16 @@ impl StateStore {
             return Some(false);
         }
         let after = memory.word(Some(address));
-        match self
-            .memory_journal
-            .iter_mut()
-            .find(|(written, _, _)| written == name)
-        {
-            Some((_, _, latest)) => *latest = after,
-            None => self.memory_journal.push((name.to_string(), before, after)),
+        // A write that moved a word named a word, so it has a position.
+        let position = memory.word_position(address)?;
+        match self.memory_journal.last_mut() {
+            Some(last) if last.position == position && last.name == name => last.after = after,
+            _ => self.memory_journal.push(MemoryChange {
+                name: name.to_string(),
+                position,
+                before,
+                after,
+            }),
         }
         Some(true)
     }
@@ -1818,12 +1846,49 @@ impl StateStore {
         self.set_word(name, address, &word)
     }
 
-    /// Every memory written since the last call, as `(name, before, after)`,
-    /// clearing the journal so the next round is measured from here.
-    pub fn take_memory_changes(&mut self) -> Vec<(String, Register, Register)> {
+    /// Every memory word written since the last call, one entry per word —
+    /// the value the round first displaced and the last one written — clearing
+    /// the journal so the next round is measured from here.
+    ///
+    /// A word that was written and then put back is no change, and is dropped
+    /// here for the reason `edges_from_changes` drops a signal that did the
+    /// same.
+    pub fn take_memory_changes(&mut self) -> Vec<MemoryChange> {
         let mut changes = std::mem::take(&mut self.memory_journal);
-        changes.sort_by(|left, right| left.0.cmp(&right.0));
-        changes
+        if changes.len() < 2 {
+            self.round_words = changes.clone();
+            return changes;
+        }
+        // Stable, so the entries for one word stay in the order they were
+        // written and the first holds what the round displaced.
+        changes.sort_by(|left, right| {
+            (left.name.as_str(), left.position).cmp(&(right.name.as_str(), right.position))
+        });
+        let mut merged: Vec<MemoryChange> = Vec::with_capacity(changes.len());
+        for change in changes {
+            match merged.last_mut() {
+                Some(last) if last.position == change.position && last.name == change.name => {
+                    last.after = change.after;
+                }
+                _ => merged.push(change),
+            }
+        }
+        merged.retain(|change| change.before != change.after);
+        self.round_words = merged.clone();
+        merged
+    }
+
+    /// What the word of memory `name` at `address` did in the settle round now
+    /// running, or `None` when the round did not move it — or when `address`
+    /// names no word, which an index outside a dimension, or the wrong number
+    /// of indices, does. Taking the memory journal is what starts a round, so
+    /// this answers for exactly the edges
+    /// [`take_memory_changes`](StateStore::take_memory_changes) handed out.
+    pub fn round_word(&self, name: &str, address: &[i64]) -> Option<&MemoryChange> {
+        let position = self.name_to_memory.get(name)?.word_position(address)?;
+        self.round_words
+            .iter()
+            .find(|change| change.position == position && change.name == name)
     }
 
     /// How a write to `name` has to be *read* — signed or not, real or not —
@@ -2246,14 +2311,60 @@ mod tests {
         store.set_word("mem", &[0], &Register::from_binary("0001"));
         store.set_word("mem", &[1], &Register::from_binary("0010"));
 
-        // One entry per *name*, not per word: the pair is the first word the
-        // round displaced and the last word written.
+        // One entry per *word*: each pair is what the round displaced from that
+        // word and what it last wrote there.
+        let changes = store.take_memory_changes();
+        assert_eq!(changes.len(), 2);
+        assert_eq!((changes[0].name.as_str(), changes[0].position), ("mem", 0));
+        assert_eq!(changes[0].before.to_binary(), "xxxx");
+        assert_eq!(changes[0].after.to_binary(), "0001");
+        assert_eq!((changes[1].name.as_str(), changes[1].position), ("mem", 1));
+        assert_eq!(changes[1].after.to_binary(), "0010");
+        assert!(store.take_memory_changes().is_empty());
+    }
+
+    /// A word of a two-dimensional array is one journal entry keyed by its
+    /// flat position, and [`StateStore::round_word`] finds it by the full
+    /// address — a neighbour in either dimension is a different word, and an
+    /// address with too few indices names no word at all.
+    #[test]
+    fn test_a_two_dimensional_memory_word_is_journalled_by_its_whole_address() {
+        let mut store = StateStore::new();
+        store.declare_memory("grid", vec![(0, 1), (0, 2)], (3, 0), false);
+        store.clear_changes();
+
+        store.set_word("grid", &[1, 2], &Register::from_binary("0101"));
         let changes = store.take_memory_changes();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, "mem");
-        assert_eq!(changes[0].1.to_binary(), "xxxx");
-        assert_eq!(changes[0].2.to_binary(), "0010");
-        assert!(store.take_memory_changes().is_empty());
+        assert_eq!(changes[0].position, 5);
+
+        assert!(store.round_word("grid", &[1, 2]).is_some());
+        assert!(store.round_word("grid", &[1, 1]).is_none());
+        assert!(store.round_word("grid", &[0, 2]).is_none());
+        assert!(store.round_word("grid", &[1]).is_none());
+    }
+
+    /// Writing a word and then putting its old value back within one round
+    /// is no change, and a word written twice around another keeps what the
+    /// round first displaced.
+    #[test]
+    fn test_a_memory_word_journal_merges_and_drops_round_trips() {
+        let mut store = StateStore::new();
+        store.declare_memory("mem", vec![(0, 3)], (3, 0), false);
+        store.set_word("mem", &[0], &Register::from_binary("0001"));
+        store.set_word("mem", &[1], &Register::from_binary("0001"));
+        store.clear_changes();
+
+        store.set_word("mem", &[0], &Register::from_binary("0010"));
+        store.set_word("mem", &[1], &Register::from_binary("0100"));
+        store.set_word("mem", &[0], &Register::from_binary("0001"));
+        store.set_word("mem", &[1], &Register::from_binary("1000"));
+
+        let changes = store.take_memory_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].position, 1);
+        assert_eq!(changes[0].before.to_binary(), "0001");
+        assert_eq!(changes[0].after.to_binary(), "1000");
     }
 
     #[test]
