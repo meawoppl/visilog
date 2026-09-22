@@ -2502,6 +2502,16 @@ tripwire.
   that behaves like a one-shot looks right in a smoke test and is wrong in a real design.
   `register::declared_name` carries the initialiser next to the memory dimension, which is
   what makes `wire x = 1, y = 2;` give the two names different drivers.
+  **So a net declaration's strength and delay are that assignment's.**
+  `wire (weak0, weak1) v = p;` and `wire #(period/3) t = d;` are
+  `assign (weak0, weak1) v = p;` and `assign #(period/3) t = d;` — `net_declaration` reads
+  the same `drive_strength` and `parse_gate_delay` an `assign` does, in the LRM's order
+  (type, strength, `signed`, range, delay), and `elaborate` hands both to
+  `ContinuousAssignment::with_timing` through `push_assignment`, so nothing past that point
+  knows the driver was a declaration (corpus `drive_strength1`, `delay5`). A delay on a net
+  declared *without* an assignment (`wire #5 w;`) delays every driver of `w`, which is a
+  property of the net rather than of one driver; that is `SimulationError::Unsupported`
+  rather than dropped, because the old parser did drop it.
 - **Both module header styles are normalised to `Vec<Port>` at parse time.**
   `parse_module_declaration` reads an ANSI header (`module m(input wire [3:0] a);`) or a
   Verilog-1995 one (`module m(a, h);` plus `input a; output [11:0] h;` in the body), lifts
