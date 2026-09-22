@@ -36,7 +36,71 @@ pub struct Delay {
     minimum: Expression,
     typical: Expression,
     maximum: Expression,
+    /// The `` `timescale `` of the module the delay was written in, stamped at
+    /// elaboration. `None` is a delay nothing stamped — one built by a test, or
+    /// one in a design whose every module counts in the clock's own tick —
+    /// which waits exactly the number it evaluates to.
+    scale: Option<DelayScale>,
 }
+
+/// How a delay written in one module becomes ticks of the simulation clock.
+///
+/// The clock counts ticks of the **finest precision** any module in the design
+/// declared, and a module's delay is first rounded to *that module's* precision
+/// and only then restated in clock ticks — so `#0.4` under `` `timescale
+/// 1ns/1ns `` is no delay at all even when another module at `1ps` makes the
+/// clock count picoseconds. Both factors are exact integers because every
+/// legal `` `timescale `` term is a power of ten.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct DelayScale {
+    /// Steps of the module's precision in one of its units.
+    pub steps_per_unit: u64,
+    /// Clock ticks in one step of the module's precision.
+    pub ticks_per_step: u64,
+}
+
+impl DelayScale {
+    /// Clock ticks in one of the module's units, which is what `$time` divides
+    /// the clock by.
+    pub fn ticks_per_unit(self) -> u64 {
+        self.steps_per_unit.saturating_mul(self.ticks_per_step)
+    }
+
+    /// A delay of `value` of the module's units, in clock ticks.
+    ///
+    /// A delay is unsigned and a resumption is scheduled at `now + ticks`, so
+    /// this is clamped rather than wrapped: a value too wide to be an `i64`
+    /// would otherwise come back negative and queue a block *before* the one
+    /// that scheduled it.
+    ///
+    /// A **real** delay is rounded to a whole step of the module's precision,
+    /// half away from zero, and then scaled. Measured against iverilog 12.0
+    /// under `` `timescale 1ns/100ps ``: `#0.55` is 0.6, `#0.25` is 0.3,
+    /// `#0.05` is 0.1 and `#0.04` is nothing. Reading the sixty-four bits of
+    /// the IEEE-754 encoding as a tick count, which is what `to_u128` would
+    /// do, is the answer that looks like nothing went wrong.
+    fn ticks(self, value: &Register) -> i64 {
+        if value.is_real() {
+            let steps = (value.to_f64() * self.steps_per_unit as f64).round();
+            return if steps.is_finite() && steps > 0.0 {
+                (steps as i64).saturating_mul(self.ticks_per_step as i64)
+            } else {
+                0
+            };
+        }
+        value
+            .to_u128()
+            .unwrap_or(0)
+            .saturating_mul(u128::from(self.ticks_per_unit()))
+            .min(i64::MAX as u128) as i64
+    }
+}
+
+/// A module whose unit, precision and clock tick are all the same.
+const UNSCALED: DelayScale = DelayScale {
+    steps_per_unit: 1,
+    ticks_per_step: 1,
+};
 
 impl Delay {
     /// A plain `#10`, whose three values are all the same.
@@ -50,6 +114,7 @@ impl Delay {
             minimum: delay.clone(),
             typical: delay.clone(),
             maximum: delay,
+            scale: None,
         }
     }
 
@@ -68,10 +133,22 @@ impl Delay {
             minimum,
             typical,
             maximum,
+            scale: None,
         }
     }
 
-    /// The number of time units to wait, worked out against `store`.
+    /// Records the `` `timescale `` of the module this delay was written in,
+    /// unless one was recorded already.
+    ///
+    /// Elaboration stamps a module's delays once its walk is over, and a child
+    /// instance's walk is over first — so "unless" is what keeps the parent's
+    /// scale off the child's delays, and off a task body that was stamped where
+    /// its own module declared it.
+    pub fn stamp(&mut self, scale: DelayScale) {
+        self.scale.get_or_insert(scale);
+    }
+
+    /// The number of clock ticks to wait, worked out against `store`.
     ///
     /// This is the **one** place a delay mode is chosen: everything that
     /// schedules a delay goes through here, so honouring `+mindelays` or
@@ -82,7 +159,8 @@ impl Delay {
     /// does with one — there is no length of time an unknown stands for, and
     /// refusing to run would stop a design over a value it never waits on.
     pub fn ticks(&self, store: &StateStore) -> Result<i64, EvalError> {
-        Ok(Delay::to_ticks(&eval(&self.typical, store)?))
+        let value = eval(&self.typical, store)?;
+        Ok(self.scale.unwrap_or(UNSCALED).ticks(&value))
     }
 
     /// The three expressions, for a pass that rewrites the names in them.
@@ -109,31 +187,6 @@ impl Delay {
     /// The `max` of a `min:typ:max` triple; the value itself for a plain delay.
     pub fn maximum(&self) -> &Expression {
         &self.maximum
-    }
-
-    /// A delay is unsigned and a resumption is scheduled at `now + ticks`, so
-    /// this is clamped rather than wrapped: a value too wide to be an `i64`
-    /// would otherwise come back negative and queue a block *before* the one
-    /// that scheduled it.
-    ///
-    /// A **real** delay is rounded to a whole tick, half away from zero — the
-    /// same rounding an assignment of a real to an integer takes. The clock
-    /// counts ticks of the design's time unit and nothing here models a finer
-    /// precision, so `#2.5` is three ticks rather than two and a half; a design
-    /// that turns on a fraction of a unit is wrong by that rounding rather than
-    /// refused. Reading the sixty-four bits of the IEEE-754 encoding as a tick
-    /// count, which is what `to_u128` would do, is the answer that looks like
-    /// nothing went wrong.
-    fn to_ticks(value: &Register) -> i64 {
-        if value.is_real() {
-            let ticks = value.to_f64().round();
-            return if ticks.is_finite() && ticks > 0.0 {
-                ticks as i64
-            } else {
-                0
-            };
-        }
-        value.to_u128().unwrap_or(0).min(i64::MAX as u128) as i64
     }
 }
 
@@ -238,6 +291,16 @@ impl GateDelay {
         // Nothing moved, so nothing is scheduled; the caller has already
         // decided there is a transaction to make.
         Ok(longest.unwrap_or(0))
+    }
+
+    /// Records the `` `timescale `` of the module the delays were written in,
+    /// on each one that has none. See [`Delay::stamp`].
+    pub fn stamp(&mut self, scale: DelayScale) {
+        self.rise.stamp(scale);
+        self.fall.stamp(scale);
+        if let Some(turn_off) = &mut self.turn_off {
+            turn_off.stamp(scale);
+        }
     }
 
     /// Every delay expression, for the pass that rewrites a flattened
@@ -473,6 +536,52 @@ mod tests {
                 .1;
             assert_eq!(delay.ticks(&store), Ok(ticks), "{}", source);
         }
+    }
+
+    /// A stamped delay is rounded to its module's precision and then restated
+    /// in clock ticks. Under `` `timescale 1ns/100ps `` on a picosecond clock
+    /// — ten steps a unit, a hundred ticks a step — iverilog 12.0 waits 0.6ns
+    /// for `#0.55`, 0.3ns for `#0.25`, 0.1ns for `#0.05` and nothing for
+    /// `#0.04`, and an integer delay is exact.
+    #[test]
+    fn test_a_stamped_delay_rounds_to_its_modules_precision() {
+        let store = StateStore::new();
+        let scale = DelayScale {
+            steps_per_unit: 10,
+            ticks_per_step: 100,
+        };
+        assert_eq!(scale.ticks_per_unit(), 1000);
+        for (source, ticks) in [
+            ("#0.55", 600),
+            ("#0.25", 300),
+            ("#0.05", 100),
+            ("#0.04", 0),
+            ("#3", 3000),
+            ("#(-1.0)", 0),
+        ] {
+            let mut delay = parse_delay(source)
+                .unwrap_or_else(|error| panic!("{} should parse: {:?}", source, error))
+                .1;
+            delay.stamp(scale);
+            assert_eq!(delay.ticks(&store), Ok(ticks), "{}", source);
+        }
+    }
+
+    /// A delay keeps the first scale it was stamped with: a child instance's
+    /// walk ends before its parent's, and the parent must not restate the
+    /// child's delays in its own unit.
+    #[test]
+    fn test_a_delay_keeps_the_first_scale_it_was_stamped_with() {
+        let mut delay = Delay::new(2);
+        delay.stamp(DelayScale {
+            steps_per_unit: 1,
+            ticks_per_step: 1,
+        });
+        delay.stamp(DelayScale {
+            steps_per_unit: 1,
+            ticks_per_step: 1000,
+        });
+        assert_eq!(delay.ticks(&StateStore::new()), Ok(2));
     }
 
     /// A real delay reaches the event queue as its rounded tick count: `#2.5`

@@ -375,7 +375,21 @@ fn harness_accepts_known_good_source() {
 /// a `` `timescale 1ps `` design every five thousand ticks and finish at
 /// 50001, and cutting them off mid-run scored them as wrong answers rather
 /// than as designs that had not been given time to run.
+///
+/// It counts units of the top module's `` `timescale ``, not clock ticks — see
+/// [`time_budget`].
 const TIME_BUDGET: i64 = 100_000;
+
+/// [`TIME_BUDGET`] in ticks of the simulation clock.
+///
+/// The clock counts the finest precision any module declared, so a design at
+/// `` `timescale 1ns/1ps `` ticks a thousand times per unit its testbench is
+/// written in. Measuring the budget in clock ticks would give that design a
+/// thousandth of the run a design with no `` `timescale `` gets, and cut short
+/// every free-running one that checks its answer late.
+fn time_budget(simulator: &Simulator) -> i64 {
+    TIME_BUDGET.saturating_mul(simulator.ticks_per_unit())
+}
 
 /// The module to elaborate: one that nothing else instantiates.
 ///
@@ -512,16 +526,12 @@ fn judge_with(
     let Ok(parsed) = front_end(preprocessor, source) else {
         return Outcome::ParseFailed;
     };
-    let timescale = parsed.timescale;
     let modules = parsed.modules;
     let Some(top) = top_module(&modules) else {
         return Outcome::ParseFailed;
     };
 
     let mut simulator = Simulator::with_modules(modules, top);
-    // The `` `timescale `` belongs to the file, which only the harness read, so
-    // a waveform the design dumps can only state it if the harness says so.
-    simulator.set_timescale(timescale);
     // `$readmemh("foo.txt", mem)` names a file relative to the test directory.
     // A `Simulator` is built from parsed modules and never learns which file
     // they came from, so the harness — which does know — supplies the path.
@@ -546,7 +556,7 @@ fn judge_with(
     if let Err(error) = simulator.setup() {
         return Outcome::SetupFailed(error_kind(&error));
     }
-    if let Err(error) = simulator.advance(TIME_BUDGET) {
+    if let Err(error) = simulator.advance(time_budget(&simulator)) {
         return Outcome::RunFailed(error_kind(&error));
     }
 
@@ -1156,13 +1166,11 @@ fn probe_output(
     let Ok(parsed) = front_end(preprocessor, source) else {
         return "<parse failed>\n".to_string();
     };
-    let timescale = parsed.timescale;
     let modules = parsed.modules;
     let Some(top) = top_module(&modules) else {
         return "<no top module>\n".to_string();
     };
     let mut simulator = Simulator::with_modules(modules, top);
-    simulator.set_timescale(timescale);
     for directory in search_paths {
         simulator.add_search_path(directory.clone());
     }
@@ -1173,7 +1181,7 @@ fn probe_output(
     if let Err(error) = simulator.setup() {
         return format!("<setup failed: {:?}>\n", error);
     }
-    if let Err(error) = simulator.advance(TIME_BUDGET) {
+    if let Err(error) = simulator.advance(time_budget(&simulator)) {
         return format!("{}<run failed: {:?}>\n", simulator.output().text(), error);
     }
     simulator.output().text().to_string()

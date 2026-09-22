@@ -1456,6 +1456,105 @@ const REAL_MATH_UNARY: [&str; 19] = [
 /// above; `$atan2` is the two-argument arc tangent and lives here.
 const REAL_MATH_BINARY: [&str; 3] = ["pow", "atan2", "hypot"];
 
+/// Gives every `$time`, `$stime` and `$realtime` in `expression` the number of
+/// clock ticks in one unit of the module it was written in, unless it has one
+/// already.
+///
+/// `eval` is handed a `&StateStore` and nothing else, so the unit a call
+/// reports in has to travel *with the call*: it is written on as a hidden
+/// argument, a call to [`TICKS_PER_UNIT`] — a name no design can spell, so a
+/// `$time(a)` the design wrote is still the arity error it always was.
+/// "Unless it has one" is what lets elaboration stamp a module once its walk
+/// is over — a child instance's walk ends first, so the parent never reaches
+/// the child's calls.
+pub fn stamp_system_time(expression: &mut Expression, ticks_per_unit: u64) {
+    let nested = |all: &mut [Expression]| {
+        for inner in all {
+            stamp_system_time(inner, ticks_per_unit);
+        }
+    };
+    match expression {
+        Expression::SystemFunctionCall(name, arguments) => {
+            if arguments.is_empty() && matches!(name.as_str(), "time" | "stime" | "realtime") {
+                let unit = VerilogConstant::from_int(ticks_per_unit.min(i64::MAX as u64) as i64);
+                arguments.push(Expression::SystemFunctionCall(
+                    TICKS_PER_UNIT.to_string(),
+                    vec![Expression::Constant(unit)],
+                ));
+            } else {
+                nested(arguments);
+            }
+        }
+        Expression::Constant(_)
+        | Expression::RealLiteral(_)
+        | Expression::Identifier(_)
+        | Expression::StringLiteral(_) => {}
+        Expression::Unary(_, inner) | Expression::Parenthetical(inner) => {
+            stamp_system_time(inner, ticks_per_unit)
+        }
+        Expression::Binary(left, _, right) => {
+            stamp_system_time(left, ticks_per_unit);
+            stamp_system_time(right, ticks_per_unit);
+        }
+        Expression::Conditional(condition, yes, no) => {
+            stamp_system_time(condition, ticks_per_unit);
+            stamp_system_time(yes, ticks_per_unit);
+            stamp_system_time(no, ticks_per_unit);
+        }
+        Expression::Concatenation(parts) => nested(parts),
+        Expression::Replication(count, parts) => {
+            stamp_system_time(count, ticks_per_unit);
+            nested(parts);
+        }
+        Expression::IndexedPartSelect { base, width, .. } => {
+            stamp_system_time(base, ticks_per_unit);
+            stamp_system_time(width, ticks_per_unit);
+        }
+        Expression::FunctionCall(_, arguments) => nested(arguments),
+        Expression::BitSelect(_, index) => stamp_system_time(index, ticks_per_unit),
+        Expression::PartSelect(_, first, second) => {
+            stamp_system_time(first, ticks_per_unit);
+            stamp_system_time(second, ticks_per_unit);
+        }
+        Expression::WordSelect {
+            indices, select, ..
+        } => {
+            nested(indices);
+            for inner in select.expressions_mut() {
+                stamp_system_time(inner, ticks_per_unit);
+            }
+        }
+    }
+}
+
+/// The name of the hidden argument [`stamp_system_time`] writes on. A system
+/// function's name is carried without its `$`, and the grammar reads a `$name`
+/// as `$` followed by an identifier, which cannot itself begin with one — so
+/// nothing a design writes produces this.
+const TICKS_PER_UNIT: &str = "$ticks_per_unit";
+
+/// The clock ticks in one unit of the module a `$time`-family call sits in:
+/// the argument [`stamp_system_time`] wrote on, or one tick for a call nothing
+/// stamped.
+fn ticks_per_unit(
+    name: &str,
+    arguments: &[Expression],
+    store: &StateStore,
+) -> Result<u128, EvalError> {
+    match arguments {
+        [] => Ok(1),
+        [Expression::SystemFunctionCall(hidden, unit)] if hidden == TICKS_PER_UNIT => {
+            let unit = unit.first().map(|unit| eval(unit, store)).transpose()?;
+            Ok(unit.and_then(|unit| unit.to_u128()).unwrap_or(1).max(1))
+        }
+        _ => Err(EvalError::SystemFunctionArity {
+            name: name.to_string(),
+            expected: "no arguments".to_string(),
+            found: arguments.len(),
+        }),
+    }
+}
+
 /// Evaluates `$name(...)`, the simulator's own functions.
 ///
 /// A name this simulator does not implement is an error that repeats the name,
@@ -1493,23 +1592,33 @@ fn eval_system_function_bits(
         // The store carries the timestamp the surrounding block is running at.
         // `$stime` is the same clock as an `integer`, which is what a design
         // that prints a timestamp with `%0d` usually wants.
+        //
+        // The clock counts ticks of the design's finest precision, and a call
+        // reports in the unit of the module it was written in — which
+        // elaboration stamps on as a hidden argument, see
+        // [`stamp_system_time`]. An integer time is **rounded**, half up:
+        // measured against iverilog 12.0 in a `1ns` module beside a `1ps` one,
+        // 1499ps is `1`, 1500ps is `2` and 2500ps is `3`.
         "time" | "stime" => {
-            arity("no arguments", &[0])?;
+            let ticks_per_unit = ticks_per_unit(name, arguments, store)?;
             let width = if name == "time" {
                 TIME_WIDTH
             } else {
                 SYSTEM_FUNCTION_WIDTH
             };
+            let ticks = store.time().unsigned_abs() as u128;
             Ok(Register::from_u128(
-                store.time().unsigned_abs() as u128,
+                (ticks + ticks_per_unit / 2) / ticks_per_unit,
                 width,
             ))
         }
-        // The same clock `$time` reads, as a real. Nothing rescales it — see
-        // `TimeFormat` — so this is the tick count with a decimal point.
+        // The same clock as a real, which is exact where `$time` rounds: the
+        // 1499ps above is `1.499`.
         "realtime" => {
-            arity("no arguments", &[0])?;
-            Ok(Register::from_f64(store.time() as f64))
+            let ticks_per_unit = ticks_per_unit(name, arguments, store)?;
+            Ok(Register::from_f64(
+                store.time() as f64 / ticks_per_unit as f64,
+            ))
         }
         // The two conversions, and the difference between them is the whole
         // point: `$rtoi` **truncates** toward zero where an assignment to an

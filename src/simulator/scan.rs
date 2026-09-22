@@ -225,8 +225,8 @@ fn convert(
         's' => Ok(string(input, width)),
         'f' | 'e' | 'g' => Ok(real(input, width)),
         // Each of these is a name rather than a silent zero. `%t` needs the
-        // `$timeformat` precision, which lives on the `TaskContext` that `eval`
-        // is not handed, and the timescale this simulator does not model;
+        // `$timeformat` precision and the calling module's timescale, both of
+        // which live on the `TaskContext` that `eval` is not handed;
         // `%u` and `%z` are raw binary, which the text-shaped output buffer
         // cannot carry; `%m` is the scope of the call, which an expression
         // does not know.

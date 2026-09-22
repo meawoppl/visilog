@@ -36,10 +36,12 @@ use std::path::PathBuf;
 use crate::parsers::expr::Expression;
 use crate::parsers::{
     assignment::ContinuousAssignment, behavior::EventControl, gates::DriveStrength,
-    modules::VerilogModule, preprocessor::Timescale,
+    modules::VerilogModule,
 };
 use crate::register::Register;
-use crate::simulator::elaborate::{elaborate, BlockKind, PulledNet, TimedBlock};
+use crate::simulator::elaborate::{
+    clock_precision, delay_scale, elaborate, BlockKind, PulledNet, TimedBlock,
+};
 use crate::simulator::eval::{eval, eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
 use crate::simulator::events::{self, SignalEdge};
@@ -576,11 +578,6 @@ pub struct Simulator {
     /// `search_paths` is: [`Simulator::setup`] builds a new `StateStore` and
     /// what the caller configured outlives any one elaboration.
     plusargs: Vec<String>,
-    /// The `` `timescale `` the source declared, which a waveform dump states
-    /// in its header. A `Simulator` is built from parsed *modules* and a
-    /// timescale is a property of the *file*, so — like the search path and the
-    /// output directory — only the caller that read the file knows it.
-    timescale: Option<Timescale>,
 }
 
 impl Simulator {
@@ -629,7 +626,6 @@ impl Simulator {
             output_directory: None,
             search_paths: Vec::new(),
             plusargs: Vec::new(),
-            timescale: None,
         }
     }
 
@@ -667,7 +663,8 @@ impl Simulator {
         self.tasks.reset();
         // What the design is called and what one tick of it is: the two things
         // a waveform header states that no task argument carries.
-        self.tasks.describe_design(self.top.clone(), self.timescale);
+        self.tasks
+            .describe_design(self.top.clone(), clock_precision(&self.modules));
 
         let top = self
             .modules
@@ -1150,7 +1147,7 @@ impl Simulator {
         Ok(())
     }
 
-    /// The current simulated time.
+    /// The current simulated time, in ticks of the simulation clock.
     pub fn now(&self) -> i64 {
         self.now
     }
@@ -1197,17 +1194,23 @@ impl Simulator {
         self.output_directory = Some(directory.into());
     }
 
-    /// The `` `timescale `` the front end recorded, which is what a waveform
-    /// dump's `$timescale` states.
+    /// How many ticks of the simulation clock one unit of the top module's
+    /// `` `timescale `` is — what a caller multiplies by to hand
+    /// [`advance`](Simulator::advance) a duration in the design's own terms.
     ///
-    /// The clock counts *ticks* and nothing rescales them, so this names the
-    /// unit a tick already is — the design's `unit`, not its `precision`. That
-    /// is exactly the reading `$timeformat` takes of the same directive, and it
-    /// is the one that makes `#5` in a `` `timescale 1ns `` design five
-    /// nanoseconds in the waveform. A design that declared none dumps in `1s`,
-    /// which is what iverilog writes for one.
-    pub fn set_timescale(&mut self, timescale: Option<Timescale>) {
-        self.timescale = timescale;
+    /// The clock counts the finest precision any module declared, so under
+    /// `` `timescale 1ns/1ps `` this is a thousand; a design that declared no
+    /// `` `timescale `` counts in seconds throughout and this is one.
+    pub fn ticks_per_unit(&self) -> i64 {
+        let clock_fs = clock_precision(&self.modules).femtoseconds();
+        let top = self
+            .modules
+            .iter()
+            .find(|module| module.identifier.name == self.top)
+            .and_then(|module| module.timescale);
+        delay_scale(top, clock_fs)
+            .ticks_per_unit()
+            .min(i64::MAX as u64) as i64
     }
 
     /// Everything the design has printed with `$display` and `$write`.
@@ -1225,7 +1228,9 @@ impl Simulator {
         self.tasks.finished()
     }
 
-    /// Runs simulated time forward by `duration` time units, executing every
+    /// Runs simulated time forward by `duration` ticks of the simulation clock
+    /// — the finest precision any module declared, see
+    /// [`ticks_per_unit`](Simulator::ticks_per_unit) — executing every
     /// scheduled block resumption along the way.
     ///
     /// This is what makes `#delay` mean something. A block that hits a delay
@@ -7916,7 +7921,176 @@ mod tests {
         );
     }
 
-    /// `%t` scales from the tick the clock counts — the design's
+    /// A delay is rounded to its module's *precision*, half away from zero,
+    /// and `$time` rounds the clock back to the module's *unit*, half up,
+    /// while `$realtime` is exact. Measured against iverilog 12.0 under
+    /// `` `timescale 1ns/100ps ``, which prints:
+    ///
+    /// ```text
+    /// A 1 1 0.600000                    6                   10
+    /// B 1 0.900000
+    /// D 1 1.400000
+    /// E 2 1.500000
+    /// F 2 1.700000
+    /// ```
+    ///
+    /// `#0.55` is 0.6, `#0.25` is 0.3, `#0.04` is nothing, `#0.05` is 0.1 and
+    /// a real *variable* delay of 0.15 is 0.2. `%t` of the `$realtime` 0.6 is
+    /// six steps of the 100ps precision, and of the `$time` 1 is ten.
+    #[test]
+    fn test_a_fractional_delay_is_rounded_to_its_modules_precision() {
+        let source = r#"
+            `timescale 1ns/100ps
+            module top;
+                real r;
+                initial begin
+                    #0.55 $display("A %0d %0d %f %t %t", $time, $stime, $realtime, $realtime, $time);
+                    #0.25 $display("B %0d %f", $time, $realtime);
+                    #0.45 #0.04 $display("D %0d %f", $time, $realtime);
+                    #0.05 $display("E %0d %f", $time, $realtime);
+                    r = 0.15; #r $display("F %0d %f", $time, $realtime);
+                end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should elaborate");
+        assert_eq!(simulator.ticks_per_unit(), 10);
+        simulator.advance(100).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "A 1 1 0.600000                    6                   10",
+                "B 1 0.900000",
+                "D 1 1.400000",
+                "E 2 1.500000",
+                "F 2 1.700000",
+            ]
+        );
+    }
+
+    /// Two modules at two scales run at their own rates on one clock, which
+    /// counts the finer precision. `$time` in the `1ns` module rounds the
+    /// picosecond clock half up, `$realtime` does not round, and a delay in the
+    /// `1ns/1ns` module is rounded to *its* precision whatever the clock counts
+    /// — `#0.4` there is no delay at all. Measured against iverilog 12.0, which
+    /// prints:
+    ///
+    /// ```text
+    /// delay1 in top at                 1000
+    /// top 1 1 1.499000                 1000
+    /// top 2 2 1.500000                 2000
+    /// top 3 3 2.500000                 3000
+    /// no delay at 3.000000
+    /// ```
+    #[test]
+    fn test_modules_at_different_timescales_share_one_clock() {
+        let source = r#"
+            `timescale 1ns/1ns
+            module top;
+                sub s();
+                always @(s.e) $display("top %0d %0d %f %t", $time, $stime, $realtime, $time);
+                initial #1 $display("delay1 in top at %t", $realtime);
+                initial #3 #0.4 $display("no delay at %f", $realtime);
+            endmodule
+            `timescale 1ps/1ps
+            module sub;
+                event e;
+                initial begin
+                    #1499 -> e;
+                    #1 -> e;
+                    #1000 -> e;
+                end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should elaborate");
+        assert_eq!(simulator.ticks_per_unit(), 1000);
+        simulator.advance(10_000).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "delay1 in top at                 1000",
+                "top 1 1 1.499000                 1000",
+                "top 2 2 1.500000                 2000",
+                "top 3 3 2.500000                 3000",
+                "no delay at 3.000000",
+            ]
+        );
+    }
+
+    /// A primitive's delay is written on its *instantiation*, so it is scaled
+    /// by the module that instantiates it rather than by the one that declares
+    /// the primitive: `#0.5` from a `1ns/100ps` module is half a nanosecond
+    /// even though the primitive was declared at `1ns/1ns`, where it would
+    /// round to a whole one. iverilog 12.0 prints `2.400000 q=1` and
+    /// `2.600000 q=0`.
+    #[test]
+    fn test_a_primitive_delay_takes_the_instantiating_modules_scale() {
+        let source = r#"
+            `timescale 1ns/1ns
+            primitive inv (q, a);
+              output q; input a;
+              table 0 : 1; 1 : 0; endtable
+            endprimitive
+            `timescale 1ns/100ps
+            module top;
+              reg a;
+              wire q;
+              inv #0.5 u (q, a);
+              initial begin
+                a = 0;
+                #2 a = 1;
+                #0.4 $display("%f q=%b", $realtime, q);
+                #0.2 $display("%f q=%b", $realtime, q);
+              end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(100).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["2.400000 q=1", "2.600000 q=0"]
+        );
+    }
+
+    /// A bare `$realtime` prints with as many decimals as its module's
+    /// precision is finer than its unit — and with none in a design that
+    /// declared no `` `timescale ``. Everything else real, including a
+    /// `$realtime` inside an expression, keeps the six significant figures.
+    /// iverilog 12.0 prints `1.23 2.23000` and `5 [5] -5.00000` for the two.
+    #[test]
+    fn test_a_bare_realtime_prints_at_its_modules_precision() {
+        let scaled = r#"
+            `timescale 1ns/10ps
+            module top;
+                initial #1.234 $display($realtime,, $realtime + 1.0);
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(scaled).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1_000).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["1.23 2.23000"]);
+
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+                initial #5 $display($realtime,, "[", $realtime, "]",, -$realtime);
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["5 [5] -5.00000"]);
+    }
+
+    /// `%t` scales from the unit `$time` reports in — the module's
     /// `` `timescale `` unit — to the unit `$timeformat` names, and a design
     /// that never called `$timeformat` prints in the finest *precision* its
     /// directives declared. Measured against iverilog 12.0 for
@@ -7930,6 +8104,7 @@ mod tests {
     #[test]
     fn test_percent_t_scales_by_the_designs_timescale() {
         let source = r#"
+            `timescale 1ns/100ps
             module scaled();
                 initial begin
                     #5 $display("default[%t]", $time);
@@ -7940,14 +8115,12 @@ mod tests {
                 end
             endmodule
         "#;
-        let (remaining, module) = parse_module_declaration(source).expect("design should parse");
-        assert!(remaining.trim().is_empty(), "unparsed input: {}", remaining);
-        let mut simulator = Simulator::new(module);
-        simulator.set_timescale(Some(
-            Timescale::parse("1ns/100ps").expect("a legal timescale"),
-        ));
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "scaled");
         simulator.setup().expect("design should elaborate");
-        simulator.advance(10).expect("time should advance");
+        simulator
+            .advance(10 * simulator.ticks_per_unit())
+            .expect("time should advance");
 
         assert_eq!(
             simulator.output().lines(),

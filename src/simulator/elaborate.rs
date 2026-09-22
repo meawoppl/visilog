@@ -50,7 +50,7 @@ use crate::parsers::{
         TaskDeclaration,
     },
     constants::VerilogConstant,
-    delay::{Delay, GateDelay},
+    delay::{Delay, DelayScale, GateDelay},
     expr::{verilog_expression, Expression},
     gates::{DriveStrength, GateInstantiation, GateKind, StrengthLevel},
     generate::{DefparamAssignment, GenerateBlock, GenerateItem, GenerateLoop},
@@ -61,14 +61,14 @@ use crate::parsers::{
     nets::NetType as WireKind,
     operators::BinaryOperator,
     parameter::ParameterDeclaration,
-    preprocessor::Timescale,
+    preprocessor::{TimeSpec, TimeUnit, Timescale},
     primitive::UdpTable,
     simple::Range,
     specify::{SpecParam, SpecParamValue},
     statements::ModuleStatement,
 };
 use crate::register::{Register, ONE, ZERO};
-use crate::simulator::eval::{eval, expression_width, select_index};
+use crate::simulator::eval::{eval, expression_width, select_index, stamp_system_time};
 use crate::simulator::events::{control_fires, signals_read, SignalEdge};
 use crate::simulator::exec::{drive, range_width, resolve_target, ResolvedTarget};
 use crate::simulator::gates::{Gate, PassSwitch, WiredKind};
@@ -264,9 +264,58 @@ pub struct PulledNet {
     pub strength: StrengthLevel,
 }
 
+/// One second, the unit and the precision of a module that declared no
+/// `` `timescale ``.
+const DEFAULT_SCALE: TimeSpec = TimeSpec {
+    value: 1,
+    unit: TimeUnit::Seconds,
+};
+
+/// What one tick of the simulation clock is: the finest `` `timescale ``
+/// precision any module in `modules` declared, and one second when none
+/// declared any.
+///
+/// Every module counts, instantiated or not, which is what iverilog does when
+/// it is not told a top module and so elaborates every uninstantiated one as a
+/// root of its own. Which modules are counted changes only how fine the clock
+/// is and never when anything happens, because a delay is rounded to its own
+/// module's precision before it is restated in ticks.
+pub fn clock_precision(modules: &[VerilogModule]) -> TimeSpec {
+    modules
+        .iter()
+        .map(|module| {
+            module
+                .timescale
+                .map_or(DEFAULT_SCALE, |scale| scale.precision)
+        })
+        .min_by_key(|precision| precision.femtoseconds())
+        .unwrap_or(DEFAULT_SCALE)
+}
+
+/// How a delay written under `timescale` becomes ticks of a clock whose tick is
+/// `clock_fs` femtoseconds.
+pub fn delay_scale(timescale: Option<Timescale>, clock_fs: u64) -> DelayScale {
+    let (unit, precision) = timescale.map_or((DEFAULT_SCALE, DEFAULT_SCALE), |scale| {
+        (scale.unit, scale.precision)
+    });
+    DelayScale {
+        steps_per_unit: unit.femtoseconds() / precision.femtoseconds(),
+        ticks_per_step: precision.femtoseconds() / clock_fs,
+    }
+}
+
 /// Flattens `modules[top]` and everything it instantiates.
 pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, SimulationError> {
+    let clock_fs = clock_precision(modules).femtoseconds();
+    // A design whose every module counts in the clock's own tick — which is
+    // every design that declares no `timescale` at all — has nothing to stamp,
+    // and is left exactly as it was compiled.
+    let rescales = modules
+        .iter()
+        .any(|module| delay_scale(module.timescale, clock_fs).ticks_per_unit() != 1);
     let mut elaborator = Elaborator {
+        clock_fs,
+        rescales,
         modules,
         out: Elaborated {
             state: StateStore::new(),
@@ -458,6 +507,12 @@ impl Scope {
 }
 
 struct Elaborator<'m> {
+    /// Femtoseconds in one tick of the simulation clock — see
+    /// [`clock_precision`].
+    clock_fs: u64,
+    /// Whether any module counts in something other than the clock's tick. A
+    /// design where none does has nothing to stamp, and `walk` skips it.
+    rescales: bool,
     modules: &'m [VerilogModule],
     out: Elaborated,
     /// Module indices on the path from the top down to what is being walked
@@ -535,6 +590,10 @@ impl<'m> Elaborator<'m> {
         // compiling the functions, and then retrying the ones held back. A
         // parameter that still cannot be evaluated then reports the reason it
         // could not, which is what it would have reported the first time.
+        // Everything this walk adds to the flat collections from here on is
+        // this module's or a child's, and a child's is stamped with its own
+        // scale before this walk's end reaches it.
+        let first = self.collection_lengths();
         let deferred = self.declare_parameters(module, scope)?;
         // Tasks sit between the parameters and the functions. A task's argument
         // widths may be made of parameters, so it cannot be compiled before
@@ -549,6 +608,7 @@ impl<'m> Elaborator<'m> {
             .map(|statement| (statement, &*scope))
             .collect();
         self.declare_functions(&own_functions, &tasks)?;
+        self.stamp_subprograms(module);
         for statement in deferred {
             self.declare(statement, scope)?;
         }
@@ -609,6 +669,7 @@ impl<'m> Elaborator<'m> {
         // empty map and every generated statement builds against the module's
         // own table.
         let block_tasks = self.declare_generated_tasks(&generated, &tasks)?;
+        self.stamp_subprograms(module);
 
         for statement in &module.statements {
             if !matches!(statement, ModuleStatement::ParameterDeclaration(_)) {
@@ -646,9 +707,80 @@ impl<'m> Elaborator<'m> {
             let table = block_tasks.get(&inner.prefix).unwrap_or(&tasks);
             self.build(statement, inner, table)?;
         }
+        self.stamp_collections(module, first);
 
         self.stack.pop();
         Ok(())
+    }
+
+    /// How long each flat collection a walk can add to is, which is where a
+    /// module's own additions start.
+    fn collection_lengths(&self) -> [usize; 4] {
+        [
+            self.out.blocks.len(),
+            self.out.assignments.len(),
+            self.out.gates.len(),
+            self.out.udps.len(),
+        ]
+    }
+
+    /// The scale `module`'s delays and `$time` calls are stamped with, or
+    /// `None` when the design has nothing to stamp.
+    fn scale_of(&self, module: &VerilogModule) -> Option<DelayScale> {
+        self.rescales
+            .then(|| delay_scale(module.timescale, self.clock_fs))
+    }
+
+    /// Stamps `module`'s scale on everything the collections gained since
+    /// `first`, leaving alone what a child instance already stamped.
+    ///
+    /// A primitive's delay is written on its *instantiation*, so it is stamped
+    /// by the module that wrote it rather than by the primitive: a primitive's
+    /// walk ends without stamping anything, and the instance falls to the
+    /// walk that created it.
+    fn stamp_collections(&mut self, module: &VerilogModule, first: [usize; 4]) {
+        let Some(scale) = self.scale_of(module) else {
+            return;
+        };
+        let ticks_per_unit = scale.ticks_per_unit();
+        for block in &mut self.out.blocks[first[0]..] {
+            block.program.stamp_timescale(scale);
+        }
+        for assignment in &mut self.out.assignments[first[1]..] {
+            stamp_system_time(assignment.rhs_mut(), ticks_per_unit);
+            if let Some(delay) = assignment.delay_mut() {
+                delay.stamp(scale);
+            }
+        }
+        for gate in &mut self.out.gates[first[2]..] {
+            if let Some(delay) = &mut gate.delay {
+                delay.stamp(scale);
+            }
+        }
+        for udp in &mut self.out.udps[first[3]..] {
+            if let Some(delay) = &mut udp.delay {
+                delay.stamp(scale);
+            }
+        }
+    }
+
+    /// Stamps `module`'s scale on the functions and task copies it has just
+    /// declared.
+    ///
+    /// These live in maps rather than in lists, so there is no position to
+    /// start from — but they are stamped the moment they are declared, before
+    /// any child instance is walked, so the only unstamped entries at that
+    /// moment are this module's own.
+    fn stamp_subprograms(&mut self, module: &VerilogModule) {
+        let Some(scale) = self.scale_of(module) else {
+            return;
+        };
+        for task in self.hierarchical_tasks.values_mut() {
+            task.program.stamp_timescale(scale);
+        }
+        for function in self.out.state.functions_mut().values_mut() {
+            function.program.stamp_timescale(scale);
+        }
     }
 
     /// Records the `defparam`s written in this scope, keyed by the flat name of

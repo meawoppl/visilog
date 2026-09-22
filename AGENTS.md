@@ -102,9 +102,8 @@ from the start deliberately: it cannot be reconstructed afterwards.
 Supported: `` `define `` (object-like, function-like, argument defaults, `\` line
 continuations), `` `undef ``/`` `undefineall ``, `` `ifdef ``/`` `ifndef ``/`` `elsif ``/
 `` `else ``/`` `endif `` including nesting, `` `timescale `` (recorded on `Preprocessed`
-and on `ModuleLibrary::timescale`, and handed to `Simulator::set_timescale` for a waveform
-dump's `$timescale`, *and* positionally in `Preprocessed::timescales` so each module knows
-the one it was written at), `` `unconnected_drive ``/`` `nounconnected_drive `` (recorded
+and on `ModuleLibrary::timescale`, *and* positionally in `Preprocessed::timescales` so
+each module knows the one it was written at — which is the only copy the simulator reads), `` `unconnected_drive ``/`` `nounconnected_drive `` (recorded
 positionally the same way, in `Preprocessed::unconnected_drives`), `` `resetall `` (which
 restores `Preprocessor::with_default_timescale` and clears the unconnected drive),
 `` `include ``
@@ -510,8 +509,8 @@ or the file's `Reader`, and every rule was measured against iverilog 12.0:
   non-whitespace, landing at the target's low end. A width (`%5s`) counts consumed
   characters, `*` suppresses the store and the count but not the match, and `%%` is a
   literal. An unknown format string is `-1` (corpus `scanf4`).
-- **Named errors, not zeros:** `%t` (it rounds to the `$timeformat` precision, which is
-  on the `TaskContext`, and scales by the timescale nothing models), `%u` and `%z` (raw
+- **Named errors, not zeros:** `%t` (it rounds to the `$timeformat` precision and
+  scales by the calling module's timescale, both on the `TaskContext`), `%u` and `%z` (raw
   binary, which the text-shaped buffer cannot carry — corpus `sscanf_u`/`_z`,
   `fscanf_u`/`_z`), `%m`, an unknown conversion, and a format asking for more arguments
   than it was given.
@@ -612,10 +611,12 @@ port aliased onto its parent's signal is declared under its own name with the pa
 identifier, which is how iverilog shows one store entry under two names — so it writes
 no second line.
 
-Where it deliberately differs from iverilog: `$timescale` states the design's *unit*
-rather than its precision, because the clock counts ticks of the unit and nothing
-rescales them (`` `timescale 1ns/1ps `` gives `1ns` and `#5`, where iverilog gives
-`1ps` and `#5000`); `$date` is ISO 8601 UTC; variables are in the store's sorted order
+`$timescale` states one tick of the simulation clock — the finest precision any module
+declared — and every `#<time>` counts those ticks, so `` `timescale 1ns/1ps `` with
+`#5` is `$timescale 1ps` and `#5000`, which is what iverilog writes too.
+`TaskContext::describe_design` hands it over from `clock_precision` at setup.
+
+Where it deliberately differs from iverilog: `$date` is ISO 8601 UTC; variables are in the store's sorted order
 grouped into one scope tree rather than one tree per `$dumpvars` call; a parameter is a
 store signal like any other and so is dumped as a `reg` in the `$dumpvars` block rather
 than as a `$var parameter` in a `$comment` block; an `integer` is a `reg [31:0]`; and
@@ -705,17 +706,17 @@ is a compiler diagnostic visilog has no channel for, which is the whole of why c
 `pr1701855b` match.
 
 **`$timeformat`'s `units` is a scale factor, and `%t` is the one place the
-`` `timescale `` reaches the output.** The clock counts ticks of the **unit** of the
-module a call was written in — `TaskContext::tick_fs`, which asks the same `scale_of`
-`$printtimescale` does — and `%t` restates one of those in the power of ten the design
-named, so `` `timescale 1ns `` with `$timeformat(-6, …)` prints `10` as `0` and with
+`` `timescale `` reaches the output.** A time value is in the **unit** of the module a
+call was written in — that is what `$time` and `$realtime` report there, see below —
+and `TaskContext::tick_fs`, which asks the same `scale_of` `$printtimescale` does, is
+what one of those is worth; `%t` restates it in the power of ten the design named, so `` `timescale 1ns `` with `$timeformat(-6, …)` prints `10` as `0` and with
 `$timeformat(-12, …)` prints it as `10000`. Both ends are held in **femtoseconds**,
 because a `` `timescale `` term is `1`, `10` or `100` of a unit and only the finest unit
 makes every ratio an exact integer.
 
 A design that never called `$timeformat` prints in the **finest precision** any
-`` `timescale `` in it declared (`TaskContext::default_time_units`), which is what the
-LRM asks for: `` `timescale 1ns/100ps `` renders `$time` of 5 as `50`. That is also why
+`` `timescale `` in it declared (`TaskContext::default_time_units`, which is the clock's
+own tick), which is what the LRM asks for: `` `timescale 1ns/100ps `` renders `$time` of 5 as `50`. That is also why
 a design with no directive at all is unchanged — a module with no `` `timescale `` is at
 `1s / 1s`, so the tick and the display unit are both a second and the ratio is one.
 
@@ -727,9 +728,57 @@ which takes the two paths as well. `precision` fractional digits, then the suffi
 right-aligned in `min_width` (twenty by default), with an explicit `%12t` overriding
 `min_width` and `%0t` meaning no padding at all.
 
-What is still not rescaled is *time itself*: `#5` advances five ticks whatever the
-module's unit is, so a design mixing `` `timescale 1ns `` and `` `timescale 1us ``
-modules runs both at the same rate where iverilog would not (#209).
+**Time itself is rescaled: the clock counts ticks of the finest precision any module
+declared, and each module's delays and `$time` calls are converted at the edge.**
+`elaborate::clock_precision` is that tick — every module in the library counts,
+instantiated or not, which is what iverilog does when it is not told a top and so
+elaborates every uninstantiated module as a root. It changes only how fine the clock is
+and never *when* anything happens, because of the rounding rule below. Four things have
+to agree about it, and they landed together (#296):
+
+- **A delay is stamped with its module's `DelayScale` at elaboration** — steps of the
+  module's precision per unit, and clock ticks per step — and `Delay::ticks` rounds a
+  real delay to a whole step of *its own module's* precision, half away from zero,
+  before restating it in ticks. Under `` `timescale 1ns/100ps `` `#0.55` is 0.6ns,
+  `#0.25` is 0.3ns and `#0.04` is nothing; in a `1ns/1ns` module `#0.4` is nothing even
+  when a `1ps` module elsewhere makes the clock count picoseconds (iverilog 12.0). An
+  integer delay is exact. `Delay`, `GateDelay` and so every `Instruction::Delay`,
+  `ScheduleWrite`, delayed `assign`, gate and UDP go through the one stamp.
+- **`$time`, `$stime` and `$realtime` report in the calling module's unit.** `eval` is
+  handed the store and nothing else, so the unit travels with the call: `stamp_system_time`
+  writes a hidden argument on — a call to `$ticks_per_unit`, a name the grammar cannot
+  produce since an identifier cannot begin with `$`, which keeps `$time(a)` the arity
+  error it always was. `$time` rounds half up (1499ps is `1` in a `1ns` module, 1500ps
+  is `2`, 2500ps is `3`) and `$realtime` divides exactly.
+- **`%t` needed nothing**, because it already scaled from the module's unit, and what
+  `$time` hands it is now in that unit. The default `$timeformat` unit is the clock tick.
+- **Stamping is by module, once, and a child's is never restamped.** `walk` records the
+  lengths of the flat block, assignment, gate and UDP lists when it starts and stamps
+  what they gained when it ends (`stamp_collections`); a child's walk ends first, and
+  `Delay::stamp` and `stamp_system_time` both leave an item that already carries a scale
+  alone. Functions and hierarchical task copies live in maps, so they are stamped the
+  moment they are declared (`stamp_subprograms`), before any child is walked. A
+  **primitive's** delay is written on its instantiation, so the primitive's walk stamps
+  nothing and the instance falls to the module that wrote the `#(...)` — measured: `#0.5`
+  on a primitive declared at `1ns/1ns` from a `1ns/100ps` module is half a nanosecond.
+
+**A design with no `` `timescale `` anywhere is untouched**: every module is at `1s/1s`,
+the clock counts seconds, and `Elaborator::rescales` is false, so nothing is stamped and
+the compiled design is what it was before this existed. The same holds for any design
+whose modules all count in the clock's own tick. `Simulator::advance` and `now` count
+clock ticks; `Simulator::ticks_per_unit` is how many of them one unit of the top module
+is, which is what a caller multiplies by to speak in the design's own terms.
+
+**A bare `$realtime` prints at its module's precision**, where every other real printed
+with no specifier is C's `%#g`: `$display($realtime)` is `1.23` under
+`` `timescale 1ns/10ps `` and `5` with no `` `timescale `` at all, while `$realtime + 1.0`
+beside it is `2.23000` (iverilog 12.0; `TaskContext::realtime_digits`, corpus
+`pr1985582`, `delay_var`). Only the call itself, written as a whole argument, is read
+that way.
+
+Still not modelled: a **negative** real delay is zero, where iverilog wraps it to an
+enormous unsigned one (corpus `delay_var`'s `rdly = -6.1`), and that file's second root
+module `top2` is not run at all (#284).
 
 **A system *function* is an expression operand, and `eval` implements it.** `$time`,
 `$stime`, `$signed`, `$unsigned`, `$random`, `$fopen`, `$bits` and `$clog2` parse anywhere an
@@ -2270,7 +2319,7 @@ telling apart.
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `set_timescale()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
@@ -2390,7 +2439,11 @@ free-running designs, and it is real: the whole corpus takes about 70 seconds at
 hundred thousand ticks against about 30 at ten thousand. It is a hundred thousand because
 the corpus writes testbenches that long — `pr528` and `pr528b` clock a `` `timescale 1ps ``
 design every five thousand ticks and finish at 50001 — and a design cut off mid-run scores
-as a wrong answer rather than as one that was not given time.
+as a wrong answer rather than as one that was not given time. It counts units of the
+**top module's** `` `timescale `` rather than clock ticks (`time_budget`, through
+`Simulator::ticks_per_unit`): the clock counts the finest precision, so a `1ns/1ps`
+design ticks a thousand times per unit its testbench is written in, and a budget in raw
+ticks would give it a thousandth of the run.
 
 The harness runs the corpus through `front_end`, which is `Preprocessor` + `parse_expanded`
 rather than `parse_source`, because the corpus files `` `include `` one another by paths
