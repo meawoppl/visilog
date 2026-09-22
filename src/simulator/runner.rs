@@ -930,7 +930,7 @@ impl Simulator {
                 let memory_changes = self.state.take_memory_changes();
                 if self.tasks.is_dumping() {
                     self.tasks
-                        .note_changes(memory_changes.iter().map(|(name, _, _)| name.as_str()));
+                        .note_changes(memory_changes.iter().map(|change| change.name.as_str()));
                 }
                 edges.extend(events::memory_edges(memory_changes));
             }
@@ -7460,6 +7460,72 @@ mod tests {
             simulator.output().lines(),
             vec!["after #0: q=01 n=00", "again: q=01 n=00", "next step: n=55",]
         );
+    }
+
+    /// A block sensitive to one word of a memory wakes when *that* word moves
+    /// and not when a neighbour does — which is one block per index in a
+    /// generate loop, each recording when it ran (corpus `pr2815398a_std`).
+    /// Journalling the memory by name wakes all three at time 1.
+    ///
+    /// iverilog 12.0 prints `1 -1 2`.
+    #[test]
+    fn test_a_memory_word_wakes_only_the_block_sensitive_to_it() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg [3:0] d [0:2];
+                integer ran [0:2];
+                genvar m;
+                generate
+                    for (m = 0; m < 3; m = m + 1) begin : g
+                        always @(d[m]) ran[m] = $time;
+                    end
+                endgenerate
+                initial begin
+                    ran[0] = -1; ran[1] = -1; ran[2] = -1;
+                    #1 d[0] = 1;
+                    #1 d[2] = 2;
+                    #1 $display("%0d %0d %0d", ran[0], ran[1], ran[2]);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("time should advance");
+
+        assert_eq!(simulator.output().lines(), vec!["1 -1 2"]);
+    }
+
+    /// The same for a word of a **two-dimensional** array: a write to
+    /// `g[0][1]` shares a column index with the block watching `g[1][1]` and
+    /// wakes nothing, and each of the other two wakes only its own block.
+    ///
+    /// iverilog 12.0 prints `1 -1 3`.
+    #[test]
+    fn test_a_two_dimensional_memory_word_wakes_only_its_own_block() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg [3:0] g [0:1][0:2];
+                integer ran [0:2];
+                genvar m;
+                generate
+                    for (m = 0; m < 3; m = m + 1) begin : w
+                        always @(g[1][m]) ran[m] = $time;
+                    end
+                endgenerate
+                initial begin
+                    ran[0] = -1; ran[1] = -1; ran[2] = -1;
+                    #1 g[1][0] = 1;
+                    #1 g[0][1] = 2;
+                    #1 g[1][2] = 3;
+                    #1 $display("%0d %0d %0d", ran[0], ran[1], ran[2]);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("time should advance");
+
+        assert_eq!(simulator.output().lines(), vec!["1 -1 3"]);
     }
 
     /// A sensitivity entry that is an *expression* has an edge of its own,
