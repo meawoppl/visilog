@@ -2820,7 +2820,9 @@ tripwire.
   `Vec<Option<Expression>>` and `elaborate::connections` filters the `None`s out *after*
   zipping against the ports. Dropping a blank at parse time instead would silently bind
   every later connection to the wrong port. A single blank is `NoArgs` — `()` is an empty
-  argument list, not a one-element list with a gap. A blank *named* connection (`.a()`) and
+  argument list, not a one-element list with a gap — and so is `( )`: no argument claims
+  the whitespace or comment inside an empty block, so `argument_block`'s closing `)` skips
+  it itself (corpus `pr985`, whose `my_module ( );` was the whole of its parse failure). A blank *named* connection (`.a()`) and
   a blank in a module *header* (`module m(a,);`) are still parse errors.
 - **`-> e;` is parsed as an assignment to the event's name.** There is no statement kind
   for a trigger and no instruction for one: a trigger and an ordinary write reach the
