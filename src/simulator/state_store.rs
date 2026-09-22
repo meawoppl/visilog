@@ -983,6 +983,13 @@ pub struct StateStore {
     /// rather than a kind of its own; shared with a frame, because a
     /// function body may print one too.
     texts: Rc<HashSet<String>>,
+    /// The packed arrays the design declares, by name — `reg [1:4][7:0] v;` —
+    /// each held in the signal map as one flat vector. A select on one of
+    /// these names counts in *elements*, and [`PackedShape`] is how an element
+    /// index becomes flat bits. Shared with a frame for the reason `texts` is,
+    /// and empty for nearly every design, which is what keeps every select off
+    /// the question.
+    packed: Rc<HashMap<String, PackedShape>>,
     /// Every event triggered since the last marker, in trigger order.
     ///
     /// This is the whole of an event's state. A trigger is momentary: it is
@@ -1034,6 +1041,73 @@ pub struct StateStore {
     output: Output,
 }
 
+/// The shape of a packed array, `reg [1:4][7:0] v;`, which the store holds as
+/// one flat vector `[31:0]`.
+///
+/// The **left** bound of the outer range is the most significant element,
+/// whichever way round the range was written: `v[1]` is the top byte of a
+/// `[1:4][7:0]` and `v[4]` of a `[4:1][7:0]` (measured against iverilog 12.0).
+/// Everything a select needs is the one mapping here — an element index to
+/// flat bits — which is why reading and writing a select cannot disagree about
+/// which bits it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedShape {
+    /// The outer range, which indexes elements.
+    pub elements: (i64, i64),
+    /// Each element's own range, which a third bracket (`v[i][j]`) indexes.
+    pub element: (i64, i64),
+}
+
+impl PackedShape {
+    /// How many bits one element holds.
+    pub fn element_width(&self) -> i64 {
+        (self.element.0 - self.element.1).abs() + 1
+    }
+
+    /// How many bits the whole array holds — the width of the flat vector.
+    pub fn width(&self) -> i64 {
+        ((self.elements.0 - self.elements.1).abs() + 1) * self.element_width()
+    }
+
+    /// How many elements are less significant than `index`.
+    ///
+    /// Deliberately not bounded: an index outside the outer range gives a
+    /// position outside the flat vector, whose bits then read `x` and take no
+    /// write — exactly what an out-of-range bit select already does.
+    fn position(&self, index: i64) -> i64 {
+        let (left, right) = self.elements;
+        if left >= right {
+            index - right
+        } else {
+            right - index
+        }
+    }
+
+    /// The flat indices, most significant first, of the elements from `first`
+    /// to `last` inclusive, in either order. One element is `first == last`;
+    /// `v[a:b]`, `v[b +: n]` and `v[b -: n]` all name a run of elements, and
+    /// all of them come back in the array's own order of significance.
+    pub fn elements_bits(&self, first: i64, last: i64) -> Vec<i64> {
+        let width = self.element_width();
+        let (a, b) = (self.position(first), self.position(last));
+        let low = a.min(b) * width;
+        let high = a.max(b) * width + width - 1;
+        (low..=high).rev().collect()
+    }
+
+    /// The flat index of bit `bit` of element `index`, or `None` when `bit` is
+    /// not one of the element's own — which must read `x` rather than reach a
+    /// bit of the element beside it.
+    pub fn element_bit(&self, index: i64, bit: i64) -> Option<i64> {
+        let (msb, lsb) = self.element;
+        let from_lsb = if msb >= lsb { bit - lsb } else { lsb - bit };
+        if from_lsb < 0 || from_lsb >= self.element_width() {
+            return None;
+        }
+        Some(self.position(index) * self.element_width() + from_lsb)
+    }
+}
+
 impl StateStore {
     pub fn new() -> Self {
         StateStore::default()
@@ -1049,6 +1123,25 @@ impl StateStore {
     /// `$display` argument prints as a string rather than as a number.
     pub fn is_text(&self, name: &str) -> bool {
         !self.texts.is_empty() && self.texts.contains(name)
+    }
+
+    /// Records that the signal `name` is a packed array of this shape.
+    pub fn declare_packed(&mut self, name: impl Into<String>, shape: PackedShape) {
+        Rc::make_mut(&mut self.packed).insert(name.into(), shape);
+    }
+
+    /// Whether the design declares any packed array. `false` is exact.
+    pub fn any_packed(&self) -> bool {
+        !self.packed.is_empty()
+    }
+
+    /// The shape of `name`, if it was declared a packed array. A design with
+    /// none answers with one length check and never hashes the name.
+    pub fn packed(&self, name: &str) -> Option<&PackedShape> {
+        if self.packed.is_empty() {
+            return None;
+        }
+        self.packed.get(name)
     }
 
     /// Whether any signal in the store was declared signed. `false` is exact —
@@ -1094,6 +1187,7 @@ impl StateStore {
             any_memory: false,
             events: HashSet::new(),
             texts: Rc::clone(&self.texts),
+            packed: Rc::clone(&self.packed),
             triggers: Vec::new(),
             // A frame holds only the call's own variables, and a function body
             // may not install a drive — nothing here can be forced.

@@ -77,7 +77,7 @@ use crate::simulator::program::{
     TaskParameter, TaskTable, FUNCTION_DELAY_UNSUPPORTED, FUNCTION_EVENT_UNSUPPORTED,
 };
 use crate::simulator::runner::SimulationError;
-use crate::simulator::state_store::{array_depth, StateStore};
+use crate::simulator::state_store::{array_depth, PackedShape, StateStore};
 
 use crate::simulator::udp::Udp;
 
@@ -162,6 +162,12 @@ const MAX_INSTANCES: usize = 65_536;
 /// A memory bigger than [`MAX_MEMORY_DEPTH`] words.
 const MEMORY_TOO_LARGE: SimulationError =
     SimulationError::Unsupported("a memory with more words than can be allocated");
+
+/// A packed range on a declaration that does not record the shape — a port, a
+/// function or task argument, a function result, a parameter. See
+/// [`Elaborator::resolve_declared_range`].
+const PACKED_ELSEWHERE: SimulationError =
+    SimulationError::Unsupported("a packed dimension on anything but a `reg` or `wire`");
 
 /// What kind of procedural block a compiled program came from.
 #[derive(Debug, PartialEq, Eq)]
@@ -1089,7 +1095,33 @@ impl<'m> Elaborator<'m> {
                 self.resolve_bound(msb, renamed(msb, scope))?,
                 self.resolve_bound(lsb, renamed(lsb, scope))?,
             )),
+            Range::Packed(_, _) => Err(PACKED_ELSEWHERE),
         }
+    }
+
+    /// The flat range a `reg` or `wire` declaration takes, and — when its range
+    /// is packed (`[1:4][7:0]`) — the shape its selects are counted in.
+    ///
+    /// A packed array is one flat vector `[elements × width − 1 : 0]`, so it
+    /// is declared exactly as a wide vector is; what makes `v[i]` an element
+    /// rather than a bit is the shape recorded beside it. That is why only a
+    /// declaration that records the shape may take a packed range, and every
+    /// other one refuses it by name ([`PACKED_ELSEWHERE`]): a port or a
+    /// function result declared flat without its shape would read `v[i]` as a
+    /// single bit, which is a wrong answer rather than an error.
+    fn resolve_declared_range(
+        &self,
+        range: &Range,
+        scope: &Scope,
+    ) -> Result<((i64, i64), Option<PackedShape>), SimulationError> {
+        let Range::Packed(elements, element) = range else {
+            return Ok((self.resolve_range(range, scope)?, None));
+        };
+        let shape = PackedShape {
+            elements: self.resolve_range(elements, scope)?,
+            element: self.resolve_range(element, scope)?,
+        };
+        Ok(((shape.width() - 1, 0), Some(shape)))
     }
 
     /// [`resolve_range`](Elaborator::resolve_range) for a declaration written
@@ -1111,6 +1143,7 @@ impl<'m> Elaborator<'m> {
                 self.resolve_bound(msb, resolved(msb))?,
                 self.resolve_bound(lsb, resolved(lsb))?,
             )),
+            Range::Packed(_, _) => Err(PACKED_ELSEWHERE),
         }
     }
 
@@ -1841,8 +1874,9 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
-                    let range = self.resolve_range(net.range(), scope)?;
+                    let (range, shape) = self.resolve_declared_range(net.range(), scope)?;
                     let local = &net.identifier().name;
+                    self.record_packed(local, shape, !net.dimensions().is_empty(), scope)?;
                     // An address dimension makes the name an *array of nets*,
                     // which is a memory in the store exactly as `reg [7:0]
                     // mem [0:15];` is — the same distinction, recorded the
@@ -1859,10 +1893,12 @@ impl<'m> Elaborator<'m> {
             }
             ModuleStatement::RegisterDeclaration(registers) => {
                 for register in registers {
-                    let range = match &register.range {
-                        Some(range) => self.resolve_range(range, scope)?,
-                        None => (0, 0),
+                    let (range, shape) = match &register.range {
+                        Some(range) => self.resolve_declared_range(range, scope)?,
+                        None => ((0, 0), None),
                     };
+                    let is_array = !register.dimensions.is_empty();
+                    self.record_packed(&register.name.name, shape, is_array, scope)?;
                     // The address dimensions are what make the name a memory
                     // rather than a vector, and they are the only place that
                     // distinction is ever recorded.
@@ -2178,6 +2214,31 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .declare_signed(scope.qualified(local), range, signed);
+    }
+
+    /// Records the shape of a packed `reg` or `wire` against the name it is
+    /// declared under, so a select on it counts in elements.
+    ///
+    /// A packed array that is *also* an unpacked one — `reg [1:0][7:0] m
+    /// [0:3];`, an array of packed words — is not modelled, and is refused by
+    /// name rather than stored as flat words whose selects would count bits.
+    fn record_packed(
+        &mut self,
+        local: &str,
+        shape: Option<PackedShape>,
+        is_array: bool,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        let Some(shape) = shape else {
+            return Ok(());
+        };
+        if is_array {
+            return Err(SimulationError::Unsupported(
+                "an unpacked array of packed words",
+            ));
+        }
+        self.out.state.declare_packed(scope.qualified(local), shape);
+        Ok(())
     }
 
     /// [`declare_local`](Elaborator::declare_local) for a net, which starts at

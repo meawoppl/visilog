@@ -283,6 +283,9 @@ impl PortReference {
             Some(PortSelect::Part(Range::Expressions(high, low))) => {
                 Expression::PartSelect(self.name.clone(), high.clone(), low.clone())
             }
+            Some(PortSelect::Part(Range::Packed(_, _))) => {
+                unreachable!("a header select is read with `range`, which reads one bracket")
+            }
         }
     }
 }

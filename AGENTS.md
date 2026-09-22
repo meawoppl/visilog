@@ -52,7 +52,7 @@ Roughly bottom-up. Each file owns one slice of Verilog grammar and carries its o
 | File | Owns |
 | --- | --- |
 | `preprocessor.rs` | the backtick directives — a lexical pass that runs *before* the grammar |
-| `simple.rs` | whitespace, comments, `raw_pos_int`, `Range` and the `range` parser, `signedness`, and the `ws` combinator |
+| `simple.rs` | whitespace, comments, `raw_pos_int`, `Range` and the `range` parser, `declared_range` (a width that may be packed, `[1:4][7:0]`), `signedness`, and the `ws` combinator |
 | `helpers.rs` | `assert_parses` / `assert_parses_to` test helpers |
 | `numbers.rs` | raw binary / hex digit runs, `unsigned_number` — a decimal run with `_` separators, which is a literal's size, a plain decimal and an unparenthesised delay — and `real_number`, the one place a real number is spelled out |
 | `constants.rs` | sized and based literals (`8'hFF`, `'b1`) → `VerilogConstant` |
@@ -3269,11 +3269,8 @@ tripwire.
   **Only a memory has a second dimension**, and nothing in the grammar can tell
   `mem[i][2]` from a second select on a vector, so `a[0][1:0]` for a plain `a` is
   `EvalError::NotAMemory` naming it rather than bits of the wrong thing. A **packed**
-  dimension (`reg [3:0][7:0] v;`) is still not modelled and is a parse error: the
-  declaration parsers take one range before the name. It is a different feature from
-  an unpacked one — one wide vector whose selects are scaled by the element width, so
-  `v[1:0]` is sixteen bits — and it is what corpus `array_packed_2d`, `br_gh497a`,
-  `br_gh497c` and `br_gh497e` still wait on (#207). A word is a bare `Register` with
+  array is the other thing a second bracket can mean, and it is not a memory at all —
+  see the packed-array Gotcha below. A word is a bare `Register` with
   no declared range, so the declared indices are mapped through the *memory's* range:
   that is `state_store::bit_position_in`, the one copy of the mapping, which
   `SignalState::bit_position` and `Memory::bit_of` / `with_bit_of` both go through.
@@ -3284,6 +3281,43 @@ tripwire.
   and the *write* path did not, so once enough designs elaborated to reach it one asked
   for a 34 GB allocation and aborted the whole test harness. Both halves now check
   `MAX_SELECT_WIDTH` before collecting indices.
+- **A packed array is one flat vector plus a shape, and its selects count elements.**
+  `reg [1:4][7:0] v;` is stored exactly as a `reg [31:0]` is, and what makes `v[i]` an
+  8-bit element rather than a bit is the `state_store::PackedShape` recorded beside it
+  (`StateStore::declare_packed`). Every select on a packed name — `v[i]`, `v[a:b]`,
+  `v[b +: n]`, `v[b -: n]` and `v[i][j]` — is turned into flat bit indices by
+  `eval::packed_select_indices`, and both the evaluator and `exec::resolve_target` call
+  it, so reading and writing one cannot disagree. Past that point a packed select is an
+  ordinary `ResolvedTarget::Bits`, which is why a packed `wire` driven a run of elements
+  at a time by several `assign`s, `force`, sensitivity and the VCD all needed nothing of
+  their own. Measured against iverilog 12.0: the **left** bound of the outer range is the
+  most significant element whichever way round it is written (`v[1]` is the top byte of
+  a `[1:4][7:0]`, `v[4]` of a `[4:1][7:0]`); a run of elements comes back in the array's
+  own order; `v[i][j]` counts `j` through the element's own range; an element index out
+  of range reads `x` and takes no write; `$bits` counts the elements' bits. Corpus
+  `array_packed_2d`, `br_gh497a`, `br_gh497c`, `br_gh497e`.
+
+  The parser half is `simple::declared_range`, used only by the `reg` and `wire`
+  declaration parsers: a second bracket is safe to read there because a *name* follows a
+  declared width, where anywhere an expression follows it would be a select. It yields
+  `Range::Packed(outer, element)`, and **only a declaration that records the shape may
+  take one** — `Elaborator::resolve_declared_range` does, and every other `resolve_range`
+  caller refuses it by name (`PACKED_ELSEWHERE`), because a port or a function result
+  declared flat without its shape would read `p[i]` as a single bit. So are an unpacked
+  array of packed words (`reg [1:0][7:0] m [0:3];`, which iverilog does support — a gap,
+  not a rule), a third packed dimension, and a packed select that is none of the five
+  shapes (`EvalError::PackedSelect`). A *constant* out-of-range element index is not
+  matched against anything: iverilog 12.0 aborts compiling one.
+
+  **The read is dispatched once, at the top of `eval_in_context`, and that placement is
+  load-bearing.** `eval_in_context` is re-entered at every level of a recursive function
+  call, so its stack frame is what `MAX_CALL_DEPTH` is measured against — and in an
+  unoptimised build each match arm's temporaries get their own stack slots. Putting a
+  packed check (with its `Result<Register, _>`) in each of the four select arms grew the
+  frame enough that `test_runaway_recursion_through_a_real_conditional_is_a_named_error`
+  overflowed the stack before the depth limit could report. One `any_packed()` check and
+  one never-inlined `packed_eval` call cost one slot instead of four. Anything added to
+  that function's arms should be weighed the same way.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
 
 ## Git workflow

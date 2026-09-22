@@ -30,8 +30,8 @@ use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::{Expression, WordSelectKind};
 use crate::register::{Register, REAL_WIDTH};
 use crate::simulator::eval::{
-    eval, eval_sized, indexed_select_indices, indexed_select_width, select_index, EvalError,
-    MAX_SELECT_WIDTH, SELF_DETERMINED,
+    eval, eval_sized, indexed_select_indices, indexed_select_width, packed_select_indices,
+    select_index, EvalError, MAX_SELECT_WIDTH, SELF_DETERMINED,
 };
 use crate::simulator::program::{
     resume, Program, Resume, TaskTable, ACTIVATION_UNSUPPORTED, DELAY_UNSUPPORTED,
@@ -383,6 +383,24 @@ pub fn resolve_target(
     state: &StateStore,
     target: &Expression,
 ) -> Result<ResolvedTarget, SimulationError> {
+    // A select on a packed array counts elements, and `packed_select_indices`
+    // is the one mapping to flat bits — the evaluator reads through the same
+    // one. A design with no packed array answers with one length check.
+    if let Expression::BitSelect(id, _)
+    | Expression::PartSelect(id, _, _)
+    | Expression::IndexedPartSelect { id, .. }
+    | Expression::WordSelect { id, .. } = target
+    {
+        if let Some(shape) = state.packed(&id.name) {
+            return Ok(match packed_select_indices(target, shape, state)? {
+                Some(indices) => ResolvedTarget::Bits {
+                    name: id.name.clone(),
+                    indices,
+                },
+                None => ResolvedTarget::Nowhere,
+            });
+        }
+    }
     match target {
         Expression::Identifier(id) => {
             if !state.contains(&id.name) {

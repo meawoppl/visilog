@@ -122,6 +122,11 @@ pub enum Range {
     /// At least one bound is an expression, to be resolved against the
     /// parameters in scope.
     Expressions(Box<Expression>, Box<Expression>),
+    /// `[1:4][7:0]` — a packed array: the outer range indexes *elements*, and
+    /// the element range is each element's own bits. It is one flat vector of
+    /// `elements × width` bits, so only a declaration that also records the
+    /// shape may use one; see `Elaborator::resolve_declared_range`.
+    Packed(Box<Range>, Box<Range>),
 }
 
 impl Range {
@@ -133,7 +138,7 @@ impl Range {
     pub fn constant(&self) -> Option<(i64, i64)> {
         match self {
             Range::Constant(msb, lsb) => Some((*msb, *lsb)),
-            Range::Expressions(_, _) => None,
+            Range::Expressions(_, _) | Range::Packed(_, _) => None,
         }
     }
 }
@@ -177,6 +182,22 @@ fn expression_range(input: &str) -> IResult<&str, Range> {
 /// literal parser at the `-` and falls through with nothing consumed.
 pub fn range(input: &str) -> IResult<&str, Range> {
     alt((constant_range, expression_range))(input)
+}
+
+/// `[7:0]` or `[1:4][7:0]` — the width a `reg` or `wire` declaration writes
+/// before its names, which may be packed.
+///
+/// Only a declaration reads this. A second range is safe to look for there,
+/// because a declared name — never a `[` — is what follows the width; anywhere
+/// an expression may follow, a second bracket would be a select instead. A
+/// third packed dimension is not modelled and is left for the name parser to
+/// refuse.
+pub fn declared_range(input: &str) -> IResult<&str, Range> {
+    let (input, outer) = range(input)?;
+    match preceded(ws_and_comments, range)(input) {
+        Ok((rest, element)) => Ok((rest, Range::Packed(Box::new(outer), Box::new(element)))),
+        Err(_) => Ok((input, outer)),
+    }
 }
 
 /// `[0:3][0:15]` — the address dimensions written after a declared name.
@@ -500,6 +521,27 @@ mod tests {
         assert!(range("abc").is_err());
         assert_eq!(range("[3:2]def"), Ok(("def", Range::Constant(3, 2))));
         assert_eq!(range("[8:4]ghi"), Ok(("ghi", Range::Constant(8, 4))));
+    }
+
+    /// A declaration's width may be packed — `[1:4][7:0]`, with whitespace or
+    /// a comment between the two — and a single range is still just a range.
+    /// The outer range comes first and the element range second.
+    #[test]
+    fn test_declared_range_reads_a_packed_dimension() {
+        let packed = |outer, element| Range::Packed(Box::new(outer), Box::new(element));
+        assert_eq!(
+            declared_range("[1:4][7:0] v"),
+            Ok((" v", packed(Range::Constant(1, 4), Range::Constant(7, 0))))
+        );
+        assert_eq!(
+            declared_range("[3:0] /* c */ [3:0] v"),
+            Ok((" v", packed(Range::Constant(3, 0), Range::Constant(3, 0))))
+        );
+        assert_eq!(declared_range("[7:0] v"), Ok((" v", Range::Constant(7, 0))));
+        assert!(matches!(
+            declared_range("[N-1:0][W-1:0]"),
+            Ok(("", Range::Packed(_, _)))
+        ));
     }
 
     /// A bound that is not a literal is kept as an expression rather than
