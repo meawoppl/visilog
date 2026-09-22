@@ -1348,6 +1348,17 @@ impl TaskContext {
                     index += 1;
                     self.render_format(format, arguments, &mut index, store, &mut text, scope)?;
                 }
+                // A parameter written as text is the literal it was written
+                // as: printed as a string and read as a format string, which
+                // is what iverilog 12.0 does with `parameter p = "PASSED";
+                // $display(p);` (corpus `param_string`).
+                argument @ TaskArgument::Value(Expression::Identifier(id))
+                    if store.is_text(&id.name) =>
+                {
+                    let format = ascii(&self.value_of(argument, store)?);
+                    index += 1;
+                    self.render_format(&format, arguments, &mut index, store, &mut text, scope)?;
+                }
                 argument => {
                     let value = self.value_of(argument, store)?;
                     // An argument with no specifier at all prints as a real

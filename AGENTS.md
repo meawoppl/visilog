@@ -2372,6 +2372,19 @@ it opens or closes rather than a value.
 A string argument is held as text rather than as an expression because a task has to try
 the *format string* reading of one first, and that is the only reason the two ever needed
 telling apart.
+
+**A parameter written as text is that literal to a `$display`.** `parameter p =
+"PASSED"; $display(p);` prints `PASSED`, and `parameter f = "fmt=%0d"; $display(f, 5);`
+formats with it — iverilog 12.0, corpus `param_string`. Its bits are an ordinary value
+everywhere else, so text is a *note* on the store (`StateStore::mark_text` / `is_text`)
+rather than a kind of value, and `TaskContext::render` is the one place that reads it: a
+bare identifier argument naming a text parameter is rendered as `TaskArgument::Text` would
+be. `elaborate::is_text` decides — a string literal, a parenthesised or concatenated run of
+them (`{"AB", "CD"}` is `ABCD`), or another text parameter; `"A" + 0` is a number — and it
+asks it of the expression the value *came from*, so an override decides for the parameter
+it overrides: `#(.p("HI"))` makes a numeric `p` text and `#(.q(5))` makes a text `q` a
+number. That is why a `#(...)` or `defparam` value travels as an `Override` (the value
+and that one flag) rather than as a bare `Register`.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` — twice, the second copy under the flat path a hierarchical enable of it resolves to |

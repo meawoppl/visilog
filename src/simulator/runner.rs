@@ -3759,6 +3759,63 @@ mod tests {
         assert_eq!(simulator.output().lines(), vec!["0 1 7"]);
     }
 
+    /// A parameter written as text is printed by `$display` as the string it
+    /// was written as, and taken as a format string, where arithmetic on one
+    /// is a number. Whether an *overridden* parameter is text follows the
+    /// override — a `#(...)` or a `defparam` — rather than the declaration.
+    ///
+    /// iverilog 12.0 prints `PASSED`, `RANGED`, `fmt=5`, `ABCD`, `        65`,
+    /// `[PASSED]`, then `HI|          5` and `          0|DP` for the two
+    /// instances (corpus `param_string`).
+    #[test]
+    fn test_a_text_parameter_displays_as_its_string() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module top;
+              parameter p = "PASSED";
+              parameter [47:0] r = "RANGED";
+              parameter f = "fmt=%0d";
+              parameter q = {"AB", "CD"};
+              parameter c = "A" + 0;
+              child #(.p("HI"), .q(5)) i();
+              child j();
+              defparam j.q = "DP";
+              initial begin
+                $display(p);
+                $display(r);
+                $display(f, 5);
+                $display(q);
+                $display(c);
+                $display("[", p, "]");
+              end
+            endmodule
+            module child;
+              parameter p = 0;
+              parameter q = "Q";
+              initial #1 $display(p, "|", q);
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(2).expect("advance should succeed");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "PASSED",
+                "RANGED",
+                "fmt=5",
+                "ABCD",
+                "        65",
+                "[PASSED]",
+                "HI|          5",
+                "          0|DP",
+            ]
+        );
+    }
+
     /// An `inout` bound to a **select** is bonded to it, not assigned from it:
     /// the port and the parent's bit become one node, so the connection
     /// carries a value in both directions.

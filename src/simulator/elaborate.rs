@@ -388,6 +388,17 @@ enum Binding {
     Bonded(Expression),
 }
 
+/// A parameter value handed down from outside the module that declares it —
+/// by a `#(...)` or a `defparam` — already evaluated where it was written.
+#[derive(Clone)]
+struct Override {
+    value: Register,
+    /// Whether the expression it came from was text, which is what decides
+    /// whether `$display(p)` prints the parameter as a string; see
+    /// [`is_text`].
+    text: bool,
+}
+
 /// One instance's — or one generate block's — view of the flat name space.
 ///
 /// A module instance and a generate block are the same kind of thing to the
@@ -409,7 +420,7 @@ struct Scope {
     bindings: HashMap<String, Binding>,
     /// Parameter values the parent overrode, already evaluated in the parent's
     /// scope.
-    overrides: HashMap<String, Register>,
+    overrides: HashMap<String, Override>,
     /// What the generate blocks in scope declare, to the store entries they
     /// took. Empty outside a generate block, which is what keeps an ordinary
     /// module's resolution exactly what it was.
@@ -531,7 +542,7 @@ struct Elaborator<'m> {
     /// The `defparam` overrides seen so far, by the flat name of the parameter
     /// each one addresses. An instantiation takes the ones that name it; what
     /// is left over at the end named nothing and is reported.
-    defparams: BTreeMap<String, Register>,
+    defparams: BTreeMap<String, Override>,
     /// How many instances have been walked, which is what bounds a recursion
     /// that *branches* — see [`MAX_INSTANCES`].
     walked: usize,
@@ -812,7 +823,7 @@ impl<'m> Elaborator<'m> {
         scope: &Scope,
     ) -> Result<(), SimulationError> {
         for assignment in assignments {
-            let value = eval(&renamed(&assignment.value, scope), &self.out.state)?;
+            let value = self.evaluated(renamed(&assignment.value, scope))?;
             self.defparams
                 .insert(scope.resolve(&assignment.path), value);
         }
@@ -1917,7 +1928,7 @@ impl<'m> Elaborator<'m> {
                     // expression it came from was written.
                     let value = match scope.overrides.get(local) {
                         Some(value) => value.clone(),
-                        None => eval(&renamed(&parameter.value, scope), &self.out.state)?,
+                        None => self.evaluated(renamed(&parameter.value, scope))?,
                     };
                     let name = scope.qualified(local);
                     let range = match &parameter.range {
@@ -1942,6 +1953,15 @@ impl<'m> Elaborator<'m> {
         Ok(())
     }
 
+    /// A parameter's value expression, evaluated, together with whether it was
+    /// text.
+    fn evaluated(&self, value: Expression) -> Result<Override, SimulationError> {
+        Ok(Override {
+            text: is_text(&value, &self.out.state),
+            value: eval(&value, &self.out.state)?,
+        })
+    }
+
     /// Records one parameter's value in the store under `name`.
     ///
     /// The declaration's own rules — what it is signed by, whether it is a
@@ -1952,9 +1972,13 @@ impl<'m> Elaborator<'m> {
         &mut self,
         parameter: &ParameterDeclaration,
         name: String,
-        value: Register,
+        value: Override,
         range: Option<(i64, i64)>,
     ) {
+        let Override { value, text } = value;
+        if text {
+            self.out.state.mark_text(&name);
+        }
         // A `signed` qualifier (or an `integer` type) makes the parameter
         // signed. Failing that, **a range is what decides**: a parameter
         // written with one is unsigned unless it says otherwise, and only a
@@ -2034,10 +2058,7 @@ impl<'m> Elaborator<'m> {
             let name = scope.qualified(&format!("{}{}", inner, parameter.name.name));
             let value = match self.defparams.remove(&name) {
                 Some(value) => value,
-                None => eval(
-                    &scoped_renamed(&parameter.value, scope, inner, &own),
-                    &self.out.state,
-                )?,
+                None => self.evaluated(scoped_renamed(&parameter.value, scope, inner, &own))?,
             };
             let range = match &parameter.range {
                 Some(range) => Some(self.resolve_scoped_range(range, scope, inner, &own)?),
@@ -3374,7 +3395,7 @@ impl<'m> Elaborator<'m> {
         child: &VerilogModule,
         instantiation: &ModuleInstantiation,
         scope: &Scope,
-    ) -> Result<HashMap<String, Register>, SimulationError> {
+    ) -> Result<HashMap<String, Override>, SimulationError> {
         // A UDP declares no parameters, so `BUFG #5 bg(o, i);` is the
         // instance's *delay* rather than an override. A gate's delay is parsed
         // and ignored, and there is nothing more a primitive's can be here:
@@ -3426,7 +3447,7 @@ impl<'m> Elaborator<'m> {
 
         let mut overrides = HashMap::new();
         for (name, expression) in pairs {
-            let value = eval(&renamed(expression, scope), &self.out.state)?;
+            let value = self.evaluated(renamed(expression, scope))?;
             overrides.insert(name.to_string(), value);
         }
         Ok(overrides)
@@ -3514,6 +3535,21 @@ fn plain_identifier(expression: &Expression) -> Option<&Identifier> {
         Expression::Identifier(id) => Some(id),
         Expression::Parenthetical(inner) => plain_identifier(inner),
         _ => None,
+    }
+}
+
+/// Whether a parameter's value expression is **text** — a string literal, a
+/// parenthesised or concatenated run of them, or another parameter that is —
+/// which is what makes `$display(p)` print it as the string it was written as
+/// rather than as the number its bits spell. A value that does arithmetic on
+/// one (`"A" + 0`) is a number. See [`StateStore::mark_text`].
+fn is_text(value: &Expression, store: &StateStore) -> bool {
+    match value {
+        Expression::StringLiteral(_) => true,
+        Expression::Parenthetical(inner) => is_text(inner, store),
+        Expression::Concatenation(parts) => parts.iter().all(|part| is_text(part, store)),
+        Expression::Identifier(id) => store.is_text(&id.name),
+        _ => false,
     }
 }
 
