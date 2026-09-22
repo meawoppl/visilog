@@ -1,6 +1,11 @@
 use nom::{
-    bytes::complete::tag, character::complete::char, combinator::opt, multi::separated_list1,
-    sequence::preceded, IResult,
+    branch::alt,
+    bytes::complete::tag,
+    character::complete::{char, satisfy},
+    combinator::{not, opt},
+    multi::separated_list1,
+    sequence::{preceded, terminated},
+    IResult,
 };
 
 use super::{
@@ -44,13 +49,30 @@ pub fn declared_name(input: &str) -> IResult<&str, (Identifier, Vec<Range>, Opti
     Ok((input, (name, dims, init)))
 }
 
+/// `reg`, or SystemVerilog's `logic`, which iverilog 12.0 reads as exactly a
+/// `reg` in its default mode — down to refusing a continuous assignment to one
+/// with "reg a; cannot be driven by primitives or continuous assignment"
+/// (corpus `br_gh1178b`, `br_gh1178c`). It is not a 1364-2005 reserved word,
+/// so it needs a word boundary: `logic_level = 1` is still an identifier.
+fn register_keyword(input: &str) -> IResult<&str, &str> {
+    alt((
+        tag("reg"),
+        terminated(
+            tag("logic"),
+            not(satisfy(|c: char| {
+                c.is_alphanumeric() || c == '_' || c == '$'
+            })),
+        ),
+    ))(input)
+}
+
 /// `reg [width]? name [dims]? (, name [dims]?)* ;`
 ///
 /// The width applies to every name in the list. A memory is not a separate
 /// production — it is one of these names with a dimension attached — so there
 /// is no "memory before register" ordering hazard to get wrong.
 pub fn parse_register_declaration(input: &str) -> IResult<&str, Vec<RegisterDeclaration>> {
-    let (input, _) = tag("reg")(input)?;
+    let (input, _) = register_keyword(input)?;
     let (input, signed) = ws(signedness)(input)?;
     let (input, width) = ws(opt(range))(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_name))(input)?;
@@ -76,6 +98,20 @@ mod tests {
     use crate::parsers::helpers::{assert_parses, assert_parses_to};
 
     use super::*;
+
+    /// `logic` declares what `reg` does, and only as a whole word.
+    #[test]
+    fn test_logic_is_a_register() {
+        assert_eq!(
+            assert_parses(parse_register_declaration, "logic [3:0] bus;"),
+            assert_parses(parse_register_declaration, "reg [3:0] bus;")
+        );
+        assert_eq!(
+            assert_parses(parse_register_declaration, "logic signed passed = 1'b1;"),
+            assert_parses(parse_register_declaration, "reg signed passed = 1'b1;")
+        );
+        assert!(parse_register_declaration("logical x;").is_err());
+    }
 
     /// A range with a bound missing must be a parse *error*, never a panic.
     ///

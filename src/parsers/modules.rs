@@ -109,6 +109,7 @@ fn parse_net_type(input: &str) -> IResult<&str, (NetType, Option<PortType>)> {
         alt((
             map(tag("wire"), |_| (NetType::Wire, None)),
             map(tag("reg"), |_| (NetType::Reg, None)),
+            map(tag("logic"), |_| (NetType::Reg, None)),
             map(tag("integer"), |_| (NetType::Reg, Some(PortType::Integer))),
             map(tag("time"), |_| (NetType::Reg, Some(PortType::Time))),
         )),
@@ -659,6 +660,9 @@ mod tests {
     fn test_parse_net_type() {
         assert_parses_to(parse_net_type, "wire", (NetType::Wire, None));
         assert_parses_to(parse_net_type, "reg", (NetType::Reg, None));
+        // `logic` is a `reg` as iverilog 12.0 reads it, and `logic_x` is a name.
+        assert_parses_to(parse_net_type, "logic", (NetType::Reg, None));
+        assert!(parse_net_type("logic_x").is_err());
         assert_parses_to(
             parse_net_type,
             "integer",

@@ -2510,6 +2510,14 @@ tripwire.
   ordering hazard that two near-identical `reg`-led parsers would otherwise create.
   A `signed` / `unsigned` qualifier belongs to the *declaration* rather than to a name, so
   every name in the list shares it; an `integer` is signed by being an `integer`.
+- **`logic` is a `reg`**, at module level (`register::register_keyword`) and as a port's
+  data type (`output logic q`). That is iverilog 12.0's reading in its default mode, and it
+  is exact rather than approximate: it refuses `assign a = …;` onto a `logic a;` with the
+  same "reg a; cannot be driven by primitives or continuous assignment" it gives a `reg`.
+  `logic` is a SystemVerilog keyword and not a 1364-2005 one, so it carries a word boundary
+  — `logical` and `logic_level` are still names — and no scored corpus file uses it as an
+  identifier. Nothing else SystemVerilog added to the type system is read this way (corpus
+  `br_gh1178c`).
 - **A declaration initialiser belongs to the *name*, and `wire` and `reg` mean opposite
   things by it.** `wire a = expr;` is shorthand for a declaration *plus a continuous
   assignment*: `elaborate` pushes it onto the same list an explicit `assign` uses, so the
