@@ -712,11 +712,19 @@ fn call_function(
         });
     }
 
-    // An argument is self-determined: the function's own declaration says how
-    // wide the variable it lands in is, and nothing around the call has a say.
+    // An argument is *assigned* to the input it lands in, so it is sized by
+    // that input the way a right hand side is sized by its target: `test(ltl +
+    // 7'd1)` for an eight bit input adds in eight bits and keeps the carry,
+    // where adding in seven wraps to zero (corpus `pr2913438b`). Nothing around
+    // the call has a say, and a real input has no width to impose.
     let mut values = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        values.push(eval(argument, store)?);
+    for (argument, input) in arguments.iter().zip(&definition.arguments) {
+        let width = if input.real {
+            SELF_DETERMINED
+        } else {
+            range_width(input.range)
+        };
+        values.push(eval_sized(argument, store, width)?);
     }
 
     let _depth = store

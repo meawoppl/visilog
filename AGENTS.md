@@ -935,9 +935,13 @@ plausible wrong number, which is why these were silent failures rather than loud
 The target's width reaches `eval` through `eval_sized(expr, store, width)`. Both callers
 resolve the left hand side *first* and ask it how wide it is —
 `ResolvedTarget::width(&store)` — so `program.rs`'s `Blocking` / `NonBlocking` and
-`runner.rs`'s `propagate` push the same number down the same path. Everything else
-(`case` subjects, conditions, task arguments, function arguments) still goes through
-`eval`, which is self-determined.
+`runner.rs`'s `propagate` push the same number down the same path. **A function argument
+is the third caller**: it is assigned to the input it lands in, so `eval::call_function`
+sizes it by that input's declared range — `test(ltl + 7'd1)` into an eight bit input adds
+in eight bits and keeps the carry (corpus `pr2913438b`), while a `real` input imposes no
+width and the argument wraps at its own. A task argument already had this, since its
+copy-in is an ordinary `Instruction::Blocking`. Everything else (`case` subjects,
+conditions, `$display` arguments) still goes through `eval`, which is self-determined.
 
 Inside `eval_in_context` the width is a **lower bound**, not an exact size: an operand is
 padded out to it and otherwise left alone. That is exactly Verilog's "the larger of the

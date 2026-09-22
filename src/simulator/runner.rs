@@ -6237,6 +6237,39 @@ mod tests {
         assert_eq!(simulator.get("y").unwrap().to_u128(), Some(72));
     }
 
+    /// An argument is sized by the input it is assigned to, as a right hand
+    /// side is by its target: a seven bit sum passed to an eight bit input
+    /// keeps its carry, one passed to a four bit input is truncated, and one
+    /// passed to a `real` input is self-determined and wraps first.
+    ///
+    /// iverilog 12.0 prints `80 10 0`, `00` and `0.000000` — the concatenation
+    /// is self-determined inside, so its sum wraps; corpus `pr2913438b`.
+    #[test]
+    fn test_a_function_argument_is_sized_by_its_input() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+              reg [6:0] a;
+              reg [3:0] b, c;
+              function [7:0] f8(input [7:0] in); f8 = in; endfunction
+              function [3:0] f4(input [3:0] in); f4 = in; endfunction
+              function real fr(input real in); fr = in; endfunction
+              initial begin
+                a = 7'd127; b = 4'd15; c = 4'd1;
+                $display("%h %h %h", f8(a + 7'd1), f8(b + c), f4(a + 7'd1));
+                $display("%h", f8({b + c}));
+                $display("%f", fr(b + c));
+              end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["80 10 0", "00", "0.000000"]
+        );
+    }
+
     /// A body-local variable is the function's own: it is declared into the
     /// frame a call builds, and a loop over it runs to a value.
     #[test]
