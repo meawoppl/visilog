@@ -238,6 +238,13 @@ pub struct Elaborated {
     /// path.
     pub wired_nets: HashMap<String, WiredKind>,
     pub blocks: Vec<TimedBlock>,
+    /// Every index into `blocks`, in the order the blocks get their first turn
+    /// at time zero: an instance's before the module that creates it, and a
+    /// module's own in source order. That is iverilog 12.0's order, measured —
+    /// a child instantiated *below* an `initial` still sees the `initial`'s
+    /// time-zero writes, and the parent's own `always` written below it does
+    /// not. `blocks` is in build order, which interleaves the two.
+    pub start_order: Vec<usize>,
     /// The *top* module's input ports, the only ones a testbench may drive.
     pub inputs: Vec<String>,
     /// Qualified name to the store entry it aliases, for ports that were bound
@@ -334,6 +341,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             pulled_nets: Vec::new(),
             wired_nets: HashMap::new(),
             blocks: Vec::new(),
+            start_order: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
             instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
@@ -580,6 +588,11 @@ impl<'m> Elaborator<'m> {
             ));
         }
         self.stack.push(index);
+        // Where this instance's blocks and its children's begin, so the ones
+        // that are its own can be put in the start order once every child has
+        // put in theirs.
+        let first_block = self.out.blocks.len();
+        let first_started = self.out.start_order.len();
 
         // A user-defined primitive is a module as far as instantiation and port
         // binding go, and nothing else: its whole body is the table, so none of
@@ -727,6 +740,15 @@ impl<'m> Elaborator<'m> {
             self.build(statement, inner, table)?;
         }
         self.stamp_collections(module, first);
+
+        let children: HashSet<usize> = self.out.start_order[first_started..]
+            .iter()
+            .copied()
+            .collect();
+        let own: Vec<usize> = (first_block..self.out.blocks.len())
+            .filter(|id| !children.contains(id))
+            .collect();
+        self.out.start_order.extend(own);
 
         self.stack.pop();
         Ok(())

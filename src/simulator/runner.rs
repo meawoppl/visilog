@@ -36,7 +36,9 @@ use std::path::PathBuf;
 use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::parsers::{
-    assignment::ContinuousAssignment, behavior::EventControl, gates::DriveStrength,
+    assignment::ContinuousAssignment,
+    behavior::{EventControl, EventTriggers},
+    gates::DriveStrength,
     modules::VerilogModule,
 };
 use crate::register::Register;
@@ -338,6 +340,12 @@ struct Waiting {
     /// What it is waiting for. `None` is a `wait (c)`, whose condition is a
     /// value the block reads for itself when it is re-entered.
     watch: Option<EventWatch>,
+    /// `Some` for an edge-triggered `always` block armed at its turn in the
+    /// time-zero round rather than suspended part way through a run — see
+    /// [`Simulator::arm`]. It holds how many named-event triggers were
+    /// already journalled when it was armed, which its first look skips: a
+    /// trigger fired before the block was listening is one it missed.
+    arming: Option<usize>,
 }
 
 /// An event control a block is suspended on, with what the signals it names
@@ -442,6 +450,23 @@ fn memory_word_values(control: &EventControl, state: &StateStore) -> Vec<Option<
             }
         })
         .collect()
+}
+
+/// Whether an `always` block with this control misses what the time-zero
+/// round wrote before its turn came — see [`Simulator::arm`].
+///
+/// Measured against iverilog 12.0, and it is not every list: one that names a
+/// `posedge` or a `negedge` anywhere, or a named event, misses it, while a list
+/// of nothing but plain signals — `@(b)`, `@(c or d)` — sees the `initial`'s
+/// write whichever side of it the block is written. `@*` sees it too.
+fn armed_at_its_turn(control: &EventControl, state: &StateStore) -> bool {
+    let EventControl::Events(events) = control else {
+        return false;
+    };
+    events.iter().any(|event| {
+        event.trigger != EventTriggers::EitherEdge
+            || matches!(&event.expression, Expression::Identifier(id) if state.is_event(&id.name))
+    })
 }
 
 /// The starting value of every *non-plain* entry in a sensitivity list, which
@@ -658,6 +683,10 @@ pub struct Simulator {
     /// one so the swap is free and a round costs a `fill` of bytes.
     ran_before: Vec<bool>,
     ran_now: Vec<bool>,
+    /// The edge-triggered `always` blocks whose turn in the time-zero round
+    /// has not come yet — see [`Simulator::arm`]. Every flag is down once
+    /// time zero has run.
+    unarmed: Vec<bool>,
     /// What each block's *non-plain* sensitivity entries last evaluated to —
     /// one slot per entry in the block's list, `None` for an entry that names
     /// a signal directly and is matched against the change journal instead.
@@ -747,6 +776,7 @@ impl Simulator {
             waiting: Vec::new(),
             ran_before: Vec::new(),
             ran_now: Vec::new(),
+            unarmed: Vec::new(),
             event_values: Vec::new(),
             expression_events: false,
             forks: Vec::new(),
@@ -875,8 +905,10 @@ impl Simulator {
             .enumerate()
             .map(|(index, task)| (task.name.clone(), index))
             .collect();
+        let start_order = elaborated.start_order;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
+        self.unarmed = vec![false; self.blocks.len()];
         self.event_values = self
             .blocks
             .iter()
@@ -925,10 +957,16 @@ impl Simulator {
 
         // Everything that starts on its own starts at time zero: `initial`
         // blocks, which run once, and free-running `always` blocks, which have
-        // no event to wait for. Edge-triggered blocks are not queued — they are
-        // woken by `settle`.
-        for id in 0..self.blocks.len() {
-            if self.blocks[id].kind == BlockKind::Initial || self.blocks[id].free_running {
+        // no event to wait for. An edge-triggered block with an explicit list
+        // is queued too, but its turn *arms* it rather than running it — see
+        // [`Simulator::arm`] — and after that it is woken by `settle`. They go
+        // on the queue in the order iverilog gives them their first turn.
+        for id in start_order {
+            let block = &self.blocks[id];
+            if block.kind == BlockKind::Initial || block.free_running {
+                self.queue.insert(0, ExecutionCursor::new(id, 0));
+            } else if armed_at_its_turn(&block.control, &self.state) {
+                self.unarmed[id] = true;
                 self.queue.insert(0, ExecutionCursor::new(id, 0));
             }
         }
@@ -1227,6 +1265,32 @@ impl Simulator {
         self.block_fires(id, &[]);
     }
 
+    /// Gives an edge-triggered `always` block its turn in the time-zero round,
+    /// which is the moment it reaches its event control and starts listening.
+    ///
+    /// iverilog gives every process a first turn at time zero, in order — the
+    /// processes of the instances a module creates before its own, and its
+    /// own in source order — and an `always` block's first turn is spent
+    /// arming its event control. A write an `initial` block makes before that
+    /// turn is one the block was not listening for: `initial begin clk = 0;
+    /// … end` above an `always @(negedge clk)` does not wake it, while the same
+    /// write above it in the file does not reach it either way round (corpus
+    /// `pr1662508`, whose monitor printed a line for time zero that iverilog
+    /// does not). So the block is parked on the waiting list with its event
+    /// control snapshotted *now*, exactly as a `@` part way through a block
+    /// would be, and it is what `settle` measures from for the rest of the
+    /// timestep.
+    fn arm(&mut self, cursor: ExecutionCursor) {
+        let id = cursor.block;
+        self.unarmed[id] = false;
+        let watch = EventWatch::arm(self.blocks[id].control.clone(), &self.state);
+        self.waiting.push(Waiting {
+            cursor,
+            watch: Some(watch),
+            arming: Some(self.state.pending_triggers()),
+        });
+    }
+
     /// Resumes every waiting block whose wait is now satisfied.
     ///
     /// The two reasons a block waits are answered differently on purpose. A
@@ -1252,11 +1316,20 @@ impl Simulator {
         let mut still_waiting = Vec::new();
         let mut woken = Vec::new();
         for mut waiting in std::mem::take(&mut self.waiting) {
+            let missed = waiting
+                .arming
+                .map_or(0, |missed| missed.min(triggers.len()));
+            if let Some(arming) = &mut waiting.arming {
+                *arming = 0;
+            }
             let wake = match &mut waiting.watch {
                 None => true,
                 Some(watch) => {
                     let mut edges = watch.edges_since(&self.state);
-                    edges.extend(triggers.iter().cloned());
+                    // Only the triggers fired after this wait was armed can wake
+                    // it; `watch.fires` then covers a memory-word entry as well
+                    // as an ordinary one.
+                    edges.extend(triggers[missed..].iter().cloned());
                     watch.fires(&edges, &self.state)
                 }
             };
@@ -1493,6 +1566,10 @@ impl Simulator {
                 // from it, so a block due at this timestamp that has not run
                 // yet does not run at all.
                 while let Some(cursor) = self.round.pop_front() {
+                    if self.unarmed[cursor.block] {
+                        self.arm(cursor);
+                        continue;
+                    }
                     let (updates, _) = self.resume_block(cursor)?;
                     pending.extend(updates);
                 }
@@ -1533,6 +1610,10 @@ impl Simulator {
             self.propagate()?;
             self.settle()?;
             self.end_of_timestep()?;
+            // An `always` block armed at its turn and not woken by the end of
+            // the timestep it was armed in goes back to being woken by
+            // `settle`, which is what every one of them is from then on.
+            self.waiting.retain(|waiting| waiting.arming.is_none());
 
             if self.finished() {
                 return Ok(());
@@ -1848,6 +1929,9 @@ impl Simulator {
         });
         self.ran_before.push(false);
         self.ran_now.push(false);
+        // An activation is started by its enable, never held back to arm at a
+        // time-zero turn, so it is never unarmed.
+        self.unarmed.push(false);
         self.event_values.push(Vec::new());
         self.automatic[task].slots.push(block);
         Ok(slot)
@@ -2151,6 +2235,7 @@ impl Simulator {
                 self.waiting.push(Waiting {
                     cursor: ExecutionCursor { pc, ..cursor },
                     watch,
+                    arming: None,
                 });
                 Ok((pending, false, None))
             }
@@ -8436,6 +8521,56 @@ mod tests {
                 "20 clock=2",
                 "30 clock=3",
                 "30 edge count=2",
+            ]
+        );
+    }
+
+    /// An `always` block whose list names an edge or an event starts listening
+    /// at its turn in the time-zero round, and the turns go an instance's
+    /// blocks first and then the module's own in source order — so a write an
+    /// `initial` makes at time zero reaches only the edge-triggered blocks
+    /// whose turn came before it. A list of plain signals hears it either way.
+    ///
+    /// iverilog 12.0 prints these three lines for this design, and nothing
+    /// for the edge, the mixed list and the event written below the `initial`,
+    /// nor for the parent's block that the child's `initial` wrote under. The
+    /// order it wakes blocks in at one instant is not what is measured here,
+    /// so the lines are compared as a set (corpus `pr1662508`, `pr3064375`).
+    #[test]
+    fn test_an_edge_triggered_block_listens_from_its_turn_at_time_zero() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module top;
+              reg a, b, c, d;
+              event e;
+              always @(negedge a) $display("edge above");
+              always @(negedge b) $display("child's write, edge above");
+              child c1();
+              initial begin a = 0; c = 0; d = 0; -> e; end
+              always @(negedge a) $display("edge below");
+              always @(c) $display("level below");
+              always @(posedge c or d) $display("mixed below");
+              always @(e) $display("event below");
+            endmodule
+            module child;
+              initial top.b = 0;
+              always @(negedge top.a) $display("child below its initial, above top's");
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(10).expect("advance should succeed");
+        let mut lines = simulator.output().lines();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                "child below its initial, above top's",
+                "edge above",
+                "level below",
             ]
         );
     }

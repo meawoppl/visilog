@@ -1667,6 +1667,12 @@ impl StateStore {
         self.holds.remove(slot)
     }
 
+    /// How many triggers have been journalled since the last
+    /// [`take_triggers`](StateStore::take_triggers).
+    pub fn pending_triggers(&self) -> usize {
+        self.triggers.len()
+    }
+
     /// Every event triggered since the last call, clearing the journal so the
     /// next round is measured from here. This is what makes a trigger wake a
     /// block exactly once: the round that takes it is the only round that can
