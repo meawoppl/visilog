@@ -3043,7 +3043,7 @@ impl<'m> Elaborator<'m> {
                 substitute_genvars(&mut connection, &scope.genvars);
             }
             let binding = match plain_identifier(&connection)
-                .filter(|_| self.can_alias(port, &connection, scope))
+                .filter(|_| self.can_alias(child, port, &connection, scope))
             {
                 Some(id) => {
                     let outer = scope.resolve(&id.name);
@@ -3115,7 +3115,20 @@ impl<'m> Elaborator<'m> {
     /// An `inout` is the one that cannot take it: it is read as well as
     /// written and one assignment only runs one way, so it stays aliased and
     /// keeps the parent's signedness.
-    fn can_alias(&self, port: &Port, connection: &Expression, scope: &Scope) -> bool {
+    ///
+    /// An input the child declares `tri0`, `tri1`, `supply0` or `supply1`
+    /// cannot share a *variable's* entry either: the pull is a permanent
+    /// driver, and on a `reg` it would outvote every procedural write, where
+    /// iverilog keeps the port a net of its own driven by the `reg` (corpus
+    /// `pr841`, whose clock never moved). Bound to a net it is one node with
+    /// it, which is what iverilog's "input port coerced to inout" says.
+    fn can_alias(
+        &self,
+        child: &VerilogModule,
+        port: &Port,
+        connection: &Expression,
+        scope: &Scope,
+    ) -> bool {
         if matches!(port.direction, PortDirection::InOut) {
             return true;
         }
@@ -3128,7 +3141,12 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .get_signal(&scope.resolve(&id.name))
-            .is_none_or(|outer| outer.is_signed() == port.signed)
+            .is_none_or(|outer| {
+                outer.is_signed() == port.signed
+                    && (outer.is_net()
+                        || port.direction != PortDirection::Input
+                        || !declares_pull(child, &port.identifier.name))
+            })
     }
 
     /// Evaluates a `#(...)` block in the *parent's* scope, keyed by the child's
@@ -3279,6 +3297,22 @@ fn plain_identifier(expression: &Expression) -> Option<&Identifier> {
         Expression::Parenthetical(inner) => plain_identifier(inner),
         _ => None,
     }
+}
+
+/// Whether `module` declares `name` as a net that drives itself — `tri0`,
+/// `tri1`, `supply0` or `supply1` — which is what [`Elaborator::record_pull`]
+/// turns into a permanent driver.
+fn declares_pull(module: &VerilogModule, name: &str) -> bool {
+    module.statements.iter().any(|statement| match statement {
+        ModuleStatement::WireDeclaration(nets) => nets.iter().any(|net| {
+            net.identifier().name == name
+                && matches!(
+                    net.kind(),
+                    WireKind::Tri0 | WireKind::Tri1 | WireKind::Supply0 | WireKind::Supply1
+                )
+        }),
+        _ => false,
+    })
 }
 
 /// Checks what a compiled function body does and reports the design signals it

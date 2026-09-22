@@ -3271,6 +3271,51 @@ mod tests {
         assert_eq!(simulator.get("c").unwrap().to_binary(), "0");
     }
 
+    /// A `tri0` input bound to a `reg` is a net of its own that the `reg`
+    /// drives, not the `reg` itself: the pull must not outvote the parent's
+    /// procedural writes. Bound to a `wire` it is one node with it, and the
+    /// pull reaches the parent's net too.
+    ///
+    /// iverilog 12.0 (which warns "input port p is coerced to inout" for the
+    /// `wire`) prints
+    /// `w=0 c1.p=0 r=x c2.p=x`, `w=0 c1.p=0 r=1 c2.p=1`, `w=0 c1.p=0 r=z c2.p=0`
+    /// — corpus `pr841`, whose clock never moved once the pull held it.
+    #[test]
+    fn test_a_pulled_input_bound_to_a_variable_is_driven_by_it() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module top;
+              wire w; reg r;
+              child c1(w);
+              child c2(r);
+              initial begin
+                #1 $display("w=%b c1.p=%b r=%b c2.p=%b", w, c1.p, r, c2.p);
+                r = 1;
+                #1 $display("w=%b c1.p=%b r=%b c2.p=%b", w, c1.p, r, c2.p);
+                r = 1'bz;
+                #1 $display("w=%b c1.p=%b r=%b c2.p=%b", w, c1.p, r, c2.p);
+              end
+            endmodule
+            module child(p);
+              input p; tri0 p;
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(5).expect("advance should succeed");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "w=0 c1.p=0 r=x c2.p=x",
+                "w=0 c1.p=0 r=1 c2.p=1",
+                "w=0 c1.p=0 r=z c2.p=0",
+            ]
+        );
+    }
+
     /// An array of nets is a memory in the store, exactly as a `reg` array is,
     /// and its undriven words read `z` because a net with no driver does.
     ///
