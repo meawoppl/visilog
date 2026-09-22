@@ -2236,8 +2236,8 @@ than a missing feature. Both lists are printed **by name** for exactly that reas
 gold mismatches carry a first-difference line (`line N: expected … got …`) for the leading
 few, which is what makes them actionable without reading the corpus by hand.
 
-Not every gold mismatch is a simulator bug: seven of them (`br1007`, `br_gh127a`…`f`)
-have gold files whose first lines are iverilog's own *compiler warnings*
+Not every gold mismatch is a simulator bug: eight of them (`br1007`, `br_gh127a`…`f`,
+`pr1723367`) have gold files whose first lines are iverilog's own *compiler warnings*
 (`./ivltests/br1007.v:15: warning: …`), which visilog has no diagnostic channel to emit.
 They are left in the list rather than filtered out, because a rule that dropped anything
 looking like a diagnostic would also drop real output — but read the first-difference line
@@ -2496,6 +2496,25 @@ tripwire.
   declaration would run, so a `reg` naming it still comes second and wins the fill — and
   `elaborate` declares it through `declare_port` with nothing bound. A **primitive** keeps
   the refusal: its body holds nothing but its terminals.
+  **A Verilog-1995 header entry is a *port expression*, and one that is not a plain name is
+  normalised away at parse time.** IEEE 1364-2005's `port` may be a part of a declaration
+  (`arg[119:96]`), a concatenation (`{a, b}`), either behind an external name
+  (`.a({b, c})`), or blank (`(a, , b)`); `HeaderPort` is those shapes and
+  `reconcile_ports` / `carried_port` turn each non-plain one into an **ordinary port** — its
+  external name, or `$port<position>`, which no design identifier can spell — plus the
+  statement that carries its connection to what it names: `assign {parts} = port;` for an
+  input, `assign port = {parts};` for an output, and a `tran` array for an `inout`, because
+  a port read as well as written cannot be carried by one assignment. What the expression
+  names in the body becomes a local (above). Nothing past the parser learns the header was
+  not a list of names — it sees ports, locals, assignments and a switch it already knew
+  (corpus `contrib8.2`, `pr377`, `pr3197917`, `port-test2`). **A name listed twice** is the
+  same shape — one net reached through two ports — and is legal only for an `inout`
+  (`module id(a, a); inout a;`, corpus `inout`, `br_gh1178b`); a repeated input or output
+  would have the child drive its parent and stays `Duplicate`. Refused with
+  `PortReconciliationError::PortExpression`: parts that disagree about direction, a width
+  that would have to be *summed* from parameters (a port that is the whole of one
+  declaration keeps its range as written, parameters and all), an external name the body
+  also declares, and an `inout` that is anything but a single reference.
   A `reg` naming a port is *not* a second declaration of it — an output backed by a
   register is one signal, and the `reg` stays an ordinary body statement.
 - **Flattening rewrites names on the compiled `Program`, not on the statement tree.**
@@ -2760,8 +2779,9 @@ tripwire.
   `Vec<Option<Expression>>` and `elaborate::connections` filters the `None`s out *after*
   zipping against the ports. Dropping a blank at parse time instead would silently bind
   every later connection to the wrong port. A single blank is `NoArgs` — `()` is an empty
-  argument list, not a one-element list with a gap. A blank *named* connection (`.a()`) and
-  a blank in a module *header* (`module m(a,);`) are still parse errors.
+  argument list, not a one-element list with a gap. A blank *named* connection (`.a()`) is still
+  a parse error; a blank in a module *header* (`module m(a,);`) is a port that nothing inside
+  reads (see the header port expressions above).
 - **`-> e;` is parsed as an assignment to the event's name.** There is no statement kind
   for a trigger and no instruction for one: a trigger and an ordinary write reach the
   simulator down the same path, and `exec::resolve_target` is where the store is asked
