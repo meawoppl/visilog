@@ -6,14 +6,17 @@ use nom::{
     character::complete::{char, satisfy},
     combinator::{map, not, opt},
     multi::{many0, separated_list1},
-    sequence::{delimited, preceded, terminated},
+    sequence::{delimited, pair, preceded, terminated},
     IResult,
 };
 
 use super::{
+    assignment::ContinuousAssignment,
+    constants::VerilogConstant,
     delay::delay_operand,
     expr::{verilog_expression, Expression},
-    identifier::{identifier, identifier_list, Identifier},
+    gates::{GateInstance, GateInstantiation, GateKind},
+    identifier::{identifier, Identifier},
     keywords::is_reserved_word,
     parameter::parse_parameter_port_list,
     preprocessor::Timescale,
@@ -249,10 +252,125 @@ fn parse_ports(input: &str) -> IResult<&str, Vec<Port>> {
     Ok((input, ports))
 }
 
-/// A Verilog-1995 header: bare port names, whose directions and widths are
-/// declared as statements in the body.
-fn parse_port_names(input: &str) -> IResult<&str, Vec<Identifier>> {
-    delimited(ws(char('(')), identifier_list, ws(char(')')))(input)
+/// One reference inside a port expression: `b`, `arg[119:96]`, `a[0]`.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct PortReference {
+    name: Identifier,
+    select: Option<PortSelect>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum PortSelect {
+    /// `arg[119:96]` — a constant range, which the header's width is made of.
+    Part(Range),
+    /// `a[0]`.
+    Bit(Expression),
+}
+
+impl PortReference {
+    /// The reference as the expression an assignment or a switch terminal
+    /// names it by.
+    fn expression(&self) -> Expression {
+        let bound = |value: &i64| Box::new(Expression::Constant(VerilogConstant::from_int(*value)));
+        match &self.select {
+            None => Expression::Identifier(self.name.clone()),
+            Some(PortSelect::Bit(index)) => {
+                Expression::BitSelect(self.name.clone(), Box::new(index.clone()))
+            }
+            Some(PortSelect::Part(Range::Constant(high, low))) => {
+                Expression::PartSelect(self.name.clone(), bound(high), bound(low))
+            }
+            Some(PortSelect::Part(Range::Expressions(high, low))) => {
+                Expression::PartSelect(self.name.clone(), high.clone(), low.clone())
+            }
+        }
+    }
+}
+
+/// One entry of a Verilog-1995 header.
+///
+/// IEEE 1364-2005's `port` is a *port expression* — a reference to what the
+/// body declares, a part of one, or a concatenation of those — optionally
+/// behind an external name: `.a({b, c})`. An entry may also be left blank.
+/// Nearly every header is the first shape only, which is `Named`.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) enum HeaderPort {
+    /// `a` — a port that is the whole of what the body declares under the
+    /// same name.
+    Named(Identifier),
+    /// `.a(b)`, `{a, b}`, `arg[119:96]`, `.a()` or a blank entry — a port whose
+    /// connection is *carried* to the body's declarations rather than being
+    /// one of them. See [`reconcile_ports`].
+    Expression {
+        name: Option<Identifier>,
+        parts: Vec<PortReference>,
+    },
+}
+
+fn port_reference(input: &str) -> IResult<&str, PortReference> {
+    let (input, name) = identifier(input)?;
+    let (input, select) = opt(preceded(
+        ws_and_comments,
+        alt((
+            map(range, PortSelect::Part),
+            map(
+                delimited(ws(char('[')), verilog_expression, ws(char(']'))),
+                PortSelect::Bit,
+            ),
+        )),
+    ))(input)?;
+    Ok((input, PortReference { name, select }))
+}
+
+fn port_expression(input: &str) -> IResult<&str, Vec<PortReference>> {
+    alt((
+        delimited(
+            ws(char('{')),
+            separated_list1(ws(char(',')), ws(port_reference)),
+            ws(char('}')),
+        ),
+        map(port_reference, |reference| vec![reference]),
+    ))(input)
+}
+
+fn header_port(input: &str) -> IResult<&str, HeaderPort> {
+    alt((
+        map(
+            preceded(
+                char('.'),
+                pair(
+                    identifier,
+                    delimited(ws(char('(')), opt(ws(port_expression)), ws(char(')'))),
+                ),
+            ),
+            |(name, parts)| HeaderPort::Expression {
+                name: Some(name),
+                parts: parts.unwrap_or_default(),
+            },
+        ),
+        map(port_expression, |mut parts| {
+            if parts.len() == 1 && parts[0].select.is_none() {
+                HeaderPort::Named(parts.remove(0).name)
+            } else {
+                HeaderPort::Expression { name: None, parts }
+            }
+        }),
+        // A blank entry — `(a, , b)`, or the trailing one of `(a, )`.
+        map(ws_and_comments, |_| HeaderPort::Expression {
+            name: None,
+            parts: Vec::new(),
+        }),
+    ))(input)
+}
+
+/// A Verilog-1995 header, whose directions and widths are declared as
+/// statements in the body.
+fn parse_port_names(input: &str) -> IResult<&str, Vec<HeaderPort>> {
+    delimited(
+        ws(char('(')),
+        separated_list1(char(','), ws(header_port)),
+        ws(char(')')),
+    )(input)
 }
 
 /// The two spellings of a module header. Both are normalised to a single
@@ -262,8 +380,8 @@ fn parse_port_names(input: &str) -> IResult<&str, Vec<Identifier>> {
 pub(crate) enum PortHeader {
     /// `module m(input wire [3:0] a);` — direction and width in the header.
     Ansi(Vec<Port>),
-    /// `module m(a, b);` — names only.
-    NonAnsi(Vec<Identifier>),
+    /// `module m(a, b);` — port expressions, nearly always plain names.
+    NonAnsi(Vec<HeaderPort>),
 }
 
 pub(crate) fn parse_port_header(input: &str) -> IResult<&str, PortHeader> {
@@ -324,6 +442,11 @@ pub enum PortReconciliationError {
     MissingDirection(Identifier),
     /// The same port declared twice.
     Duplicate(Identifier),
+    /// The port expression at this header position cannot be carried to the
+    /// body: its parts disagree about direction, its width is not made of
+    /// constants, its external name is also a name the body declares, or it
+    /// is an `inout` that is not a single reference.
+    PortExpression(usize),
 }
 
 /// Rejects a name that appears more than once in the same list.
@@ -349,6 +472,9 @@ pub(crate) struct ReconciledPorts {
     /// body as a [`ModuleStatement::PortDeclaration`] and `elaborate` declares
     /// it as a local.
     pub locals: Vec<Port>,
+    /// What carries a port expression's connection to the declarations it
+    /// names — see [`reconcile_ports`].
+    pub connections: Vec<ModuleStatement>,
 }
 
 /// Folds a module's header and its body declarations into the one
@@ -361,7 +487,7 @@ pub(crate) fn reconcile_ports(
     header: PortHeader,
     declared: Vec<Port>,
 ) -> Result<ReconciledPorts, PortReconciliationError> {
-    let names = match header {
+    let entries = match header {
         PortHeader::Ansi(ports) => {
             let names: Vec<Identifier> = ports.iter().map(|p| p.identifier.clone()).collect();
             check_unique(&names)?;
@@ -378,19 +504,52 @@ pub(crate) fn reconcile_ports(
             return Ok(ReconciledPorts {
                 ports,
                 locals: declared,
+                connections: Vec::new(),
             });
         }
-        PortHeader::NonAnsi(names) => names,
+        PortHeader::NonAnsi(entries) => entries,
     };
-    check_unique(&names)?;
 
-    let mut ports: Vec<Option<Port>> = names.iter().map(|_| None).collect();
-    let mut locals = Vec::new();
+    // A name the header lists a second time is one net reached through two
+    // ports (`module id(a, a); inout a;`, corpus `inout`), so the repeat is
+    // carried like any other port expression; `.a(a)` is just `a`.
+    let mut named: Vec<Identifier> = Vec::new();
+    let entries: Vec<HeaderPort> = entries
+        .into_iter()
+        .map(|entry| match entry {
+            HeaderPort::Named(name) if named.contains(&name) => HeaderPort::Expression {
+                name: None,
+                parts: vec![PortReference { name, select: None }],
+            },
+            HeaderPort::Expression {
+                name: Some(name),
+                parts,
+            } if !named.contains(&name)
+                && parts.len() == 1
+                && parts[0].select.is_none()
+                && parts[0].name == name =>
+            {
+                named.push(name.clone());
+                HeaderPort::Named(name)
+            }
+            HeaderPort::Named(name) => {
+                named.push(name.clone());
+                HeaderPort::Named(name)
+            }
+            other => other,
+        })
+        .collect();
+
+    let mut ports: Vec<Option<Port>> = entries.iter().map(|_| None).collect();
+    let mut locals: Vec<Port> = Vec::new();
     for port in declared {
-        let Some(at) = names.iter().position(|name| *name == port.identifier) else {
+        let at = entries
+            .iter()
+            .position(|entry| matches!(entry, HeaderPort::Named(name) if *name == port.identifier));
+        let Some(at) = at else {
             if locals
                 .iter()
-                .any(|local: &Port| local.identifier == port.identifier)
+                .any(|local| local.identifier == port.identifier)
             {
                 return Err(PortReconciliationError::Duplicate(port.identifier));
             }
@@ -403,12 +562,152 @@ pub(crate) fn reconcile_ports(
         ports[at] = Some(port);
     }
 
-    let ports = names
-        .into_iter()
-        .zip(ports)
-        .map(|(name, port)| port.ok_or(PortReconciliationError::MissingDirection(name)))
-        .collect::<Result<_, _>>()?;
-    Ok(ReconciledPorts { ports, locals })
+    let mut connections = Vec::new();
+    let mut resolved = Vec::with_capacity(entries.len());
+    for (at, entry) in entries.iter().enumerate() {
+        let port = match entry {
+            HeaderPort::Named(name) => ports[at]
+                .take()
+                .ok_or_else(|| PortReconciliationError::MissingDirection(name.clone()))?,
+            HeaderPort::Expression { name, parts } => {
+                let declared = |reference: &PortReference| {
+                    ports
+                        .iter()
+                        .flatten()
+                        .chain(resolved.iter())
+                        .chain(locals.iter())
+                        .find(|port: &&Port| port.identifier == reference.name)
+                };
+                carried_port(at, name.as_ref(), parts, declared, &mut connections)?
+            }
+        };
+        resolved.push(port);
+    }
+    Ok(ReconciledPorts {
+        ports: resolved,
+        locals,
+        connections,
+    })
+}
+
+/// The port a header [`HeaderPort::Expression`] stands for, and the statement
+/// that carries its connection to the declarations the expression names.
+///
+/// The port is an ordinary one — external name or `$port<position>`, which no
+/// design identifier can spell — and what it names in the body is left to be
+/// declared as locals. The connection then runs in the port's direction: an
+/// `input` is `assign {parts} = port;`, an `output` is `assign port =
+/// {parts};`, and an `inout` is a `tran` per bit, because a port that is read
+/// as well as written cannot be carried by one assignment. Everything past the
+/// parser therefore sees ports, locals, assignments and switches it already
+/// knew, and nothing learns that the header was not a list of names. A blank
+/// entry is a one-bit input that nothing inside reads.
+fn carried_port<'a>(
+    at: usize,
+    name: Option<&Identifier>,
+    parts: &[PortReference],
+    declared: impl Fn(&PortReference) -> Option<&'a Port>,
+    connections: &mut Vec<ModuleStatement>,
+) -> Result<Port, PortReconciliationError> {
+    let refused = || PortReconciliationError::PortExpression(at);
+    let identifier = match name {
+        Some(name) => name.clone(),
+        None => Identifier::new(format!("$port{at}")),
+    };
+    if declared(&PortReference {
+        name: identifier.clone(),
+        select: None,
+    })
+    .is_some()
+    {
+        return Err(refused());
+    }
+
+    let mut direction = None;
+    let mut width = 0;
+    let mut range = None;
+    for part in parts {
+        let port = declared(part)
+            .ok_or_else(|| PortReconciliationError::MissingDirection(part.name.clone()))?;
+        if direction.is_some_and(|direction| direction != port.direction) {
+            return Err(refused());
+        }
+        direction = Some(port.direction);
+        // A port that is the whole of one declaration takes its range as
+        // written, parameters and all; anything else is a sum of widths,
+        // which have to be constants to be added up here.
+        if parts.len() == 1 && part.select.is_none() {
+            range = Some(port.range.clone());
+            continue;
+        }
+        width += match &part.select {
+            None => port.range.constant().map(range_width),
+            Some(PortSelect::Part(select)) => select.constant().map(range_width),
+            Some(PortSelect::Bit(_)) => Some(1),
+        }
+        .ok_or_else(refused)?;
+    }
+    let direction = direction.unwrap_or(PortDirection::Input);
+    // Only a port that is read as well as written can share its net with
+    // another: two inputs onto one net would have the child drive its parent.
+    if let [repeat] = parts {
+        if name.is_none() && repeat.select.is_none() && direction != PortDirection::InOut {
+            return Err(PortReconciliationError::Duplicate(repeat.name.clone()));
+        }
+    }
+    let range = match range {
+        Some(range) => range,
+        None if parts.is_empty() => Range::SINGLE_BIT,
+        None => Range::Constant(width - 1, 0),
+    };
+    let port_expression = Expression::Identifier(identifier.clone());
+    let inside = match parts {
+        [] => None,
+        [part] => Some(part.expression()),
+        parts => Some(Expression::Concatenation(
+            parts.iter().map(PortReference::expression).collect(),
+        )),
+    };
+    if let Some(inside) = inside {
+        connections.push(match direction {
+            PortDirection::Input => ModuleStatement::Assignment(vec![ContinuousAssignment::new(
+                inside,
+                port_expression,
+            )]),
+            PortDirection::Output => ModuleStatement::Assignment(vec![ContinuousAssignment::new(
+                port_expression,
+                inside,
+            )]),
+            PortDirection::InOut => {
+                if parts.len() != 1 {
+                    return Err(refused());
+                }
+                ModuleStatement::GateInstantiation(vec![GateInstantiation {
+                    kind: GateKind::Tran,
+                    strength: None,
+                    delay: None,
+                    instance: GateInstance {
+                        name: None,
+                        range: (range != Range::SINGLE_BIT).then(|| range.clone()),
+                        terminals: vec![port_expression, inside],
+                    },
+                }])
+            }
+        });
+    }
+    Ok(Port {
+        direction,
+        net_type: None,
+        range,
+        identifier,
+        signed: false,
+        init: None,
+    })
+}
+
+/// How many bits `[high:low]` spans, whichever way round it was written.
+fn range_width((high, low): (i64, i64)) -> i64 {
+    (high - low).abs() + 1
 }
 
 /// Parses `module name (ports); … endmodule`.
@@ -457,7 +756,11 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             other => statements.push(other),
         }
     }
-    let ReconciledPorts { ports, locals } = reconcile_ports(header, declared).map_err(|_| {
+    let ReconciledPorts {
+        ports,
+        locals,
+        connections,
+    } = reconcile_ports(header, declared).map_err(|_| {
         nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
     })?;
     // In front of the body, where a port's own declaration would be: a `reg`
@@ -469,6 +772,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             ModuleStatement::PortDeclaration(locals),
         );
     }
+    statements.extend(connections);
 
     Ok((
         input,
@@ -1331,6 +1635,16 @@ mod tests {
         }
     }
 
+    /// A Verilog-1995 header of plain names.
+    fn names_header(names: &[&str]) -> PortHeader {
+        PortHeader::NonAnsi(
+            names
+                .iter()
+                .map(|name| HeaderPort::Named((*name).into()))
+                .collect(),
+        )
+    }
+
     fn named_port(direction: PortDirection, name: &str) -> Port {
         Port {
             direction,
@@ -1496,7 +1810,7 @@ mod tests {
     fn test_a_header_name_needs_a_direction() {
         assert_eq!(
             reconcile_ports(
-                PortHeader::NonAnsi(vec!["a".into(), "b".into()]),
+                names_header(&["a", "b"]),
                 vec![named_port(PortDirection::Input, "a")],
             ),
             Err(PortReconciliationError::MissingDirection("b".into()))
@@ -1513,7 +1827,7 @@ mod tests {
     fn test_a_direction_outside_the_header_is_a_local() {
         assert_eq!(
             reconcile_ports(
-                PortHeader::NonAnsi(vec!["a".into()]),
+                names_header(&["a"]),
                 vec![
                     named_port(PortDirection::Input, "a"),
                     named_port(PortDirection::Output, "b"),
@@ -1522,6 +1836,7 @@ mod tests {
             Ok(ReconciledPorts {
                 ports: vec![named_port(PortDirection::Input, "a")],
                 locals: vec![named_port(PortDirection::Output, "b")],
+                connections: Vec::new(),
             })
         );
 
@@ -1553,11 +1868,116 @@ mod tests {
         }
     }
 
+    /// The statements a module declaration carried a header's port
+    /// expressions with, rendered back as source for a readable assertion.
+    fn carried(module: &VerilogModule) -> Vec<String> {
+        module
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                ModuleStatement::Assignment(assignments) => Some(format!(
+                    "assign {} = {}",
+                    assignments[0].lhs().to_contracted_string(),
+                    assignments[0].rhs().to_contracted_string()
+                )),
+                ModuleStatement::GateInstantiation(gates) => Some(format!(
+                    "tran {:?} ({})",
+                    gates[0].instance.range,
+                    gates[0]
+                        .instance
+                        .terminals
+                        .iter()
+                        .map(Expression::to_contracted_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// IEEE 1364-2005's `port` is a *port expression*, optionally behind an
+    /// external name. Each is normalised to an ordinary port whose connection
+    /// is carried to the body's declarations — `assign` inward for an input,
+    /// outward for an output — and what it names in the body becomes a local
+    /// (corpus `contrib8.2`, `pr377`, `pr3197917`, `port-test2`).
+    #[test]
+    fn test_a_header_port_may_be_an_expression() {
+        let module = assert_parses(
+            parse_module_declaration,
+            "module c(.a({b, c}), q[3:0], ); input [10:0] b; input c; output [7:0] q; endmodule",
+        );
+        let ports: Vec<(&str, PortDirection, Range)> = module
+            .ports
+            .iter()
+            .map(|port| {
+                (
+                    port.identifier.name.as_str(),
+                    port.direction,
+                    port.range.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                ("a", PortDirection::Input, Range::Constant(11, 0)),
+                ("$port1", PortDirection::Output, Range::Constant(3, 0)),
+                ("$port2", PortDirection::Input, Range::SINGLE_BIT),
+            ]
+        );
+        assert_eq!(
+            carried(&module),
+            vec!["assign {b, c} = a", "assign $port1 = q[3:0]"]
+        );
+        // What the expressions named is declared in the body, not as a port.
+        assert!(matches!(
+            &module.statements[0],
+            ModuleStatement::PortDeclaration(locals) if locals.len() == 3
+        ));
+    }
+
+    /// `module id(a, a); inout a;` — one net reached through two ports, which
+    /// a `tran` carries because an `inout` is read as well as written (corpus
+    /// `inout`, `br_gh1178b`). Two *inputs* sharing a net would have the
+    /// child drive its parent, so a repeat of anything else is still refused.
+    #[test]
+    fn test_an_inout_may_be_listed_twice() {
+        let module = assert_parses(
+            parse_module_declaration,
+            "module net_connect #(parameter W = 1) (w, w); inout wire [W-1:0] w; endmodule",
+        );
+        assert_eq!(module.ports.len(), 2);
+        assert_eq!(module.ports[0].identifier, "w".into());
+        assert_eq!(module.ports[1].identifier, "$port1".into());
+        assert_eq!(module.ports[1].direction, PortDirection::InOut);
+        assert_eq!(module.ports[1].range, module.ports[0].range);
+        assert_eq!(carried(&module).len(), 1);
+        assert!(carried(&module)[0].ends_with("($port1, w)"));
+
+        assert!(parse_module_declaration("module m(a, a); input a; endmodule").is_err());
+    }
+
+    /// What a port expression cannot say is refused rather than guessed: parts
+    /// that disagree about direction, a width made of parameters that would
+    /// have to be summed, and an external name the body also declares.
+    #[test]
+    fn test_a_port_expression_that_cannot_be_carried_is_refused() {
+        for source in [
+            "module m({a, b}); input a; output b; endmodule",
+            "module m #(parameter W = 2) ({a, b}); input [W-1:0] a; input b; endmodule",
+            "module m(.b(a[1:0])); input [3:0] a; input b; endmodule",
+            "module m(.p({a, b})); inout a, b; endmodule",
+        ] {
+            assert!(parse_module_declaration(source).is_err(), "{}", source);
+        }
+    }
+
     #[test]
     fn test_a_port_cannot_be_declared_twice() {
         assert_eq!(
             reconcile_ports(
-                PortHeader::NonAnsi(vec!["a".into()]),
+                names_header(&["a"]),
                 vec![
                     named_port(PortDirection::Input, "a"),
                     named_port(PortDirection::Output, "a"),
@@ -1571,7 +1991,7 @@ mod tests {
         // The same name twice in the header itself is the same mistake.
         assert_eq!(
             reconcile_ports(
-                PortHeader::NonAnsi(vec!["a".into(), "a".into()]),
+                names_header(&["a", "a"]),
                 vec![named_port(PortDirection::Input, "a")],
             ),
             Err(PortReconciliationError::Duplicate("a".into()))

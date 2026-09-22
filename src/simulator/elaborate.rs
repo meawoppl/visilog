@@ -6534,6 +6534,45 @@ mod tests {
         assert_eq!(simulator.output().text(), "x z 32\n-1 1\n");
     }
 
+    /// A header port that is an expression carries its connection to what it
+    /// names: `arg[7:4]` and `arg[1:0]` drive two parts of one input and leave
+    /// the bits between them floating, `.q({hi, lo})` is an output made of two
+    /// declarations, and `short(a, a)` joins whatever its two `inout`s are
+    /// bound to. iverilog 12.0 prints `1010zz01 11 0` then `1`.
+    #[test]
+    fn test_header_port_expressions_are_carried() {
+        let split = r#"
+            module split(arg[7:4], arg[1:0], .q({hi, lo}));
+                input [7:0] arg;
+                output hi, lo;
+                assign hi = arg[7];
+                assign lo = arg[0];
+            endmodule
+        "#;
+        let short = "module short(a, a); inout a; endmodule";
+        let top = r#"
+            module top;
+                reg [3:0] x;
+                reg [1:0] y;
+                wire [1:0] q;
+                wire b, c;
+                reg drive, en;
+                split s(x, y, q);
+                short k(b, c);
+                assign b = en ? drive : 1'bz;
+                initial begin
+                    x = 4'b1010; y = 2'b01; en = 1; drive = 0;
+                    #1 $display("%b %b %b", s.arg, q, c);
+                    drive = 1;
+                    #1 $display("%b", c);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[split, short, top], "top");
+        simulator.advance(3).unwrap();
+        assert_eq!(simulator.output().text(), "1010zz01 11 0\n1\n");
+    }
+
     /// `reg a = expr;` is a starting value, not a driver: a procedural write
     /// owns the register from then on and the initialiser does not fight it.
     #[test]
