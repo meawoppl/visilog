@@ -90,9 +90,9 @@ impl Source {
     fn value(&self, store: &StateStore) -> Option<Register> {
         match self {
             Source::Signal(name) => store.get(name).cloned(),
-            Source::Word(name, address) => {
-                store.memory(name).map(|memory| memory.word(Some(*address)))
-            }
+            Source::Word(name, address) => store
+                .memory(name)
+                .map(|memory| memory.word(Some(std::slice::from_ref(address)))),
         }
     }
 }
@@ -327,8 +327,19 @@ impl VcdDump {
             match target {
                 DumpTarget::Word(name, address) => {
                     let name = relative(name, top);
-                    if store.memory(&name).is_none() {
-                        return Err(format!("`{}` is not a memory", name));
+                    match store.memory(&name) {
+                        None => return Err(format!("`{}` is not a memory", name)),
+                        // One index names a word only of a one-dimensional
+                        // array; anything else would dump a word that reads
+                        // `x` for ever rather than the one the design meant.
+                        Some(memory) if memory.dimensions() != 1 => {
+                            return Err(format!(
+                                "`{}` has {} dimensions, so one index names no word of it",
+                                name,
+                                memory.dimensions()
+                            ))
+                        }
+                        Some(_) => {}
                     }
                     let (scopes, leaf) = split(&name, top);
                     self.declare(

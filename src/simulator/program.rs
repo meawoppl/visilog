@@ -447,8 +447,11 @@ fn calls(expression: &Expression, name: &str) -> bool {
         Expression::FunctionCall(_, arguments) => nested(arguments),
         Expression::BitSelect(_, index) => calls(index, name),
         Expression::PartSelect(_, first, second) => calls(first, name) || calls(second, name),
-        Expression::WordSelect { index, select, .. } => {
-            calls(index, name) || select.expressions().iter().any(|inner| calls(inner, name))
+        Expression::WordSelect {
+            indices, select, ..
+        } => {
+            indices.iter().any(|index| calls(index, name))
+                || select.expressions().iter().any(|inner| calls(inner, name))
         }
     }
 }

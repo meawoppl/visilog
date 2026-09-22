@@ -56,12 +56,14 @@ use crate::parsers::expr::{Expression, WordSelectKind};
 use crate::parsers::identifier::Identifier;
 use crate::parsers::operators::{BinaryOperator, UnaryOperator};
 use crate::register::{sign_extend_to_i128, Chunk, Register, ONE, REAL_WIDTH, X, Z, ZERO};
-use crate::simulator::exec::{range_width, resolve_target, ResolvedTarget};
+use crate::simulator::exec::{
+    address_brackets, range_width, resolve_target, word_select_split, ResolvedTarget,
+};
 use crate::simulator::plusargs;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::scan::{self, Slot, END_OF_FILE};
 use crate::simulator::state_store::{
-    random_from_seed, DriveLevel, NotReadable, SignalState, StateStore, MAX_CALL_DEPTH,
+    random_from_seed, DriveLevel, Memory, NotReadable, SignalState, StateStore, MAX_CALL_DEPTH,
 };
 use crate::simulator::tasks::ascii;
 
@@ -97,6 +99,20 @@ pub enum EvalError {
     /// modelled — so this names what was asked for rather than selecting
     /// bits of the wrong thing.
     NotAMemory(String),
+    /// An array indexed by the wrong number of addresses: `a[i]` or `a[i][j][k]`
+    /// where `a` was declared `reg [7:0] a [0:3][0:15];`.
+    ///
+    /// A word of an array is named by one index per declared dimension, and
+    /// anything else names no word at all — a partial address is a whole row,
+    /// which is not a value, and one index too many is a select of something
+    /// that has already been narrowed to a word. Both are reported by name,
+    /// because reading *some* word instead is the quietest possible wrong
+    /// answer: it returns a real value that the design never asked for.
+    ArrayDimensions {
+        name: String,
+        declared: usize,
+        used: usize,
+    },
     /// A named event read as though it were a value. An event has no value at
     /// all — it is triggered by `-> e;` and waited on by `@(e)` — so a name
     /// that exists is reported as what it is rather than as unknown.
@@ -169,6 +185,19 @@ impl fmt::Display for EvalError {
             EvalError::NotAMemory(name) => {
                 write!(f, "`{}` is not a memory, so it has no second select", name)
             }
+            EvalError::ArrayDimensions {
+                name,
+                declared,
+                used,
+            } => write!(
+                f,
+                "array `{}` has {} dimension{}, so {} index{} names no word of it",
+                name,
+                declared,
+                if *declared == 1 { "" } else { "s" },
+                used,
+                if *used == 1 { "" } else { "es" },
+            ),
             EvalError::EventAsValue(name) => {
                 write!(f, "event `{}` has no value; it can only be triggered", name)
             }
@@ -463,7 +492,22 @@ fn eval_in_context(
                 // are the same syntax, and the only thing that tells them apart
                 // is which map the declaration put the name in.
                 None => match store.memory(&id.name) {
-                    Some(memory) => demoted(memory.word(index), signed_context),
+                    Some(memory) => {
+                        // One index names a word only of a one-dimensional
+                        // array; `a[i]` of `reg [7:0] a [0:3][0:15];` is a
+                        // whole row, which is not a value.
+                        if memory.dimensions() != 1 {
+                            return Err(EvalError::ArrayDimensions {
+                                name: id.name.clone(),
+                                declared: memory.dimensions(),
+                                used: 1,
+                            });
+                        }
+                        demoted(
+                            memory.word(index.as_ref().map(std::slice::from_ref)),
+                            signed_context,
+                        )
+                    }
                     None => return Err(EvalError::UnknownIdentifier(id.name.clone())),
                 },
             };
@@ -512,12 +556,45 @@ fn eval_in_context(
         // `mem[i][3:0]` — the word first, then the select inside it. A word is
         // a bare `Register`, so the declared indices are mapped through the
         // *memory's* range rather than a signal's.
-        Expression::WordSelect { id, index, select } => {
+        Expression::WordSelect {
+            id,
+            indices: brackets,
+            select,
+        } => {
             let Some(memory) = store.memory(&id.name) else {
                 return Err(EvalError::NotAMemory(id.name.clone()));
             };
-            let address = numeric(&eval(index, store)?)?.and_then(|v| i64::try_from(v).ok());
-            let word = memory.word(address);
+            let declared = memory.dimensions();
+            let Some(split) = word_select_split(brackets.len(), select, declared) else {
+                return Err(EvalError::ArrayDimensions {
+                    name: id.name.clone(),
+                    declared,
+                    used: address_brackets(brackets.len(), select),
+                });
+            };
+            // An index that is unknown, or too far from zero to be an address,
+            // names no word — which reads `x`, exactly as an out-of-range one
+            // does.
+            let mut address = Vec::with_capacity(declared);
+            let mut known = true;
+            for bracket in &brackets[..split.leading] {
+                match select_index(&eval(bracket, store)?)? {
+                    Some(index) => address.push(index),
+                    None => known = false,
+                }
+            }
+            if !split.selects_within {
+                let WordSelectKind::Bit(last) = select else {
+                    unreachable!("`word_select_split` only takes a plain index as an address")
+                };
+                match select_index(&eval(last, store)?)? {
+                    Some(index) => address.push(index),
+                    None => known = false,
+                }
+                let word = memory.word(known.then_some(address.as_slice()));
+                return Ok(widened(demoted(word, signed_context), width));
+            }
+            let word = memory.word(known.then_some(address.as_slice()));
             let value = match select {
                 WordSelectKind::Bit(bit) => {
                     match numeric(&eval(bit, store)?)?.and_then(|v| i64::try_from(v).ok()) {
@@ -580,6 +657,25 @@ fn eval_in_context(
             width,
         ),
     }
+}
+
+/// The array a word select names a *whole word* of, or `None` when its last
+/// bracket selects bits inside the word, or it names no word at all.
+///
+/// `a[i][j]` of `reg [7:0] a [0:3][0:15];` is a whole word, and so is as wide,
+/// as signed and as real as the array's element; `mem[i][j]` of a
+/// one-dimensional array is one bit of a word and is none of those. The
+/// walks that size and sign an expression before evaluating it ask this so
+/// they answer the same question [`eval`] does.
+fn whole_word<'a>(
+    name: &str,
+    indices: &[Expression],
+    select: &WordSelectKind,
+    store: &'a StateStore,
+) -> Option<&'a Memory> {
+    let memory = store.memory(name)?;
+    let split = word_select_split(indices.len(), select, memory.dimensions())?;
+    (!split.selects_within).then_some(memory)
 }
 
 /// The error for a name that produced no value: a memory used where a value was
@@ -898,10 +994,15 @@ fn unary_keeps_signedness(op: &UnaryOperator) -> bool {
 fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
     match expr {
         Expression::Constant(constant) => constant.is_signed(),
-        // A select out of a word is a run of bits, and a run of bits is
-        // unsigned however the memory was declared — the same rule a part
-        // select of a signed `reg` follows.
-        Expression::WordSelect { .. } => false,
+        // A whole word of a multi-dimensional array is as signed as the array
+        // was declared. A select out of a word is a run of bits, and a run of
+        // bits is unsigned however the memory was declared — the same rule a
+        // part select of a signed `reg` follows.
+        Expression::WordSelect {
+            id,
+            indices,
+            select,
+        } => whole_word(&id.name, indices, select, store).is_some_and(Memory::is_signed),
         // A real has a sign, and saying otherwise would make the *integer*
         // beside it unsigned: `2.5 > -1` has to read that `-1` as -1 rather
         // than as four billion before converting it.
@@ -965,9 +1066,14 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
 fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
     match expr {
         Expression::RealLiteral(_) => true,
-        // A real has no bits to select from, so a select out of one is not
-        // itself real.
-        Expression::WordSelect { .. } => false,
+        // A whole word of an array of reals is a real, as `r[i][j]` of
+        // `real r [3:0][1:0];` is. A real has no bits to select from, so a
+        // select out of one is not itself real.
+        Expression::WordSelect {
+            id,
+            indices,
+            select,
+        } => whole_word(&id.name, indices, select, store).is_some_and(Memory::is_real),
         // The store's hint first, the way [`expression_is_signed`] asks it:
         // `declare_real` and `declare_real_memory` are the only two things that
         // set the flag, so `false` means no *declaration* is real and the name
@@ -1128,17 +1234,24 @@ fn sized_within(expr: &Expression) -> bool {
 pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
     match expr {
         Expression::Constant(constant) => constant.size().unwrap_or(UNSIZED_CONSTANT_WIDTH),
-        // As wide as the second bracket names, which is the same question the
-        // three plain selects answer.
-        Expression::WordSelect { select, .. } => match select {
-            WordSelectKind::Bit(_) => 1,
-            WordSelectKind::Part(first, second) => {
+        // A whole word of a multi-dimensional array is as wide as the array's
+        // element: `$bits(a[0][1])` of `reg [7:0] a [0:2][3:1];` is 8
+        // (iverilog 12.0). Otherwise it is as wide as the last bracket names,
+        // which is the same question the three plain selects answer.
+        Expression::WordSelect {
+            id,
+            indices,
+            select,
+        } => match (whole_word(&id.name, indices, select, store), select) {
+            (Some(memory), _) => memory.width(),
+            (None, WordSelectKind::Bit(_)) => 1,
+            (None, WordSelectKind::Part(first, second)) => {
                 match (select_bound(first, store), select_bound(second, store)) {
                     (Ok(first), Ok(second)) => (first - second).unsigned_abs() as usize + 1,
                     _ => 1,
                 }
             }
-            WordSelectKind::Indexed { width, .. } => {
+            (None, WordSelectKind::Indexed { width, .. }) => {
                 indexed_select_width(width, store).unwrap_or(1)
             }
         },

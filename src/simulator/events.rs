@@ -543,8 +543,12 @@ fn collect_target_reads(target: &Expression, names: &mut BTreeSet<String>) {
             collect_expression_reads(base, names);
             collect_expression_reads(width, names);
         }
-        Expression::WordSelect { index, select, .. } => {
-            collect_expression_reads(index, names);
+        Expression::WordSelect {
+            indices, select, ..
+        } => {
+            for index in indices {
+                collect_expression_reads(index, names);
+            }
             for inner in select.expressions() {
                 collect_expression_reads(inner, names);
             }
@@ -604,9 +608,15 @@ fn collect_expression_reads(expression: &Expression, names: &mut BTreeSet<String
             collect_expression_reads(base, names);
             collect_expression_reads(width, names);
         }
-        Expression::WordSelect { id, index, select } => {
+        Expression::WordSelect {
+            id,
+            indices,
+            select,
+        } => {
             names.insert(id.name.clone());
-            collect_expression_reads(index, names);
+            for index in indices {
+                collect_expression_reads(index, names);
+            }
             for inner in select.expressions() {
                 collect_expression_reads(inner, names);
             }

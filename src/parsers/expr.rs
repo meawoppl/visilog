@@ -72,19 +72,25 @@ pub enum Expression {
     SystemFunctionCall(String, Vec<Expression>),
     BitSelect(Identifier, Box<Expression>),
     PartSelect(Identifier, Box<Expression>, Box<Expression>),
-    /// `mem[i][3:0]` — a select *within one word of a memory*, written as two
-    /// brackets.
+    /// `mem[i][3:0]`, `array[i][j]`, `array[i][j][3:0]` — a name under more
+    /// than one bracket.
     ///
-    /// Only a memory has a second dimension to select from, and only the
-    /// declaration says which bracket is which: the first is the word address
-    /// and the second is the bit, part or indexed part select of that word.
+    /// Only an array has a dimension past the first, and only the
+    /// *declaration* says what each bracket means: an array of one dimension
+    /// reads `mem[i][3:0]` as a word address and a select inside that word,
+    /// while one of two reads `array[i][j]` as two addresses. The brackets are
+    /// therefore kept as they were written — `indices`, the leading plain
+    /// indices, and `select`, the last bracket, which is the only one that may
+    /// be a part or indexed part select — and `exec::resolve_target` and
+    /// `eval` ask the store how many of them are addresses.
+    ///
     /// It is its own node rather than a select whose base is an expression,
     /// because the one shape Verilog allows here is exactly this one — a
     /// select of a select of anything else is not legal — so a general base
     /// would be a hole nothing fills.
     WordSelect {
         id: Identifier,
-        index: Box<Expression>,
+        indices: Vec<Expression>,
         select: WordSelectKind,
     },
 }
@@ -244,10 +250,17 @@ impl Expression {
                 if *upward { "+" } else { "-" },
                 width.to_contracted_string()
             ),
-            Expression::WordSelect { id, index, select } => format!(
-                "{}[{}][{}]",
+            Expression::WordSelect {
+                id,
+                indices,
+                select,
+            } => format!(
+                "{}{}[{}]",
                 id.name,
-                index.to_contracted_string(),
+                indices
+                    .iter()
+                    .map(|index| format!("[{}]", index.to_contracted_string()))
+                    .collect::<String>(),
                 select.to_contracted_string()
             ),
         }
@@ -363,12 +376,19 @@ impl Expression {
                 base.to_ast_string(indent + 1),
                 width.to_ast_string(indent + 1)
             ),
-            Expression::WordSelect { id, index, select } => format!(
-                "{}WordSelect(\n{}{}[{}],\n{}{})",
+            Expression::WordSelect {
+                id,
+                indices,
+                select,
+            } => format!(
+                "{}WordSelect(\n{}{}{},\n{}{})",
                 indent_str,
                 indent_str,
                 id.name,
-                index.to_contracted_string(),
+                indices
+                    .iter()
+                    .map(|index| format!("[{}]", index.to_contracted_string()))
+                    .collect::<String>(),
                 indent_str,
                 select.to_contracted_string()
             ),
@@ -626,39 +646,48 @@ fn bracketed_select(input: &str) -> IResult<&str, WordSelectKind> {
 }
 
 /// A name with a select after it: `a[i]`, `a[3:0]`, `a[base +: 4]`, and the
-/// two-bracket `mem[i][3:0]`.
+/// multi-bracket `mem[i][3:0]`, `array[i][j]`, `array[i][j][3:0]`.
 ///
 /// One parser rather than four alternatives, because the name and the first
 /// bracket are the same in all of them: trying each shape separately re-parses
 /// the prefix once per shape, and looking for a second bracket separately
 /// re-parses it again.
 ///
-/// A second bracket is a select *inside a memory word*, so the first one has
-/// to be the word address — a single index. `mem[3:0][1]` is not Verilog, and
-/// a first bracket that is not a plain index is simply the whole select.
+/// Every bracket but the last has to be a plain index, because only the last
+/// one can be a range: `mem[3:0][1]` is not Verilog, so a bracket that is not
+/// a plain index ends the run. What each of them *means* is the declaration's
+/// to say — an address of a multi-dimensional array, or a select inside a word
+/// — and that question is asked of the store rather than here.
 ///
 /// The name and the `[` are separate tokens, so `v [0]` is `v[0]`. That is a
 /// widening of `operand_no_ws` and safe in a way that whitespace after a unary
 /// operator is not: `[` is not an operator, so nothing else can claim it.
 pub fn select(input: &str) -> IResult<&str, Expression> {
     let (rest, id) = hierarchical_identifier(input)?;
-    let (rest, first) = bracketed_select(rest)?;
-    if matches!(first, WordSelectKind::Bit(_)) {
-        if let Ok((after, second)) = bracketed_select(rest) {
-            let WordSelectKind::Bit(index) = first else {
-                unreachable!("just matched a bit select")
-            };
-            return Ok((
-                after,
-                Expression::WordSelect {
-                    id,
-                    index,
-                    select: second,
-                },
-            ));
-        }
+    let (mut rest, mut last) = bracketed_select(rest)?;
+    let mut indices: Vec<Expression> = Vec::new();
+    while let WordSelectKind::Bit(_) = last {
+        let Ok((after, next)) = bracketed_select(rest) else {
+            break;
+        };
+        let WordSelectKind::Bit(index) = last else {
+            unreachable!("the loop condition just matched a bit select")
+        };
+        indices.push(*index);
+        last = next;
+        rest = after;
     }
-    Ok((rest, first.applied_to(id)))
+    if indices.is_empty() {
+        return Ok((rest, last.applied_to(id)));
+    }
+    Ok((
+        rest,
+        Expression::WordSelect {
+            id,
+            indices,
+            select: last,
+        },
+    ))
 }
 
 /// `a[i]` — a single-bit select and nothing else, for a production that must
@@ -972,6 +1001,35 @@ mod tests {
     use crate::parsers::helpers::{assert_parses, assert_parses_to};
 
     use super::*;
+
+    /// `a[i][j]` and `a[i][j][3:0]` keep every bracket as written: the leading
+    /// plain indices, then the last bracket, which alone may be a range. Which
+    /// of them are addresses is the declaration's to say, so nothing here
+    /// decides it. A range before the last bracket ends the run, since
+    /// `a[3:0][1]` is not Verilog.
+    #[test]
+    fn test_a_select_keeps_every_bracket() {
+        let index = |name: &str| Expression::Identifier(name.into());
+        assert_parses_to(
+            verilog_expression,
+            "a[i][j]",
+            Expression::WordSelect {
+                id: "a".into(),
+                indices: vec![index("i")],
+                select: WordSelectKind::Bit(Box::new(index("j"))),
+            },
+        );
+        match assert_parses(verilog_expression, "a[i] [j][k][3:0]") {
+            Expression::WordSelect {
+                indices,
+                select: WordSelectKind::Part(_, _),
+                ..
+            } => assert_eq!(indices, vec![index("i"), index("j"), index("k")]),
+            other => panic!("expected a four bracket word select, got {:?}", other),
+        }
+        let (rest, _) = verilog_expression("a[3:0][1]").expect("the first bracket parses");
+        assert_eq!(rest, "[1]");
+    }
 
     /// A real literal parses in both of IEEE 1364's spellings, and it is tried
     /// *before* the integer grammar — which would otherwise read `0.9` as the

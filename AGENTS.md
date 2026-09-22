@@ -220,6 +220,30 @@ and an address outside the declared range reads `x` and discards a write, which
 is what an out-of-range *bit* select already did. `integer i [0:3];` is a memory
 of 32-bit signed words by the same path.
 
+**An array may have more than one dimension, and the declaration is what says how
+many brackets are addresses.** `reg [7:0] a [0:3][0:15];` is one `Memory` whose
+`addresses` are a *list* — words laid out row-major, last dimension fastest — and
+`register::declared_name` reads every dimension through `simple::dimensions`. The
+brackets reach the simulator as they were written: `Expression::WordSelect` holds the
+leading plain indices and the last bracket, and `exec::word_select_split` asks the
+array how many dimensions it has. That is the only thing that tells `m[i][j]` of a
+one-dimensional array (a *bit* of a word) from `a[i][j]` of a two-dimensional one (a
+whole word), and `eval`, `resolve_target` and the pre-evaluation walks
+(`eval::whole_word`, which sizes, signs and makes real a whole word the way the
+element was declared) all go through it so they cannot disagree. One more bracket than
+there are dimensions is a select inside the word (`a[i][j][3:0]`). **Anything else —
+a partial address (`a[i]`, a whole row), an index too many, or a range where an
+address belongs — is `EvalError::ArrayDimensions` naming the array**, which is also
+what iverilog 12.0 answers ("Array a needs 2 indices, but got only 1"): reading the
+row's first word instead would be a real value nothing asked for. An index outside
+*any* dimension reads `x` and discards a write, exactly as for one dimension, and
+`MAX_MEMORY_DEPTH` is measured against the **product** of the dimensions
+(`state_store::array_depth`, saturating), since that is how many words are
+allocated. `$readmemh`/`$writememh` into a multi-dimensional array and a `$dumpvars`
+of one word of one are named errors — the file format and the single-index dump name
+say nothing about rows. Corpus `array7`, `br_gh33`, `pr3582052`,
+`real_array_multi_dim`.
+
 A memory write **is** journalled, in a list of its own: `always @(bus[index[0]])`
 has to wake when `index[0]` moves. The journal keeps one before/after pair per
 memory *name* rather than per word, which over-approximates in the direction
@@ -2658,8 +2682,8 @@ tripwire.
   `Expression` says nothing, and a `BitSelect` on a memory is not distinguishable
   from one on a vector in the AST. A bare memory name, or a part select of one,
   is `EvalError::MemoryAsValue` rather than `UnknownIdentifier`: the name does
-  exist. `MAX_MEMORY_DEPTH` in `elaborate.rs` makes a nonsense dimension a named
-  error rather than an allocation nothing survives.
+  exist. `MAX_MEMORY_DEPTH` in `elaborate.rs` makes a nonsense dimension — or a
+  product of several — a named error rather than an allocation nothing survives.
 - **A select may be separated from the name it selects from.** `v [0]` and `v [3:0]` are
   `v[0]` and `v[3:0]` — `expr.rs`'s `bit_select` / `part_select` skip whitespace and
   comments before the `[`. That widening is safe where the unary junction's is not: `[` is
@@ -2893,12 +2917,17 @@ tripwire.
   inside a `delimited` that has already eaten the `[`. `bit_select` / `part_select` /
   `indexed_part_select` survive as one-shape wrappers over the same parser, because a
   `specify` path terminal takes exactly one select and must not take a word one.
-  A first bracket that is *not* a plain index is the whole select, since `mem[3:0][1]`
-  is not Verilog.
+  `select` keeps reading brackets while each one is a plain index, so
+  `a[i][j][k][3:0]` is one node; a bracket that is *not* a plain index ends the run,
+  since `mem[3:0][1]` is not Verilog.
   **Only a memory has a second dimension**, and nothing in the grammar can tell
   `mem[i][2]` from a second select on a vector, so `a[0][1:0]` for a plain `a` is
-  `EvalError::NotAMemory` naming it rather than bits of the wrong thing — a packed
-  dimension (`reg [3:0][7:0] v;`) is still not modelled. A word is a bare `Register` with
+  `EvalError::NotAMemory` naming it rather than bits of the wrong thing. A **packed**
+  dimension (`reg [3:0][7:0] v;`) is still not modelled and is a parse error: the
+  declaration parsers take one range before the name. It is a different feature from
+  an unpacked one — one wide vector whose selects are scaled by the element width, so
+  `v[1:0]` is sixteen bits — and it is what corpus `array_packed_2d`, `br_gh497a`,
+  `br_gh497c` and `br_gh497e` still wait on (#207). A word is a bare `Register` with
   no declared range, so the declared indices are mapped through the *memory's* range:
   that is `state_store::bit_position_in`, the one copy of the mapping, which
   `SignalState::bit_position` and `Memory::bit_of` / `with_bit_of` both go through.

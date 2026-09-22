@@ -2143,7 +2143,7 @@ impl Simulator {
         }
         // Grouped by net, in the order the drivers were written, so a design
         // resolves the same way twice.
-        let mut nets: Vec<(&str, Option<i64>)> = Vec::new();
+        let mut nets: Vec<(&str, Option<&[i64]>)> = Vec::new();
         for contribution in &contributions {
             let net = (
                 contribution.target.name(),
@@ -2177,6 +2177,7 @@ impl Simulator {
                         .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
                     (memory.width(), memory.word(Some(index)).get_raw().to_vec())
                 }
+
                 None => {
                     let signal = self
                         .state
@@ -2247,7 +2248,7 @@ impl Simulator {
             }
             resolving.push(NetDrivers {
                 name: name.to_string(),
-                address,
+                address: address.map(<[i64]>::to_vec),
                 bits,
                 driven,
             });
@@ -2272,9 +2273,9 @@ impl Simulator {
                 }
             }
             let target = match net.address {
-                Some(index) => ResolvedTarget::Word {
+                Some(address) => ResolvedTarget::Word {
                     name: net.name,
-                    index,
+                    address,
                 },
                 None => ResolvedTarget::Whole(net.name),
             };
@@ -2400,7 +2401,7 @@ struct SwitchBits {
 /// One net's per-bit driver lists, before they are resolved.
 struct NetDrivers {
     name: String,
-    address: Option<i64>,
+    address: Option<Vec<i64>>,
     /// What the net holds now. A bit no driver reaches keeps its value.
     bits: Vec<u8>,
     /// The drivers of each bit, most significant first.
@@ -6700,6 +6701,143 @@ mod tests {
         );
 
         assert_eq!(simulator.output().lines(), vec!["0001 xxxx"]);
+    }
+
+    /// `reg [7:0] a [0:2][3:1];` — a two-dimensional array, one word per
+    /// *pair* of indices, with the second dimension declared descending. Every
+    /// line was measured against iverilog 12.0, which prints
+    ///
+    /// ```text
+    /// 01 23 12
+    /// xx xx
+    /// 21 03
+    /// 1 2
+    /// 1a
+    /// xx
+    /// 01 02 xx
+    /// 8
+    /// ```
+    ///
+    /// — each word its own, an index outside either dimension reading `x` and
+    /// discarding a write, a third bracket selecting bits *inside* the word,
+    /// an unknown index reading `x`, and `$bits` of a word being the element's
+    /// width. The second array runs its first dimension downward.
+    #[test]
+    fn test_a_two_dimensional_array_addresses_one_word_per_index_pair() {
+        let simulator = simulator_for(
+            r#"
+            module t;
+                reg [7:0] a [0:2][3:1];
+                reg [7:0] d [2:0][0:1];
+                integer i, j;
+                initial begin
+                    for (i = 0; i < 3; i = i + 1)
+                        for (j = 1; j <= 3; j = j + 1)
+                            a[i][j] = i * 16 + j;
+                    $display("%h %h %h", a[0][1], a[2][3], a[1][2]);
+                    $display("%h %h", a[3][1], a[0][0]);
+                    a[5][1] = 8'hff; a[0][4] = 8'hff;
+                    $display("%h %h", a[2][1], a[0][3]);
+                    $display("%b %h", a[1][2][4], a[2][3][7:4]);
+                    a[1][2][3:0] = 4'ha;
+                    $display("%h", a[1][2]);
+                    i = 'bx; $display("%h", a[i][1]);
+                    d[2][0] = 1; d[0][1] = 2;
+                    $display("%h %h %h", d[2][0], d[0][1], d[1][1]);
+                    $display("%0d", $bits(a[0][1]));
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["01 23 12", "xx xx", "21 03", "1 2", "1a", "xx", "01 02 xx", "8"]
+        );
+    }
+
+    /// A word of a multi-dimensional `integer` array is as signed as the
+    /// array, and one of a `real` array is a real — both are decided before
+    /// the word is evaluated, so the walks that size an expression have to
+    /// know a whole word from a bit of one. iverilog 12.0 prints `neg 0.5`.
+    #[test]
+    fn test_a_multi_dimensional_word_keeps_its_signedness_and_realness() {
+        let simulator = simulator_for(
+            r#"
+            module t;
+                integer n [0:1][0:1];
+                real r [0:1][0:1];
+                initial begin
+                    n[1][0] = -1;
+                    r[0][1] = 1.0;
+                    if (n[1][0] < 0) $display("neg"); else $display("pos");
+                    $display("%0.1f", (1 ? r[0][1] : 2) / 2);
+                end
+            endmodule
+        "#,
+        );
+
+        assert_eq!(simulator.output().lines(), vec!["neg", "0.5"]);
+    }
+
+    /// One index into a two-dimensional array names a whole row, which is not
+    /// a value: iverilog 12.0 refuses `a[1]` with "Array a['sd1] needs 2
+    /// indices, but got only 1", and so does this, by name — reading the row's
+    /// first word instead would be a real value nobody asked for. So is an
+    /// index too many, reading or writing.
+    #[test]
+    fn test_the_wrong_number_of_indices_is_a_named_error() {
+        for body in [
+            "$display(\"%h\", a[1]);",
+            "a[1] = 0;",
+            "$display(\"%h\", a[1][2][3][4]);",
+            "a[1][2][3][4] = 0;",
+            "$display(\"%h\", a[1][3:0]);",
+        ] {
+            let source = format!(
+                "module t; reg [7:0] a [0:2][0:3]; initial begin {} end endmodule",
+                body
+            );
+            let (_, module) = parse_module_declaration(&source).unwrap();
+            let mut simulator = Simulator::new(module);
+            let error = simulator
+                .setup()
+                .expect_err("a partial or overlong address should be refused");
+            assert!(
+                error.to_string().contains("array `a` has 2 dimensions"),
+                "{}: {}",
+                body,
+                error
+            );
+        }
+    }
+
+    /// An array's size is the *product* of its dimensions, so four dimensions
+    /// each well inside `MAX_MEMORY_DEPTH` are still refused by name before
+    /// anything is allocated.
+    #[test]
+    fn test_a_multi_dimensional_array_is_measured_by_its_product() {
+        let (_, module) =
+            parse_module_declaration("module t; reg a [0:1023][0:1023][0:1023][0:1023]; endmodule")
+                .unwrap();
+        let mut simulator = Simulator::new(module);
+        assert!(simulator.setup().is_err());
+    }
+
+    /// A memory file is a list of words for one run of addresses, which only a
+    /// one-dimensional array has, so `$readmemh` into a two-dimensional one is
+    /// named rather than loaded in an order this simulator would have to
+    /// invent.
+    #[test]
+    fn test_readmemh_into_a_multi_dimensional_array_is_refused() {
+        let (_, module) = parse_module_declaration(
+            r#"module t; reg [7:0] a [0:1][0:1];
+               initial $readmemh("nowhere.hex", a); endmodule"#,
+        )
+        .unwrap();
+        let mut simulator = Simulator::new(module);
+        let error = simulator.setup().expect_err("a 2-D load is refused");
+        assert!(error.to_string().contains("has 2 dimensions"), "{}", error);
     }
 
     /// A continuous assignment reading a memory word settles against it, which
