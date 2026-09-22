@@ -2968,6 +2968,11 @@ tripwire.
   index that really is out of range. That is the **one** place the rule lives: every
   select comes through it — a bit, a part, an indexed part and a memory word, reading and
   writing alike — so none of them can disagree about which word a design named.
+  **And an index is an `int`**: a value thirty-two bits wide or wider is read by its low
+  thirty-two bits as two's complement *whatever its declared signedness*, which is
+  iverilog 12.0's answer — a 128 bit index holding `2**120 + 7` names word 7 (corpus
+  `signed_a`) and an unsigned `32'hFFFFFFFF` names word `-1` of an array declared
+  `[-8:8]`. A narrower value keeps its own signedness, so `4'b1111` is still 15.
 - **A range is what decides a parameter's signedness**, failing a `signed` qualifier: one
   written with a range is unsigned unless it says otherwise, and only a *rangeless*
   parameter keeps the signedness its value arrived with. The trap is that a bare decimal

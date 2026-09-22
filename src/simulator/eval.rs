@@ -2218,6 +2218,14 @@ fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError>
 /// write into a silent no-op and a read into `x` (corpus `negative_genvar`,
 /// `signed_net_display`).
 ///
+/// An index is an **`int`**: a value thirty-two bits wide or wider is read by
+/// its low thirty-two bits as a two's complement number, whatever its declared
+/// signedness. That is iverilog 12.0's answer, measured: a 128 bit index
+/// holding `2**120 + 7` names word 7 (corpus `signed_a`, whose comment is
+/// "This should be stripped!"), and an *unsigned* `32'hFFFFFFFF` names word
+/// `-1` of `reg [3:0] a [-8:8]`. A narrower value keeps its own signedness, so
+/// `4'b1111` is still 15.
+///
 /// This is the one place that rule lives. Every select — a bit, a part, an
 /// indexed part, and a memory word, reading and writing alike — comes through
 /// it, so none of them can disagree about which word a design named.
@@ -2225,7 +2233,9 @@ pub fn select_index(value: &Register) -> Result<Option<i64>, EvalError> {
     let Some(bits) = numeric(value)? else {
         return Ok(None);
     };
-    Ok(if value.is_signed() {
+    Ok(if value.width() >= 32 {
+        Some(i64::from(bits as u32 as i32))
+    } else if value.is_signed() {
         i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
     } else {
         i64::try_from(bits).ok()

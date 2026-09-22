@@ -3107,6 +3107,45 @@ mod tests {
         assert_eq!(simulator.output().text(), "-7 -1 7  v=00000000\n");
     }
 
+    /// An index is an `int`: one thirty-two bits wide or wider is read by its
+    /// low thirty-two bits as a two's complement number, signed or not, for a
+    /// word and a bit alike, reading and writing alike.
+    ///
+    /// iverilog 12.0 prints `1001 1 | 1001 | xxxx x | 0110` for this design —
+    /// the high bits of `2**100 + 7` are dropped, an unsigned `32'hFFFFFFFF`
+    /// is word `-1`, and `2**31 + 7` is a negative index and names nothing
+    /// (corpus `signed_a`).
+    #[test]
+    fn test_an_index_is_read_as_a_thirty_two_bit_int() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [3:0] array [1:8];
+                reg [3:0] neg [-8:8];
+                reg [7:0] v;
+                reg [127:0] wide;
+                reg [31:0] all_ones;
+                initial begin
+                    array[7] = 4'b1001;
+                    neg[-1] = 4'b1001;
+                    v = 8'b10000001;
+                    wide = 7; wide[100] = 1'b1;
+                    all_ones = 32'hFFFFFFFF;
+                    $write("%b %b | %b | ", array[wide], v[wide], neg[all_ones]);
+                    wide = 7; wide[31] = 1'b1;
+                    $write("%b %b | ", array[wide], v[wide]);
+                    wide = 6; wide[64] = 1'b1;
+                    array[wide] = 4'b0110;
+                    $display("%b", array[6]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "1001 1 | 1001 | xxxx x | 0110\n");
+    }
+
     /// A vector declared `[base+15:base]` for a negative `base` really does
     /// have negative bit indices, so an indexed part select whose base is a
     /// *signed* value has to read it as the negative number it is. Reading
