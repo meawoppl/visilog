@@ -32,7 +32,7 @@ use visilog::parsers::modules::VerilogModule;
 use visilog::parsers::preprocessor::{Preprocessor, Timescale};
 use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
 use visilog::parsers::statements::ModuleStatement;
-use visilog::simulator::runner::Simulator;
+use visilog::simulator::runner::{SimulationError, Simulator};
 use visilog::simulator::tasks::is_supported_system_name;
 
 /// Where the corpus lives. `VISILOG_IVTEST` overrides the default cache path.
@@ -366,9 +366,9 @@ fn harness_accepts_known_good_source() {
 ///
 /// A design that calls `$finish` stops on its own and costs what it costs; this
 /// bound is only what a design that *never* finishes is given before it is
-/// judged on what it printed so far. So the cost of raising it falls entirely
-/// on the free-running designs — the whole corpus takes about 70 seconds here
-/// against about 30 at ten thousand.
+/// judged on what it printed so far — along with [`STEP_BUDGET`], which is
+/// what a design whose events are far apart is given instead. So the cost of
+/// raising either falls entirely on the free-running designs.
 ///
 /// A hundred thousand rather than a round-enough ten thousand because the
 /// corpus really does write testbenches that long: `pr528` and `pr528b` clock
@@ -376,6 +376,34 @@ fn harness_accepts_known_good_source() {
 /// 50001, and cutting them off mid-run scored them as wrong answers rather
 /// than as designs that had not been given time to run.
 const TIME_BUDGET: i64 = 100_000;
+
+/// How many further timesteps a design that has not finished by
+/// [`TIME_BUDGET`] is given, stepping from one scheduled event to the next.
+///
+/// Time is the wrong measure of what a run costs: a timestep costs the same
+/// whether it is one tick after the last or a billion. `pr2883958` waits
+/// `#1100000000` three times and does nothing in between, `pr511` finishes at
+/// 308250 with a handful of clocks running, and `sqrt32` clocks every five
+/// ticks until 910255 — all three are designs that finish, cut off by a clock
+/// rather than by work. A design with nothing left scheduled stops at once,
+/// so the bound only ever costs a design that runs for ever.
+const STEP_BUDGET: usize = 200_000;
+
+/// Runs a design until it calls `$finish`, has nothing left to do, or has
+/// used both [`TIME_BUDGET`] and [`STEP_BUDGET`].
+fn run_to_completion(simulator: &mut Simulator) -> Result<(), SimulationError> {
+    simulator.advance(TIME_BUDGET)?;
+    for _ in 0..STEP_BUDGET {
+        if simulator.finished() {
+            break;
+        }
+        let Some(next) = simulator.next_time() else {
+            break;
+        };
+        simulator.advance(next - simulator.now())?;
+    }
+    Ok(())
+}
 
 /// The module to elaborate: one that nothing else instantiates.
 ///
@@ -546,7 +574,7 @@ fn judge_with(
     if let Err(error) = simulator.setup() {
         return Outcome::SetupFailed(error_kind(&error));
     }
-    if let Err(error) = simulator.advance(TIME_BUDGET) {
+    if let Err(error) = run_to_completion(&mut simulator) {
         return Outcome::RunFailed(error_kind(&error));
     }
 
@@ -867,6 +895,28 @@ fn harness_reaches_passed_on_a_self_checking_design() {
     assert_eq!(judge(source), Outcome::Passed);
 }
 
+/// A design whose events are far apart is not a design that runs for ever: one
+/// that waits a billion ticks and then checks itself reaches its check, because
+/// past [`TIME_BUDGET`] the harness steps from one event to the next rather
+/// than counting ticks (corpus `pr2883958`, which waits `#1100000000` three
+/// times). A free-running clock beside it does not stop it either, since
+/// neither is anywhere near [`STEP_BUDGET`].
+#[test]
+fn harness_runs_a_sparse_design_past_the_time_budget() {
+    let source = r#"
+        module main;
+            reg clk = 0;
+            always #500000 clk = ~clk;
+            initial begin
+                #1000000000;
+                $display("PASSED");
+                $finish;
+            end
+        endmodule
+    "#;
+    assert_eq!(judge(source), Outcome::Passed);
+}
+
 /// The other half of the control: a design that computes the wrong thing must
 /// be reported as a wrong answer, not quietly as a pass.
 #[test]
@@ -1173,7 +1223,7 @@ fn probe_output(
     if let Err(error) = simulator.setup() {
         return format!("<setup failed: {:?}>\n", error);
     }
-    if let Err(error) = simulator.advance(TIME_BUDGET) {
+    if let Err(error) = run_to_completion(&mut simulator) {
         return format!("{}<run failed: {:?}>\n", simulator.output().text(), error);
     }
     simulator.output().text().to_string()
