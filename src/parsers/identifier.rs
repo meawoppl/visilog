@@ -9,7 +9,11 @@ use nom::{
     IResult,
 };
 
-use super::{base::RawToken, simple::raw_pos_int, simple::ws};
+use super::{
+    base::RawToken,
+    expr::verilog_expression,
+    simple::{raw_pos_int, ws, ws_and_comments},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Identifier {
@@ -113,9 +117,7 @@ fn simple_identifier(input: &str) -> IResult<&str, Identifier> {
     )(input)
 }
 
-/// The index of one generate block a hierarchical name descends through: the
-/// `[0]` of `stage[0].u`. It is a literal, because a name is written where no
-/// signal has a value yet.
+/// A literal generate index: the `[0]` of `stage[0].u`, or `[-1]`.
 fn scope_index(input: &str) -> IResult<&str, i64> {
     map(pair(opt(char('-')), raw_pos_int), |(sign, value)| {
         if sign.is_some() {
@@ -126,17 +128,69 @@ fn scope_index(input: &str) -> IResult<&str, i64> {
     })(input)
 }
 
+/// The index of one generate block a hierarchical name descends through,
+/// rendered the way it goes into the folded name.
+///
+/// A literal is written tight — `3` — because that is the store key's own
+/// spelling. Anything else is a **computed** index, `target[i].val` or
+/// `U[(i+1)%4].x`, whose value is a genvar's and does not exist until the loop
+/// is unrolled. It is kept as the text it was written as, padded with a space
+/// on each side: `[ (i+1)%4 ]`. The space is the marker, and an unambiguous
+/// one — an escaped identifier ends at whitespace and a simple one cannot hold
+/// a `[` — so no segment of a name can be mistaken for one. Elaboration
+/// evaluates it against the genvars in scope before the name is resolved.
+fn path_index(input: &str) -> IResult<&str, String> {
+    let literal = ws(scope_index)(input);
+    if let Ok((rest, value)) = literal {
+        if rest.starts_with(']') {
+            return Ok((rest, value.to_string()));
+        }
+    }
+    let (rest, _) = ws(verilog_expression)(input)?;
+    let text = input[..input.len() - rest.len()].trim();
+    Ok((rest, format!(" {} ", text)))
+}
+
+/// Where the bracket that opens `input` closes, counting the brackets nested
+/// inside it.
+fn closing_bracket(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, byte) in input.bytes().enumerate() {
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `input` with its leading spaces and tabs skipped.
+///
+/// Not [`ws_and_comments`](super::simple::ws_and_comments): this is asked of
+/// every identifier the expression grammar reads, and the cheap question is
+/// the one that stops at the first byte that is not a blank.
+fn after_blanks(input: &str) -> &str {
+    input.trim_start_matches([' ', '\t'])
+}
+
 /// One `.name` step of a hierarchical name, with the generate index that may
 /// stand in front of the dot.
 ///
 /// The index is only part of the *path* when a `.` follows it: `a[3]` is a bit
 /// select and `a[3].b` is a name inside the fourth iteration of the generate
-/// block `a`. Nothing here skips whitespace, which is what keeps the two
-/// apart cheaply — a hierarchical name is written tight, and a bare
-/// identifier pays one character comparison to find out it is not one.
-fn hierarchical_step(input: &str) -> IResult<&str, (Option<i64>, Identifier)> {
-    let (input, index) = opt(delimited(char('['), ws(scope_index), char(']')))(input)?;
+/// block `a`. The dot is a token of its own, so blanks may stand in front of
+/// it and whitespace or a comment after it — `inst . x` is `inst.x`.
+fn hierarchical_step(input: &str) -> IResult<&str, (Option<String>, Identifier)> {
+    let (input, index) = opt(delimited(char('['), path_index, char(']')))(input)?;
+    let input = after_blanks(input);
     let (input, _) = char('.')(input)?;
+    let (input, _) = ws_and_comments(input)?;
     let (input, name) = identifier(input)?;
     Ok((input, (index, name)))
 }
@@ -154,12 +208,14 @@ pub fn hierarchical_identifier(input: &str) -> IResult<&str, Identifier> {
     // the `]` — `a[3]` is a bit select and just `a[3].b` is a name inside a
     // generate block. Asking that here rather than by parsing the index and
     // backtracking is what keeps this off the expression grammar's hot path,
-    // where every operand tries this parser several times over.
+    // where every operand tries this parser several times over: `a + b` pays
+    // for the one blank in front of the `+` and nothing more.
     let continues = match rest.as_bytes().first() {
         Some(b'.') => true,
-        Some(b'[') => rest
-            .find(']')
-            .is_some_and(|at| rest[at + 1..].starts_with('.')),
+        Some(b' ' | b'\t') => after_blanks(rest).starts_with('.'),
+        Some(b'[') => {
+            closing_bracket(rest).is_some_and(|at| after_blanks(&rest[at + 1..]).starts_with('.'))
+        }
         _ => false,
     };
     if !continues {
@@ -173,7 +229,7 @@ pub fn hierarchical_identifier(input: &str) -> IResult<&str, Identifier> {
     for (index, step) in steps {
         if let Some(index) = index {
             name.push('[');
-            name.push_str(&index.to_string());
+            name.push_str(&index);
             name.push(']');
         }
         name.push('.');
@@ -244,6 +300,66 @@ mod tests {
         assert_eq!(head.name, "top.cpu3");
         let (_, tail) = hierarchical_identifier("top.\\cpu3 ").unwrap();
         assert_eq!(tail.name, "top.cpu3");
+    }
+
+    /// The dot of a hierarchical name is a token: blanks may stand before it
+    /// and whitespace after it, and the name folds exactly as the tight
+    /// spelling does (corpus `hierspace`). An escaped segment on either side
+    /// keeps its backslash, so `\c.d . \y.z` is signal `\y.z` inside instance
+    /// `\c.d` — corpus `dotinid` and `mangle_1`, which iverilog 12.0 passes.
+    #[test]
+    fn test_whitespace_around_a_hierarchical_dot() {
+        for spelling in ["inst.x", "inst .x", "inst. x", "inst . x", "inst\t.\tx"] {
+            let (rest, name) = hierarchical_identifier(spelling).unwrap();
+            assert_eq!((rest, name.name.as_str()), ("", "inst.x"), "{spelling}");
+        }
+        let (rest, name) = hierarchical_identifier("\\c.d . \\y.z  <= 1'b1;").unwrap();
+        assert_eq!(name.name, "\\c.d.\\y.z");
+        assert_eq!(rest, "<= 1'b1;");
+        // A bracket inside an escaped segment is part of its name, never an
+        // index for elaboration to evaluate: no `[ ` can come out of one.
+        let (_, name) = hierarchical_identifier("\\in[i] .x").unwrap();
+        assert_eq!(name.name, "\\in[i].x");
+        let (_, name) = hierarchical_identifier("stage[0] . u").unwrap();
+        assert_eq!(name.name, "stage[0].u");
+    }
+
+    /// A name followed by anything but a dot is not hierarchical, blanks or no
+    /// blanks, and what follows it is left alone for the expression grammar.
+    #[test]
+    fn test_a_name_without_a_dot_is_not_hierarchical() {
+        assert_eq!(
+            hierarchical_identifier("a + b").unwrap(),
+            (" + b", "a".into())
+        );
+        assert_eq!(
+            hierarchical_identifier("a[3] + b").unwrap(),
+            ("[3] + b", "a".into())
+        );
+        assert_eq!(
+            hierarchical_identifier("a[b[1]] + c").unwrap(),
+            ("[b[1]] + c", "a".into())
+        );
+    }
+
+    /// A generate index that is not a literal is kept as its text between
+    /// `[ ` and ` ]`, for elaboration to evaluate once the genvars have values;
+    /// a literal is still folded tight, spaces or not. Corpus `pr1691599b`,
+    /// `pr1755629`, `pr3011327` and `pr3557493`.
+    #[test]
+    fn test_a_computed_generate_index_is_kept_for_elaboration() {
+        let (rest, name) = hierarchical_identifier("target[i].val;").unwrap();
+        assert_eq!((rest, name.name.as_str()), (";", "target[ i ].val"));
+        let (_, name) = hierarchical_identifier("U[(i+1)%4].x = 0;").unwrap();
+        assert_eq!(name.name, "U[ (i+1)%4 ].x");
+        let (rest, name) = hierarchical_identifier("what[i].slice[i] = 1;").unwrap();
+        assert_eq!((rest, name.name.as_str()), ("[i] = 1;", "what[ i ].slice"));
+        let (_, name) = hierarchical_identifier("m2.Loop3[i].m.p = 1;").unwrap();
+        assert_eq!(name.name, "m2.Loop3[ i ].m.p");
+        let (_, name) = hierarchical_identifier("stage[ 3 ].u").unwrap();
+        assert_eq!(name.name, "stage[3].u");
+        let (_, name) = hierarchical_identifier("stage[-1].u").unwrap();
+        assert_eq!(name.name, "stage[-1].u");
     }
 
     /// The terminator is required — without it there is no way to know where

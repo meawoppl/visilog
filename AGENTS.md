@@ -1886,12 +1886,41 @@ use.
 single `Identifier` whose name is the whole dotted path, which is exactly the store key
 flattening produced — so nothing downstream had to learn about hierarchy. An index
 belongs to the *path* only when a `.` follows it, which is what tells `a[3]` (a bit
-select) from `a[3].b` (a name inside the fourth iteration of generate block `a`); nothing
-in the production skips whitespace, so an ordinary name pays one character comparison to
-find out it is not a hierarchical one. An **absolute** name starts at the top module by
+select) from `a[3].b` (a name inside the fourth iteration of generate block `a`). An
+**absolute** name starts at the top module by
 name — `main.dut.count` — and the top module is the root of the flat name space and
 carries no prefix, so `Scope::resolve` drops that leading segment. A scope of its own
 shadows it, which is why the `locals` lookup is asked first.
+
+**The dot is a token, so whitespace may stand on either side of it** — `inst . x`,
+`inst. x`, and `\c.d . \y.z` (an escaped segment on each side, which is `\y.z` inside
+instance `\c.d`) all fold exactly as the tight spelling does (corpus `hierspace`, `dotinid`,
+`mangle_1`). What keeps that off the hot path is *where* the whitespace is looked for:
+**before** the dot only spaces and tabs are skipped, by a byte scan (`after_blanks`) that
+stops at the first non-blank — so `a + b` pays for the one space in front of the `+` and
+nothing more, and `bench parse/*` does not move. **After** the dot the name is already
+committed, so that side takes the full `ws_and_comments`.
+
+**A generate index may be computed, and it is resolved at elaboration because that is
+the first moment it has a value.** `target[i].val`, `U[(i+1)%4].x` and
+`defparam Loop2[i].m.p` are how a loop reaches into a *sibling* iteration (corpus
+`pr1691599b`, `pr1755629`, `pr3011327`, `pr3557493`), and a genvar is substituted into
+expression *nodes* while a hierarchical name is one *string* — there is no node inside it
+for `substitute_genvars` to reach. So `identifier::path_index` keeps a literal index tight
+(`[3]`, the store key's spelling) and anything else as its source text between `[ ` and
+` ]` — `U[ (i+1)%4 ].x`. The space is the marker and an unambiguous one: an escaped
+identifier ends at whitespace and a simple one holds no `[`, so no segment of a name can
+contain `[ `. `Scope::resolve` asks `computed_path_indices` first, which parses each
+marked index back, substitutes the scope's genvars, evaluates what is left as a constant
+and writes the number in. Doing it in `resolve` rather than in `renamed` is what makes
+every position a name can stand in — an operand, an assignment target, a `defparam` path,
+a task enable, an event — take it with no second walk.
+
+An index that does **not** evaluate from the genvars alone — a parameter, a signal, an
+`x` — leaves the name exactly as written, which is a key the store cannot have, so the
+design stops at `UnknownSignal("stage[ P ].v")` rather than at a guess about which
+iteration was meant. That is a gap rather than a rule: iverilog 12.0 accepts a parameter
+there, but `resolve` is handed the genvars and not the store.
 
 **An escaped identifier keeps its backslash unless a simple identifier could have spelled
 it**, and that is what keeps it one *segment* of that dotted name space. IEEE 1364 §3.7.1
@@ -2914,6 +2943,14 @@ tripwire.
   a name that resolves to anything, so qualifying it would produce a signal nothing
   declares — which is a silent `x` rather than an error. `Program::substitute` is the
   instruction-list half of it; `TaskCall::substitute` the `$display` argument half.
+  A genvar inside a hierarchical *path* (`stage[i].v`) is the exception: the path is one
+  string, so it is carried as the text `stage[ i ].v` and evaluated by `Scope::resolve`
+  (`computed_path_indices`). Anything that compares names *before* resolving them will
+  see that spelling, and must not read the `[ ` as part of a store key.
+- **`hierarchical_identifier` skips blanks in front of a dot and nothing else there.** A
+  full `ws_and_comments` before the `.` would be a comment-and-whitespace skip on every
+  operand the expression grammar reads. A comment between a name and its dot
+  (`inst /*c*/ .x`) is therefore still rejected; one *after* the dot is fine.
 - **An unnamed generate block is numbered from a counter on the `Elaborator`**, and a
   loop takes its label *once*, before the iterations — numbering per iteration would give
   `genblk1[0]`, `genblk2[1]` and defeat the point.
