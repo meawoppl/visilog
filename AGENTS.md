@@ -2528,6 +2528,15 @@ as a wrong answer rather than as one that was not given time. It counts units of
 design ticks a thousand times per unit its testbench is written in, and a budget in raw
 ticks would give it a thousandth of the run.
 
+**Past `TIME_BUDGET` a design is given `STEP_BUDGET` more *timesteps*, not more ticks.**
+`run_to_completion` steps from one `Simulator::next_time` to the next until the design
+calls `$finish`, has nothing scheduled, or has used 200,000 of them — because a timestep
+costs the same whether it is one tick after the last or a billion, so a clock is the wrong
+measure of what a run costs. `pr2883958` waits `#1100000000` three times, `pr511` finishes
+at 308250 and `sqrt32` clocks every five ticks until 910255; all three finish, and all
+three were being cut off by the clock. The bound only ever costs a design that runs for
+ever: the whole release-mode corpus went from about 8 to about 10.5 seconds.
+
 The harness runs the corpus through `front_end`, which is `Preprocessor` + `parse_expanded`
 rather than `parse_source`, because the corpus files `` `include `` one another by paths
 relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare

@@ -1553,7 +1553,12 @@ impl Simulator {
     ///
     /// A design that names no delay on an `assign` answers out of the queue
     /// alone — `delays` is empty and the iterator ends immediately.
-    fn next_time(&self) -> Option<i64> {
+    ///
+    /// `None` means nothing is scheduled at all, so the design will not move
+    /// again unless a caller drives it. A caller that runs a design until it
+    /// is done, rather than for a fixed time, steps from one of these to the
+    /// next.
+    pub fn next_time(&self) -> Option<i64> {
         let due = self
             .delays
             .iter()
