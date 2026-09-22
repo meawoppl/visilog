@@ -1722,13 +1722,21 @@ rather than outwards to the module (corpus `generate_case2`); the hierarchical
 `blk.f(…)` written outside already resolved, since a block's prefix is the module's plus
 the label.
 
-A **`task`** inside a block is still a named error, and the reason is the `TaskTable`
-rather than the ordering: it is keyed by the name an enable *spells*, which is the bare one
-inside a block and outside it alike, so a task the block declares and one the module
-declares would share a single slot and the enable could not say which it meant. A function
-has no such table — it is stored under its qualified name and a call resolves through the
-scope like any other reference — which is the whole of why that half works and this one
-does not (#186).
+**A `task` inside a block is compiled in the same second round, into a table of the
+block's own.** The `TaskTable` is keyed by the name an enable *spells*, which is the bare
+one inside a block and outside it alike, so one table per module cannot hold a block's task
+beside a module task of the same name. `Elaborator::declare_generated_tasks` therefore
+hands back one table per block prefix — the module's with the block's tasks laid over it —
+and the build pass compiles each generated statement against its block's table, so a bare
+enable inside the block finds the block's task first. The task is also registered under
+the block's prefix in `hierarchical_tasks` (`gen.foo_task`, `name_tf[0].name_task`), which
+is all a hierarchical enable from outside needs; its variables are declared under that
+prefix, and its name is one of `declared_names` so the body's `foo_task.x` resolves into
+the block rather than outwards. A loop's genvar is substituted into the body before any of
+that — and into a *function* body inside a loop too, which had been left for the rename to
+turn into a signal nothing declares. A block nested inside another sees the module's tasks
+and its own but not its parent block's; a bare enable of one of those is `UnknownTask`.
+Corpus `pr1704726b`, `pr1988310` (#316).
 
 **A generate block is a *nested* scope, and that is the whole difference between it and
 an instance.** A module cannot see out of itself, so everything a module names is its
@@ -2729,8 +2737,8 @@ tripwire.
   **hierarchical**, because a task belongs to the module that declares it and a design
   reaches one across the hierarchy (`n.incr(1);`, `top.main.test1;`, `gen.foo_task;`). The
   reserved-word guard still tests the path's *head* segment, which is all it ever had to.
-  Elaboration does not resolve one of those yet (#173), so those ten designs stop at
-  `UnknownTask` naming the path — which is the right place for them to stop.
+  Elaboration links them after the walk (`Instruction::HierarchicalEnable`); the ones
+  still stopping at `UnknownTask` name a task of a module nothing instantiates (#284).
 - **An event is reached by its hierarchical name too, in both the places one is named.**
   `-> et1.m1.e2;` (corpus `event3`) and `@top.toplevel_event` (`pr572`) both read the whole
   dotted path, which is the flat store key the trigger namespace is keyed by. The bare
