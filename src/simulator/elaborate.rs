@@ -60,6 +60,7 @@ use crate::parsers::{
     },
     nets::NetType as WireKind,
     operators::BinaryOperator,
+    parameter::ParameterDeclaration,
     preprocessor::Timescale,
     primitive::UdpTable,
     simple::Range,
@@ -906,8 +907,30 @@ impl<'m> Elaborator<'m> {
         match range {
             Range::Constant(msb, lsb) => Ok((*msb, *lsb)),
             Range::Expressions(msb, lsb) => Ok((
-                self.resolve_bound(msb, scope)?,
-                self.resolve_bound(lsb, scope)?,
+                self.resolve_bound(msb, renamed(msb, scope))?,
+                self.resolve_bound(lsb, renamed(lsb, scope))?,
+            )),
+        }
+    }
+
+    /// [`resolve_range`](Elaborator::resolve_range) for a declaration written
+    /// inside a subprogram or a named block, where a bound may name one of the
+    /// scope's own constants: `parameter width = 8; reg [width-1:0] mem …;`
+    /// (corpus `pr2132552`). A constant the scope declares takes the scope's
+    /// dotted prefix; anything else resolves outwards to the module.
+    fn resolve_scoped_range(
+        &self,
+        range: &Range,
+        scope: &Scope,
+        inner: &str,
+        own: &BTreeSet<&str>,
+    ) -> Result<(i64, i64), SimulationError> {
+        let resolved = |bound: &Expression| scoped_renamed(bound, scope, inner, own);
+        match range {
+            Range::Constant(msb, lsb) => Ok((*msb, *lsb)),
+            Range::Expressions(msb, lsb) => Ok((
+                self.resolve_bound(msb, resolved(msb))?,
+                self.resolve_bound(lsb, resolved(lsb))?,
             )),
         }
     }
@@ -917,14 +940,18 @@ impl<'m> Elaborator<'m> {
     /// Anything that is not a number — an unknown name, an `x`, a value too
     /// wide to be a bound — is a **named** error. A width the simulator picked
     /// for itself would be wrong for the whole run and look like nothing at
-    /// all had gone wrong.
-    fn resolve_bound(&self, bound: &Expression, scope: &Scope) -> Result<i64, SimulationError> {
+    /// all had gone wrong. `bound` is the bound as written, which is what the
+    /// error names; `resolved` is it with every name resolved into the store.
+    fn resolve_bound(
+        &self,
+        bound: &Expression,
+        resolved: Expression,
+    ) -> Result<i64, SimulationError> {
         let unresolved = |why: String| SimulationError::UnresolvedRange {
             bound: bound.to_contracted_string(),
             why,
         };
-        let value = eval(&renamed(bound, scope), &self.out.state)
-            .map_err(|why| unresolved(why.to_string()))?;
+        let value = eval(&resolved, &self.out.state).map_err(|why| unresolved(why.to_string()))?;
         let wide = if value.is_signed() {
             value.to_i128()
         } else {
@@ -1190,26 +1217,21 @@ impl<'m> Elaborator<'m> {
         // A named block inside a task body is scoped under the task, the same
         // way the body's instructions spell it.
         let inside = block_scope("", &task.name.name);
+        // A task argument may be sized from a parameter — the module's,
+        // `input [WIDTH-1:0] a;`, or the task's own, `parameter width = 8; reg
+        // [width-1:0] mem [depth-1:0];` (corpus `pr2132552`) — and this is the
+        // one place a task's widths are ever recorded.
+        self.declare_scope(
+            &task.parameters,
+            task.arguments
+                .iter()
+                .map(|argument| &argument.variable)
+                .chain(&task.locals),
+            &task.events,
+            scope,
+            &inside,
+        )?;
         self.declare_block_locals(&task.statements, scope, &inside)?;
-        for variable in task
-            .arguments
-            .iter()
-            .map(|argument| &argument.variable)
-            .chain(&task.locals)
-        {
-            // A task argument may be sized from a parameter — `input
-            // [WIDTH-1:0] a;` — exactly as any other declaration is, and this
-            // is the one place a task's widths are ever recorded.
-            let range = self.resolve_range(&variable.range, scope)?;
-            let name = scope.qualified(&task_variable(&task.name.name, &variable.name.name));
-            // A `real` argument is declared as one, so a value copied into it
-            // is converted rather than reinterpreted.
-            if variable.real {
-                self.out.state.declare_real(name);
-            } else {
-                self.out.state.declare_signed(name, range, variable.signed);
-            }
-        }
 
         let mut qualified = definition.clone();
         if scope.needs_renaming() {
@@ -1345,11 +1367,16 @@ impl<'m> Elaborator<'m> {
                         Some(name) => block_scope(block, &name.name),
                         None => block.to_string(),
                     };
-                    for local in &inner.locals {
-                        let range = self.resolve_range(&local.range, scope)?;
-                        let name = scope.qualified(&format!("{}{}", nested, local.name.name));
-                        self.out.state.declare_signed(name, range, local.signed);
-                    }
+                    // The constants go in first: a local's width may be made of
+                    // one, exactly as a module's parameters precede its own
+                    // declarations.
+                    self.declare_scope(
+                        &inner.parameters,
+                        inner.locals.iter(),
+                        &inner.events,
+                        scope,
+                        &nested,
+                    )?;
                     self.declare_block_locals(&inner.statements, scope, &nested)?;
                 }
                 ProceduralStatements::If(conditional) => {
@@ -1400,6 +1427,19 @@ impl<'m> Elaborator<'m> {
         let mut staged: BTreeMap<String, FunctionDefinition> = BTreeMap::new();
         for (statement, scope) in declarations {
             if let ModuleStatement::FunctionDeclaration(function) = statement {
+                // A function's constants and named events are *not* frame
+                // variables: a constant outlives every call and an event is not
+                // a value at all, so both are ordinary store entries under the
+                // function's dotted name and a call copies the constant in with
+                // everything else it reads.
+                let inner = block_scope("", &function.name.name);
+                self.declare_scope(
+                    &function.parameters,
+                    std::iter::empty(),
+                    &function.events,
+                    scope,
+                    &inner,
+                )?;
                 let definition = self.compile_function(function, scope, tasks)?;
                 staged.insert(definition.result.name.clone(), definition);
             }
@@ -1431,10 +1471,33 @@ impl<'m> Elaborator<'m> {
         let mut frame_names: HashMap<&str, String> = HashMap::new();
         frame_names.insert(function.name.name.as_str(), qualified.clone());
 
+        // A width inside the function may be made of one of its own constants,
+        // which `declare_functions` has already put in the store.
+        let inner = block_scope("", &function.name.name);
+        let own: BTreeSet<&str> = function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.name.as_str())
+            .collect();
         let variable = |variable: &FunctionVariable| {
+            // An address dimension makes the local a *memory*, which the frame
+            // declares in its memory map. Without it `tmp[1] = …` would write a
+            // bit of a scalar where the design wrote a whole word — corpus
+            // `constfunc15` and `br_gh674`.
+            let dimensions = match &variable.dimensions {
+                Some(addresses) => {
+                    let addresses = self.resolve_scoped_range(addresses, scope, &inner, &own)?;
+                    if range_width(addresses) > MAX_MEMORY_DEPTH {
+                        return Err(MEMORY_TOO_LARGE);
+                    }
+                    Some(addresses)
+                }
+                None => None,
+            };
             Ok(FrameVariable {
                 name: format!("{}.{}", qualified, variable.name.name),
-                range: self.resolve_range(&variable.range, scope)?,
+                range: self.resolve_scoped_range(&variable.range, scope, &inner, &own)?,
+                dimensions,
                 signed: variable.signed,
                 real: variable.real,
             })
@@ -1458,6 +1521,20 @@ impl<'m> Elaborator<'m> {
             frame_names.insert(declared.name.name.as_str(), frame.name.clone());
         }
 
+        // What the *frame* holds is settled here, before the constants and the
+        // events are added to the rename: those live in the design's store, so
+        // a call copies the constant in with everything else it reads rather
+        // than declaring one of its own.
+        let own: BTreeSet<String> = frame_names.values().cloned().collect();
+        for local in function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.name.as_str())
+            .chain(function.events.iter().map(|event| event.name.as_str()))
+        {
+            frame_names.insert(local, format!("{}.{}", qualified, local));
+        }
+
         let mut program = Program::compile(&function.statements, tasks)?;
         // A function inside a generate loop may read the loop's genvar, which
         // is a number rather than a name — so it is substituted before the
@@ -1471,13 +1548,13 @@ impl<'m> Elaborator<'m> {
             None => scope.resolve(name),
         });
 
-        let own: BTreeSet<String> = frame_names.values().cloned().collect();
         let names = analyse_function_body(&program, &own)?;
 
         Ok(FunctionDefinition {
             result: FrameVariable {
                 name: qualified,
                 range: self.resolve_range(&function.range, scope)?,
+                dimensions: None,
                 signed: function.signed,
                 real: function.real,
             },
@@ -1629,53 +1706,11 @@ impl<'m> Elaborator<'m> {
                         None => eval(&renamed(&parameter.value, scope), &self.out.state)?,
                     };
                     let name = scope.qualified(local);
-                    // A `signed` qualifier (or an `integer` type) makes the
-                    // parameter signed. Failing that, **a range is what
-                    // decides**: a parameter written with one is unsigned
-                    // unless it says otherwise, and only a rangeless one keeps
-                    // the signedness its value arrived with. That is IEEE
-                    // 1364-2005 and it is what iverilog 12.0 does —
-                    // `parameter [3:0] DAC = 8;` is 8, where reading the bare
-                    // decimal's own signedness makes it -8 and
-                    // `pm_next_st[DAC]` selects a bit nothing has (corpus
-                    // `pr542`).
-                    //
-                    // The flag is applied on both sides of `coerced`
-                    // deliberately: it is read *before*, to widen by sign
-                    // extension rather than zero extension, and rebuilding a
-                    // register does not carry it, so it has to be restated
-                    // *after* or the stored parameter reads unsigned.
-                    let signed =
-                        parameter.signed || (parameter.range.is_none() && value.is_signed());
-                    // A `real` parameter holds a double whatever its value was
-                    // written as, so `parameter real HALF = 1;` is `1.0` and
-                    // not one bit. It is the declaration that says so, exactly
-                    // as it does for a `real` variable.
-                    let value = if parameter.real && !value.is_real() {
-                        Register::from_f64(value.to_f64())
-                    } else {
-                        value
-                    };
-                    let value = value.with_signedness(signed);
                     let range = match &parameter.range {
                         Some(range) => Some(self.resolve_range(range, scope)?),
                         None => None,
                     };
-                    // A real has no width to be coerced to; a range beside
-                    // one would be a declaration of something else.
-                    let value = match range {
-                        Some(range) if !value.is_real() => value.coerced(range_width(range)),
-                        _ => value,
-                    }
-                    .with_signedness(signed);
-                    match range {
-                        // A real carries its own sixty-four bits, so a range
-                        // written beside one says nothing about it.
-                        Some(range) if !value.is_real() => {
-                            self.out.state.set_ranged(name, value, range)
-                        }
-                        _ => self.out.state.set(name, value),
-                    }
+                    self.record_parameter(parameter, name, value, range);
                 }
             }
             ModuleStatement::SpecifyBlock(block) => {
@@ -1689,6 +1724,143 @@ impl<'m> Elaborator<'m> {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Records one parameter's value in the store under `name`.
+    ///
+    /// The declaration's own rules — what it is signed by, whether it is a
+    /// real, what width it is coerced to — live here and nowhere else, so a
+    /// parameter written inside a task or a named block cannot end up meaning
+    /// something different from one written at module level.
+    fn record_parameter(
+        &mut self,
+        parameter: &ParameterDeclaration,
+        name: String,
+        value: Register,
+        range: Option<(i64, i64)>,
+    ) {
+        // A `signed` qualifier (or an `integer` type) makes the parameter
+        // signed. Failing that, **a range is what decides**: a parameter
+        // written with one is unsigned unless it says otherwise, and only a
+        // rangeless one keeps the signedness its value arrived with. That is
+        // IEEE 1364-2005 and it is what iverilog 12.0 does — `parameter [3:0]
+        // DAC = 8;` is 8, where reading the bare decimal's own signedness makes
+        // it -8 and `pm_next_st[DAC]` selects a bit nothing has (corpus
+        // `pr542`).
+        //
+        // The flag is applied on both sides of `coerced` deliberately: it is
+        // read *before*, to widen by sign extension rather than zero
+        // extension, and rebuilding a register does not carry it, so it has to
+        // be restated *after* or the stored parameter reads unsigned.
+        let signed = parameter.signed || (parameter.range.is_none() && value.is_signed());
+        // A `real` parameter holds a double whatever its value was written as,
+        // so `parameter real HALF = 1;` is `1.0` and not one bit. It is the
+        // declaration that says so, exactly as it does for a `real` variable.
+        let value = if parameter.real && !value.is_real() {
+            Register::from_f64(value.to_f64())
+        } else {
+            value
+        };
+        let value = value.with_signedness(signed);
+        // A real has no width to be coerced to; a range beside one would be a
+        // declaration of something else.
+        let value = match range {
+            Some(range) if !value.is_real() => value.coerced(range_width(range)),
+            _ => value,
+        }
+        .with_signedness(signed);
+        match range {
+            // A real carries its own sixty-four bits, so a range written beside
+            // one says nothing about it.
+            Some(range) if !value.is_real() => self.out.state.set_ranged(name, value, range),
+            _ => self.out.state.set(name, value),
+        }
+    }
+
+    /// Declares what a subprogram or a named block declares inside itself —
+    /// its constants, its variables and its named events — under the scope's
+    /// own dotted name: `test_task.depth`, `dut.my_block.p`.
+    ///
+    /// The constants go in **first**, before the scope's variables, for the reason the module's
+    /// own parameters go in before everything else: `reg [width-1:0] mem
+    /// [depth-1:0];` has no width until `width` has a value. A value that names
+    /// a sibling constant resolves to the scope's own entry — `localparam l = p
+    /// + 1;` means *this* `p` — and anything else resolves outwards to the
+    /// module, which is exactly what a nested scope means.
+    ///
+    /// A `defparam` naming one is applied here, because the path it writes
+    /// (`sub.my_block.p`) is already the flat spelling the constant ends up
+    /// under: the two meet with no translation, the same way an instance's do.
+    ///
+    /// The variables follow. The address dimension is what makes one a
+    /// **memory**, and it lands in the store's memory map rather than its
+    /// signal map — a name is in one or the other and never both, which is the
+    /// whole of what tells `mem[3]` a word from `a[3]` a bit. Without it
+    /// `tempram[i] = i;` would write a *bit* of a scalar (corpus `task_mem`).
+    ///
+    /// The events come last. An event has no value at all, so it goes into the
+    /// store's third, valueless namespace under the scope's dotted name — which
+    /// is also the name a testbench reaches it by (`-> sub.my_block.trigger;`,
+    /// corpus `scoped_events`).
+    fn declare_scope<'v>(
+        &mut self,
+        parameters: &[ParameterDeclaration],
+        variables: impl Iterator<Item = &'v FunctionVariable>,
+        events: &[Identifier],
+        scope: &Scope,
+        inner: &str,
+    ) -> Result<(), SimulationError> {
+        let own: BTreeSet<&str> = parameters
+            .iter()
+            .map(|parameter| parameter.name.name.as_str())
+            .collect();
+        for parameter in parameters {
+            let name = scope.qualified(&format!("{}{}", inner, parameter.name.name));
+            let value = match self.defparams.remove(&name) {
+                Some(value) => value,
+                None => eval(
+                    &scoped_renamed(&parameter.value, scope, inner, &own),
+                    &self.out.state,
+                )?,
+            };
+            let range = match &parameter.range {
+                Some(range) => Some(self.resolve_scoped_range(range, scope, inner, &own)?),
+                None => None,
+            };
+            self.record_parameter(parameter, name, value, range);
+        }
+
+        for variable in variables {
+            let range = self.resolve_scoped_range(&variable.range, scope, inner, &own)?;
+            let name = scope.qualified(&format!("{}{}", inner, variable.name.name));
+            match (&variable.dimensions, variable.real) {
+                (Some(addresses), real) => {
+                    let addresses = self.resolve_scoped_range(addresses, scope, inner, &own)?;
+                    if range_width(addresses) > MAX_MEMORY_DEPTH {
+                        return Err(MEMORY_TOO_LARGE);
+                    }
+                    match real {
+                        true => self.out.state.declare_real_memory(name, addresses),
+                        false => {
+                            self.out
+                                .state
+                                .declare_memory(name, addresses, range, variable.signed)
+                        }
+                    }
+                }
+                // A `real` is declared as one, so a value copied into it is
+                // converted rather than reinterpreted.
+                (None, true) => self.out.state.declare_real(name),
+                (None, false) => self.out.state.declare_signed(name, range, variable.signed),
+            }
+        }
+
+        for event in events {
+            self.out
+                .state
+                .declare_event(scope.qualified(&format!("{}{}", inner, event.name)));
         }
         Ok(())
     }
@@ -3505,17 +3677,22 @@ fn compile_task(
     task: &TaskDeclaration,
     tasks: &TaskTable,
 ) -> Result<TaskDefinition, SimulationError> {
+    // A task's constants and its named events are its own names exactly as its
+    // variables are, so all three go through the one rename: a `parameter` left
+    // bare would resolve outwards to the module and read whatever the module
+    // happens to declare under that spelling.
     let names: HashMap<&str, String> = task
         .arguments
         .iter()
-        .map(|argument| &argument.variable)
-        .chain(&task.locals)
-        .map(|variable| {
-            (
-                variable.name.name.as_str(),
-                task_variable(&task.name.name, &variable.name.name),
-            )
-        })
+        .map(|argument| argument.variable.name.name.as_str())
+        .chain(task.locals.iter().map(|local| local.name.name.as_str()))
+        .chain(
+            task.parameters
+                .iter()
+                .map(|parameter| parameter.name.name.as_str()),
+        )
+        .chain(task.events.iter().map(|event| event.name.as_str()))
+        .map(|variable| (variable, task_variable(&task.name.name, variable)))
         .collect();
 
     let mut program =
@@ -3574,6 +3751,26 @@ fn close_reads(functions: &mut BTreeMap<String, FunctionDefinition>) {
             return;
         }
     }
+}
+
+/// [`renamed`] for an expression written inside a subprogram or a named block
+/// whose own constants are `own`: one of those takes the scope's dotted prefix
+/// `inner`, and every other name resolves outwards to the module.
+fn scoped_renamed(
+    expression: &Expression,
+    scope: &Scope,
+    inner: &str,
+    own: &BTreeSet<&str>,
+) -> Expression {
+    let mut copy = expression.clone();
+    if !scope.genvars.is_empty() {
+        substitute_genvars(&mut copy, &scope.genvars);
+    }
+    rename_expression(&mut copy, &|local| match own.contains(local) {
+        true => scope.qualified(&format!("{}{}", inner, local)),
+        false => scope.resolve(local),
+    });
+    copy
 }
 
 /// A copy of `expression` with every signal it names resolved into the flat
@@ -6284,5 +6481,118 @@ mod tests {
             elaborate(&modules, 0),
             Err(SimulationError::Unsupported(_))
         ));
+    }
+
+    /// A memory declared inside a task lands in the memory map, so `mem[3]`
+    /// writes a whole word rather than a bit of a scalar, and its width may be
+    /// made of the task's own constants. iverilog 12.0 prints `8 f0 f3 8`
+    /// (corpus `task_mem`, `pr2132552`).
+    #[test]
+    fn test_a_task_declares_a_memory_sized_by_its_own_parameters() {
+        let source = r#"
+            module top;
+                task load;
+                    parameter depth = 4;
+                    localparam width = depth * 2;
+                    reg [width-1:0] mem [0:depth-1];
+                    integer i;
+                    begin
+                        for (i = 0; i < depth; i = i + 1) mem[i] = i + 8'hf0;
+                        $display("%0d %h %h %0d", $bits(mem[0]), mem[0], mem[3], width);
+                    end
+                endtask
+                initial load;
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        assert!(
+            simulator.get("load.mem").is_err(),
+            "a memory is not a signal"
+        );
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "8 f0 f3 8\n");
+    }
+
+    /// A memory local to a function is a memory in the call's frame: iverilog
+    /// 12.0 prints `a5` for this swap (corpus `constfunc15`, `br_gh674`).
+    #[test]
+    fn test_a_function_declares_a_memory_in_its_frame() {
+        let source = r#"
+            module top;
+                function [7:0] swap(input [7:0] v);
+                    reg [3:0] tmp [1:2];
+                    begin
+                        tmp[1] = v[3:0];
+                        tmp[2] = v[7:4];
+                        swap = {tmp[1], tmp[2]};
+                    end
+                endfunction
+                initial $display("%h", swap(8'h5a));
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "a5\n");
+    }
+
+    /// A named block declares constants, memories and events of its own, under
+    /// its own dotted name. iverilog 12.0 prints `4 ab` (corpus `pr2533175`).
+    #[test]
+    fn test_a_named_block_declares_a_parameter_a_memory_and_an_event() {
+        let source = r#"
+            module top;
+                parameter p = 9;
+                initial begin : blk
+                    parameter p = 3;
+                    localparam l = p + 1;
+                    reg [7:0] words [0:1];
+                    event go;
+                    words[1] = 8'hab;
+                    $display("%0d %h", l, words[1]);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        assert_eq!(simulator.get("blk.l").unwrap().to_u128(), Some(4));
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "4 ab\n");
+    }
+
+    /// A `defparam` reaches a constant a named block or a task declares, and
+    /// an event a task declares is triggered from outside by its dotted name.
+    /// iverilog 12.0 prints `block 5` then `task 6` (corpus `scoped_events`).
+    #[test]
+    fn test_a_defparam_and_a_trigger_reach_into_a_block_and_a_task() {
+        let sub = r#"
+            module sub;
+                initial begin : my_block
+                    parameter p = 0;
+                    localparam l = p + 1;
+                    event trigger;
+                    @trigger $display("block %0d", l);
+                end
+                task my_task;
+                    parameter p = 0;
+                    localparam l = p + 1;
+                    event trigger;
+                    @trigger $display("task %0d", l);
+                endtask
+                initial my_task;
+            endmodule
+        "#;
+        let top = r#"
+            module top;
+                sub s();
+                defparam s.my_block.p = 4;
+                defparam s.my_task.p = 5;
+                initial begin
+                    #1 -> s.my_block.trigger;
+                    #1 -> s.my_task.trigger;
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[sub, top], "top");
+        simulator.advance(5).expect("the design should run");
+        assert_eq!(simulator.output().text(), "block 5\ntask 6\n");
     }
 }
