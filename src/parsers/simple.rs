@@ -179,6 +179,30 @@ pub fn range(input: &str) -> IResult<&str, Range> {
     alt((constant_range, expression_range))(input)
 }
 
+/// `[0:3][0:15]` — the address dimensions written after a declared name.
+///
+/// A dimension is what makes a name an array, and there may be more than one:
+/// `reg [7:0] a [0:3][0:15];` is a four-by-sixteen array of bytes. The list is
+/// empty for an ordinary vector, which is what every declaration but an array
+/// is, and each dimension is an ordinary [`range`] so a bound may name a
+/// parameter.
+///
+/// Nearly every declared name has no dimension at all, so the first one is
+/// looked for on its own and a name without one hands back an empty `Vec`,
+/// which does not allocate — `many0` would allocate for every name in every
+/// declaration. `many0` is safe for the rest because `range` has to see a `[`:
+/// it cannot match the empty string, so the loop always makes progress.
+pub fn dimensions(input: &str) -> IResult<&str, Vec<Range>> {
+    let Ok((rest, first)) = preceded(ws_and_comments, range)(input) else {
+        return Ok((input, Vec::new()));
+    };
+    let (rest, more) = many0(preceded(ws_and_comments, range))(rest)?;
+    let mut dimensions = Vec::with_capacity(1 + more.len());
+    dimensions.push(first);
+    dimensions.extend(more);
+    Ok((rest, dimensions))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -55,14 +55,16 @@ pub enum ResolvedTarget {
     /// A bit or part select, held as the declared bit indices it names, most
     /// significant first: `q[3:1] <= d;` resolves to `[3, 2, 1]`.
     Bits { name: String, indices: Vec<i64> },
-    /// One word of a memory, as in `mem[addr] <= d;`. Written the same way as a
-    /// bit select and told apart from one by the declaration alone.
-    Word { name: String, index: i64 },
-    /// Bits of one word of a memory, as in `mem[addr][3:1] <= d;` — the two
-    /// brackets of a [`Expression::WordSelect`], both already resolved.
+    /// One word of a memory, as in `mem[addr] <= d;` or `a[i][j] <= d;`.
+    /// Written the same way as a bit select and told apart from one by the
+    /// declaration alone; `address` holds one index per declared dimension.
+    Word { name: String, address: Vec<i64> },
+    /// Bits of one word of a memory, as in `mem[addr][3:1] <= d;` — the
+    /// brackets of a [`Expression::WordSelect`], all already resolved, with
+    /// the word's address split from the bits inside it.
     WordBits {
         name: String,
-        index: i64,
+        address: Vec<i64>,
         indices: Vec<i64>,
     },
     /// A named event, as in `-> done;`. It holds no value, so the write that
@@ -140,11 +142,12 @@ impl ResolvedTarget {
     /// `foo[1]` share a *name* and are two different places, so anything that
     /// asks "is this the same target?" has to ask this as well. Two drivers of
     /// one word resolve against each other and a `force` on one word holds
-    /// nothing about the other.
-    pub fn word_address(&self) -> Option<i64> {
+    /// nothing about the other. A multi-dimensional array's address is every
+    /// index of it, for the same reason.
+    pub fn word_address(&self) -> Option<&[i64]> {
         match self {
-            ResolvedTarget::Word { index, .. } | ResolvedTarget::WordBits { index, .. } => {
-                Some(*index)
+            ResolvedTarget::Word { address, .. } | ResolvedTarget::WordBits { address, .. } => {
+                Some(address)
             }
             _ => None,
         }
@@ -328,6 +331,52 @@ pub fn range_width(range: (i64, i64)) -> usize {
     ((range.0 - range.1).unsigned_abs() + 1) as usize
 }
 
+/// How the brackets of a [`Expression::WordSelect`] divide into the word's
+/// address and the select inside that word.
+pub struct WordSelectSplit {
+    /// How many of the *leading* brackets are addresses. The final bracket is
+    /// counted by `selects_within` instead, since it is the only one that may
+    /// be a range.
+    pub leading: usize,
+    /// Whether the final bracket selects bits *inside* the word rather than
+    /// being the innermost address. `mem[i][3:0]` selects within; `a[i][j]` of
+    /// a two-dimensional array does not.
+    pub selects_within: bool,
+}
+
+/// How many of a word select's brackets could be an address: the leading plain
+/// indices, plus the final bracket when that is a plain index too.
+///
+/// A part or indexed part select can only ever be a select *inside* a word — no
+/// dimension of an unpacked array is addressed by a range — so it is never one.
+pub fn address_brackets(leading: usize, select: &WordSelectKind) -> usize {
+    leading + usize::from(matches!(select, WordSelectKind::Bit(_)))
+}
+
+/// Divides `leading + 1` brackets between the `declared` addresses of an array
+/// and a select inside the word they name, or `None` when they cannot be
+/// divided at all.
+///
+/// The declaration is the only thing that can decide this: `m[i][j]` is a word
+/// of a two-dimensional array and a *bit of a word* of a one-dimensional one,
+/// and the expression alone says nothing. Anything that names neither — a
+/// partial address, one index too many, or a range where an address belongs —
+/// is `None`, and the caller reports it by name rather than reading a word the
+/// design did not ask for.
+pub fn word_select_split(
+    leading: usize,
+    select: &WordSelectKind,
+    declared: usize,
+) -> Option<WordSelectSplit> {
+    if address_brackets(leading, select) < declared || leading > declared {
+        return None;
+    }
+    Some(WordSelectSplit {
+        leading: leading.min(declared),
+        selects_within: leading == declared,
+    })
+}
+
 /// Works out which bits an assignment's left hand side names.
 pub fn resolve_target(
     state: &StateStore,
@@ -350,14 +399,28 @@ pub fn resolve_target(
             // `a[3] = …` writes a bit and `m[3] = …` writes a word; the syntax
             // is the same and the declaration is what decides. `any_memory`
             // answers for a design that declares none without hashing the name.
-            if state.any_memory() && state.memory(&id.name).is_some() {
-                return Ok(ResolvedTarget::Word {
-                    name: id.name.clone(),
-                    index: match known_index(state, index)? {
-                        Some(index) => index,
-                        None => return Ok(ResolvedTarget::Nowhere),
-                    },
-                });
+            if state.any_memory() {
+                if let Some(memory) = state.memory(&id.name) {
+                    // One bracket names a word only of a one-dimensional
+                    // array. `a[i]` of `reg [7:0] a [0:3][0:15];` is a whole
+                    // *row*, which nothing here can hold, so it is named
+                    // rather than silently read as the row's first word.
+                    if memory.dimensions() != 1 {
+                        return Err(EvalError::ArrayDimensions {
+                            name: id.name.clone(),
+                            declared: memory.dimensions(),
+                            used: 1,
+                        }
+                        .into());
+                    }
+                    return Ok(ResolvedTarget::Word {
+                        name: id.name.clone(),
+                        address: match known_index(state, index)? {
+                            Some(index) => vec![index],
+                            None => return Ok(ResolvedTarget::Nowhere),
+                        },
+                    });
+                }
             }
             Ok(ResolvedTarget::Bits {
                 name: id.name.clone(),
@@ -412,15 +475,49 @@ pub fn resolve_target(
                 indices,
             })
         }
-        // `mem[i][3:1] = d;` — the word address and the bits inside it, both
-        // resolved here, exactly as each half is resolved on its own.
-        Expression::WordSelect { id, index, select } => {
-            if state.memory(&id.name).is_none() {
+        // `mem[i][3:1] = d;` and `a[i][j] = d;` — the word's address and, when
+        // a bracket is left over, the bits inside it. Which brackets are
+        // addresses is the *declaration's* to say, so the array is asked how
+        // many dimensions it has and that many leading indices are taken.
+        Expression::WordSelect {
+            id,
+            indices: brackets,
+            select,
+        } => {
+            let Some(memory) = state.memory(&id.name) else {
                 return Err(EvalError::NotAMemory(id.name.clone()).into());
-            }
-            let Some(index) = known_index(state, index)? else {
-                return Ok(ResolvedTarget::Nowhere);
             };
+            let declared = memory.dimensions();
+            let Some(split) = word_select_split(brackets.len(), select, declared) else {
+                return Err(EvalError::ArrayDimensions {
+                    name: id.name.clone(),
+                    declared,
+                    used: address_brackets(brackets.len(), select),
+                }
+                .into());
+            };
+            let mut address = Vec::with_capacity(declared);
+            for bracket in &brackets[..split.leading] {
+                match known_index(state, bracket)? {
+                    Some(index) => address.push(index),
+                    None => return Ok(ResolvedTarget::Nowhere),
+                }
+            }
+            if !split.selects_within {
+                // The last bracket is the innermost address rather than a
+                // select inside the word: `a[i][j]` of a two-dimensional array.
+                let WordSelectKind::Bit(last) = select else {
+                    unreachable!("`word_select_split` only takes a plain index as an address")
+                };
+                match known_index(state, last)? {
+                    Some(index) => address.push(index),
+                    None => return Ok(ResolvedTarget::Nowhere),
+                }
+                return Ok(ResolvedTarget::Word {
+                    name: id.name.clone(),
+                    address,
+                });
+            }
             let indices = match select {
                 WordSelectKind::Bit(bit) => match known_index(state, bit)? {
                     Some(bit) => vec![bit],
@@ -456,7 +553,7 @@ pub fn resolve_target(
             };
             Ok(ResolvedTarget::WordBits {
                 name: id.name.clone(),
-                index,
+                address,
                 indices,
             })
         }
@@ -544,7 +641,7 @@ enum Held {
 fn held_bits(
     state: &StateStore,
     name: &str,
-    word: Option<i64>,
+    word: Option<&[i64]>,
     level: DriveLevel,
 ) -> Result<Held, SimulationError> {
     // The overwhelmingly common case is a design that forces nothing, and it
@@ -580,7 +677,7 @@ fn held_bits(
 /// A concatenation is asked part by part, because only the parts that name
 /// this signal say anything about it: `assign {a, b[1]} = e;` holds the whole
 /// of `a` and one bit of `b`.
-fn held_by(target: &ResolvedTarget, name: &str, word: Option<i64>, bits: &mut Vec<i64>) -> bool {
+fn held_by(target: &ResolvedTarget, name: &str, word: Option<&[i64]>, bits: &mut Vec<i64>) -> bool {
     match target {
         ResolvedTarget::Bits {
             name: held,
@@ -708,13 +805,13 @@ pub fn drive_at(
             }
             drive_bits(state, name, indices, value)
         }
-        ResolvedTarget::Word { name, index } => drive_word(state, name, *index, value),
+        ResolvedTarget::Word { name, address } => drive_word(state, name, address, value),
         ResolvedTarget::WordBits {
             name,
-            index,
+            address,
             indices,
         } => state
-            .set_word_bits(name, *index, indices, value)
+            .set_word_bits(name, address, indices, value)
             .ok_or_else(|| SimulationError::UnknownSignal(name.clone())),
         ResolvedTarget::Event(name) => {
             state.trigger_event(name);
@@ -891,11 +988,11 @@ fn released_covers(released: &[(&str, Option<&[i64]>)], held: &[(&str, Option<&[
 fn drive_word(
     state: &mut StateStore,
     name: &str,
-    index: i64,
+    address: &[i64],
     value: &Register,
 ) -> Result<bool, SimulationError> {
     state
-        .set_word(name, index, value)
+        .set_word(name, address, value)
         .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))
 }
 

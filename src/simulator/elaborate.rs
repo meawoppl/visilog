@@ -77,7 +77,7 @@ use crate::simulator::program::{
     TaskParameter, TaskTable, FUNCTION_DELAY_UNSUPPORTED, FUNCTION_EVENT_UNSUPPORTED,
 };
 use crate::simulator::runner::SimulationError;
-use crate::simulator::state_store::StateStore;
+use crate::simulator::state_store::{array_depth, StateStore};
 
 use crate::simulator::udp::Udp;
 
@@ -1583,21 +1583,12 @@ impl<'m> Elaborator<'m> {
                     // mem [0:15];` is — the same distinction, recorded the
                     // same way. A pull belongs to a net that has a value, so
                     // an array does not take one.
-                    match net.dimensions() {
-                        Some(addresses) => {
-                            let addresses = self.resolve_range(addresses, scope)?;
-                            self.declare_net_memory(
-                                local,
-                                addresses,
-                                range,
-                                net.is_signed(),
-                                scope,
-                            )?
-                        }
-                        None => {
-                            self.declare_local_net(local, range, net.is_signed(), scope);
-                            self.record_pull(local, net.kind(), scope);
-                        }
+                    if net.dimensions().is_empty() {
+                        self.declare_local_net(local, range, net.is_signed(), scope);
+                        self.record_pull(local, net.kind(), scope);
+                    } else {
+                        let addresses = self.resolve_dimensions(net.dimensions(), scope)?;
+                        self.declare_net_memory(local, addresses, range, net.is_signed(), scope)?;
                     }
                 }
             }
@@ -1607,23 +1598,20 @@ impl<'m> Elaborator<'m> {
                         Some(range) => self.resolve_range(range, scope)?,
                         None => (0, 0),
                     };
-                    // The address dimension is what makes the name a memory
-                    // rather than a vector, and it is the only place that
+                    // The address dimensions are what make the name a memory
+                    // rather than a vector, and they are the only place that
                     // distinction is ever recorded.
-                    match &register.dimensions {
-                        Some(addresses) => {
-                            let addresses = self.resolve_range(addresses, scope)?;
-                            self.declare_memory(
-                                &register.name.name,
-                                addresses,
-                                range,
-                                register.signed,
-                                scope,
-                            )?
-                        }
-                        None => {
-                            self.declare_local(&register.name.name, range, register.signed, scope)
-                        }
+                    if register.dimensions.is_empty() {
+                        self.declare_local(&register.name.name, range, register.signed, scope);
+                    } else {
+                        let addresses = self.resolve_dimensions(&register.dimensions, scope)?;
+                        self.declare_memory(
+                            &register.name.name,
+                            addresses,
+                            range,
+                            register.signed,
+                            scope,
+                        )?;
                     }
                 }
             }
@@ -1632,18 +1620,17 @@ impl<'m> Elaborator<'m> {
                     // An `integer` is a 32 bit *signed* variable. Signedness is
                     // part of what the keyword means, so there is no qualifier
                     // to read here — it is always true.
-                    match &declaration.dimensions {
-                        Some(addresses) => {
-                            let addresses = self.resolve_range(addresses, scope)?;
-                            self.declare_memory(
-                                &declaration.name.name,
-                                addresses,
-                                (31, 0),
-                                true,
-                                scope,
-                            )?
-                        }
-                        None => self.declare_local(&declaration.name.name, (31, 0), true, scope),
+                    if declaration.dimensions.is_empty() {
+                        self.declare_local(&declaration.name.name, (31, 0), true, scope);
+                    } else {
+                        let addresses = self.resolve_dimensions(&declaration.dimensions, scope)?;
+                        self.declare_memory(
+                            &declaration.name.name,
+                            addresses,
+                            (31, 0),
+                            true,
+                            scope,
+                        )?;
                     }
                 }
             }
@@ -1652,20 +1639,17 @@ impl<'m> Elaborator<'m> {
                     // A `time` is 64 bits wide and unsigned; like an `integer`
                     // the keyword is the whole of its type, so there is no
                     // range or qualifier to read.
-                    match &declaration.dimensions {
-                        Some(addresses) => {
-                            let addresses = self.resolve_range(addresses, scope)?;
-                            self.declare_memory(
-                                &declaration.name.name,
-                                addresses,
-                                TIME_RANGE,
-                                false,
-                                scope,
-                            )?
-                        }
-                        None => {
-                            self.declare_local(&declaration.name.name, TIME_RANGE, false, scope)
-                        }
+                    if declaration.dimensions.is_empty() {
+                        self.declare_local(&declaration.name.name, TIME_RANGE, false, scope);
+                    } else {
+                        let addresses = self.resolve_dimensions(&declaration.dimensions, scope)?;
+                        self.declare_memory(
+                            &declaration.name.name,
+                            addresses,
+                            TIME_RANGE,
+                            false,
+                            scope,
+                        )?;
                     }
                 }
             }
@@ -1673,16 +1657,14 @@ impl<'m> Elaborator<'m> {
                 for declaration in reals {
                     // A `real` has no declarable width — the type is the whole
                     // of it, the way an `integer`'s 32 bits are — so there is
-                    // no range to resolve, only the optional array dimension.
-                    match &declaration.dimensions {
-                        Some(addresses) => {
-                            let addresses = self.resolve_range(addresses, scope)?;
-                            self.declare_real_memory(&declaration.name.name, addresses, scope)?
-                        }
-                        None => self
-                            .out
+                    // no range to resolve, only the array dimensions.
+                    if declaration.dimensions.is_empty() {
+                        self.out
                             .state
-                            .declare_real(scope.qualified(&declaration.name.name)),
+                            .declare_real(scope.qualified(&declaration.name.name));
+                    } else {
+                        let addresses = self.resolve_dimensions(&declaration.dimensions, scope)?;
+                        self.declare_real_memory(&declaration.name.name, addresses, scope)?;
                     }
                 }
             }
@@ -1841,13 +1823,16 @@ impl<'m> Elaborator<'m> {
                     if range_width(addresses) > MAX_MEMORY_DEPTH {
                         return Err(MEMORY_TOO_LARGE);
                     }
+                    // A local declares one dimension, where a module-level
+                    // array may declare several.
                     match real {
-                        true => self.out.state.declare_real_memory(name, addresses),
-                        false => {
-                            self.out
-                                .state
-                                .declare_memory(name, addresses, range, variable.signed)
-                        }
+                        true => self.out.state.declare_real_memory(name, vec![addresses]),
+                        false => self.out.state.declare_memory(
+                            name,
+                            vec![addresses],
+                            range,
+                            variable.signed,
+                        ),
                     }
                 }
                 // A `real` is declared as one, so a value copied into it is
@@ -1997,21 +1982,38 @@ impl<'m> Elaborator<'m> {
         }
     }
 
-    /// Declares a memory local to this instance: `reg [7:0] mem [0:255];`.
+    /// The address dimensions of an array declaration, each resolved against
+    /// the parameters in scope the way a width is.
+    ///
+    /// The bound a design writes is an expression — `reg [7:0] a [0:N-1][0:3];`
+    /// — so every dimension goes through
+    /// [`resolve_range`](Elaborator::resolve_range) and a bound that is not a
+    /// constant is the same named error a width's is.
+    fn resolve_dimensions(
+        &mut self,
+        dimensions: &[Range],
+        scope: &Scope,
+    ) -> Result<Vec<(i64, i64)>, SimulationError> {
+        dimensions
+            .iter()
+            .map(|dimension| self.resolve_range(dimension, scope))
+            .collect()
+    }
+
+    /// Declares a memory local to this instance: `reg [7:0] mem [0:255];`, or
+    /// `reg [7:0] a [0:3][0:15];` for one of more than one dimension.
     ///
     /// A memory cannot be a port, so there is no aliasing to reconcile the way
     /// [`declare_local`](Elaborator::declare_local) has to.
     fn declare_memory(
         &mut self,
         local: &str,
-        addresses: (i64, i64),
+        addresses: Vec<(i64, i64)>,
         range: (i64, i64),
         signed: bool,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
-        if range_width(addresses) > MAX_MEMORY_DEPTH {
-            return Err(MEMORY_TOO_LARGE);
-        }
+        Elaborator::check_depth(&addresses)?;
         self.out
             .state
             .declare_memory(scope.qualified(local), addresses, range, signed);
@@ -2023,12 +2025,10 @@ impl<'m> Elaborator<'m> {
     fn declare_real_memory(
         &mut self,
         local: &str,
-        addresses: (i64, i64),
+        addresses: Vec<(i64, i64)>,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
-        if range_width(addresses) > MAX_MEMORY_DEPTH {
-            return Err(MEMORY_TOO_LARGE);
-        }
+        Elaborator::check_depth(&addresses)?;
         self.out
             .state
             .declare_real_memory(scope.qualified(local), addresses);
@@ -2040,17 +2040,29 @@ impl<'m> Elaborator<'m> {
     fn declare_net_memory(
         &mut self,
         local: &str,
-        addresses: (i64, i64),
+        addresses: Vec<(i64, i64)>,
         range: (i64, i64),
         signed: bool,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
-        if range_width(addresses) > MAX_MEMORY_DEPTH {
-            return Err(MEMORY_TOO_LARGE);
-        }
+        Elaborator::check_depth(&addresses)?;
         self.out
             .state
             .declare_net_memory(scope.qualified(local), addresses, range, signed);
+        Ok(())
+    }
+
+    /// Refuses an array with more words than [`MAX_MEMORY_DEPTH`] before one is
+    /// allocated.
+    ///
+    /// It is the **product** of the dimensions that is measured, because that
+    /// is how many words a multi-dimensional array really holds: four
+    /// dimensions each within the bound can still ask for more memory than the
+    /// machine has.
+    fn check_depth(addresses: &[(i64, i64)]) -> Result<(), SimulationError> {
+        if array_depth(addresses) > MAX_MEMORY_DEPTH {
+            return Err(MEMORY_TOO_LARGE);
+        }
         Ok(())
     }
 
@@ -3526,8 +3538,12 @@ impl BodyNames {
                 self.expression(base);
                 self.expression(width);
             }
-            Expression::WordSelect { index, select, .. } => {
-                self.expression(index);
+            Expression::WordSelect {
+                indices, select, ..
+            } => {
+                for index in indices {
+                    self.expression(index);
+                }
                 for inner in select.expressions() {
                     self.expression(inner);
                 }
@@ -3594,9 +3610,15 @@ impl BodyNames {
                 self.expression(base);
                 self.expression(width);
             }
-            Expression::WordSelect { id, index, select } => {
+            Expression::WordSelect {
+                id,
+                indices,
+                select,
+            } => {
                 self.reads.insert(id.name.clone());
-                self.expression(index);
+                for index in indices {
+                    self.expression(index);
+                }
                 for inner in select.expressions() {
                     self.expression(inner);
                 }
@@ -3841,8 +3863,12 @@ fn substitute_genvars(expression: &mut Expression, genvars: &HashMap<String, i64
             substitute_genvars(base, genvars);
             substitute_genvars(width, genvars);
         }
-        Expression::WordSelect { index, select, .. } => {
-            substitute_genvars(index, genvars);
+        Expression::WordSelect {
+            indices, select, ..
+        } => {
+            for index in indices {
+                substitute_genvars(index, genvars);
+            }
             for inner in select.expressions_mut() {
                 substitute_genvars(inner, genvars);
             }
@@ -4102,9 +4128,15 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
             rename_expression(base, resolve);
             rename_expression(width, resolve);
         }
-        Expression::WordSelect { id, index, select } => {
+        Expression::WordSelect {
+            id,
+            indices,
+            select,
+        } => {
             id.name = resolve(&id.name);
-            rename_expression(index, resolve);
+            for index in indices {
+                rename_expression(index, resolve);
+            }
             for inner in select.expressions_mut() {
                 rename_expression(inner, resolve);
             }

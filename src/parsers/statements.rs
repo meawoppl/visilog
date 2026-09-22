@@ -218,7 +218,7 @@ mod tests {
             ModuleStatement::RegisterDeclaration(registers) => {
                 assert_eq!(registers.len(), 1);
                 assert_eq!(registers[0].range, Some(Range::Constant(7, 0)));
-                assert_eq!(registers[0].dimensions, Some(Range::Constant(0, 255)));
+                assert_eq!(registers[0].dimensions, vec![Range::Constant(0, 255)]);
             }
             other => panic!("expected a memory declaration, got {:?}", other),
         }

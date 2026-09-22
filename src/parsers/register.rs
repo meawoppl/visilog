@@ -6,14 +6,17 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{range, signedness, ws, ws_and_comments, Range},
+    simple::{dimensions, range, signedness, ws, Range},
 };
 
 #[derive(Debug, PartialEq)]
 pub struct RegisterDeclaration {
     pub name: Identifier,
     pub range: Option<Range>,
-    pub dimensions: Option<Range>,
+    /// The address dimensions that make the name an array, outermost first:
+    /// one for `mem [0:255]`, two for `mem [0:3][0:15]`, none for an ordinary
+    /// vector.
+    pub dimensions: Vec<Range>,
     /// Whether the declaration carried a `signed` qualifier. The qualifier
     /// belongs to the declaration, so every name in `reg signed [3:0] a, b;`
     /// gets it.
@@ -26,21 +29,19 @@ pub struct RegisterDeclaration {
     pub init: Option<Expression>,
 }
 
-/// One declared name, the optional address dimension that makes it a memory
-/// (`mem [0:255]`), and the optional initialiser that gives it a starting
-/// value (`a = 0`).
+/// One declared name, the address dimensions that make it a memory
+/// (`mem [0:255]`, `mem [0:3][0:15]`), and the optional initialiser that gives
+/// it a starting value (`a = 0`).
 ///
 /// Both belong to the *name*, not to the declaration as a whole, which is what
 /// makes `reg [7:0] a, mem [0:15];` legal — one width, but only the second name
 /// is a memory — and what gives `reg a = 0, b = 1;` two different starting
 /// values.
-pub fn declared_name(
-    input: &str,
-) -> IResult<&str, (Identifier, Option<Range>, Option<Expression>)> {
+pub fn declared_name(input: &str) -> IResult<&str, (Identifier, Vec<Range>, Option<Expression>)> {
     let (input, name) = identifier(input)?;
-    let (input, dimensions) = opt(preceded(ws_and_comments, range))(input)?;
+    let (input, dims) = dimensions(input)?;
     let (input, init) = opt(preceded(ws(char('=')), verilog_expression))(input)?;
-    Ok((input, (name, dimensions, init)))
+    Ok((input, (name, dims, init)))
 }
 
 /// `reg [width]? name [dims]? (, name [dims]?)* ;`
@@ -105,9 +106,31 @@ mod tests {
         let memory = assert_parses(parse_register_declaration, "reg [7:0] m [0: depth-1];");
         assert!(matches!(memory[0].range, Some(Range::Constant(7, 0))));
         assert!(matches!(
-            memory[0].dimensions,
-            Some(Range::Expressions(_, _))
+            memory[0].dimensions[..],
+            [Range::Expressions(_, _)]
         ));
+    }
+
+    /// `reg [7:0] a [0:3][0:15];` — a multi-dimensional unpacked array, whose
+    /// dimensions belong to the name and are kept in the order they were
+    /// written, outermost first.
+    #[test]
+    fn test_multi_dimensional_array_keeps_every_dimension() {
+        let declared = assert_parses(parse_register_declaration, "reg [7:0] a [0:3][0:15];");
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].range, Some(Range::Constant(7, 0)));
+        assert_eq!(
+            declared[0].dimensions,
+            vec![Range::Constant(0, 3), Range::Constant(0, 15)]
+        );
+
+        // Whitespace and comments between dimensions are token boundaries like
+        // any other.
+        let spaced = assert_parses(
+            parse_register_declaration,
+            "reg [3:0] m [0:1] /* rows */ [0:2][0:3];",
+        );
+        assert_eq!(spaced[0].dimensions.len(), 3);
     }
 
     #[test]
@@ -118,7 +141,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "a".into(),
                 range: None,
-                dimensions: None,
+                dimensions: Vec::new(),
                 signed: false,
                 init: None,
             }],
@@ -130,7 +153,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "a".into(),
                 range: Some(Range::Constant(7, 0)),
-                dimensions: None,
+                dimensions: Vec::new(),
                 signed: false,
                 init: None,
             }],
@@ -142,7 +165,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "a".into(),
                 range: None,
-                dimensions: Some(Range::Constant(7, 0)),
+                dimensions: vec![Range::Constant(7, 0)],
                 signed: false,
                 init: None,
             }],
@@ -155,7 +178,7 @@ mod tests {
                 vec![RegisterDeclaration {
                     name: "b".into(),
                     range: Some(Range::Constant(15, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 }]
@@ -169,7 +192,7 @@ mod tests {
                 vec![RegisterDeclaration {
                     name: "c".into(),
                     range: None,
-                    dimensions: Some(Range::Constant(15, 0)),
+                    dimensions: vec![Range::Constant(15, 0)],
                     signed: false,
                     init: None,
                 }]
@@ -183,7 +206,7 @@ mod tests {
                 vec![RegisterDeclaration {
                     name: "d".into(),
                     range: Some(Range::Constant(31, 0)),
-                    dimensions: Some(Range::Constant(0, 255)),
+                    dimensions: vec![Range::Constant(0, 255)],
                     signed: false,
                     init: None,
                 }]
@@ -199,7 +222,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "memb".into(),
                 range: Some(Range::Constant(7, 0)),
-                dimensions: Some(Range::Constant(0, 255)),
+                dimensions: vec![Range::Constant(0, 255)],
                 signed: false,
                 init: None,
             }],
@@ -212,7 +235,7 @@ mod tests {
                 vec![RegisterDeclaration {
                     name: "mem".into(),
                     range: Some(Range::Constant(15, 0)),
-                    dimensions: Some(Range::Constant(0, 1023)),
+                    dimensions: vec![Range::Constant(0, 1023)],
                     signed: false,
                     init: None,
                 }]
@@ -226,7 +249,7 @@ mod tests {
                 vec![RegisterDeclaration {
                     name: "mem32".into(),
                     range: Some(Range::Constant(31, 0)),
-                    dimensions: Some(Range::Constant(0, 2047)),
+                    dimensions: vec![Range::Constant(0, 2047)],
                     signed: false,
                     init: None,
                 }]
@@ -240,7 +263,7 @@ mod tests {
                 vec![RegisterDeclaration {
                     name: "mem64".into(),
                     range: Some(Range::Constant(63, 0)),
-                    dimensions: Some(Range::Constant(0, 4095)),
+                    dimensions: vec![Range::Constant(0, 4095)],
                     signed: false,
                     init: None,
                 }]
@@ -258,14 +281,14 @@ mod tests {
                 RegisterDeclaration {
                     name: "result".into(),
                     range: Some(Range::Constant(4, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some(Range::Constant(4, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
@@ -279,21 +302,21 @@ mod tests {
                 RegisterDeclaration {
                     name: "a".into(),
                     range: None,
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: None,
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "c".into(),
                     range: None,
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
@@ -312,21 +335,21 @@ mod tests {
                 RegisterDeclaration {
                     name: "a".into(),
                     range: Some(Range::Constant(7, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "mem".into(),
                     range: Some(Range::Constant(7, 0)),
-                    dimensions: Some(Range::Constant(0, 15)),
+                    dimensions: vec![Range::Constant(0, 15)],
                     signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some(Range::Constant(7, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
@@ -344,14 +367,14 @@ mod tests {
                 RegisterDeclaration {
                     name: "a".into(),
                     range: Some(Range::Constant(3, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some(Range::Constant(3, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
@@ -388,7 +411,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "b".into(),
                 range: Some(Range::Constant(3, 0)),
-                dimensions: None,
+                dimensions: Vec::new(),
                 signed: false,
                 init: Some(expression("4'h5")),
             }],
@@ -406,21 +429,21 @@ mod tests {
                 RegisterDeclaration {
                     name: "x".into(),
                     range: None,
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: Some(expression("1")),
                 },
                 RegisterDeclaration {
                     name: "y".into(),
                     range: None,
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: Some(expression("2")),
                 },
                 RegisterDeclaration {
                     name: "z".into(),
                     range: None,
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: false,
                     init: None,
                 },
@@ -439,14 +462,14 @@ mod tests {
                 RegisterDeclaration {
                     name: "a".into(),
                     range: Some(Range::Constant(3, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: true,
                     init: None,
                 },
                 RegisterDeclaration {
                     name: "b".into(),
                     range: Some(Range::Constant(3, 0)),
-                    dimensions: None,
+                    dimensions: Vec::new(),
                     signed: true,
                     init: None,
                 },
@@ -461,7 +484,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "x".into(),
                 range: None,
-                dimensions: None,
+                dimensions: Vec::new(),
                 signed: false,
                 init: None,
             }],
@@ -472,7 +495,7 @@ mod tests {
             vec![RegisterDeclaration {
                 name: "signed_x".into(),
                 range: None,
-                dimensions: None,
+                dimensions: Vec::new(),
                 signed: false,
                 init: None,
             }],

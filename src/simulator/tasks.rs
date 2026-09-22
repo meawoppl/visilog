@@ -1624,7 +1624,7 @@ impl TaskContext {
         let memory = store
             .memory(&memory_name)
             .ok_or_else(|| not_a_memory(&memory_name))?;
-        let (first, last) = memory.addresses();
+        let (first, last) = linear_addresses(memory.addresses(), &memory_name)?;
         let (lowest, highest) = (first.min(last), first.max(last));
 
         let start = match arguments.get(2) {
@@ -1671,7 +1671,7 @@ impl TaskContext {
                             memory_name, cursor, name, start, finish
                         )));
                     }
-                    store.set_word(&memory_name, cursor, &memory_word(&digits, radix)?);
+                    store.set_word(&memory_name, &[cursor], &memory_word(&digits, radix)?);
                     cursor += step;
                 }
             }
@@ -1710,7 +1710,7 @@ impl TaskContext {
         let memory = store
             .memory(&memory_name)
             .ok_or_else(|| not_a_memory(&memory_name))?;
-        let (first, last) = memory.addresses();
+        let (first, last) = linear_addresses(memory.addresses(), &memory_name)?;
         let (lowest, highest) = (first.min(last), first.max(last));
         let start = match arguments.get(2) {
             Some(argument) => self.address_argument(argument, store, "start")?,
@@ -1725,7 +1725,7 @@ impl TaskContext {
         let mut text = String::new();
         let mut cursor = start;
         loop {
-            let word = memory.word(Some(cursor));
+            let word = memory.word(Some(&[cursor]));
             text.push_str(&match radix {
                 Radix::Binary => binary(&word),
                 _ => hex(&word),
@@ -1923,6 +1923,23 @@ fn memory_argument(argument: &TaskArgument, task: &str) -> Result<String, Simula
         _ => Err(SimulationError::SystemTask(format!(
             "`{}`'s second argument names the memory, and must be a plain identifier",
             task
+        ))),
+    }
+}
+
+/// The one address range a memory file is read into or written from.
+///
+/// Both `$readmem…` and `$writemem…` run an array from one address to another,
+/// which only a *one-dimensional* array has. A multi-dimensional one is named
+/// rather than loaded row by row: the file format says nothing about where one
+/// row ends, so any order chosen for it would be this simulator's invention.
+fn linear_addresses(addresses: &[(i64, i64)], name: &str) -> Result<(i64, i64), SimulationError> {
+    match addresses {
+        [single] => Ok(*single),
+        _ => Err(SimulationError::SystemTask(format!(
+            "`{}` has {} dimensions, and a memory file names one address per word",
+            name,
+            addresses.len()
         ))),
     }
 }
@@ -3522,7 +3539,7 @@ mod tests {
         std::fs::write(&file, "0 1 2 3 4 5 6 7\n").expect("data file");
 
         let mut store = StateStore::new();
-        store.declare_memory("mem", (0, 3), (7, 0), false);
+        store.declare_memory("mem", vec![(0, 3)], (7, 0), false);
         let mut context = TaskContext::new();
 
         // An explicit finish says where to stop, so the four words past it are
@@ -3530,7 +3547,7 @@ mod tests {
         let source = format!(r#"$readmemh("{}", mem, 0, 3);"#, file.display());
         run_in(&mut context, &source, &mut store);
         assert_eq!(
-            store.memory("mem").expect("mem").word(Some(3)),
+            store.memory("mem").expect("mem").word(Some(&[3])),
             Register::from_u128(3, 8)
         );
 

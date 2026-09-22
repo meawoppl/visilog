@@ -566,12 +566,19 @@ fn range_width(range: (i64, i64)) -> usize {
 /// register, and an address outside the declared range reads `x` and swallows a
 /// write — the same thing [`SignalState::bit`] and [`SignalState::set_bit`] do
 /// with an out-of-range bit.
+///
+/// An array may have more than one dimension — `reg [7:0] a [0:3][0:15];`, a
+/// word of which is named `a[i][j]` — so the addresses are a *list* and the
+/// words are laid out in row-major order, last dimension fastest. An address
+/// is therefore always as many indices as the declaration wrote, which is what
+/// keeps a partial one (`a[i]` of a two-dimensional array) a named error
+/// rather than a word nothing named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Memory {
     words: Vec<Register>,
-    /// The declared address range: `(0, 255)` for `mem [0:255]`, `(15, 8)` for
-    /// `mem [15:8]`.
-    addresses: (i64, i64),
+    /// The declared address ranges, outermost first: `[(0, 255)]` for
+    /// `mem [0:255]`, `[(0, 3), (0, 15)]` for `mem [0:3][0:15]`.
+    addresses: Vec<(i64, i64)>,
     /// The `(msb, lsb)` range of one word.
     range: (i64, i64),
 }
@@ -600,33 +607,45 @@ pub fn bit_position_in(range: (i64, i64), index: i64) -> Option<usize> {
     Some(offset as usize)
 }
 
+/// How many words an array over `addresses` holds — the product of its
+/// dimensions, which is what a multi-dimensional declaration has to be
+/// measured by.
+/// The product saturates rather than wrapping: a wrapped one could come out
+/// small enough to pass the depth guard and then allocate everything the
+/// machine has.
+pub fn array_depth(addresses: &[(i64, i64)]) -> usize {
+    addresses.iter().fold(1usize, |depth, range| {
+        depth.saturating_mul(range_width(*range))
+    })
+}
+
 impl Memory {
     /// A memory of `addresses` words, each `range` wide and every bit `x`.
-    pub fn new(addresses: (i64, i64), range: (i64, i64), signed: bool) -> Self {
+    pub fn new(addresses: Vec<(i64, i64)>, range: (i64, i64), signed: bool) -> Self {
         Memory::filled(addresses, range, signed, Register::unknown)
     }
 
     /// An **array of nets**, whose undriven words read `z` rather than `x` for
     /// the same reason a scalar net does — see [`StateStore::declare_net`].
-    pub fn of_nets(addresses: (i64, i64), range: (i64, i64), signed: bool) -> Self {
+    pub fn of_nets(addresses: Vec<(i64, i64)>, range: (i64, i64), signed: bool) -> Self {
         Memory::filled(addresses, range, signed, Register::high_impedance)
     }
 
     /// An array of `real`s. A real has no `x`, so an unwritten word is `0.0`
     /// rather than unknown — the same rule a scalar `real` follows.
-    pub fn of_reals(addresses: (i64, i64)) -> Self {
+    pub fn of_reals(addresses: Vec<(i64, i64)>) -> Self {
         Memory::filled(addresses, REAL_RANGE, true, |_| Register::from_f64(0.0))
     }
 
     fn filled(
-        addresses: (i64, i64),
+        addresses: Vec<(i64, i64)>,
         range: (i64, i64),
         signed: bool,
         fill: impl Fn(usize) -> Register,
     ) -> Self {
         let word = fill(range_width(range)).with_signedness(signed);
         Memory {
-            words: vec![word; range_width(addresses)],
+            words: vec![word; array_depth(&addresses)],
             addresses,
             range,
         }
@@ -637,9 +656,15 @@ impl Memory {
         self.words.len()
     }
 
-    /// The declared address range.
-    pub fn addresses(&self) -> (i64, i64) {
-        self.addresses
+    /// The declared address ranges, outermost first.
+    pub fn addresses(&self) -> &[(i64, i64)] {
+        &self.addresses
+    }
+
+    /// How many address dimensions the declaration wrote, which is how many
+    /// indices a word of this array is named by.
+    pub fn dimensions(&self) -> usize {
+        self.addresses.len()
     }
 
     /// The `(msb, lsb)` range of one word.
@@ -666,25 +691,37 @@ impl Memory {
     /// the address written first — so `mem [0:255]` and `mem [15:8]` both run in
     /// the order their declarations read. `None` is an address outside the
     /// declared range.
-    pub fn word_position(&self, address: i64) -> Option<usize> {
-        let (first, last) = self.addresses;
-        let offset = if first <= last {
-            if address < first || address > last {
-                return None;
-            }
-            address - first
-        } else {
-            if address > first || address < last {
-                return None;
-            }
-            first - address
-        };
-        Some(offset as usize)
+    ///
+    /// A multi-dimensional array takes one index per dimension and lays its
+    /// words out row-major, last dimension fastest. An address with the wrong
+    /// number of indices names no word at all, which is what keeps `a[i]` of a
+    /// two-dimensional array from reading the first row's first word.
+    pub fn word_position(&self, address: &[i64]) -> Option<usize> {
+        if address.len() != self.addresses.len() {
+            return None;
+        }
+        let mut offset = 0usize;
+        for (index, (first, last)) in address.iter().zip(self.addresses.iter()) {
+            let (first, last) = (*first, *last);
+            let within = if first <= last {
+                if *index < first || *index > last {
+                    return None;
+                }
+                index - first
+            } else {
+                if *index > first || *index < last {
+                    return None;
+                }
+                first - index
+            };
+            offset = offset * range_width((first, last)) + within as usize;
+        }
+        Some(offset)
     }
 
     /// The word at `address`. An address that is unknown — `None`, which is what
     /// an `x` index evaluates to — or outside the declared range reads `x`.
-    pub fn word(&self, address: Option<i64>) -> Register {
+    pub fn word(&self, address: Option<&[i64]>) -> Register {
         match address.and_then(|address| self.word_position(address)) {
             Some(offset) => self.words[offset].clone(),
             // An array of reals has no unknown to read: `0.0` is what an
@@ -718,7 +755,7 @@ impl Memory {
 
     /// Writes a word, resized to the memory's own width, and reports whether the
     /// stored value moved. A write outside the declared range is discarded.
-    pub fn set_word(&mut self, address: i64, value: &Register) -> bool {
+    pub fn set_word(&mut self, address: &[i64], value: &Register) -> bool {
         let Some(offset) = self.word_position(address) else {
             return false;
         };
@@ -1650,7 +1687,7 @@ impl StateStore {
     }
 
     /// Declares an array of `real`s: `real samples [0:3];`.
-    pub fn declare_real_memory(&mut self, name: impl Into<String>, addresses: (i64, i64)) {
+    pub fn declare_real_memory(&mut self, name: impl Into<String>, addresses: Vec<(i64, i64)>) {
         self.any_signed = true;
         self.any_real = true;
         self.insert_memory(name, Memory::of_reals(addresses), true);
@@ -1686,7 +1723,7 @@ impl StateStore {
     pub fn declare_memory(
         &mut self,
         name: impl Into<String>,
-        addresses: (i64, i64),
+        addresses: Vec<(i64, i64)>,
         range: (i64, i64),
         signed: bool,
     ) {
@@ -1698,7 +1735,7 @@ impl StateStore {
     pub fn declare_net_memory(
         &mut self,
         name: impl Into<String>,
-        addresses: (i64, i64),
+        addresses: Vec<(i64, i64)>,
         range: (i64, i64),
         signed: bool,
     ) {
@@ -1740,7 +1777,7 @@ impl StateStore {
     /// is the first word displaced this round and the last word written, which
     /// over-approximates in exactly the direction `event_fires` already does —
     /// a block may be woken more often than it should, never less.
-    pub fn set_word(&mut self, name: &str, address: i64, value: &Register) -> Option<bool> {
+    pub fn set_word(&mut self, name: &str, address: &[i64], value: &Register) -> Option<bool> {
         let memory = self.name_to_memory.get_mut(name)?;
         let before = memory.word(Some(address));
         if !memory.set_word(address, value) {
@@ -1768,7 +1805,7 @@ impl StateStore {
     pub fn set_word_bits(
         &mut self,
         name: &str,
-        address: i64,
+        address: &[i64],
         indices: &[i64],
         value: &Register,
     ) -> Option<bool> {
@@ -2122,12 +2159,12 @@ mod tests {
     #[test]
     fn test_memory_holds_one_register_per_declared_address() {
         let mut store = StateStore::new();
-        store.declare_memory("mem", (0, 255), (7, 0), false);
+        store.declare_memory("mem", vec![(0, 255)], (7, 0), false);
 
         let memory = store.memory("mem").expect("mem should be a memory");
         assert_eq!(memory.depth(), 256);
         assert_eq!(memory.width(), 8);
-        assert_eq!(memory.addresses(), (0, 255));
+        assert_eq!(memory.addresses(), [(0, 255)]);
         assert_eq!(memory.range(), (7, 0));
         // A name is a signal or a memory, never both — which is exactly what
         // tells a word select from a bit select.
@@ -2138,50 +2175,50 @@ mod tests {
     #[test]
     fn test_memory_words_start_unknown_and_are_independent() {
         let mut store = StateStore::new();
-        store.declare_memory("mem", (0, 3), (7, 0), false);
+        store.declare_memory("mem", vec![(0, 3)], (7, 0), false);
 
         assert_eq!(
-            store.memory("mem").unwrap().word(Some(0)).to_binary(),
+            store.memory("mem").unwrap().word(Some(&[0])).to_binary(),
             "xxxxxxxx"
         );
 
-        store.set_word("mem", 1, &Register::from_binary("00000001"));
-        store.set_word("mem", 2, &Register::from_binary("00000010"));
+        store.set_word("mem", &[1], &Register::from_binary("00000001"));
+        store.set_word("mem", &[2], &Register::from_binary("00000010"));
 
         let memory = store.memory("mem").unwrap();
-        assert_eq!(memory.word(Some(0)).to_binary(), "xxxxxxxx");
-        assert_eq!(memory.word(Some(1)).to_binary(), "00000001");
-        assert_eq!(memory.word(Some(2)).to_binary(), "00000010");
-        assert_eq!(memory.word(Some(3)).to_binary(), "xxxxxxxx");
+        assert_eq!(memory.word(Some(&[0])).to_binary(), "xxxxxxxx");
+        assert_eq!(memory.word(Some(&[1])).to_binary(), "00000001");
+        assert_eq!(memory.word(Some(&[2])).to_binary(), "00000010");
+        assert_eq!(memory.word(Some(&[3])).to_binary(), "xxxxxxxx");
     }
 
     #[test]
     fn test_memory_addresses_run_ascending_or_descending() {
-        let ascending = Memory::new((0, 3), (7, 0), false);
-        assert_eq!(ascending.word_position(0), Some(0));
-        assert_eq!(ascending.word_position(3), Some(3));
-        assert_eq!(ascending.word_position(4), None);
-        assert_eq!(ascending.word_position(-1), None);
+        let ascending = Memory::new(vec![(0, 3)], (7, 0), false);
+        assert_eq!(ascending.word_position(&[0]), Some(0));
+        assert_eq!(ascending.word_position(&[3]), Some(3));
+        assert_eq!(ascending.word_position(&[4]), None);
+        assert_eq!(ascending.word_position(&[-1]), None);
 
         // `reg [7:0] m [15:8];` addresses 15 down to 8, and nothing else.
-        let descending = Memory::new((15, 8), (7, 0), false);
-        assert_eq!(descending.word_position(15), Some(0));
-        assert_eq!(descending.word_position(8), Some(7));
-        assert_eq!(descending.word_position(7), None);
-        assert_eq!(descending.word_position(16), None);
+        let descending = Memory::new(vec![(15, 8)], (7, 0), false);
+        assert_eq!(descending.word_position(&[15]), Some(0));
+        assert_eq!(descending.word_position(&[8]), Some(7));
+        assert_eq!(descending.word_position(&[7]), None);
+        assert_eq!(descending.word_position(&[16]), None);
     }
 
     #[test]
     fn test_memory_out_of_range_reads_x_and_discards_a_write() {
         let mut store = StateStore::new();
-        store.declare_memory("mem", (0, 3), (3, 0), false);
+        store.declare_memory("mem", vec![(0, 3)], (3, 0), false);
 
         assert_eq!(
-            store.set_word("mem", 9, &Register::from_binary("1111")),
+            store.set_word("mem", &[9], &Register::from_binary("1111")),
             Some(false)
         );
         let memory = store.memory("mem").unwrap();
-        assert_eq!(memory.word(Some(9)).to_binary(), "xxxx");
+        assert_eq!(memory.word(Some(&[9])).to_binary(), "xxxx");
         // An index that did not evaluate to a number reads `x` as well.
         assert_eq!(memory.word(None).to_binary(), "xxxx");
         assert!(memory.words.iter().all(|word| word.to_binary() == "xxxx"));
@@ -2190,10 +2227,10 @@ mod tests {
     #[test]
     fn test_memory_write_is_resized_and_keeps_the_declared_signedness() {
         let mut store = StateStore::new();
-        store.declare_memory("mem", (0, 1), (31, 0), true);
+        store.declare_memory("mem", vec![(0, 1)], (31, 0), true);
 
-        store.set_word("mem", 0, &Register::from_binary("1010"));
-        let word = store.memory("mem").unwrap().word(Some(0));
+        store.set_word("mem", &[0], &Register::from_binary("1010"));
+        let word = store.memory("mem").unwrap().word(Some(&[0]));
         assert_eq!(word.width(), 32);
         assert!(word.is_signed(), "a value may not change a declaration");
     }
@@ -2201,13 +2238,13 @@ mod tests {
     #[test]
     fn test_memory_writes_are_journalled_so_a_block_can_wake_on_them() {
         let mut store = StateStore::new();
-        store.declare_memory("mem", (0, 3), (3, 0), false);
+        store.declare_memory("mem", vec![(0, 3)], (3, 0), false);
         store.clear_changes();
 
         // Rewriting the same value is not a change and is not journalled.
-        store.set_word("mem", 0, &Register::from_binary("0001"));
-        store.set_word("mem", 0, &Register::from_binary("0001"));
-        store.set_word("mem", 1, &Register::from_binary("0010"));
+        store.set_word("mem", &[0], &Register::from_binary("0001"));
+        store.set_word("mem", &[0], &Register::from_binary("0001"));
+        store.set_word("mem", &[1], &Register::from_binary("0010"));
 
         // One entry per *name*, not per word: the pair is the first word the
         // round displaced and the last word written.
@@ -2225,11 +2262,11 @@ mod tests {
         store.declare("plain", (7, 0));
 
         assert_eq!(
-            store.set_word("plain", 0, &Register::from_binary("1")),
+            store.set_word("plain", &[0], &Register::from_binary("1")),
             None
         );
         assert_eq!(
-            store.set_word("absent", 0, &Register::from_binary("1")),
+            store.set_word("absent", &[0], &Register::from_binary("1")),
             None
         );
     }

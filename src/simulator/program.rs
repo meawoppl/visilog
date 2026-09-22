@@ -447,8 +447,11 @@ fn calls(expression: &Expression, name: &str) -> bool {
         Expression::FunctionCall(_, arguments) => nested(arguments),
         Expression::BitSelect(_, index) => calls(index, name),
         Expression::PartSelect(_, first, second) => calls(first, name) || calls(second, name),
-        Expression::WordSelect { index, select, .. } => {
-            calls(index, name) || select.expressions().iter().any(|inner| calls(inner, name))
+        Expression::WordSelect {
+            indices, select, ..
+        } => {
+            indices.iter().any(|index| calls(index, name))
+                || select.expressions().iter().any(|inner| calls(inner, name))
         }
     }
 }
@@ -1921,11 +1924,11 @@ impl FunctionDefinition {
             // the whole of what tells `tmp[1]` a word from `tmp[1]` a bit.
             match (variable.dimensions, variable.real) {
                 (Some(addresses), true) => {
-                    frame.declare_real_memory(variable.name.clone(), addresses)
+                    frame.declare_real_memory(variable.name.clone(), vec![addresses])
                 }
                 (Some(addresses), false) => frame.declare_memory(
                     variable.name.clone(),
-                    addresses,
+                    vec![addresses],
                     variable.range,
                     variable.signed,
                 ),
