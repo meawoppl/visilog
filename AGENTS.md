@@ -1942,13 +1942,31 @@ three terms, and a delay a design wrote and the simulator dropped is a wrong ans
 right values.
 
 A **sequential** UDP — one whose output is a `reg`, whose rows carry a current-state field,
-and whose input columns may name an edge (`(01)`, `r`, `*`) — parses and is then
-`SimulationError::SequentialPrimitive`, naming it. Its rows ask about the *previous* value
-of an input, and a continuous driver is handed only the present ones; a driver that quietly
-answered from the levels alone would be a wrong answer wearing a working simulator's
-clothes. A UDP instance also still needs an instance *name*: `p(Q, D);` — legal, and how a
-UDP is often written — is a parse error, because a module instantiation's name is not
-optional (corpus `pr298`, `pr3587570`).
+and whose input columns may name an edge (`(01)`, `r`, `*`) — is still a continuous driver:
+`udp::UdpMemory` keeps the inputs as they stood at the last lookup and the state the
+primitive holds, on the instance, so an edge row can be asked about what an input *was*
+without the settle loop learning that one exists (`UdpTable::sequential_output`; corpus
+`pr298`, `udp_sched`).
+
+**A UDP instance's name is optional and a module instance's is not, and only elaboration
+can tell the two apart.** `p (Q, D);` is how a UDP is often written (corpus `pr298`,
+`pr3587570`), and the grammar cannot know `p` is a primitive, so
+`parse_module_instantiation_statement` takes a missing name for any instantiation —
+`ModuleInstantiation::instance_name` is an `Option` — and `instantiate_each` asks the
+module: a primitive is named `$<module><n>` from a counter on the `Elaborator` (a `$`
+cannot begin a design identifier, so the name meets nothing), and a module is
+`SimulationError::UnnamedInstance`. That split is iverilog 12.0's too: it parses the
+unnamed module instance and then stops with "Instantiation of module child requires an
+instance name". The name matters because a port bound to an expression (`(b, !i)`) takes a
+store entry under the instance's prefix. Without a name the statement is only an
+identifier and an argument block, so a **reserved word** is never read as the module it
+instantiates — the same guard the task enable and the bare event control carry.
+
+**An instantiation is a list**, like every declaration: `u_dff ff0(…), ff1(…);` shares
+one module name and one parameter block across its instances, so the statement is
+`ModuleStatement::ModuleInstantiation(Vec<ModuleInstantiation>)` — one full instance
+apiece — and nothing past the parser learns it was written as a list (corpus
+`udp_sched`).
 
 **A `specify` block records and does not simulate, and that is the one place a no-op is the
 honest reading.** A module path delay (`(A => Z) = (0.1, 0.2);`) changes only *when* a value
@@ -2260,8 +2278,8 @@ than a missing feature. Both lists are printed **by name** for exactly that reas
 gold mismatches carry a first-difference line (`line N: expected … got …`) for the leading
 few, which is what makes them actionable without reading the corpus by hand.
 
-Not every gold mismatch is a simulator bug: seven of them (`br1007`, `br_gh127a`…`f`)
-have gold files whose first lines are iverilog's own *compiler warnings*
+Not every gold mismatch is a simulator bug: eight of them (`br1007`, `br_gh127a`…`f`,
+`pr1723367`) have gold files whose first lines are iverilog's own *compiler warnings*
 (`./ivltests/br1007.v:15: warning: …`), which visilog has no diagnostic channel to emit.
 They are left in the list rather than filtered out, because a rule that dropped anything
 looking like a diagnostic would also drop real output — but read the first-difference line
@@ -2492,6 +2510,14 @@ tripwire.
   ordering hazard that two near-identical `reg`-led parsers would otherwise create.
   A `signed` / `unsigned` qualifier belongs to the *declaration* rather than to a name, so
   every name in the list shares it; an `integer` is signed by being an `integer`.
+- **`logic` is a `reg`**, at module level (`register::register_keyword`) and as a port's
+  data type (`output logic q`). That is iverilog 12.0's reading in its default mode, and it
+  is exact rather than approximate: it refuses `assign a = …;` onto a `logic a;` with the
+  same "reg a; cannot be driven by primitives or continuous assignment" it gives a `reg`.
+  `logic` is a SystemVerilog keyword and not a 1364-2005 one, so it carries a word boundary
+  — `logical` and `logic_level` are still names — and no scored corpus file uses it as an
+  identifier. Nothing else SystemVerilog added to the type system is read this way (corpus
+  `br_gh1178c`).
 - **A declaration initialiser belongs to the *name*, and `wire` and `reg` mean opposite
   things by it.** `wire a = expr;` is shorthand for a declaration *plus a continuous
   assignment*: `elaborate` pushes it onto the same list an explicit `assign` uses, so the
@@ -2502,13 +2528,53 @@ tripwire.
   that behaves like a one-shot looks right in a smoke test and is wrong in a real design.
   `register::declared_name` carries the initialiser next to the memory dimension, which is
   what makes `wire x = 1, y = 2;` give the two names different drivers.
+  **So a net declaration's strength and delay are that assignment's.**
+  `wire (weak0, weak1) v = p;` and `wire #(period/3) t = d;` are
+  `assign (weak0, weak1) v = p;` and `assign #(period/3) t = d;` — `net_declaration` reads
+  the same `drive_strength` and `parse_gate_delay` an `assign` does, in the LRM's order
+  (type, strength, `signed`, range, delay), and `elaborate` hands both to
+  `ContinuousAssignment::with_timing` through `push_assignment`, so nothing past that point
+  knows the driver was a declaration (corpus `drive_strength1`, `delay5`). A delay on a net
+  declared *without* an assignment (`wire #5 w;`) delays every driver of `w`, which is a
+  property of the net rather than of one driver; that is `SimulationError::Unsupported`
+  rather than dropped, because the old parser did drop it.
 - **Both module header styles are normalised to `Vec<Port>` at parse time.**
   `parse_module_declaration` reads an ANSI header (`module m(input wire [3:0] a);`) or a
   Verilog-1995 one (`module m(a, h);` plus `input a; output [11:0] h;` in the body), lifts
   the body direction declarations out of `statements`, and reconciles them against the
   header names. Nothing downstream can tell the two apart, which is why `elaborate` needs
-  no notion of either. Mixing them, a header name with no direction, a direction naming
-  something absent from the header, and a port declared twice are all `nom::Err::Failure`.
+  no notion of either. A header name with no direction and a port declared twice — in the
+  body twice, or in an ANSI header and again in the body — are `nom::Err::Failure`.
+  **A direction naming something the header does not list is a local, not an error.**
+  `module test; output reg a;` (corpus `module_output_port_var2`), `module m(a); input a;
+  output b;` and `module m(input a); output b;` all compile silently in iverilog 12.0, even
+  under `-Wall`, and the name is the declaration it would be without the direction — a net
+  reading `z`, or a variable reading `x` when it says `reg`, `integer` or `time`. Nothing can
+  connect to it, so it is not a port: `reconcile_ports` hands it back in
+  `ReconciledPorts::locals`, `parse_module_declaration` keeps it in the body as a
+  `ModuleStatement::PortDeclaration` — in *front* of the body, where a port's own
+  declaration would run, so a `reg` naming it still comes second and wins the fill — and
+  `elaborate` declares it through `declare_port` with nothing bound. A **primitive** keeps
+  the refusal: its body holds nothing but its terminals.
+  **A Verilog-1995 header entry is a *port expression*, and one that is not a plain name is
+  normalised away at parse time.** IEEE 1364-2005's `port` may be a part of a declaration
+  (`arg[119:96]`), a concatenation (`{a, b}`), either behind an external name
+  (`.a({b, c})`), or blank (`(a, , b)`); `HeaderPort` is those shapes and
+  `reconcile_ports` / `carried_port` turn each non-plain one into an **ordinary port** — its
+  external name, or `$port<position>`, which no design identifier can spell — plus the
+  statement that carries its connection to what it names: `assign {parts} = port;` for an
+  input, `assign port = {parts};` for an output, and a `tran` array for an `inout`, because
+  a port read as well as written cannot be carried by one assignment. What the expression
+  names in the body becomes a local (above). Nothing past the parser learns the header was
+  not a list of names — it sees ports, locals, assignments and a switch it already knew
+  (corpus `contrib8.2`, `pr377`, `pr3197917`, `port-test2`). **A name listed twice** is the
+  same shape — one net reached through two ports — and is legal only for an `inout`
+  (`module id(a, a); inout a;`, corpus `inout`, `br_gh1178b`); a repeated input or output
+  would have the child drive its parent and stays `Duplicate`. Refused with
+  `PortReconciliationError::PortExpression`: parts that disagree about direction, a width
+  that would have to be *summed* from parameters (a port that is the whole of one
+  declaration keeps its range as written, parameters and all), an external name the body
+  also declares, and an `inout` that is anything but a single reference.
   A `reg` naming a port is *not* a second declaration of it — an output backed by a
   register is one signal, and the `reg` stays an ordinary body statement.
 - **Flattening rewrites names on the compiled `Program`, not on the statement tree.**
@@ -2773,8 +2839,12 @@ tripwire.
   `Vec<Option<Expression>>` and `elaborate::connections` filters the `None`s out *after*
   zipping against the ports. Dropping a blank at parse time instead would silently bind
   every later connection to the wrong port. A single blank is `NoArgs` — `()` is an empty
-  argument list, not a one-element list with a gap. A blank *named* connection (`.a()`) and
-  a blank in a module *header* (`module m(a,);`) are still parse errors.
+  argument list, not a one-element list with a gap — and so is `( )`: no argument claims
+  the whitespace or comment inside an empty block, so `argument_block`'s closing `)` skips
+  it itself (corpus `pr985`, whose `my_module ( );` was the whole of its parse failure). A
+  blank *named* connection (`.a()`) is still a parse error; a blank in a module *header*
+  (`module m(a,);`) is a port that nothing inside reads (see the header port expressions
+  above).
 - **`-> e;` is parsed as an assignment to the event's name.** There is no statement kind
   for a trigger and no instruction for one: a trigger and an ordinary write reach the
   simulator down the same path, and `exec::resolve_target` is where the store is asked

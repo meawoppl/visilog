@@ -486,7 +486,12 @@ pub fn parse_primitive_declaration(input: &str) -> IResult<&str, VerilogModule> 
             PrimitiveItem::Initial(value) => initial = Some(value),
         }
     }
-    let ports = reconcile_ports(header, declared).map_err(|_| malformed(input))?;
+    let ports = match reconcile_ports(header, declared) {
+        Ok(reconciled) if reconciled.locals.is_empty() => reconciled.ports,
+        // A primitive has nothing but its terminals, so a direction for any
+        // other name is not a local of it.
+        _ => return Err(malformed(input)),
+    };
 
     // The output is the first terminal, and the only one: that is what a UDP
     // is, so a header that says otherwise is not one.

@@ -65,7 +65,9 @@ pub enum ModuleStatement {
     /// `and g1 (out, a, b);` — one built-in primitive per instance declared,
     /// since one statement may declare several.
     GateInstantiation(Vec<GateInstantiation>),
-    ModuleInstantiation(ModuleInstantiation),
+    /// `inv u1 (o1, i1), u2 (o2, i2);` — one per instance, sharing the module
+    /// name and the parameter block the way a gate list shares its kind.
+    ModuleInstantiation(Vec<ModuleInstantiation>),
     /// `specify … endspecify` — module path delays, timing checks and the
     /// `specparam`s written with them. Only the specparams reach the
     /// simulation; see `specify.rs` for why the rest cannot.
@@ -269,9 +271,9 @@ mod tests {
             "adder my_adder (.a(in_a),.b(in_b),.c(sum));",
         );
         match statement {
-            ModuleStatement::ModuleInstantiation(instantiation) => {
-                assert_eq!(instantiation.module_name, "adder".into());
-                assert_eq!(instantiation.instance_name, "my_adder".into());
+            ModuleStatement::ModuleInstantiation(instances) => {
+                assert_eq!(instances[0].module_name, "adder".into());
+                assert_eq!(instances[0].instance_name, Some("my_adder".into()));
             }
             _ => panic!("Expected a module instantiation, got {:?}", statement),
         }

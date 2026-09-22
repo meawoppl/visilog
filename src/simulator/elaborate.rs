@@ -280,6 +280,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
         walked: 0,
         defparams: BTreeMap::new(),
         blocks_generated: 0,
+        unnamed_instances: 0,
         hierarchical_tasks: HashMap::new(),
     };
     elaborator.walk(top, &mut Scope::root(&modules[top].identifier.name))?;
@@ -464,6 +465,9 @@ struct Elaborator<'m> {
     /// A block with no label still needs a scope — two iterations of an
     /// unnamed loop body would otherwise declare the same names twice.
     blocks_generated: usize,
+    /// How many unnamed primitive instances have been given a name, which is
+    /// what keeps two `p (q, d);` in one scope from sharing store entries.
+    unnamed_instances: usize,
     /// Every task in the design under the flat path a hierarchical enable
     /// resolves to — `j.set`, `main.test1` — with its body already renamed
     /// into the names of the instance that declares it.
@@ -622,16 +626,7 @@ impl<'m> Elaborator<'m> {
         // port takes the value once, a net port takes it as a continuous
         // assignment and follows its operands for the whole run.
         for port in &module.ports {
-            let Some(init) = &port.init else { continue };
-            if port_is_variable(port) {
-                self.initialise(&port.identifier.name, init, scope)?;
-            } else {
-                let target =
-                    Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)));
-                self.out
-                    .assignments
-                    .push(ContinuousAssignment::new(target, renamed(init, scope)));
-            }
+            self.initialise_port(port, scope)?;
         }
         for statement in &module.statements {
             self.build(statement, scope, &tasks)?;
@@ -1031,6 +1026,25 @@ impl<'m> Elaborator<'m> {
 
     /// Declares one port, unless it was aliased onto a signal that already
     /// exists.
+    /// A port's default value, `output reg [31:0] x = 1;`: a variable takes
+    /// it once, a net takes it as a continuous assignment — the split a body
+    /// declaration's initialiser already makes.
+    fn initialise_port(&mut self, port: &Port, scope: &Scope) -> Result<(), SimulationError> {
+        let Some(init) = &port.init else {
+            return Ok(());
+        };
+        if port_is_variable(port) {
+            self.initialise(&port.identifier.name, init, scope)?;
+        } else {
+            let target =
+                Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)));
+            self.out
+                .assignments
+                .push(ContinuousAssignment::new(target, renamed(init, scope)));
+        }
+        Ok(())
+    }
+
     fn declare_port(
         &mut self,
         port: &Port,
@@ -1574,6 +1588,15 @@ impl<'m> Elaborator<'m> {
         scope: &Scope,
     ) -> Result<(), SimulationError> {
         match statement {
+            // A direction declared for a name the header does not list is the
+            // declaration it would be without the direction. Nothing binds it,
+            // so `declare_port` gives it exactly that: a net filled with `z`,
+            // or a variable filled with `x`.
+            ModuleStatement::PortDeclaration(locals) => {
+                for local in locals {
+                    self.declare_port(local, scope, None)?;
+                }
+            }
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
                     let range = self.resolve_range(net.range(), scope)?;
@@ -1949,19 +1972,23 @@ impl<'m> Elaborator<'m> {
                     }
                 }
             }
-            ModuleStatement::ModuleInstantiation(instantiation) => match &instantiation.arguments {
-                ModuleInitArguments::NoArgs => {}
-                ModuleInitArguments::Positional(connections) => {
-                    for connection in connections.iter().flatten() {
-                        operand_names(connection, &mut names);
+            ModuleStatement::ModuleInstantiation(instances) => {
+                for instantiation in instances {
+                    match &instantiation.arguments {
+                        ModuleInitArguments::NoArgs => {}
+                        ModuleInitArguments::Positional(connections) => {
+                            for connection in connections.iter().flatten() {
+                                operand_names(connection, &mut names);
+                            }
+                        }
+                        ModuleInitArguments::Keyword(connections) => {
+                            for connection in connections.values() {
+                                operand_names(connection, &mut names);
+                            }
+                        }
                     }
                 }
-                ModuleInitArguments::Keyword(connections) => {
-                    for connection in connections.values() {
-                        operand_names(connection, &mut names);
-                    }
-                }
-            },
+            }
             _ => {}
         }
         for local in names {
@@ -2573,17 +2600,43 @@ impl<'m> Elaborator<'m> {
             // `wire a = expr;` is a declaration plus a continuous assignment,
             // so the initialiser joins the same list an explicit `assign`
             // uses and settles through the same fixpoint. The net follows its
-            // operands for the whole simulation.
+            // operands for the whole simulation. Its strength and its delay
+            // are the assignment's, exactly as an `assign`'s are.
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
-                    if let Some(init) = net.init() {
-                        let target = Expression::Identifier(Identifier::new(
-                            scope.resolve(&net.identifier().name),
-                        ));
-                        self.out
-                            .assignments
-                            .push(ContinuousAssignment::new(target, renamed(init, scope)));
-                    }
+                    let Some(init) = net.init() else {
+                        // `wire #5 w;` delays *every* driver of `w`, which is
+                        // a property of the net rather than of one driver and
+                        // is not modelled; dropping it would run the design
+                        // at the wrong edge times.
+                        if net.delay().is_some() {
+                            return Err(SimulationError::Unsupported(
+                                "a net delay on a net declared without an assignment",
+                            ));
+                        }
+                        continue;
+                    };
+                    let target = Expression::Identifier(Identifier::new(
+                        scope.resolve(&net.identifier().name),
+                    ));
+                    let delay = net.delay().map(|delay| {
+                        let mut delay = delay.clone();
+                        for expression in delay.expressions_mut() {
+                            *expression = renamed(expression, scope);
+                        }
+                        delay
+                    });
+                    self.push_assignment(ContinuousAssignment::with_timing(
+                        target,
+                        renamed(init, scope),
+                        net.strength(),
+                        delay,
+                    ));
+                }
+            }
+            ModuleStatement::PortDeclaration(locals) => {
+                for local in locals {
+                    self.initialise_port(local, scope)?;
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -2726,8 +2779,10 @@ impl<'m> Elaborator<'m> {
                     program,
                 });
             }
-            ModuleStatement::ModuleInstantiation(instantiation) => {
-                self.instantiate_each(instantiation, scope)?
+            ModuleStatement::ModuleInstantiation(instances) => {
+                for instantiation in instances {
+                    self.instantiate_each(instantiation, scope)?
+                }
             }
             _ => {}
         }
@@ -2746,6 +2801,14 @@ impl<'m> Elaborator<'m> {
         instantiation: &ModuleInstantiation,
         scope: &Scope,
     ) -> Result<(), SimulationError> {
+        let named;
+        let instantiation = match instantiation.instance_name {
+            Some(_) => instantiation,
+            None => {
+                named = self.named_primitive_instance(instantiation)?;
+                &named
+            }
+        };
         let Some(range) = &instantiation.range else {
             return self.instantiate(instantiation, scope);
         };
@@ -2812,10 +2875,11 @@ impl<'m> Elaborator<'m> {
             };
             let element = ModuleInstantiation {
                 module_name: instantiation.module_name.clone(),
-                instance_name: Identifier::new(format!(
+                instance_name: Some(Identifier::new(format!(
                     "{}[{}]",
-                    instantiation.instance_name.name, index
-                )),
+                    instance_name(instantiation),
+                    index
+                ))),
                 range: None,
                 parameters: instantiation.parameters.clone(),
                 arguments,
@@ -2859,7 +2923,7 @@ impl<'m> Elaborator<'m> {
             return Ok(connection.clone());
         }
         let mismatch = || SimulationError::ArrayConnectionWidth {
-            instance: instantiation.instance_name.name.clone(),
+            instance: instance_name(instantiation).to_string(),
             port: port.identifier.name.clone(),
             port_width,
             count,
@@ -2894,6 +2958,34 @@ impl<'m> Elaborator<'m> {
         })
     }
 
+    /// Names `p (q, d);`, which IEEE 1364-2005 allows for a user-defined
+    /// primitive and not for a module — so the module being instantiated is
+    /// asked, and an unnamed module instance is refused rather than invented a
+    /// name, which is iverilog 12.0's answer as well. The name begins with a
+    /// `$`, which no design identifier can, so it cannot meet one.
+    fn named_primitive_instance(
+        &mut self,
+        instantiation: &ModuleInstantiation,
+    ) -> Result<ModuleInstantiation, SimulationError> {
+        let wanted = &instantiation.module_name.name;
+        let child = self
+            .modules
+            .iter()
+            .find(|module| &module.identifier.name == wanted)
+            .ok_or_else(|| SimulationError::UnknownModule(wanted.clone()))?;
+        if primitive_table(child).is_none() {
+            return Err(SimulationError::UnnamedInstance(wanted.clone()));
+        }
+        self.unnamed_instances += 1;
+        Ok(ModuleInstantiation {
+            instance_name: Some(Identifier::new(format!(
+                "${}{}",
+                wanted, self.unnamed_instances
+            ))),
+            ..instantiation.clone()
+        })
+    }
+
     fn instantiate(
         &mut self,
         instantiation: &ModuleInstantiation,
@@ -2910,13 +3002,13 @@ impl<'m> Elaborator<'m> {
         // A module cannot see out of itself, so the instance's prefix is the
         // whole of what a name inside it resolves to — the generate block it
         // may stand in is already part of the prefix it was created under.
-        let prefix = format!("{}{}.", scope.prefix, instantiation.instance_name.name);
+        let prefix = format!("{}{}.", scope.prefix, instance_name(instantiation));
         // The hierarchical name a design writes this instance under, which is
         // the store prefix with the top module's own name in front: the top is
         // the root of the flat name space and carries no prefix, but a design
         // still calls it `top`.
         self.out.instances.push((
-            scope.hierarchy(&instantiation.instance_name.name),
+            scope.hierarchy(instance_name(instantiation)),
             child.timescale,
         ));
         // `BUFG #5 bg(out, in);` reads as a parameter override, because that
@@ -2985,7 +3077,7 @@ impl<'m> Elaborator<'m> {
                 }
                 None => {
                     return Err(SimulationError::UndrivablePort {
-                        instance: instantiation.instance_name.name.clone(),
+                        instance: instance_name(instantiation).to_string(),
                         port: local.clone(),
                         connection: connection.to_contracted_string(),
                     })
@@ -3296,6 +3388,15 @@ fn is_drivable(expression: &Expression) -> bool {
         Expression::Concatenation(parts) => parts.iter().all(is_drivable),
         _ => false,
     }
+}
+
+/// The name of an instance `instantiate_each` has already named.
+fn instance_name(instantiation: &ModuleInstantiation) -> &str {
+    &instantiation
+        .instance_name
+        .as_ref()
+        .expect("an unnamed instance is named before it is instantiated")
+        .name
 }
 
 /// Whether a port names a variable rather than a net.
@@ -3953,9 +4054,14 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
         ModuleStatement::ParameterDeclaration(parameters) => {
             names.extend(parameters.iter().map(|it| it.name.name.clone()))
         }
-        ModuleStatement::ModuleInstantiation(instantiation) => {
-            names.push(instantiation.instance_name.name.clone())
-        }
+        // An unnamed primitive instance cannot be named, so it declares
+        // nothing a reference could reach.
+        ModuleStatement::ModuleInstantiation(instances) => names.extend(
+            instances
+                .iter()
+                .filter_map(|instance| instance.instance_name.as_ref())
+                .map(|name| name.name.clone()),
+        ),
         // A function declared inside a generate block is stored under the
         // block's prefix, so a call written inside the block has to resolve
         // through it — without the name here, `funfun(select)` beside the
@@ -6330,6 +6436,141 @@ mod tests {
         // one-shot starting value would not do.
         simulator.poke("a", Register::from_u128(5, 4)).unwrap();
         assert_eq!(simulator.get("doubled").unwrap().to_u128(), Some(10));
+    }
+
+    /// `wire #(period/3) trace = drive;` is `assign #(period/3)`: the delay is
+    /// the declaration assignment's, and it is an expression evaluated when a
+    /// transaction is scheduled, so a `period` that moves changes the next
+    /// one (corpus `delay5`, which iverilog 12.0 passes).
+    #[test]
+    fn test_net_declaration_delay_is_scheduled() {
+        let source = r#"
+            module main;
+                time period;
+                reg drive;
+                wire #(period/3) trace = drive;
+                initial begin
+                    period = 24;
+                    #1 drive = 1;
+                    #7 $display("%b", trace);
+                    #2 $display("%b", trace);
+                    period = 18;
+                    drive = 0;
+                    #5 $display("%b", trace);
+                    #2 $display("%b", trace);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "main");
+        simulator.advance(20).unwrap();
+        // Times 8, 10, 15 and 17 — measured against iverilog 12.0.
+        assert_eq!(simulator.output().text(), "x\n1\n1\n0\n");
+    }
+
+    /// `wire (weak0, weak1) value = pullval;` drives at `weak`, so a gate's
+    /// `strong` output overrides it and it holds the net once the gate floats
+    /// (corpus `drive_strength1`).
+    #[test]
+    fn test_net_declaration_strength_resolves() {
+        let source = r#"
+            module main;
+                reg pullval, en;
+                wire (weak0, weak1) value = pullval;
+                bufif1 (value, 1'b0, en);
+                initial begin
+                    en = 0; pullval = 1;
+                    #1 $display("%b", value);
+                    en = 1;
+                    #1 $display("%b", value);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "main");
+        simulator.advance(5).unwrap();
+        assert_eq!(simulator.output().text(), "1\n0\n");
+    }
+
+    /// A delay on a net with no declaration assignment is a property of every
+    /// driver of the net, which is not modelled — so it is refused by name
+    /// rather than dropped.
+    #[test]
+    fn test_a_bare_net_delay_is_refused() {
+        let source = r#"
+            module main;
+                reg a;
+                wire #5 w;
+                assign w = a;
+            endmodule
+        "#;
+        let error = setup_error(&[source], "main");
+        assert!(
+            matches!(error, SimulationError::Unsupported(_)),
+            "{error:?}"
+        );
+    }
+
+    /// A direction declared for a name the header does not list is the
+    /// declaration it would be without the direction: `output reg a` a
+    /// variable reading `x`, a plain `output w` a net reading `z`, `output
+    /// integer d` thirty-two signed bits — iverilog 12.0 prints
+    /// `x z 32 -1 1` for the same design (corpus `module_output_port_var2`).
+    #[test]
+    fn test_a_direction_outside_the_header_declares_a_local() {
+        let source = r#"
+            module test;
+                output reg a;
+                output w;
+                output integer d;
+                output reg b = 1'b1;
+                initial begin
+                    $display("%b %b %0d", a, w, $bits(d));
+                    d = -1;
+                    $display("%0d %b", d, b);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "test");
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.output().text(), "x z 32\n-1 1\n");
+    }
+
+    /// A header port that is an expression carries its connection to what it
+    /// names: `arg[7:4]` and `arg[1:0]` drive two parts of one input and leave
+    /// the bits between them floating, `.q({hi, lo})` is an output made of two
+    /// declarations, and `short(a, a)` joins whatever its two `inout`s are
+    /// bound to. iverilog 12.0 prints `1010zz01 11 0` then `1`.
+    #[test]
+    fn test_header_port_expressions_are_carried() {
+        let split = r#"
+            module split(arg[7:4], arg[1:0], .q({hi, lo}));
+                input [7:0] arg;
+                output hi, lo;
+                assign hi = arg[7];
+                assign lo = arg[0];
+            endmodule
+        "#;
+        let short = "module short(a, a); inout a; endmodule";
+        let top = r#"
+            module top;
+                reg [3:0] x;
+                reg [1:0] y;
+                wire [1:0] q;
+                wire b, c;
+                reg drive, en;
+                split s(x, y, q);
+                short k(b, c);
+                assign b = en ? drive : 1'bz;
+                initial begin
+                    x = 4'b1010; y = 2'b01; en = 1; drive = 0;
+                    #1 $display("%b %b %b", s.arg, q, c);
+                    drive = 1;
+                    #1 $display("%b", c);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[split, short, top], "top");
+        simulator.advance(3).unwrap();
+        assert_eq!(simulator.output().text(), "1010zz01 11 0\n1\n");
     }
 
     /// `reg a = expr;` is a starting value, not a driver: a procedural write
