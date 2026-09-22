@@ -622,16 +622,7 @@ impl<'m> Elaborator<'m> {
         // port takes the value once, a net port takes it as a continuous
         // assignment and follows its operands for the whole run.
         for port in &module.ports {
-            let Some(init) = &port.init else { continue };
-            if port_is_variable(port) {
-                self.initialise(&port.identifier.name, init, scope)?;
-            } else {
-                let target =
-                    Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)));
-                self.out
-                    .assignments
-                    .push(ContinuousAssignment::new(target, renamed(init, scope)));
-            }
+            self.initialise_port(port, scope)?;
         }
         for statement in &module.statements {
             self.build(statement, scope, &tasks)?;
@@ -1031,6 +1022,25 @@ impl<'m> Elaborator<'m> {
 
     /// Declares one port, unless it was aliased onto a signal that already
     /// exists.
+    /// A port's default value, `output reg [31:0] x = 1;`: a variable takes
+    /// it once, a net takes it as a continuous assignment — the split a body
+    /// declaration's initialiser already makes.
+    fn initialise_port(&mut self, port: &Port, scope: &Scope) -> Result<(), SimulationError> {
+        let Some(init) = &port.init else {
+            return Ok(());
+        };
+        if port_is_variable(port) {
+            self.initialise(&port.identifier.name, init, scope)?;
+        } else {
+            let target =
+                Expression::Identifier(Identifier::new(scope.resolve(&port.identifier.name)));
+            self.out
+                .assignments
+                .push(ContinuousAssignment::new(target, renamed(init, scope)));
+        }
+        Ok(())
+    }
+
     fn declare_port(
         &mut self,
         port: &Port,
@@ -1574,6 +1584,15 @@ impl<'m> Elaborator<'m> {
         scope: &Scope,
     ) -> Result<(), SimulationError> {
         match statement {
+            // A direction declared for a name the header does not list is the
+            // declaration it would be without the direction. Nothing binds it,
+            // so `declare_port` gives it exactly that: a net filled with `z`,
+            // or a variable filled with `x`.
+            ModuleStatement::PortDeclaration(locals) => {
+                for local in locals {
+                    self.declare_port(local, scope, None)?;
+                }
+            }
             ModuleStatement::WireDeclaration(nets) => {
                 for net in nets {
                     let range = self.resolve_range(net.range(), scope)?;
@@ -2572,6 +2591,11 @@ impl<'m> Elaborator<'m> {
                             .assignments
                             .push(ContinuousAssignment::new(target, renamed(init, scope)));
                     }
+                }
+            }
+            ModuleStatement::PortDeclaration(locals) => {
+                for local in locals {
+                    self.initialise_port(local, scope)?;
                 }
             }
             ModuleStatement::RegisterDeclaration(registers) => {
@@ -6298,6 +6322,31 @@ mod tests {
         // one-shot starting value would not do.
         simulator.poke("a", Register::from_u128(5, 4)).unwrap();
         assert_eq!(simulator.get("doubled").unwrap().to_u128(), Some(10));
+    }
+
+    /// A direction declared for a name the header does not list is the
+    /// declaration it would be without the direction: `output reg a` a
+    /// variable reading `x`, a plain `output w` a net reading `z`, `output
+    /// integer d` thirty-two signed bits — iverilog 12.0 prints
+    /// `x z 32 -1 1` for the same design (corpus `module_output_port_var2`).
+    #[test]
+    fn test_a_direction_outside_the_header_declares_a_local() {
+        let source = r#"
+            module test;
+                output reg a;
+                output w;
+                output integer d;
+                output reg b = 1'b1;
+                initial begin
+                    $display("%b %b %0d", a, w, $bits(d));
+                    d = -1;
+                    $display("%0d %b", d, b);
+                end
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "test");
+        simulator.advance(1).unwrap();
+        assert_eq!(simulator.output().text(), "x z 32\n-1 1\n");
     }
 
     /// `reg a = expr;` is a starting value, not a driver: a procedural write

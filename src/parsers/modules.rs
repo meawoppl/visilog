@@ -318,12 +318,8 @@ fn declared_port(input: &str) -> IResult<&str, (Identifier, Option<Expression>)>
 /// Why a module's header and its body port declarations do not agree.
 #[derive(Debug, PartialEq)]
 pub enum PortReconciliationError {
-    /// The header declares directions *and* the body does.
-    MixedStyles,
     /// A header name that no body declaration gives a direction.
     MissingDirection(Identifier),
-    /// A body declaration naming something the header does not list.
-    NotInHeader(Identifier),
     /// The same port declared twice.
     Duplicate(Identifier),
 }
@@ -338,7 +334,22 @@ fn check_unique(names: &[Identifier]) -> Result<(), PortReconciliationError> {
     Ok(())
 }
 
-/// Folds a Verilog-1995 header and its body declarations into the one
+/// A module's ports in header order, and the body direction declarations no
+/// header port claims.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReconciledPorts {
+    pub ports: Vec<Port>,
+    /// `module test; output reg a;` — a direction declared for a name the
+    /// header does not list. That is not a port, because nothing can connect
+    /// to it, and iverilog 12.0 reads it as the ordinary declaration it would
+    /// be without the direction: a net, or a variable when it names `reg`,
+    /// `integer` or `time` — silently, even under `-Wall`. It stays in the
+    /// body as a [`ModuleStatement::PortDeclaration`] and `elaborate` declares
+    /// it as a local.
+    pub locals: Vec<Port>,
+}
+
+/// Folds a module's header and its body declarations into the one
 /// `Vec<Port>` an ANSI header produces directly, in header order.
 ///
 /// A `reg` declaration that names a port is *not* one of `declared` — it is an
@@ -347,37 +358,55 @@ fn check_unique(names: &[Identifier]) -> Result<(), PortReconciliationError> {
 pub(crate) fn reconcile_ports(
     header: PortHeader,
     declared: Vec<Port>,
-) -> Result<Vec<Port>, PortReconciliationError> {
+) -> Result<ReconciledPorts, PortReconciliationError> {
     let names = match header {
         PortHeader::Ansi(ports) => {
-            if !declared.is_empty() {
-                return Err(PortReconciliationError::MixedStyles);
-            }
             let names: Vec<Identifier> = ports.iter().map(|p| p.identifier.clone()).collect();
             check_unique(&names)?;
-            return Ok(ports);
+            // An ANSI port has its direction already, so a body declaration
+            // of the same name is a second one.
+            if let Some(again) = declared
+                .iter()
+                .find(|port| names.contains(&port.identifier))
+            {
+                return Err(PortReconciliationError::Duplicate(again.identifier.clone()));
+            }
+            let locals: Vec<Identifier> = declared.iter().map(|p| p.identifier.clone()).collect();
+            check_unique(&locals)?;
+            return Ok(ReconciledPorts {
+                ports,
+                locals: declared,
+            });
         }
         PortHeader::NonAnsi(names) => names,
     };
     check_unique(&names)?;
 
     let mut ports: Vec<Option<Port>> = names.iter().map(|_| None).collect();
+    let mut locals = Vec::new();
     for port in declared {
-        let at = names
-            .iter()
-            .position(|name| *name == port.identifier)
-            .ok_or_else(|| PortReconciliationError::NotInHeader(port.identifier.clone()))?;
+        let Some(at) = names.iter().position(|name| *name == port.identifier) else {
+            if locals
+                .iter()
+                .any(|local: &Port| local.identifier == port.identifier)
+            {
+                return Err(PortReconciliationError::Duplicate(port.identifier));
+            }
+            locals.push(port);
+            continue;
+        };
         if ports[at].is_some() {
             return Err(PortReconciliationError::Duplicate(port.identifier));
         }
         ports[at] = Some(port);
     }
 
-    names
+    let ports = names
         .into_iter()
         .zip(ports)
         .map(|(name, port)| port.ok_or(PortReconciliationError::MissingDirection(name)))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(ReconciledPorts { ports, locals })
 }
 
 /// Parses `module name (ports); … endmodule`.
@@ -416,6 +445,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     // The parameter ports go in front of the body, because a body declaration
     // may be written in terms of one — `#(parameter W = 8)` with
     // `reg [W-1:0] r;` below it — and elaboration reads them in order.
+    let header_parameters = parameter_ports.is_some();
     if let Some(parameters) = parameter_ports {
         statements.push(ModuleStatement::ParameterDeclaration(parameters));
     }
@@ -425,9 +455,18 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             other => statements.push(other),
         }
     }
-    let ports = reconcile_ports(header, declared).map_err(|_| {
+    let ReconciledPorts { ports, locals } = reconcile_ports(header, declared).map_err(|_| {
         nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
     })?;
+    // In front of the body, where a port's own declaration would be: a `reg`
+    // naming the same name is a second declaration of it, and has to run
+    // after this one to give the variable its `x`.
+    if !locals.is_empty() {
+        statements.insert(
+            usize::from(header_parameters),
+            ModuleStatement::PortDeclaration(locals),
+        );
+    }
 
     Ok((
         input,
@@ -1412,8 +1451,13 @@ mod tests {
         assert!(parse_module_declaration("module m(a, b); input a; endmodule").is_err());
     }
 
+    /// A direction for a name the header does not list is not a port —
+    /// nothing can connect to it — but the declaration it would be without
+    /// the direction. iverilog 12.0 accepts all three spellings below
+    /// silently, `-Wall` included, and reads `output reg a` in
+    /// `module test;` as a variable (corpus `module_output_port_var2`).
     #[test]
-    fn test_a_declaration_must_name_a_header_port() {
+    fn test_a_direction_outside_the_header_is_a_local() {
         assert_eq!(
             reconcile_ports(
                 PortHeader::NonAnsi(vec!["a".into()]),
@@ -1422,9 +1466,38 @@ mod tests {
                     named_port(PortDirection::Output, "b"),
                 ],
             ),
-            Err(PortReconciliationError::NotInHeader("b".into()))
+            Ok(ReconciledPorts {
+                ports: vec![named_port(PortDirection::Input, "a")],
+                locals: vec![named_port(PortDirection::Output, "b")],
+            })
         );
-        assert!(parse_module_declaration("module m(a); input a; output b; endmodule").is_err());
+
+        for source in [
+            "module m(a); input a; output b; endmodule",
+            "module m(input a); output b; endmodule",
+            "module test; output reg a; output integer d; endmodule",
+        ] {
+            let module = assert_parses(parse_module_declaration, source);
+            let locals: Vec<&str> = module
+                .statements
+                .iter()
+                .filter_map(|statement| match statement {
+                    ModuleStatement::PortDeclaration(locals) => Some(locals),
+                    _ => None,
+                })
+                .flatten()
+                .map(|local| local.identifier.name.as_str())
+                .collect();
+            assert!(!locals.is_empty(), "{}", source);
+            assert!(
+                module
+                    .ports
+                    .iter()
+                    .all(|port| !locals.contains(&port.identifier.name.as_str())),
+                "{}",
+                source
+            );
+        }
     }
 
     #[test]
@@ -1440,6 +1513,7 @@ mod tests {
             Err(PortReconciliationError::Duplicate("a".into()))
         );
         assert!(parse_module_declaration("module m(a); input a; input a; endmodule").is_err());
+        assert!(parse_module_declaration("module m; output b; output b; endmodule").is_err());
 
         // The same name twice in the header itself is the same mistake.
         assert_eq!(
@@ -1449,16 +1523,15 @@ mod tests {
             ),
             Err(PortReconciliationError::Duplicate("a".into()))
         );
-    }
 
-    #[test]
-    fn test_the_two_header_styles_cannot_be_mixed() {
+        // An ANSI port already has its direction, so the body cannot give it
+        // a second one.
         assert_eq!(
             reconcile_ports(
                 PortHeader::Ansi(vec![named_port(PortDirection::Input, "a")]),
                 vec![named_port(PortDirection::Input, "a")],
             ),
-            Err(PortReconciliationError::MixedStyles)
+            Err(PortReconciliationError::Duplicate("a".into()))
         );
         assert!(parse_module_declaration("module m(input a); input a; endmodule").is_err());
     }
