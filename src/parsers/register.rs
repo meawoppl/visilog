@@ -11,7 +11,7 @@ use nom::{
 use super::{
     expr::{verilog_expression, Expression},
     identifier::{identifier, Identifier},
-    simple::{dimensions, range, signedness, ws, Range},
+    simple::{declared_range, dimensions, signedness, ws, Range},
 };
 
 #[derive(Debug, PartialEq)]
@@ -74,7 +74,7 @@ fn register_keyword(input: &str) -> IResult<&str, &str> {
 pub fn parse_register_declaration(input: &str) -> IResult<&str, Vec<RegisterDeclaration>> {
     let (input, _) = register_keyword(input)?;
     let (input, signed) = ws(signedness)(input)?;
-    let (input, width) = ws(opt(range))(input)?;
+    let (input, width) = ws(opt(declared_range))(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_name))(input)?;
     let (input, _) = ws(char(';'))(input)?;
 

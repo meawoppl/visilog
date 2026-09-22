@@ -3720,6 +3720,104 @@ mod tests {
         assert_eq!(simulator.get("out").unwrap().to_binary(), "0110");
     }
 
+    /// A **packed** array counts its selects in elements, and the left bound of
+    /// the outer range is the most significant element whichever way round it
+    /// was written: `up[1]` is the top byte of a `[1:4][7:0]`, `down[4]` of a
+    /// `[4:1][7:0]`. A run of elements (`[a:b]`, `[b +: n]`, `[b -: n]`) comes
+    /// back in the array's own order, `v[i][j]` is one bit of an element
+    /// through the element's own range (`[8:5]` here), an element index out of
+    /// range reads `x` and takes no write, and `$bits` counts elements' bits.
+    ///
+    /// Every line is what iverilog 12.0 prints for this design. A *constant*
+    /// out-of-range element index is not in it: iverilog 12.0 aborts compiling
+    /// one (`elab_expr.cc: failed assertion`), so there is nothing to match.
+    #[test]
+    fn test_a_packed_array_selects_elements() {
+        let mut simulator = simulator_for(
+            r#"
+            module t;
+                reg [1:4][7:0] up;
+                reg [4:1][7:0] down;
+                reg [3:0][8:5] odd;
+                integer k;
+                initial begin
+                    up = 32'h11223344; down = 32'h11223344; odd = 16'h4321;
+                    $display("%h %h %h %h", up[1], up[4], down[1], down[4]);
+                    $display("%h %h %h", up[1:2], up[2+:2], up[3-:2]);
+                    $display("%h %h %h", down[3:2], down[1+:2], down[4-:2]);
+                    $display("%h %h %b %b", odd[0], odd[3], odd[1][6], odd[1][8]);
+                    $display("%0d %0d %0d", $bits(up), $bits(up[1]), $bits(up[1:2]));
+                    k = 0; $display("%h", up[k]);
+                    k = 5; $display("%h", up[k]);
+                    k = 2; up[k] = 8'hAA;
+                    k = 0; up[k] = 8'hFF;
+                    $display("%h", up);
+                    down[3:2] = 16'hBEEF;
+                    $display("%h", down);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "11 44 44 11",
+                "1122 2233 2233",
+                "2233 3344 1122",
+                "1 4 1 0",
+                "32 8 16",
+                "xx",
+                "xx",
+                "11aa3344",
+                "11beef44",
+            ]
+        );
+    }
+
+    /// A packed `wire` takes a continuous assignment per run of elements, and
+    /// an element nothing drives floats — `z` — rather than taking the value of
+    /// its neighbour. iverilog 12.0 prints `4321 z32z` (corpus `br_gh497a`).
+    #[test]
+    fn test_a_packed_net_is_driven_a_run_of_elements_at_a_time() {
+        let mut simulator = simulator_for(
+            r#"
+            module t;
+                wire [3:0][3:0] whole;
+                wire [3:0][3:0] middle;
+                assign whole[0+:2] = 8'h21;
+                assign whole[3:2] = 8'h43;
+                assign middle[2-:2] = 8'h32;
+                initial #1 $display("%h %h", whole, middle);
+            endmodule
+        "#,
+        );
+
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["4321 z32z"]);
+    }
+
+    /// An unpacked array of packed words — `reg [1:0][7:0] m [0:3];` — is not
+    /// modelled, and is refused by name rather than stored as flat words: a
+    /// word select's second bracket would then read *bit* `j` of the word,
+    /// where iverilog 12.0 reads element `j` (`m[1][0]` of `16'hABCD` is
+    /// `cd`). A gap, not a rule — iverilog supports it.
+    #[test]
+    fn test_a_packed_array_of_words_is_refused_by_name() {
+        let mut simulator = Simulator::new(
+            parse_module_declaration("module t; reg [1:0][7:0] m [0:3]; endmodule")
+                .expect("design should parse")
+                .1,
+        );
+        assert_eq!(
+            simulator.setup(),
+            Err(SimulationError::Unsupported(
+                "an unpacked array of packed words"
+            ))
+        );
+    }
+
     /// An index is a **position**, so a negative one names a real word.
     ///
     /// `reg [3:0] value [-7:7];` is an ordinary declaration and `value[-7]` is

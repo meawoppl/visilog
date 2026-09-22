@@ -63,7 +63,8 @@ use crate::simulator::plusargs;
 use crate::simulator::runner::SimulationError;
 use crate::simulator::scan::{self, Slot, END_OF_FILE};
 use crate::simulator::state_store::{
-    random_from_seed, DriveLevel, Memory, NotReadable, SignalState, StateStore, MAX_CALL_DEPTH,
+    random_from_seed, DriveLevel, Memory, NotReadable, PackedShape, SignalState, StateStore,
+    MAX_CALL_DEPTH,
 };
 use crate::simulator::tasks::ascii;
 
@@ -94,11 +95,15 @@ pub enum EvalError {
     /// of one. Only a word select (`mem[addr]`) reads a memory, so this is a
     /// name that exists reported as what it is rather than as unknown.
     MemoryAsValue(String),
-    /// `a[0][1:0]` where `a` is a plain vector. Only a memory has a second
-    /// dimension to select from, and a vector with a packed one is not
-    /// modelled — so this names what was asked for rather than selecting
-    /// bits of the wrong thing.
+    /// `a[0][1:0]` where `a` is a plain vector. Only a memory or a packed
+    /// array has a second dimension to select from, so this names what was
+    /// asked for rather than selecting bits of the wrong thing.
     NotAMemory(String),
+    /// A select on a packed array that is none of the modelled shapes — an
+    /// element `v[i]`, a run of elements (`v[a:b]`, `v[b +: n]`, `v[b -: n]`),
+    /// or one bit of an element `v[i][j]`. `v[i][3:0]` and a third bracket are
+    /// refused by name rather than read as bits of the flat vector.
+    PackedSelect(String),
     /// An array indexed by the wrong number of addresses: `a[i]` or `a[i][j][k]`
     /// where `a` was declared `reg [7:0] a [0:3][0:15];`.
     ///
@@ -185,6 +190,11 @@ impl fmt::Display for EvalError {
             EvalError::NotAMemory(name) => {
                 write!(f, "`{}` is not a memory, so it has no second select", name)
             }
+            EvalError::PackedSelect(select) => write!(
+                f,
+                "`{}` selects a packed array in a way that is not modelled",
+                select
+            ),
             EvalError::ArrayDimensions {
                 name,
                 declared,
@@ -310,6 +320,16 @@ fn eval_in_context(
     signed_context: bool,
     width: usize,
 ) -> Result<Register, EvalError> {
+    // A select on a packed array counts elements rather than bits. It is
+    // answered here, once, rather than in each select arm below: this function
+    // is re-entered at every level of a recursive call, and a result slot per
+    // arm grew its unoptimised stack frame enough to overflow before
+    // `MAX_CALL_DEPTH` reported. A design with no packed array pays one check.
+    if store.any_packed() {
+        if let Some(read) = packed_eval(expr, store) {
+            return read.map(|value| widened(value, width));
+        }
+    }
     match expr {
         // Only a *leaf* has to be told that its context is unsigned. Every
         // operator below already asks its own operands, and an operand
@@ -1297,6 +1317,17 @@ pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
             let inner: usize = parts.iter().map(|part| expression_width(part, store)).sum();
             replication_count(count, store).map_or(inner, |times| inner * times)
         }
+        // A select on a packed array counts elements, so it is as wide as the
+        // elements it names: `$bits(v[1])` of `reg [1:4][7:0] v;` is 8.
+        Expression::BitSelect(id, _)
+        | Expression::IndexedPartSelect { id, .. }
+        | Expression::PartSelect(id, _, _)
+            if store.packed(&id.name).is_some() =>
+        {
+            store
+                .packed(&id.name)
+                .map_or(1, |shape| packed_select_width(expr, shape, store))
+        }
         Expression::BitSelect(_, _) => 1,
         // The width is constant by construction, so this is exact whenever the
         // expression is legal at all.
@@ -2048,6 +2079,130 @@ pub fn indexed_select_width(expr: &Expression, store: &StateStore) -> Result<usi
         return Err(EvalError::WidthOverflow(span));
     }
     Ok(span)
+}
+
+/// The flat bit indices, most significant first, that a select on a packed
+/// array names — `v[i]`, `v[a:b]`, `v[b +: n]`, `v[b -: n]` or `v[i][j]` — or
+/// `None` when an index is not a known number.
+///
+/// This is the one place a packed select is turned into bits, and both the
+/// evaluator and [`resolve_target`](crate::simulator::exec::resolve_target)
+/// call it, so reading and writing one cannot disagree about which bits it
+/// names. Every index here counts *elements* except the `j` of `v[i][j]`, which
+/// counts bits of the element through the element's own range. `None` reads
+/// `x` and takes no write, exactly as an unknown bit index does; an index out
+/// of range needs no case of its own, since it names bits outside the flat
+/// vector.
+pub(crate) fn packed_select_indices(
+    expr: &Expression,
+    shape: &PackedShape,
+    store: &StateStore,
+) -> Result<Option<Vec<i64>>, EvalError> {
+    let run = |first: i64, last: i64| -> Result<Option<Vec<i64>>, EvalError> {
+        let span = ((first - last).unsigned_abs() as usize + 1)
+            .saturating_mul(shape.element_width() as usize);
+        if span > MAX_SELECT_WIDTH {
+            return Err(EvalError::WidthOverflow(span));
+        }
+        Ok(Some(shape.elements_bits(first, last)))
+    };
+    match expr {
+        Expression::BitSelect(_, index) => match select_index(&eval(index, store)?)? {
+            Some(index) => run(index, index),
+            None => Ok(None),
+        },
+        Expression::PartSelect(_, first, second) => {
+            run(select_bound(first, store)?, select_bound(second, store)?)
+        }
+        Expression::IndexedPartSelect {
+            base,
+            width,
+            upward,
+            ..
+        } => {
+            let count = indexed_select_width(width, store)? as i64;
+            let Some(base) = select_index(&eval(base, store)?)? else {
+                return Ok(None);
+            };
+            if *upward {
+                run(base, base + count - 1)
+            } else {
+                run(base - count + 1, base)
+            }
+        }
+        Expression::WordSelect {
+            indices,
+            select: WordSelectKind::Bit(bit),
+            ..
+        } if indices.len() == 1 => {
+            let element = select_index(&eval(&indices[0], store)?)?;
+            let bit = select_index(&eval(bit, store)?)?;
+            Ok(element
+                .zip(bit)
+                .and_then(|(element, bit)| shape.element_bit(element, bit))
+                .map(|flat| vec![flat]))
+        }
+        _ => Err(EvalError::PackedSelect(expr.to_contracted_string())),
+    }
+}
+
+/// How many bits a select on a packed array names, without evaluating a
+/// moving index: an element's width per element, and one bit for `v[i][j]`.
+/// It is what `$bits` answers and what an unknown index reads `x` at.
+fn packed_select_width(expr: &Expression, shape: &PackedShape, store: &StateStore) -> usize {
+    let element = shape.element_width() as usize;
+    match expr {
+        Expression::BitSelect(_, _) => element,
+        Expression::PartSelect(_, first, second) => {
+            match (select_bound(first, store), select_bound(second, store)) {
+                (Ok(first), Ok(second)) => ((first - second).unsigned_abs() as usize + 1) * element,
+                _ => element,
+            }
+        }
+        Expression::IndexedPartSelect { width, .. } => {
+            indexed_select_width(width, store).map_or(element, |count| count * element)
+        }
+        _ => 1,
+    }
+}
+
+/// The read of `expr` when it is a select on a packed array, or `None` when it
+/// is anything else — which `eval_in_context` then evaluates as usual.
+///
+/// Never inlined, and that is load-bearing rather than tidy: its `Vec` and its
+/// `Register` would otherwise land in `eval_in_context`'s stack frame, which is
+/// what `MAX_CALL_DEPTH` is measured against.
+#[cold]
+#[inline(never)]
+fn packed_eval(expr: &Expression, store: &StateStore) -> Option<Result<Register, EvalError>> {
+    let (Expression::BitSelect(id, _)
+    | Expression::PartSelect(id, _, _)
+    | Expression::IndexedPartSelect { id, .. }
+    | Expression::WordSelect { id, .. }) = expr
+    else {
+        return None;
+    };
+    let shape = store.packed(&id.name)?;
+    let signal = store.get_signal(&id.name)?;
+    Some(packed_read(expr, shape, signal, store))
+}
+
+/// A read of a select on a packed array: the bits
+/// [`packed_select_indices`] names, or `x` at the select's width when an index
+/// is unknown.
+fn packed_read(
+    expr: &Expression,
+    shape: &PackedShape,
+    signal: &SignalState,
+    store: &StateStore,
+) -> Result<Register, EvalError> {
+    Ok(match packed_select_indices(expr, shape, store)? {
+        Some(indices) => {
+            let bits: Vec<u8> = indices.into_iter().map(|i| signal.bit(i)).collect();
+            Register::from_bits(bits)
+        }
+        None => Register::unknown(packed_select_width(expr, shape, store)),
+    })
 }
 
 /// The declared bit indices a `[base +: span]` or `[base -: span]` names, most

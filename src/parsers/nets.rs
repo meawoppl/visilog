@@ -8,7 +8,7 @@ use super::{
     expr::{verilog_expression, Expression},
     gates::{drive_strength, DriveStrength},
     identifier::{identifier, Identifier},
-    simple::{dimensions, range, signedness, ws, Range},
+    simple::{declared_range, dimensions, signedness, ws, Range},
 };
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -166,7 +166,7 @@ pub fn net_declaration(input: &str) -> IResult<&str, Vec<Net>> {
     let (input, net_type) = net_type(input)?;
     let (input, strength) = opt(drive_strength)(input)?;
     let (input, signed) = ws(signedness)(input)?;
-    let (input, range) = ws(opt(range))(input)?;
+    let (input, range) = ws(opt(declared_range))(input)?;
     let (input, delay) = opt(parse_gate_delay)(input)?;
     let (input, names) = separated_list1(ws(char(',')), ws(declared_net))(input)?;
     let (input, _) = ws(tag(";"))(input)?;
