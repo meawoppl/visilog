@@ -1154,7 +1154,13 @@ machinery then decides between them and everything else with no second rule: `tr
 assign c = d;` reads `0` while `d` is `z` and `1` once `d` is `1`, purely because `strong`
 outranks `pull`. A pulled net that is also a *port bound to a parent signal* has no entry
 of its own, so the pull is recorded against the entry it aliases — getting that wrong
-costs the design its elaboration rather than just its answer.
+costs the design its elaboration rather than just its answer. **Only when that signal is
+a net**, though: a pulled *input* bound to a `reg` is not aliased (`can_alias` asks
+`declares_pull`), because on a variable the pull is a permanent driver that outvotes every
+procedural write — the port keeps its own entry, driven by the `reg` through a continuous
+assignment and pulled only when the `reg` is `z`. That is iverilog 12.0's answer, and it
+coerces the `wire` case to one node with an "input port coerced to inout" warning (corpus
+`pr841`, whose `always @(posedge clk)` never woke because the pull held `clk` at `0`).
 
 **A signal can have more than one source, and `StateStore` says which one wins.**
 `assign v = e;` and `force v = e;` written *inside* a procedural block install a continuous
