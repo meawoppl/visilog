@@ -203,6 +203,26 @@ are queued at time zero; edge-triggered blocks are woken by `settle` instead, so
 deliberately skipped in the time wheel (`EventControl::None` reports as firing on *every*
 edge, so a free-running block must not also be edge-driven).
 
+**An edge-triggered block starts listening at its turn in the time-zero round, and the
+turns have an order.** iverilog gives every process a first turn at time zero, and an
+`always` block spends its turn arming its event control — so `initial begin clk = 0; … end`
+written *above* `always @(negedge clk)` does not wake it, where the same block written
+above the `initial` is woken (corpus `pr1662508`, whose monitor printed a line for time
+zero that iverilog does not, and `pr3064375`). The order is `Elaborated::start_order`: an
+instance's blocks before the module that creates it, then the module's own in source
+order, which `walk` builds by appending a module's own blocks only once its children have
+appended theirs. `setup` queues the blocks in that order, an edge-triggered block among
+them flagged `unarmed`; its turn in the round is `Simulator::arm`, which parks it on the
+waiting list with an `EventWatch` snapshotted *then* — the machinery a `@` part way
+through a block already had — and a `Waiting::arming` entry not woken by the end of the
+timestep is dropped, after which `settle` wakes the block exactly as before. **Which
+blocks is measured, not reasoned**: a list naming a `posedge` or `negedge` anywhere, or a
+named event, misses the earlier write; a list of plain signals (`@(b)`, `@(c or d)`) and
+`@*` hear it whichever side of the `initial` they are written (`armed_at_its_turn`). A
+trigger fired before the turn is skipped by count, since a trigger has no value to
+snapshot. Among blocks woken at the same instant iverilog's order still differs from
+ours.
+
 **A `#0` yields to the blocks the design just woke, and not to their non-blocking
 updates.** It re-queues a block at the same instant, in what IEEE 1364-2005 calls the
 *inactive* region — which drains only after the blocks the active region's writes woke
@@ -935,9 +955,13 @@ plausible wrong number, which is why these were silent failures rather than loud
 The target's width reaches `eval` through `eval_sized(expr, store, width)`. Both callers
 resolve the left hand side *first* and ask it how wide it is —
 `ResolvedTarget::width(&store)` — so `program.rs`'s `Blocking` / `NonBlocking` and
-`runner.rs`'s `propagate` push the same number down the same path. Everything else
-(`case` subjects, conditions, task arguments, function arguments) still goes through
-`eval`, which is self-determined.
+`runner.rs`'s `propagate` push the same number down the same path. **A function argument
+is the third caller**: it is assigned to the input it lands in, so `eval::call_function`
+sizes it by that input's declared range — `test(ltl + 7'd1)` into an eight bit input adds
+in eight bits and keeps the carry (corpus `pr2913438b`), while a `real` input imposes no
+width and the argument wraps at its own. A task argument already had this, since its
+copy-in is an ordinary `Instruction::Blocking`. Everything else (`case` subjects,
+conditions, `$display` arguments) still goes through `eval`, which is self-determined.
 
 Inside `eval_in_context` the width is a **lower bound**, not an exact size: an operand is
 padded out to it and otherwise left alone. That is exactly Verilog's "the larger of the
@@ -1150,7 +1174,13 @@ machinery then decides between them and everything else with no second rule: `tr
 assign c = d;` reads `0` while `d` is `z` and `1` once `d` is `1`, purely because `strong`
 outranks `pull`. A pulled net that is also a *port bound to a parent signal* has no entry
 of its own, so the pull is recorded against the entry it aliases — getting that wrong
-costs the design its elaboration rather than just its answer.
+costs the design its elaboration rather than just its answer. **Only when that signal is
+a net**, though: a pulled *input* bound to a `reg` is not aliased (`can_alias` asks
+`declares_pull`), because on a variable the pull is a permanent driver that outvotes every
+procedural write — the port keeps its own entry, driven by the `reg` through a continuous
+assignment and pulled only when the `reg` is `z`. That is iverilog 12.0's answer, and it
+coerces the `wire` case to one node with an "input port coerced to inout" warning (corpus
+`pr841`, whose `always @(posedge clk)` never woke because the pull held `clk` at `0`).
 
 **A signal can have more than one source, and `StateStore` says which one wins.**
 `assign v = e;` and `force v = e;` written *inside* a procedural block install a continuous
@@ -2368,6 +2398,19 @@ it opens or closes rather than a value.
 A string argument is held as text rather than as an expression because a task has to try
 the *format string* reading of one first, and that is the only reason the two ever needed
 telling apart.
+
+**A parameter written as text is that literal to a `$display`.** `parameter p =
+"PASSED"; $display(p);` prints `PASSED`, and `parameter f = "fmt=%0d"; $display(f, 5);`
+formats with it — iverilog 12.0, corpus `param_string`. Its bits are an ordinary value
+everywhere else, so text is a *note* on the store (`StateStore::mark_text` / `is_text`)
+rather than a kind of value, and `TaskContext::render` is the one place that reads it: a
+bare identifier argument naming a text parameter is rendered as `TaskArgument::Text` would
+be. `elaborate::is_text` decides — a string literal, a parenthesised or concatenated run of
+them (`{"AB", "CD"}` is `ABCD`), or another text parameter; `"A" + 0` is a number — and it
+asks it of the expression the value *came from*, so an override decides for the parameter
+it overrides: `#(.p("HI"))` makes a numeric `p` text and `#(.q(5))` makes a text `q` a
+number. That is why a `#(...)` or `defparam` value travels as an `Override` (the value
+and that one flag) rather than as a bare `Register`.
 | File | Role |
 | --- | --- |
 | `elaborate.rs` | `elaborate` — flattens a module hierarchy into one `StateStore`, one assignment list and one block list, with qualified names and aliased ports; also owns `TimedBlock`, `rename_expression`, `resolve_range` (a declared width against the parameters in scope), the unrolling of a `generate` region and the application of a `defparam`, and the compiling of a `function` into a `FunctionDefinition` and of a `task` into a `TaskDefinition` — twice, the second copy under the flat path a hierarchical enable of it resolves to |
@@ -2505,11 +2548,28 @@ as a wrong answer rather than as one that was not given time. It counts units of
 design ticks a thousand times per unit its testbench is written in, and a budget in raw
 ticks would give it a thousandth of the run.
 
+**Past `TIME_BUDGET` a design is given `STEP_BUDGET` more *timesteps*, not more ticks.**
+`run_to_completion` steps from one `Simulator::next_time` to the next until the design
+calls `$finish`, has nothing scheduled, or has used 200,000 of them — because a timestep
+costs the same whether it is one tick after the last or a billion, so a clock is the wrong
+measure of what a run costs. `pr2883958` waits `#1100000000` three times, `pr511` finishes
+at 308250 and `sqrt32` clocks every five ticks until 910255; all three finish, and all
+three were being cut off by the clock. The bound only ever costs a design that runs for
+ever: the whole release-mode corpus went from about 8 to about 10.5 seconds.
+
 The harness runs the corpus through `front_end`, which is `Preprocessor` + `parse_expanded`
 rather than `parse_source`, because the corpus files `` `include `` one another by paths
 relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
 `judge(source: &str)` signature so the control tests exercise exactly the corpus
 path; `judge_with` is the one that takes the configured preprocessor and the gold text.
+
+**The harness picks one top, and a module is a root only if *nothing* instantiates it —
+including from inside a `generate` region.** `top_module` walks every region, loop, branch
+and case arm (`instantiated_modules`), because a ripple adder written as `for (…) begin :
+addbit add1 bit(…); end` otherwise leaves its cell looking like a root, and the cell is
+last in the file, which is the tie-break. The design then runs its leaf and prints nothing
+(corpus `pr1676071`, `pr1758122`). A file with two *genuine* roots still runs only one of
+them, where iverilog elaborates both (corpus `resetall2`).
 
 **`VISILOG_ONLY=<name>` runs one design and shows what it printed.** The closure report
 names the files that got a wrong answer but cannot say *what* they got — printing 1514
@@ -3165,6 +3225,11 @@ tripwire.
   index that really is out of range. That is the **one** place the rule lives: every
   select comes through it — a bit, a part, an indexed part and a memory word, reading and
   writing alike — so none of them can disagree about which word a design named.
+  **And an index is an `int`**: a value thirty-two bits wide or wider is read by its low
+  thirty-two bits as two's complement *whatever its declared signedness*, which is
+  iverilog 12.0's answer — a 128 bit index holding `2**120 + 7` names word 7 (corpus
+  `signed_a`) and an unsigned `32'hFFFFFFFF` names word `-1` of an array declared
+  `[-8:8]`. A narrower value keeps its own signedness, so `4'b1111` is still 15.
 - **A range is what decides a parameter's signedness**, failing a `signed` qualifier: one
   written with a range is unsigned unless it says otherwise, and only a *rangeless*
   parameter keeps the signedness its value arrived with. The trap is that a bare decimal

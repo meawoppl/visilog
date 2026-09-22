@@ -976,6 +976,13 @@ pub struct StateStore {
     /// entry in either. That is what makes reading one a named error instead
     /// of a plausible pattern of bits.
     events: HashSet<String>,
+    /// The parameters whose value was written as **text** — `parameter p =
+    /// "PASSED";` — which a `$display` prints as the string it is, and takes
+    /// as a format string, exactly as it would the literal. Their bits are an
+    /// ordinary value everywhere else, so this is a note beside the signal
+    /// rather than a kind of its own; shared with a frame, because a
+    /// function body may print one too.
+    texts: Rc<HashSet<String>>,
     /// Every event triggered since the last marker, in trigger order.
     ///
     /// This is the whole of an event's state. A trigger is momentary: it is
@@ -1032,6 +1039,18 @@ impl StateStore {
         StateStore::default()
     }
 
+    /// Notes that the parameter `name` was written as text; see
+    /// [`is_text`](StateStore::is_text).
+    pub fn mark_text(&mut self, name: &str) {
+        Rc::make_mut(&mut self.texts).insert(name.to_string());
+    }
+
+    /// Whether `name` is a parameter whose value was written as text, which a
+    /// `$display` argument prints as a string rather than as a number.
+    pub fn is_text(&self, name: &str) -> bool {
+        !self.texts.is_empty() && self.texts.contains(name)
+    }
+
     /// Whether any signal in the store was declared signed. `false` is exact —
     /// nothing here is signed — while `true` only means something once was.
     pub fn any_signed(&self) -> bool {
@@ -1074,6 +1093,7 @@ impl StateStore {
             any_real: false,
             any_memory: false,
             events: HashSet::new(),
+            texts: Rc::clone(&self.texts),
             triggers: Vec::new(),
             // A frame holds only the call's own variables, and a function body
             // may not install a drive — nothing here can be forced.
@@ -1645,6 +1665,12 @@ impl StateStore {
     /// once and read once, so it is removed rather than left behind.
     pub fn take_hold(&mut self, slot: &str) -> Option<Register> {
         self.holds.remove(slot)
+    }
+
+    /// How many triggers have been journalled since the last
+    /// [`take_triggers`](StateStore::take_triggers).
+    pub fn pending_triggers(&self) -> usize {
+        self.triggers.len()
     }
 
     /// Every event triggered since the last call, clearing the journal so the

@@ -36,7 +36,9 @@ use std::path::PathBuf;
 use crate::parsers::expr::Expression;
 use crate::parsers::identifier::Identifier;
 use crate::parsers::{
-    assignment::ContinuousAssignment, behavior::EventControl, gates::DriveStrength,
+    assignment::ContinuousAssignment,
+    behavior::{EventControl, EventTriggers},
+    gates::DriveStrength,
     modules::VerilogModule,
 };
 use crate::register::Register;
@@ -338,6 +340,12 @@ struct Waiting {
     /// What it is waiting for. `None` is a `wait (c)`, whose condition is a
     /// value the block reads for itself when it is re-entered.
     watch: Option<EventWatch>,
+    /// `Some` for an edge-triggered `always` block armed at its turn in the
+    /// time-zero round rather than suspended part way through a run — see
+    /// [`Simulator::arm`]. It holds how many named-event triggers were
+    /// already journalled when it was armed, which its first look skips: a
+    /// trigger fired before the block was listening is one it missed.
+    arming: Option<usize>,
 }
 
 /// An event control a block is suspended on, with what the signals it names
@@ -442,6 +450,23 @@ fn memory_word_values(control: &EventControl, state: &StateStore) -> Vec<Option<
             }
         })
         .collect()
+}
+
+/// Whether an `always` block with this control misses what the time-zero
+/// round wrote before its turn came — see [`Simulator::arm`].
+///
+/// Measured against iverilog 12.0, and it is not every list: one that names a
+/// `posedge` or a `negedge` anywhere, or a named event, misses it, while a list
+/// of nothing but plain signals — `@(b)`, `@(c or d)` — sees the `initial`'s
+/// write whichever side of it the block is written. `@*` sees it too.
+fn armed_at_its_turn(control: &EventControl, state: &StateStore) -> bool {
+    let EventControl::Events(events) = control else {
+        return false;
+    };
+    events.iter().any(|event| {
+        event.trigger != EventTriggers::EitherEdge
+            || matches!(&event.expression, Expression::Identifier(id) if state.is_event(&id.name))
+    })
 }
 
 /// The starting value of every *non-plain* entry in a sensitivity list, which
@@ -658,6 +683,10 @@ pub struct Simulator {
     /// one so the swap is free and a round costs a `fill` of bytes.
     ran_before: Vec<bool>,
     ran_now: Vec<bool>,
+    /// The edge-triggered `always` blocks whose turn in the time-zero round
+    /// has not come yet — see [`Simulator::arm`]. Every flag is down once
+    /// time zero has run.
+    unarmed: Vec<bool>,
     /// What each block's *non-plain* sensitivity entries last evaluated to —
     /// one slot per entry in the block's list, `None` for an entry that names
     /// a signal directly and is matched against the change journal instead.
@@ -747,6 +776,7 @@ impl Simulator {
             waiting: Vec::new(),
             ran_before: Vec::new(),
             ran_now: Vec::new(),
+            unarmed: Vec::new(),
             event_values: Vec::new(),
             expression_events: false,
             forks: Vec::new(),
@@ -875,8 +905,10 @@ impl Simulator {
             .enumerate()
             .map(|(index, task)| (task.name.clone(), index))
             .collect();
+        let start_order = elaborated.start_order;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
+        self.unarmed = vec![false; self.blocks.len()];
         self.event_values = self
             .blocks
             .iter()
@@ -925,10 +957,16 @@ impl Simulator {
 
         // Everything that starts on its own starts at time zero: `initial`
         // blocks, which run once, and free-running `always` blocks, which have
-        // no event to wait for. Edge-triggered blocks are not queued — they are
-        // woken by `settle`.
-        for id in 0..self.blocks.len() {
-            if self.blocks[id].kind == BlockKind::Initial || self.blocks[id].free_running {
+        // no event to wait for. An edge-triggered block with an explicit list
+        // is queued too, but its turn *arms* it rather than running it — see
+        // [`Simulator::arm`] — and after that it is woken by `settle`. They go
+        // on the queue in the order iverilog gives them their first turn.
+        for id in start_order {
+            let block = &self.blocks[id];
+            if block.kind == BlockKind::Initial || block.free_running {
+                self.queue.insert(0, ExecutionCursor::new(id, 0));
+            } else if armed_at_its_turn(&block.control, &self.state) {
+                self.unarmed[id] = true;
                 self.queue.insert(0, ExecutionCursor::new(id, 0));
             }
         }
@@ -1227,6 +1265,32 @@ impl Simulator {
         self.block_fires(id, &[]);
     }
 
+    /// Gives an edge-triggered `always` block its turn in the time-zero round,
+    /// which is the moment it reaches its event control and starts listening.
+    ///
+    /// iverilog gives every process a first turn at time zero, in order — the
+    /// processes of the instances a module creates before its own, and its
+    /// own in source order — and an `always` block's first turn is spent
+    /// arming its event control. A write an `initial` block makes before that
+    /// turn is one the block was not listening for: `initial begin clk = 0;
+    /// … end` above an `always @(negedge clk)` does not wake it, while the same
+    /// write above it in the file does not reach it either way round (corpus
+    /// `pr1662508`, whose monitor printed a line for time zero that iverilog
+    /// does not). So the block is parked on the waiting list with its event
+    /// control snapshotted *now*, exactly as a `@` part way through a block
+    /// would be, and it is what `settle` measures from for the rest of the
+    /// timestep.
+    fn arm(&mut self, cursor: ExecutionCursor) {
+        let id = cursor.block;
+        self.unarmed[id] = false;
+        let watch = EventWatch::arm(self.blocks[id].control.clone(), &self.state);
+        self.waiting.push(Waiting {
+            cursor,
+            watch: Some(watch),
+            arming: Some(self.state.pending_triggers()),
+        });
+    }
+
     /// Resumes every waiting block whose wait is now satisfied.
     ///
     /// The two reasons a block waits are answered differently on purpose. A
@@ -1252,11 +1316,20 @@ impl Simulator {
         let mut still_waiting = Vec::new();
         let mut woken = Vec::new();
         for mut waiting in std::mem::take(&mut self.waiting) {
+            let missed = waiting
+                .arming
+                .map_or(0, |missed| missed.min(triggers.len()));
+            if let Some(arming) = &mut waiting.arming {
+                *arming = 0;
+            }
             let wake = match &mut waiting.watch {
                 None => true,
                 Some(watch) => {
                     let mut edges = watch.edges_since(&self.state);
-                    edges.extend(triggers.iter().cloned());
+                    // Only the triggers fired after this wait was armed can wake
+                    // it; `watch.fires` then covers a memory-word entry as well
+                    // as an ordinary one.
+                    edges.extend(triggers[missed..].iter().cloned());
                     watch.fires(&edges, &self.state)
                 }
             };
@@ -1493,6 +1566,10 @@ impl Simulator {
                 // from it, so a block due at this timestamp that has not run
                 // yet does not run at all.
                 while let Some(cursor) = self.round.pop_front() {
+                    if self.unarmed[cursor.block] {
+                        self.arm(cursor);
+                        continue;
+                    }
                     let (updates, _) = self.resume_block(cursor)?;
                     pending.extend(updates);
                 }
@@ -1533,6 +1610,10 @@ impl Simulator {
             self.propagate()?;
             self.settle()?;
             self.end_of_timestep()?;
+            // An `always` block armed at its turn and not woken by the end of
+            // the timestep it was armed in goes back to being woken by
+            // `settle`, which is what every one of them is from then on.
+            self.waiting.retain(|waiting| waiting.arming.is_none());
 
             if self.finished() {
                 return Ok(());
@@ -1553,7 +1634,12 @@ impl Simulator {
     ///
     /// A design that names no delay on an `assign` answers out of the queue
     /// alone — `delays` is empty and the iterator ends immediately.
-    fn next_time(&self) -> Option<i64> {
+    ///
+    /// `None` means nothing is scheduled at all, so the design will not move
+    /// again unless a caller drives it. A caller that runs a design until it
+    /// is done, rather than for a fixed time, steps from one of these to the
+    /// next.
+    pub fn next_time(&self) -> Option<i64> {
         let due = self
             .delays
             .iter()
@@ -1843,6 +1929,9 @@ impl Simulator {
         });
         self.ran_before.push(false);
         self.ran_now.push(false);
+        // An activation is started by its enable, never held back to arm at a
+        // time-zero turn, so it is never unarmed.
+        self.unarmed.push(false);
         self.event_values.push(Vec::new());
         self.automatic[task].slots.push(block);
         Ok(slot)
@@ -2146,6 +2235,7 @@ impl Simulator {
                 self.waiting.push(Waiting {
                     cursor: ExecutionCursor { pc, ..cursor },
                     watch,
+                    arming: None,
                 });
                 Ok((pending, false, None))
             }
@@ -3662,6 +3752,75 @@ mod tests {
         assert_eq!(simulator.output().text(), "-7 -1 7  v=00000000\n");
     }
 
+    /// An index is an `int`: one thirty-two bits wide or wider is read by its
+    /// low thirty-two bits as a two's complement number, signed or not, for a
+    /// word and a bit alike, reading and writing alike.
+    ///
+    /// iverilog 12.0 prints `1001 1 | 1001 | xxxx x | 0110` for this design —
+    /// the high bits of `2**100 + 7` are dropped, an unsigned `32'hFFFFFFFF`
+    /// is word `-1`, and `2**31 + 7` is a negative index and names nothing
+    /// (corpus `signed_a`).
+    #[test]
+    fn test_an_index_is_read_as_a_thirty_two_bit_int() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg [3:0] array [1:8];
+                reg [3:0] neg [-8:8];
+                reg [7:0] v;
+                reg [127:0] wide;
+                reg [31:0] all_ones;
+                initial begin
+                    array[7] = 4'b1001;
+                    neg[-1] = 4'b1001;
+                    v = 8'b10000001;
+                    wide = 7; wide[100] = 1'b1;
+                    all_ones = 32'hFFFFFFFF;
+                    $write("%b %b | %b | ", array[wide], v[wide], neg[all_ones]);
+                    wide = 7; wide[31] = 1'b1;
+                    $write("%b %b | ", array[wide], v[wide]);
+                    wide = 6; wide[64] = 1'b1;
+                    array[wide] = 4'b0110;
+                    $display("%b", array[6]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "1001 1 | 1001 | xxxx x | 0110\n");
+    }
+
+    /// A bit select out of a memory *word* reads a signed index as the negative
+    /// number it is, like every other select: bit `-1` of a `[7:0]` word names
+    /// nothing and reads `x`, where reading the two bit `-1` unsigned names bit
+    /// 3. A write through it is dropped.
+    ///
+    /// iverilog 12.0 prints `0000000x 00000001` for this design (corpus
+    /// `array_select`).
+    #[test]
+    fn test_a_bit_of_a_word_reads_a_signed_index_as_negative() {
+        let mut simulator = simulator_for(
+            r#"
+            module m();
+                reg signed [7:0] arr [0:7];
+                reg signed [1:0] idx;
+                reg [7:0] res;
+                initial begin
+                    arr[0] = 8'sd1;
+                    idx = -1;
+                    res = arr[0][idx];
+                    arr[0][idx] = 1'b1;
+                    $display("%b %b", res, arr[0]);
+                end
+            endmodule
+        "#,
+        );
+
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(simulator.output().text(), "0000000x 00000001\n");
+    }
+
     /// A vector declared `[base+15:base]` for a negative `base` really does
     /// have negative bit indices, so an indexed part select whose base is a
     /// *signed* value has to read it as the negative number it is. Reading
@@ -3718,6 +3877,63 @@ mod tests {
         simulator.setup().expect("design should elaborate");
         simulator.advance(1).expect("advance should succeed");
         assert_eq!(simulator.output().lines(), vec!["0 1 7"]);
+    }
+
+    /// A parameter written as text is printed by `$display` as the string it
+    /// was written as, and taken as a format string, where arithmetic on one
+    /// is a number. Whether an *overridden* parameter is text follows the
+    /// override — a `#(...)` or a `defparam` — rather than the declaration.
+    ///
+    /// iverilog 12.0 prints `PASSED`, `RANGED`, `fmt=5`, `ABCD`, `        65`,
+    /// `[PASSED]`, then `HI|          5` and `          0|DP` for the two
+    /// instances (corpus `param_string`).
+    #[test]
+    fn test_a_text_parameter_displays_as_its_string() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module top;
+              parameter p = "PASSED";
+              parameter [47:0] r = "RANGED";
+              parameter f = "fmt=%0d";
+              parameter q = {"AB", "CD"};
+              parameter c = "A" + 0;
+              child #(.p("HI"), .q(5)) i();
+              child j();
+              defparam j.q = "DP";
+              initial begin
+                $display(p);
+                $display(r);
+                $display(f, 5);
+                $display(q);
+                $display(c);
+                $display("[", p, "]");
+              end
+            endmodule
+            module child;
+              parameter p = 0;
+              parameter q = "Q";
+              initial #1 $display(p, "|", q);
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(2).expect("advance should succeed");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "PASSED",
+                "RANGED",
+                "fmt=5",
+                "ABCD",
+                "        65",
+                "[PASSED]",
+                "HI|          5",
+                "          0|DP",
+            ]
+        );
     }
 
     /// An `inout` bound to a **select** is bonded to it, not assigned from it:
@@ -3875,6 +4091,51 @@ mod tests {
         assert_eq!(
             simulator.output().text(),
             "down=St0 up=St1 weak=St0 pulled=St0 alone=St1 vec=0x01\n"
+        );
+    }
+
+    /// A `tri0` input bound to a `reg` is a net of its own that the `reg`
+    /// drives, not the `reg` itself: the pull must not outvote the parent's
+    /// procedural writes. Bound to a `wire` it is one node with it, and the
+    /// pull reaches the parent's net too.
+    ///
+    /// iverilog 12.0 (which warns "input port p is coerced to inout" for the
+    /// `wire`) prints
+    /// `w=0 c1.p=0 r=x c2.p=x`, `w=0 c1.p=0 r=1 c2.p=1`, `w=0 c1.p=0 r=z c2.p=0`
+    /// — corpus `pr841`, whose clock never moved once the pull held it.
+    #[test]
+    fn test_a_pulled_input_bound_to_a_variable_is_driven_by_it() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module top;
+              wire w; reg r;
+              child c1(w);
+              child c2(r);
+              initial begin
+                #1 $display("w=%b c1.p=%b r=%b c2.p=%b", w, c1.p, r, c2.p);
+                r = 1;
+                #1 $display("w=%b c1.p=%b r=%b c2.p=%b", w, c1.p, r, c2.p);
+                r = 1'bz;
+                #1 $display("w=%b c1.p=%b r=%b c2.p=%b", w, c1.p, r, c2.p);
+              end
+            endmodule
+            module child(p);
+              input p; tri0 p;
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(5).expect("advance should succeed");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "w=0 c1.p=0 r=x c2.p=x",
+                "w=0 c1.p=0 r=1 c2.p=1",
+                "w=0 c1.p=0 r=z c2.p=0",
+            ]
         );
     }
 
@@ -6237,6 +6498,39 @@ mod tests {
         assert_eq!(simulator.get("y").unwrap().to_u128(), Some(72));
     }
 
+    /// An argument is sized by the input it is assigned to, as a right hand
+    /// side is by its target: a seven bit sum passed to an eight bit input
+    /// keeps its carry, one passed to a four bit input is truncated, and one
+    /// passed to a `real` input is self-determined and wraps first.
+    ///
+    /// iverilog 12.0 prints `80 10 0`, `00` and `0.000000` — the concatenation
+    /// is self-determined inside, so its sum wraps; corpus `pr2913438b`.
+    #[test]
+    fn test_a_function_argument_is_sized_by_its_input() {
+        let mut simulator = simulator_for(
+            r#"
+            module top;
+              reg [6:0] a;
+              reg [3:0] b, c;
+              function [7:0] f8(input [7:0] in); f8 = in; endfunction
+              function [3:0] f4(input [3:0] in); f4 = in; endfunction
+              function real fr(input real in); fr = in; endfunction
+              initial begin
+                a = 7'd127; b = 4'd15; c = 4'd1;
+                $display("%h %h %h", f8(a + 7'd1), f8(b + c), f4(a + 7'd1));
+                $display("%h", f8({b + c}));
+                $display("%f", fr(b + c));
+              end
+            endmodule
+        "#,
+        );
+        simulator.advance(1).unwrap();
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["80 10 0", "00", "0.000000"]
+        );
+    }
+
     /// A body-local variable is the function's own: it is declared into the
     /// frame a call builds, and a loop over it runs to a value.
     #[test]
@@ -8227,6 +8521,56 @@ mod tests {
                 "20 clock=2",
                 "30 clock=3",
                 "30 edge count=2",
+            ]
+        );
+    }
+
+    /// An `always` block whose list names an edge or an event starts listening
+    /// at its turn in the time-zero round, and the turns go an instance's
+    /// blocks first and then the module's own in source order — so a write an
+    /// `initial` makes at time zero reaches only the edge-triggered blocks
+    /// whose turn came before it. A list of plain signals hears it either way.
+    ///
+    /// iverilog 12.0 prints these three lines for this design, and nothing
+    /// for the edge, the mixed list and the event written below the `initial`,
+    /// nor for the parent's block that the child's `initial` wrote under. The
+    /// order it wakes blocks in at one instant is not what is measured here,
+    /// so the lines are compared as a set (corpus `pr1662508`, `pr3064375`).
+    #[test]
+    fn test_an_edge_triggered_block_listens_from_its_turn_at_time_zero() {
+        let modules = crate::parsers::source::parse_verilog_source(
+            r#"
+            module top;
+              reg a, b, c, d;
+              event e;
+              always @(negedge a) $display("edge above");
+              always @(negedge b) $display("child's write, edge above");
+              child c1();
+              initial begin a = 0; c = 0; d = 0; -> e; end
+              always @(negedge a) $display("edge below");
+              always @(c) $display("level below");
+              always @(posedge c or d) $display("mixed below");
+              always @(e) $display("event below");
+            endmodule
+            module child;
+              initial top.b = 0;
+              always @(negedge top.a) $display("child below its initial, above top's");
+            endmodule
+        "#,
+        )
+        .expect("design should parse")
+        .1;
+        let mut simulator = Simulator::with_modules(modules, "top");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(10).expect("advance should succeed");
+        let mut lines = simulator.output().lines();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                "child below its initial, above top's",
+                "edge above",
+                "level below",
             ]
         );
     }

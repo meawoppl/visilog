@@ -596,12 +596,10 @@ fn eval_in_context(
             }
             let word = memory.word(known.then_some(address.as_slice()));
             let value = match select {
-                WordSelectKind::Bit(bit) => {
-                    match numeric(&eval(bit, store)?)?.and_then(|v| i64::try_from(v).ok()) {
-                        Some(bit) => logic_bit(memory.bit_of(&word, bit)),
-                        None => Register::unknown(1),
-                    }
-                }
+                WordSelectKind::Bit(bit) => match select_index(&eval(bit, store)?)? {
+                    Some(bit) => logic_bit(memory.bit_of(&word, bit)),
+                    None => Register::unknown(1),
+                },
                 WordSelectKind::Part(first, second) => {
                     let first = select_bound(first, store)?;
                     let second = select_bound(second, store)?;
@@ -712,11 +710,19 @@ fn call_function(
         });
     }
 
-    // An argument is self-determined: the function's own declaration says how
-    // wide the variable it lands in is, and nothing around the call has a say.
+    // An argument is *assigned* to the input it lands in, so it is sized by
+    // that input the way a right hand side is sized by its target: `test(ltl +
+    // 7'd1)` for an eight bit input adds in eight bits and keeps the carry,
+    // where adding in seven wraps to zero (corpus `pr2913438b`). Nothing around
+    // the call has a say, and a real input has no width to impose.
     let mut values = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        values.push(eval(argument, store)?);
+    for (argument, input) in arguments.iter().zip(&definition.arguments) {
+        let width = if input.real {
+            SELF_DETERMINED
+        } else {
+            range_width(input.range)
+        };
+        values.push(eval_sized(argument, store, width)?);
     }
 
     let _depth = store
@@ -2327,6 +2333,14 @@ fn select_bound(expr: &Expression, store: &StateStore) -> Result<i64, EvalError>
 /// write into a silent no-op and a read into `x` (corpus `negative_genvar`,
 /// `signed_net_display`).
 ///
+/// An index is an **`int`**: a value thirty-two bits wide or wider is read by
+/// its low thirty-two bits as a two's complement number, whatever its declared
+/// signedness. That is iverilog 12.0's answer, measured: a 128 bit index
+/// holding `2**120 + 7` names word 7 (corpus `signed_a`, whose comment is
+/// "This should be stripped!"), and an *unsigned* `32'hFFFFFFFF` names word
+/// `-1` of `reg [3:0] a [-8:8]`. A narrower value keeps its own signedness, so
+/// `4'b1111` is still 15.
+///
 /// This is the one place that rule lives. Every select — a bit, a part, an
 /// indexed part, and a memory word, reading and writing alike — comes through
 /// it, so none of them can disagree about which word a design named.
@@ -2334,7 +2348,9 @@ pub fn select_index(value: &Register) -> Result<Option<i64>, EvalError> {
     let Some(bits) = numeric(value)? else {
         return Ok(None);
     };
-    Ok(if value.is_signed() {
+    Ok(if value.width() >= 32 {
+        Some(i64::from(bits as u32 as i32))
+    } else if value.is_signed() {
         i64::try_from(sign_extend_to_i128(bits, value.width())).ok()
     } else {
         i64::try_from(bits).ok()

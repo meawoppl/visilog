@@ -238,6 +238,13 @@ pub struct Elaborated {
     /// path.
     pub wired_nets: HashMap<String, WiredKind>,
     pub blocks: Vec<TimedBlock>,
+    /// Every index into `blocks`, in the order the blocks get their first turn
+    /// at time zero: an instance's before the module that creates it, and a
+    /// module's own in source order. That is iverilog 12.0's order, measured —
+    /// a child instantiated *below* an `initial` still sees the `initial`'s
+    /// time-zero writes, and the parent's own `always` written below it does
+    /// not. `blocks` is in build order, which interleaves the two.
+    pub start_order: Vec<usize>,
     /// The *top* module's input ports, the only ones a testbench may drive.
     pub inputs: Vec<String>,
     /// Qualified name to the store entry it aliases, for ports that were bound
@@ -334,6 +341,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             pulled_nets: Vec::new(),
             wired_nets: HashMap::new(),
             blocks: Vec::new(),
+            start_order: Vec::new(),
             inputs: Vec::new(),
             aliases: HashMap::new(),
             instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
@@ -388,6 +396,17 @@ enum Binding {
     Bonded(Expression),
 }
 
+/// A parameter value handed down from outside the module that declares it —
+/// by a `#(...)` or a `defparam` — already evaluated where it was written.
+#[derive(Clone)]
+struct Override {
+    value: Register,
+    /// Whether the expression it came from was text, which is what decides
+    /// whether `$display(p)` prints the parameter as a string; see
+    /// [`is_text`].
+    text: bool,
+}
+
 /// One instance's — or one generate block's — view of the flat name space.
 ///
 /// A module instance and a generate block are the same kind of thing to the
@@ -409,7 +428,7 @@ struct Scope {
     bindings: HashMap<String, Binding>,
     /// Parameter values the parent overrode, already evaluated in the parent's
     /// scope.
-    overrides: HashMap<String, Register>,
+    overrides: HashMap<String, Override>,
     /// What the generate blocks in scope declare, to the store entries they
     /// took. Empty outside a generate block, which is what keeps an ordinary
     /// module's resolution exactly what it was.
@@ -531,7 +550,7 @@ struct Elaborator<'m> {
     /// The `defparam` overrides seen so far, by the flat name of the parameter
     /// each one addresses. An instantiation takes the ones that name it; what
     /// is left over at the end named nothing and is reported.
-    defparams: BTreeMap<String, Register>,
+    defparams: BTreeMap<String, Override>,
     /// How many instances have been walked, which is what bounds a recursion
     /// that *branches* — see [`MAX_INSTANCES`].
     walked: usize,
@@ -569,6 +588,11 @@ impl<'m> Elaborator<'m> {
             ));
         }
         self.stack.push(index);
+        // Where this instance's blocks and its children's begin, so the ones
+        // that are its own can be put in the start order once every child has
+        // put in theirs.
+        let first_block = self.out.blocks.len();
+        let first_started = self.out.start_order.len();
 
         // A user-defined primitive is a module as far as instantiation and port
         // binding go, and nothing else: its whole body is the table, so none of
@@ -717,6 +741,15 @@ impl<'m> Elaborator<'m> {
         }
         self.stamp_collections(module, first);
 
+        let children: HashSet<usize> = self.out.start_order[first_started..]
+            .iter()
+            .copied()
+            .collect();
+        let own: Vec<usize> = (first_block..self.out.blocks.len())
+            .filter(|id| !children.contains(id))
+            .collect();
+        self.out.start_order.extend(own);
+
         self.stack.pop();
         Ok(())
     }
@@ -812,7 +845,7 @@ impl<'m> Elaborator<'m> {
         scope: &Scope,
     ) -> Result<(), SimulationError> {
         for assignment in assignments {
-            let value = eval(&renamed(&assignment.value, scope), &self.out.state)?;
+            let value = self.evaluated(renamed(&assignment.value, scope))?;
             self.defparams
                 .insert(scope.resolve(&assignment.path), value);
         }
@@ -1917,7 +1950,7 @@ impl<'m> Elaborator<'m> {
                     // expression it came from was written.
                     let value = match scope.overrides.get(local) {
                         Some(value) => value.clone(),
-                        None => eval(&renamed(&parameter.value, scope), &self.out.state)?,
+                        None => self.evaluated(renamed(&parameter.value, scope))?,
                     };
                     let name = scope.qualified(local);
                     let range = match &parameter.range {
@@ -1942,6 +1975,15 @@ impl<'m> Elaborator<'m> {
         Ok(())
     }
 
+    /// A parameter's value expression, evaluated, together with whether it was
+    /// text.
+    fn evaluated(&self, value: Expression) -> Result<Override, SimulationError> {
+        Ok(Override {
+            text: is_text(&value, &self.out.state),
+            value: eval(&value, &self.out.state)?,
+        })
+    }
+
     /// Records one parameter's value in the store under `name`.
     ///
     /// The declaration's own rules — what it is signed by, whether it is a
@@ -1952,9 +1994,13 @@ impl<'m> Elaborator<'m> {
         &mut self,
         parameter: &ParameterDeclaration,
         name: String,
-        value: Register,
+        value: Override,
         range: Option<(i64, i64)>,
     ) {
+        let Override { value, text } = value;
+        if text {
+            self.out.state.mark_text(&name);
+        }
         // A `signed` qualifier (or an `integer` type) makes the parameter
         // signed. Failing that, **a range is what decides**: a parameter
         // written with one is unsigned unless it says otherwise, and only a
@@ -2034,10 +2080,7 @@ impl<'m> Elaborator<'m> {
             let name = scope.qualified(&format!("{}{}", inner, parameter.name.name));
             let value = match self.defparams.remove(&name) {
                 Some(value) => value,
-                None => eval(
-                    &scoped_renamed(&parameter.value, scope, inner, &own),
-                    &self.out.state,
-                )?,
+                None => self.evaluated(scoped_renamed(&parameter.value, scope, inner, &own))?,
             };
             let range = match &parameter.range {
                 Some(range) => Some(self.resolve_scoped_range(range, scope, inner, &own)?),
@@ -3279,7 +3322,7 @@ impl<'m> Elaborator<'m> {
                 substitute_genvars(&mut connection, &scope.genvars);
             }
             let binding = match plain_identifier(&connection)
-                .filter(|_| self.can_alias(port, &connection, scope))
+                .filter(|_| self.can_alias(child, port, &connection, scope))
             {
                 Some(id) => {
                     let outer = scope.resolve(&id.name);
@@ -3351,7 +3394,20 @@ impl<'m> Elaborator<'m> {
     /// An `inout` is the one that cannot take it: it is read as well as
     /// written and one assignment only runs one way, so it stays aliased and
     /// keeps the parent's signedness.
-    fn can_alias(&self, port: &Port, connection: &Expression, scope: &Scope) -> bool {
+    ///
+    /// An input the child declares `tri0`, `tri1`, `supply0` or `supply1`
+    /// cannot share a *variable's* entry either: the pull is a permanent
+    /// driver, and on a `reg` it would outvote every procedural write, where
+    /// iverilog keeps the port a net of its own driven by the `reg` (corpus
+    /// `pr841`, whose clock never moved). Bound to a net it is one node with
+    /// it, which is what iverilog's "input port coerced to inout" says.
+    fn can_alias(
+        &self,
+        child: &VerilogModule,
+        port: &Port,
+        connection: &Expression,
+        scope: &Scope,
+    ) -> bool {
         if matches!(port.direction, PortDirection::InOut) {
             return true;
         }
@@ -3364,7 +3420,12 @@ impl<'m> Elaborator<'m> {
         self.out
             .state
             .get_signal(&scope.resolve(&id.name))
-            .is_none_or(|outer| outer.is_signed() == port.signed)
+            .is_none_or(|outer| {
+                outer.is_signed() == port.signed
+                    && (outer.is_net()
+                        || port.direction != PortDirection::Input
+                        || !declares_pull(child, &port.identifier.name))
+            })
     }
 
     /// Evaluates a `#(...)` block in the *parent's* scope, keyed by the child's
@@ -3374,7 +3435,7 @@ impl<'m> Elaborator<'m> {
         child: &VerilogModule,
         instantiation: &ModuleInstantiation,
         scope: &Scope,
-    ) -> Result<HashMap<String, Register>, SimulationError> {
+    ) -> Result<HashMap<String, Override>, SimulationError> {
         // A UDP declares no parameters, so `BUFG #5 bg(o, i);` is the
         // instance's *delay* rather than an override. A gate's delay is parsed
         // and ignored, and there is nothing more a primitive's can be here:
@@ -3426,7 +3487,7 @@ impl<'m> Elaborator<'m> {
 
         let mut overrides = HashMap::new();
         for (name, expression) in pairs {
-            let value = eval(&renamed(expression, scope), &self.out.state)?;
+            let value = self.evaluated(renamed(expression, scope))?;
             overrides.insert(name.to_string(), value);
         }
         Ok(overrides)
@@ -3515,6 +3576,37 @@ fn plain_identifier(expression: &Expression) -> Option<&Identifier> {
         Expression::Parenthetical(inner) => plain_identifier(inner),
         _ => None,
     }
+}
+
+/// Whether a parameter's value expression is **text** — a string literal, a
+/// parenthesised or concatenated run of them, or another parameter that is —
+/// which is what makes `$display(p)` print it as the string it was written as
+/// rather than as the number its bits spell. A value that does arithmetic on
+/// one (`"A" + 0`) is a number. See [`StateStore::mark_text`].
+fn is_text(value: &Expression, store: &StateStore) -> bool {
+    match value {
+        Expression::StringLiteral(_) => true,
+        Expression::Parenthetical(inner) => is_text(inner, store),
+        Expression::Concatenation(parts) => parts.iter().all(|part| is_text(part, store)),
+        Expression::Identifier(id) => store.is_text(&id.name),
+        _ => false,
+    }
+}
+
+/// Whether `module` declares `name` as a net that drives itself — `tri0`,
+/// `tri1`, `supply0` or `supply1` — which is what [`Elaborator::record_pull`]
+/// turns into a permanent driver.
+fn declares_pull(module: &VerilogModule, name: &str) -> bool {
+    module.statements.iter().any(|statement| match statement {
+        ModuleStatement::WireDeclaration(nets) => nets.iter().any(|net| {
+            net.identifier().name == name
+                && matches!(
+                    net.kind(),
+                    WireKind::Tri0 | WireKind::Tri1 | WireKind::Supply0 | WireKind::Supply1
+                )
+        }),
+        _ => false,
+    })
 }
 
 /// Checks what a compiled function body does and reports the design signals it
