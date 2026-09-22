@@ -204,6 +204,20 @@ are queued at time zero; edge-triggered blocks are woken by `settle` instead, so
 deliberately skipped in the time wheel (`EventControl::None` reports as firing on *every*
 edge, so a free-running block must not also be edge-driven).
 
+**A `#0` yields to the blocks the design just woke, and not to their non-blocking
+updates.** It re-queues a block at the same instant, in what IEEE 1364-2005 calls the
+*inactive* region — which drains only after the blocks the active region's writes woke
+have run. So between two rounds at one instant `advance` runs `Simulator::delta_rounds`
+with a `carry`: the wake half of `settle`, whose woken blocks' `<=` updates join the
+timestep's own `pending` rather than being committed each round. They land together at
+the end of the timestep, where iverilog lands them too — the new test prints `n=00`
+after *two* `#0`s. That separation is the whole fix: calling the full `settle` between
+rounds also fixed `br1000` and `br1019` but committed the updates early, which measured
+**net −4** (it broke `multi_driver_delay`, `pr1883052`, `pr1883052b`, `pr2801662` and the
+four `rise_fall_*`); carrying them is +2 with nothing else moving. The wake pass runs
+only when another round is due at the same instant, so a timestep with no `#0` in it
+pays one `peek_time`.
+
 **A memory is stored apart from the signals, and that is what tells a bit select
 from a word select.** `reg [7:0] mem [0:255];` declares 256 registers, and
 `elaborate` puts them in the `StateStore`'s *memory* map rather than its signal

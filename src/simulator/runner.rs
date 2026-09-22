@@ -895,6 +895,16 @@ impl Simulator {
     /// keeps toggling, say — reports [`SimulationError::NoConvergence`] rather
     /// than hanging.
     fn settle(&mut self) -> Result<usize, SimulationError> {
+        self.delta_rounds(None)
+    }
+
+    /// The delta-cycle loop behind [`Simulator::settle`]. `carry` is where the
+    /// woken blocks' non-blocking updates go: `None` commits them each round,
+    /// which is `settle`; `Some` hands them to the caller to commit later.
+    fn delta_rounds(
+        &mut self,
+        mut carry: Option<&mut Vec<PendingUpdate>>,
+    ) -> Result<usize, SimulationError> {
         for delta in 1..=MAX_DELTA_CYCLES {
             // The blocks that ran in the previous round are what this round
             // measures "was that edge one of mine?" against, so the two lists
@@ -1005,7 +1015,12 @@ impl Simulator {
 
             pending.extend(self.wake_waiting(&triggers)?);
 
-            commit_updates(pending, &mut self.state)?;
+            match carry.as_deref_mut() {
+                Some(carried) => carried.extend(pending),
+                None => {
+                    commit_updates(pending, &mut self.state)?;
+                }
+            }
             self.propagate()?;
         }
 
@@ -1318,6 +1333,14 @@ impl Simulator {
                 // ends the timestep, not by an intermediate one that has only
                 // seen part of the round's writes.
                 let _ = self.propagate();
+                // A `#0` puts a block in the inactive region, which drains
+                // only after the blocks this round's writes woke have run —
+                // so they are woken here, before the next round at this
+                // instant. Their non-blocking updates join the timestep's own
+                // and land with them at its end.
+                if self.queue.peek_time() == Some(time) {
+                    self.delta_rounds(Some(&mut pending))?;
+                }
             }
 
             // A write an `a <= #2 b;` scheduled for this instant is a
@@ -7394,6 +7417,49 @@ mod tests {
         simulator.advance(5).expect("time should advance");
 
         assert_eq!(simulator.output().lines(), vec!["hit=1110"]);
+    }
+
+    /// A `#0` yields to the blocks the round's writes woke, but not to their
+    /// non-blocking updates, which still land at the end of the timestep.
+    /// Both halves are what this pins: the `@*` block has run by the time
+    /// the `#0` resumes, while the `<=` the other block made is still in
+    /// flight after two of them (corpus `br1000`, `br1019`).
+    ///
+    /// iverilog 12.0:
+    ///
+    /// ```text
+    /// after #0: q=01 n=00
+    /// again: q=01 n=00
+    /// next step: n=55
+    /// ```
+    #[test]
+    fn test_a_zero_delay_yields_to_woken_blocks_but_not_to_their_updates() {
+        let mut simulator = simulator_for(
+            r#"
+            module top();
+                reg a, c;
+                reg [7:0] q, n;
+                always @* q = {7'b0, a};
+                always @(a) n <= 8'h55;
+                initial begin
+                    n = 0;
+                    a = 1;
+                    #0;
+                    $display("after #0: q=%h n=%h", q, n);
+                    c = 1;
+                    #0;
+                    $display("again: q=%h n=%h", q, n);
+                    #1 $display("next step: n=%h", n);
+                end
+            endmodule
+        "#,
+        );
+        simulator.advance(10).expect("time should advance");
+
+        assert_eq!(
+            simulator.output().lines(),
+            vec!["after #0: q=01 n=00", "again: q=01 n=00", "next step: n=55",]
+        );
     }
 
     /// A sensitivity entry that is an *expression* has an edge of its own,
