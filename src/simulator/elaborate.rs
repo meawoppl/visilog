@@ -158,16 +158,6 @@ const MAX_INSTANTIATION_DEPTH: usize = 24;
 /// design that plausibly elaborates.
 const MAX_INSTANCES: usize = 65_536;
 
-/// A task is keyed in the [`TaskTable`] by the name an enable *spells*, which
-/// is the bare one both inside a generate block and outside it — so a task
-/// declared in a block and one declared by the module around it have a single
-/// slot between them, and the enable cannot say which it meant. A function has
-/// no such table: it is stored under its qualified name and a call resolves
-/// through the scope like any other reference, which is why that half is
-/// supported and this one is not.
-const GENERATE_TASK_UNSUPPORTED: SimulationError =
-    SimulationError::Unsupported("a task declared inside a generate block");
-
 /// A memory bigger than [`MAX_MEMORY_DEPTH`] words.
 const MEMORY_TOO_LARGE: SimulationError =
     SimulationError::Unsupported("a memory with more words than can be allocated");
@@ -598,6 +588,11 @@ impl<'m> Elaborator<'m> {
                 .collect();
             self.declare_functions(&all, &tasks)?;
         }
+        // A task declared inside a generate block belongs to that block for the
+        // same reason, and is compiled here for it. A design with none gets an
+        // empty map and every generated statement builds against the module's
+        // own table.
+        let block_tasks = self.declare_generated_tasks(&generated, &tasks)?;
 
         for statement in &module.statements {
             if !matches!(statement, ModuleStatement::ParameterDeclaration(_)) {
@@ -641,7 +636,8 @@ impl<'m> Elaborator<'m> {
             self.build(statement, scope, &tasks)?;
         }
         for (statement, inner) in &generated {
-            self.build(statement, inner, &tasks)?;
+            let table = block_tasks.get(&inner.prefix).unwrap_or(&tasks);
+            self.build(statement, inner, table)?;
         }
 
         self.stack.pop();
@@ -699,7 +695,6 @@ impl<'m> Elaborator<'m> {
                     ModuleStatement::Defparam(assignments) => {
                         self.record_defparams(assignments, scope)?
                     }
-                    ModuleStatement::TaskDeclaration(_) => return Err(GENERATE_TASK_UNSUPPORTED),
                     _ => out.push((statement, scope.clone())),
                 },
                 GenerateItem::Block(block) => self.expand_block(block, None, scope, out)?,
@@ -1172,49 +1167,104 @@ impl<'m> Elaborator<'m> {
         }
 
         for task in &declarations {
-            // A named block inside a task body is scoped under the task, the
-            // same way the body's instructions spell it.
-            let inside = block_scope("", &task.name.name);
-            self.declare_block_locals(&task.statements, scope, &inside)?;
-            for variable in task
-                .arguments
-                .iter()
-                .map(|argument| &argument.variable)
-                .chain(&task.locals)
-            {
-                // A task argument may be sized from a parameter — `input
-                // [WIDTH-1:0] a;` — exactly as any other declaration is, and
-                // this is the one place a task's widths are ever recorded.
-                let range = self.resolve_range(&variable.range, scope)?;
-                let name = scope.qualified(&task_variable(&task.name.name, &variable.name.name));
-                // A `real` argument is declared as one, so a value copied into
-                // it is converted rather than reinterpreted.
-                if variable.real {
-                    self.out.state.declare_real(name);
-                } else {
-                    self.out.state.declare_signed(name, range, variable.signed);
-                }
-            }
-        }
-
-        // The second copy: the same bodies, resolved into *this* instance's
-        // names, under the flat path a hierarchical enable of one resolves to.
-        // It has to be taken here because this is the only moment the task and
-        // the scope it belongs to are both in hand; a block that enables one
-        // reaches it long afterwards, with a scope of its own.
-        for (name, definition) in &tasks {
-            let mut qualified = definition.clone();
-            if scope.needs_renaming() {
-                qualified.program.rename(&|local| scope.resolve(local));
-            }
-            for argument in &mut qualified.arguments {
-                argument.name = scope.resolve(&argument.name);
-            }
-            self.hierarchical_tasks
-                .insert(scope.qualified(name), qualified);
+            self.register_task(task, &tasks[&task.name.name], scope)?;
         }
 
         Ok(tasks)
+    }
+
+    /// Declares the variables one compiled task names, and records the copy of
+    /// it a hierarchical enable splices.
+    ///
+    /// The copy is the same body resolved into *this* scope's names, under the
+    /// flat path an enable of it resolves to. It has to be taken here because
+    /// this is the only moment the task and the scope it belongs to are both in
+    /// hand; a block that enables one reaches it long afterwards, with a scope
+    /// of its own.
+    fn register_task(
+        &mut self,
+        task: &TaskDeclaration,
+        definition: &TaskDefinition,
+        scope: &Scope,
+    ) -> Result<(), SimulationError> {
+        // A named block inside a task body is scoped under the task, the same
+        // way the body's instructions spell it.
+        let inside = block_scope("", &task.name.name);
+        self.declare_block_locals(&task.statements, scope, &inside)?;
+        for variable in task
+            .arguments
+            .iter()
+            .map(|argument| &argument.variable)
+            .chain(&task.locals)
+        {
+            // A task argument may be sized from a parameter — `input
+            // [WIDTH-1:0] a;` — exactly as any other declaration is, and this
+            // is the one place a task's widths are ever recorded.
+            let range = self.resolve_range(&variable.range, scope)?;
+            let name = scope.qualified(&task_variable(&task.name.name, &variable.name.name));
+            // A `real` argument is declared as one, so a value copied into it
+            // is converted rather than reinterpreted.
+            if variable.real {
+                self.out.state.declare_real(name);
+            } else {
+                self.out.state.declare_signed(name, range, variable.signed);
+            }
+        }
+
+        let mut qualified = definition.clone();
+        if scope.needs_renaming() {
+            qualified.program.rename(&|local| scope.resolve(local));
+        }
+        for argument in &mut qualified.arguments {
+            argument.name = scope.resolve(&argument.name);
+        }
+        self.hierarchical_tasks
+            .insert(scope.qualified(&task.name.name), qualified);
+        Ok(())
+    }
+
+    /// Compiles the tasks declared inside generate blocks, once the region has
+    /// been unrolled and each block has a scope, and hands back the table each
+    /// such block's own statements are compiled against.
+    ///
+    /// A block's table is the module's with the block's tasks laid over it, so
+    /// a bare enable written inside the block finds the block's task first —
+    /// which is the whole of why a task in a block could not share the module's
+    /// single table, keyed as it is by the bare name an enable spells. A task
+    /// declared by a block is also stored under the block's prefix for a
+    /// hierarchical enable (`gen.foo_task;`) exactly as the module's are under
+    /// the instance's. A block nested inside another sees the module's tasks
+    /// and its own, not its parent block's: a bare enable of one of those is
+    /// `UnknownTask` rather than a guess.
+    fn declare_generated_tasks(
+        &mut self,
+        generated: &[(&ModuleStatement, Scope)],
+        tasks: &TaskTable,
+    ) -> Result<HashMap<String, TaskTable>, SimulationError> {
+        let mut tables: HashMap<String, TaskTable> = HashMap::new();
+        for (statement, inner) in generated {
+            let ModuleStatement::TaskDeclaration(task) = statement else {
+                continue;
+            };
+            let table = tables
+                .entry(inner.prefix.clone())
+                .or_insert_with(|| tasks.clone());
+            let mut definition = compile_task(task, table)?;
+            definition
+                .program
+                .qualify_scopes(&|block| inner.hierarchy(block));
+            // A task inside a generate loop may print or index by the loop's
+            // genvar, which is a number here and nowhere else — every splice
+            // of the body is one iteration's copy.
+            if !inner.genvars.is_empty() {
+                definition
+                    .program
+                    .substitute(&|expression| substitute_genvars(expression, &inner.genvars));
+            }
+            table.insert(task.name.name.clone(), definition.clone());
+            self.register_task(task, &definition, inner)?;
+        }
+        Ok(tables)
     }
 
     /// Splices in every enable of another instance's task, repeating until
@@ -1409,6 +1459,13 @@ impl<'m> Elaborator<'m> {
         }
 
         let mut program = Program::compile(&function.statements, tasks)?;
+        // A function inside a generate loop may read the loop's genvar, which
+        // is a number rather than a name — so it is substituted before the
+        // rename, which would otherwise qualify it into a signal nothing
+        // declares.
+        if !scope.genvars.is_empty() {
+            program.substitute(&|expression| substitute_genvars(expression, &scope.genvars));
+        }
         program.rename(&|name| match frame_names.get(name) {
             Some(qualified) => qualified.clone(),
             None => scope.resolve(name),
@@ -3682,6 +3739,11 @@ fn declared_by(statement: &ModuleStatement, names: &mut Vec<String>) {
         // `endfunction` resolves outwards to the module and finds nothing
         // (corpus `generate_case2`).
         ModuleStatement::FunctionDeclaration(function) => names.push(function.name.name.clone()),
+        // So is a task, and for the same reason one level down: its arguments
+        // and locals are declared under the block's prefix (`gen.foo_task.x`),
+        // and its body spells them `foo_task.x` — which resolves outwards to
+        // the module and finds nothing unless the task's name is the block's.
+        ModuleStatement::TaskDeclaration(task) => names.push(task.name.name.clone()),
         // A named block is a scope, and one opened inside a generate block
         // belongs to that block: `elaborate` declares its variables under the
         // block's prefix, so the label has to be here or a reference to one of
@@ -4118,26 +4180,81 @@ mod tests {
         assert_eq!(simulator.output().text(), "inside=5\noutside=9\n");
     }
 
-    /// A *task* in a generate block is still a named error, because the
-    /// [`TaskTable`] is keyed by the name an enable spells — which is the bare
-    /// one inside a block and outside it alike, so the two would share a slot.
+    /// A task declared in a generate block belongs to the block. A bare enable
+    /// inside the block finds it ahead of a module task of the same name, one
+    /// outside reaches it by the block's label, its variables live under the
+    /// block's prefix, and a loop's genvar is a number inside each iteration's
+    /// copy.
+    ///
+    /// iverilog 12.0 prints `module nudge`, `block nudge top.blk.nudge` twice,
+    /// `lp 1`, `lp 0` and `seen=9`.
     #[test]
-    fn test_a_task_declared_inside_a_generate_block_is_named() {
+    fn test_a_task_declared_inside_a_generate_block_belongs_to_it() {
         let source = r#"
             module top;
+                task nudge;
+                    $display("module nudge");
+                endtask
                 generate
                     if (1) begin : blk
+                        reg [3:0] seen;
                         task nudge;
-                            $display("nudged");
+                            begin
+                                seen = 4'd9;
+                                $display("block nudge %m");
+                            end
+                        endtask
+                        initial #1 nudge;
+                    end
+                endgenerate
+                genvar i;
+                generate
+                    for (i = 0; i < 2; i = i + 1) begin : lp
+                        task tell;
+                            $display("lp %0d", i);
                         endtask
                     end
                 endgenerate
+                initial begin
+                    nudge;
+                    #2 blk.nudge;
+                    lp[1].tell;
+                    lp[0].tell;
+                    $display("seen=%0d", blk.seen);
+                end
             endmodule
         "#;
-        assert!(matches!(
-            setup_error(&[source], "top"),
-            SimulationError::Unsupported("a task declared inside a generate block")
-        ));
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(5).expect("the design should run");
+        assert_eq!(
+            simulator.output().text(),
+            "module nudge\nblock nudge top.blk.nudge\nblock nudge top.blk.nudge\n\
+             lp 1\nlp 0\nseen=9\n"
+        );
+    }
+
+    /// A function inside a generate loop reads the loop's genvar as the number
+    /// it is in that iteration, rather than as a signal nothing declares.
+    /// iverilog 12.0 prints `0 1`.
+    #[test]
+    fn test_a_function_inside_a_generate_loop_reads_its_genvar() {
+        let source = r#"
+            module top;
+                genvar k;
+                generate
+                    for (k = 0; k < 2; k = k + 1) begin : ff
+                        function f;
+                            input dummy;
+                            f = k % 2;
+                        endfunction
+                    end
+                endgenerate
+                initial $display("%0d %0d", ff[0].f(0), ff[1].f(0));
+            endmodule
+        "#;
+        let mut simulator = simulator_for(&[source], "top");
+        simulator.advance(1).expect("the design should run");
+        assert_eq!(simulator.output().text(), "0 1\n");
     }
 
     /// An enable of another instance's task runs that instance's body against
