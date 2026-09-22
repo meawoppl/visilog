@@ -2543,8 +2543,19 @@ tripwire.
   Verilog-1995 one (`module m(a, h);` plus `input a; output [11:0] h;` in the body), lifts
   the body direction declarations out of `statements`, and reconciles them against the
   header names. Nothing downstream can tell the two apart, which is why `elaborate` needs
-  no notion of either. Mixing them, a header name with no direction, a direction naming
-  something absent from the header, and a port declared twice are all `nom::Err::Failure`.
+  no notion of either. A header name with no direction and a port declared twice — in the
+  body twice, or in an ANSI header and again in the body — are `nom::Err::Failure`.
+  **A direction naming something the header does not list is a local, not an error.**
+  `module test; output reg a;` (corpus `module_output_port_var2`), `module m(a); input a;
+  output b;` and `module m(input a); output b;` all compile silently in iverilog 12.0, even
+  under `-Wall`, and the name is the declaration it would be without the direction — a net
+  reading `z`, or a variable reading `x` when it says `reg`, `integer` or `time`. Nothing can
+  connect to it, so it is not a port: `reconcile_ports` hands it back in
+  `ReconciledPorts::locals`, `parse_module_declaration` keeps it in the body as a
+  `ModuleStatement::PortDeclaration` — in *front* of the body, where a port's own
+  declaration would run, so a `reg` naming it still comes second and wins the fill — and
+  `elaborate` declares it through `declare_port` with nothing bound. A **primitive** keeps
+  the refusal: its body holds nothing but its terminals.
   A `reg` naming a port is *not* a second declaration of it — an output backed by a
   register is one signal, and the `reg` stays an ordinary body statement.
 - **Flattening rewrites names on the compiled `Program`, not on the statement tree.**
