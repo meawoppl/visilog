@@ -35,7 +35,6 @@ on the simulator should leave it alone.
 src/
   lib.rs               the library root; exports everything below
   main.rs              stub binary, currently empty
-  git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
   register.rs          4-state (0/1/x/z) value type, packed into two bit planes
   parsers/             the Verilog front end — see below
   simulator/           elaboration and the event-driven run loop — see below
@@ -2754,8 +2753,14 @@ tripwire.
   `mixed_width_case` and `constfunc13` are that gap, and they fail honestly — they run and
   print `FAILED`. Fixing it means `Instruction::CaseSubject` knowing its arms, since the
   labels are separate `JumpIfMatch` instructions by the time `resume` sees them.
-- **`git_utils.rs`'s only test is disabled** (its `#[test]` is commented out) because it
-  hits the network. Don't re-enable it in CI without gating it.
+- **The library builds for `wasm32-unknown-unknown`, and CI keeps it that way.** Nothing
+  in `[dependencies]` may need a C toolchain or an OS entropy source — `rand` is a
+  dev-dependency for exactly that reason, since `getrandom` refuses the target. Two
+  things behave differently there at run time rather than at build time:
+  `SystemTime::now()` panics instead of returning an error, so `vcd.rs::now()` answers
+  `$date` with `unknown` on wasm without asking; and there is no filesystem, so `$fopen`
+  returns 0 and `$readmemh` reports the file it could not find — the rules those already
+  had for a file that is not there.
 - **A declared range holds *expressions*, and a literal one is folded where it is
   written.** `simple.rs::Range` is `Constant(i64, i64)` when both bounds were literals and
   `Expressions(..)` when either was not, so `reg [WIDTH-1:0] q;` and `output [0:count-1] y`
