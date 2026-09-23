@@ -22,6 +22,7 @@
 //! one timestep a single line rather than three, which is what iverilog writes.
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::parsers::preprocessor::TimeSpec;
@@ -845,7 +846,15 @@ fn identifier(index: usize) -> String {
     }
 }
 
+/// What `$date` says on a target with no clock: `SystemTime::now()` panics on
+/// `wasm32-unknown-unknown` rather than returning an error.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn now() -> String {
+    "unknown".to_string()
+}
+
 /// What `$date` says: the wall clock, as an ISO 8601 instant in UTC.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn now() -> String {
     let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return "unknown".to_string();
@@ -866,6 +875,7 @@ fn now() -> String {
 
 /// Howard Hinnant's `civil_from_days`: a day number since 1970-01-01 to a
 /// calendar date, with no dependency behind it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
