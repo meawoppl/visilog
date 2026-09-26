@@ -40,7 +40,7 @@ jobs:
       # than vendored. Sparse and blobless keeps it to tens of megabytes.
       - name: Cache ivtest corpus
         id: corpus-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/visilog/ivtest
           key: ivtest-${{ env.IVTEST_REF }}
