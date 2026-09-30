@@ -925,10 +925,12 @@ pub struct StateStore {
     /// by an address costs a design with no memory in it ~4.5% on
     /// `bench tick/counter_4bit`.
     round_words: Vec<MemoryChange>,
-    /// For every signal written since the last marker, the value it held at
-    /// that marker. `None` records a name that did not exist yet, which makes
-    /// the write a declaration rather than a change.
-    journal: HashMap<String, Option<Register>>,
+    /// For every signal written since the last marker, when it was first
+    /// written — a count of journal entries, so the writes can be handed back
+    /// in the order they were made — and the value it held at that marker.
+    /// `None` records a name that did not exist yet, which makes the write a
+    /// declaration rather than a change.
+    journal: HashMap<String, (usize, Option<Register>)>,
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
@@ -1666,12 +1668,18 @@ impl StateStore {
             .name_to_signal
             .get(name)
             .map(|signal| signal.register().clone());
-        self.journal.insert(name.to_string(), previous);
+        let order = self.journal.len();
+        self.journal.insert(name.to_string(), (order, previous));
     }
 
     /// The name and pre-write value of every signal written since the last
-    /// call, sorted by name, clearing the journal so the next round is measured
-    /// from here.
+    /// call, in the order each was first written, clearing the journal so the
+    /// next round is measured from here.
+    ///
+    /// The order is the one iverilog wakes the blocks in: it schedules the
+    /// waiters on a signal the moment the signal is written, so two blocks
+    /// woken by two writes run in the order the writes were made (corpus
+    /// `vector`).
     ///
     /// A name that did not exist at the last call is left out: it was declared
     /// rather than changed, and declaring a signal is not a simulation event.
@@ -1680,13 +1688,16 @@ impl StateStore {
     /// caller compares.
     pub fn take_changes(&mut self) -> Vec<(String, Register)> {
         let mut changes = Vec::with_capacity(self.journal.len());
-        for (name, previous) in self.journal.drain() {
+        for (name, (order, previous)) in self.journal.drain() {
             if let Some(previous) = previous {
-                changes.push((name, previous));
+                changes.push((order, name, previous));
             }
         }
-        changes.sort_by(|left, right| left.0.cmp(&right.0));
+        changes.sort_unstable_by_key(|(order, _, _)| *order);
         changes
+            .into_iter()
+            .map(|(_, name, previous)| (name, previous))
+            .collect()
     }
 
     /// Rewrites every journalled starting value that was entirely `z` as `x`.
@@ -1697,7 +1708,10 @@ impl StateStore {
     /// the rule iverilog follows, and which a `z` baseline gets wrong in the
     /// direction of waking blocks on a value nobody set.
     pub fn treat_undriven_start_as_unknown(&mut self) {
-        for previous in self.journal.values_mut().flatten() {
+        for (_, previous) in self.journal.values_mut() {
+            let Some(previous) = previous else {
+                continue;
+            };
             if *previous == Register::high_impedance(previous.width()) {
                 *previous = Register::unknown(previous.width());
             }

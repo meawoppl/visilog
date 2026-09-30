@@ -1063,6 +1063,10 @@ impl TaskContext {
     ///
     /// with the second line indented under the message. visilog has no source
     /// lines to name, so the `file:line:` is left out and the rest is kept.
+    /// The time is the raw clock — ticks of the finest precision in the
+    /// design, `500` for `#5` under `` `timescale 1ns/10ps `` — and the scope
+    /// is the call's own `%m`, a task's name included
+    /// (`memory_tb.spi_read_check`); both measured against iverilog 12.0.
     /// `$fatal` may be given a finish number first, which says how much the
     /// simulator reports about itself on the way out and changes nothing here.
     fn report(
@@ -1077,15 +1081,13 @@ impl TaskContext {
         };
         let message = self.render(arguments, store, Radix::Decimal, &call.scope)?;
         let label = level.label();
-        let now = u128::from(store.time().max(0) as u64) * self.default_time_units()
-            / self.tick_fs(&call.scope);
         self.output.push(&format!(
             "{}: {}\n{:indent$}Time: {}  Scope: {}\n",
             label,
             message,
             "",
-            now,
-            self.enclosing_instance(&call.scope),
+            store.time(),
+            call.scope,
             indent = label.len() + 2,
         ));
         if matches!(level, ReportLevel::Error | ReportLevel::Fatal) {

@@ -29,6 +29,7 @@
 //! was connected to. Hand the simulator more than one module with
 //! [`Simulator::with_modules`].
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
@@ -357,6 +358,8 @@ struct Waiting {
     /// already journalled when it was armed, which its first look skips: a
     /// trigger fired before the block was listening is one it missed.
     arming: Option<usize>,
+    /// When the wait was armed — see [`Simulator::next_arming`].
+    armed_at: u64,
 }
 
 /// An event control a block is suspended on, with what the signals it names
@@ -651,6 +654,12 @@ pub struct Simulator {
     /// the round is collected, so [`Simulator::cancel_scope`] looking only at
     /// the queue would find nothing and let it run anyway (corpus `sdw_dsbl`).
     round: VecDeque<ExecutionCursor>,
+    /// The blocks a settle round has decided to wake and has not run yet, in
+    /// the order it will run them. A field for the reason `round` is one: the
+    /// block that runs first may `disable` one further down (corpus
+    /// `disable_cleanup`, where the most recently armed waiter disables the
+    /// other before its turn).
+    settling: VecDeque<ExecutionCursor>,
     /// Whether the continuous assignments have been settled once, before the
     /// first block ran. See [`Simulator::advance`].
     settled_once: bool,
@@ -694,6 +703,12 @@ pub struct Simulator {
     /// one so the swap is free and a round costs a `fill` of bytes.
     ran_before: Vec<bool>,
     ran_now: Vec<bool>,
+    /// When each edge-triggered `always` block last reached its event control,
+    /// as a count of armings — see [`Simulator::next_arming`]. Blocks woken
+    /// by one settle round run most recently armed first.
+    armed_at: Vec<u64>,
+    /// How many times any block has armed an event control.
+    arming_clock: u64,
     /// The edge-triggered `always` blocks whose turn in the time-zero round
     /// has not come yet — see [`Simulator::arm`]. Every flag is down once
     /// time zero has run.
@@ -782,6 +797,7 @@ impl Simulator {
             udp_delays: Vec::new(),
             scheduled: Vec::new(),
             round: VecDeque::new(),
+            settling: VecDeque::new(),
             settled_once: false,
             gates: Vec::new(),
             udps: Vec::new(),
@@ -793,6 +809,8 @@ impl Simulator {
             waiting: Vec::new(),
             ran_before: Vec::new(),
             ran_now: Vec::new(),
+            armed_at: Vec::new(),
+            arming_clock: 0,
             unarmed: Vec::new(),
             event_values: Vec::new(),
             expression_events: false,
@@ -925,6 +943,8 @@ impl Simulator {
         let start_order = elaborated.start_order;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
+        self.armed_at = vec![0; self.blocks.len()];
+        self.arming_clock = 0;
         self.unarmed = vec![false; self.blocks.len()];
         self.event_values = self
             .blocks
@@ -1168,6 +1188,12 @@ impl Simulator {
             }
 
             let mut pending = Vec::new();
+            // Who this round wakes is decided before any of them runs, and
+            // then they run in the order iverilog would have scheduled them:
+            // by which write woke them, in the order the writes were made,
+            // and among the waiters on one write most recently armed first —
+            // see [`Simulator::next_arming`].
+            let mut woken: Vec<(usize, u64, ExecutionCursor)> = Vec::new();
             // Hoisted out of the loop: a design with no `posedge (a & b)` in
             // it pays one `bool` for the whole round.
             let expression_events = self.expression_events;
@@ -1199,38 +1225,41 @@ impl Simulator {
                     continue;
                 }
                 // An edge the block made *itself* on its last run through
-                // does not wake it. A block is sensitive only while it is
-                // parked at its event control, so a write it made on its way
-                // to the end happened while it was not listening, and by the
-                // time it comes back the event is in the past. Corpus
-                // `event_list3`, whose block assigns a signal its own
-                // sensitivity list names and runs twice without this.
-                let filtered;
-                let offered = if self.ran_before[id] && !self.blocks[id].writes.is_empty() {
-                    filtered = edges
-                        .iter()
-                        .filter(|edge| !self.blocks[id].writes.contains(&edge.name))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    &filtered[..]
-                } else {
-                    &edges[..]
-                };
+                // does not wake it.
+                let offered = self.offered_edges(id, &edges);
                 let fires = if expression_events {
-                    self.block_fires(id, offered)
+                    self.block_fires(id, &offered)
                 } else {
-                    self.blocks[id].fires(offered, &self.state)
+                    self.blocks[id].fires(&offered, &self.state)
                 };
                 if fires {
-                    let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
-                    pending.extend(updates);
+                    // Ranked below, and only if the round wakes more than one.
+                    woken.push((usize::MAX, self.armed_at[id], ExecutionCursor::new(id, 0)));
                 }
+            }
+            self.take_satisfied_waiters(&triggers, &edges, &mut woken);
+            // One woken block has nothing to be ordered against, which is the
+            // common round and costs nothing more than it did.
+            if woken.len() > 1 {
+                for entry in woken.iter_mut() {
+                    if entry.0 == usize::MAX {
+                        let id = entry.2.block;
+                        entry.0 = self.wake_rank(id, &self.offered_edges(id, &edges), &edges);
+                    }
+                }
+                // Stable, so blocks that have never armed keep their order.
+                woken.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            }
+            self.settling
+                .extend(woken.into_iter().map(|(_, _, cursor)| cursor));
+            while let Some(cursor) = self.settling.pop_front() {
+                let (updates, _) = self.resume_block(cursor)?;
+                pending.extend(updates);
                 if self.finished() {
+                    self.settling.clear();
                     break;
                 }
             }
-
-            pending.extend(self.wake_waiting(&triggers)?);
 
             match carry.as_deref_mut() {
                 Some(carried) => carried.extend(pending),
@@ -1272,6 +1301,58 @@ impl Simulator {
         fired
     }
 
+    /// The edges block `id` is offered this round: all of them, less the ones
+    /// it made itself on its last run through.
+    ///
+    /// A block is sensitive only while it is parked at its event control, so
+    /// a write it made on its way to the end happened while it was not
+    /// listening, and by the time it comes back the event is in the past.
+    /// Corpus `event_list3`, whose block assigns a signal its own sensitivity
+    /// list names and runs twice without this.
+    fn offered_edges<'a>(&self, id: usize, edges: &'a [SignalEdge]) -> Cow<'a, [SignalEdge]> {
+        if self.ran_before[id] && !self.blocks[id].writes.is_empty() {
+            Cow::Owned(
+                edges
+                    .iter()
+                    .filter(|edge| !self.blocks[id].writes.contains(&edge.name))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(edges)
+        }
+    }
+
+    /// Where in this round's `edges` the write that woke block `id` sits.
+    ///
+    /// iverilog schedules the waiters on a signal the moment the signal is
+    /// written, so blocks woken by different writes run in the order the
+    /// writes were made: four `always @(x)` blocks over four registers an
+    /// `initial` block writes in turn print in that order (corpus `vector`).
+    /// The answer is the shortest prefix of `offered` that still fires the
+    /// block — firing is monotonic in the edges offered, so it is a binary
+    /// search — located back in the round's journal order. A round with one
+    /// edge in it has only one answer and asks nothing.
+    fn wake_rank(&self, id: usize, offered: &[SignalEdge], edges: &[SignalEdge]) -> usize {
+        if edges.len() < 2 || offered.is_empty() {
+            return 0;
+        }
+        let (mut low, mut high) = (0, offered.len() - 1);
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.blocks[id].fires(&offered[..=middle], &self.state) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let name = &offered[low].name;
+        edges
+            .iter()
+            .position(|edge| &edge.name == name)
+            .unwrap_or(0)
+    }
+
     /// Re-measures a block's *expression* sensitivity entries without asking
     /// whether they fire, for the rounds the block is not offered a turn at
     /// all. Nothing to do for a block whose entries all name a signal.
@@ -1301,11 +1382,31 @@ impl Simulator {
         let id = cursor.block;
         self.unarmed[id] = false;
         let watch = EventWatch::arm(self.blocks[id].control.clone(), &self.state);
+        let armed_at = self.next_arming();
+        self.armed_at[id] = armed_at;
         self.waiting.push(Waiting {
             cursor,
             watch: Some(watch),
             arming: Some(self.state.pending_triggers()),
+            armed_at,
         });
+    }
+
+    /// The next arming stamp.
+    ///
+    /// iverilog keeps one wait list per event and pushes a process onto its
+    /// *front* when the process reaches the event control, so the processes a
+    /// single edge wakes run **most recently armed first**. Measured against
+    /// iverilog 12.0: three `always @(posedge clk)` blocks armed at time zero
+    /// in the order A, B, C run C, B, A at the first edge; each re-arms as it
+    /// finishes, so the second edge runs A, B, C; and an `initial` block that
+    /// reached `@(posedge clk)` after all three last ran goes ahead of them.
+    /// A testbench that writes an input with a blocking assignment on the same
+    /// edge its design samples it on depends on exactly this — widlar's
+    /// `spi_tb` and `PulseGenerator_tb` both do.
+    fn next_arming(&mut self) -> u64 {
+        self.arming_clock += 1;
+        self.arming_clock
     }
 
     /// Resumes every waiting block whose wait is now satisfied.
@@ -1320,18 +1421,20 @@ impl Simulator {
     /// are offered to every waiter as they are.
     ///
     /// A block that is still not satisfied goes back on the list, and writes
-    /// nothing, so it cannot keep the settle loop from converging.
-    fn wake_waiting(
+    /// nothing, so it cannot keep the settle loop from converging. The ones
+    /// that are satisfied are handed back in `woken` with their arming stamps,
+    /// for the round to run in its own order.
+    fn take_satisfied_waiters(
         &mut self,
         triggers: &[SignalEdge],
-    ) -> Result<Vec<PendingUpdate>, SimulationError> {
-        let mut pending = Vec::new();
+        round: &[SignalEdge],
+        woken: &mut Vec<(usize, u64, ExecutionCursor)>,
+    ) {
         if self.waiting.is_empty() {
-            return Ok(pending);
+            return;
         }
 
         let mut still_waiting = Vec::new();
-        let mut woken = Vec::new();
         for mut waiting in std::mem::take(&mut self.waiting) {
             let missed = waiting
                 .arming
@@ -1339,6 +1442,10 @@ impl Simulator {
             if let Some(arming) = &mut waiting.arming {
                 *arming = 0;
             }
+            // Where the earliest write it watches sits in the round's journal,
+            // which is when iverilog would have scheduled it — see
+            // [`Simulator::wake_rank`]. A condition has no edge to place.
+            let mut rank = 0;
             let wake = match &mut waiting.watch {
                 None => true,
                 Some(watch) => {
@@ -1347,25 +1454,21 @@ impl Simulator {
                     // it; `watch.fires` then covers a memory-word entry as well
                     // as an ordinary one.
                     edges.extend(triggers[missed..].iter().cloned());
+                    rank = edges
+                        .iter()
+                        .filter_map(|edge| round.iter().position(|seen| seen.name == edge.name))
+                        .min()
+                        .unwrap_or(0);
                     watch.fires(&edges, &self.state)
                 }
             };
             if wake {
-                woken.push(waiting.cursor);
+                woken.push((rank, waiting.armed_at, waiting.cursor));
             } else {
                 still_waiting.push(waiting);
             }
         }
         self.waiting = still_waiting;
-
-        for cursor in woken {
-            let (updates, _) = self.resume_block(cursor)?;
-            pending.extend(updates);
-            if self.finished() {
-                break;
-            }
-        }
-        Ok(pending)
     }
 
     /// Runs whatever the timestep just finished deferred to its end.
@@ -1964,6 +2067,7 @@ impl Simulator {
         });
         self.ran_before.push(false);
         self.ran_now.push(false);
+        self.armed_at.push(0);
         // An activation is started by its enable, never held back to arm at a
         // time-zero turn, so it is never unarmed.
         self.unarmed.push(false);
@@ -2067,6 +2171,7 @@ impl Simulator {
             .cursors()
             .copied()
             .chain(self.round.iter().copied())
+            .chain(self.settling.iter().copied())
             .chain(self.waiting.iter().map(|waiting| waiting.cursor));
         let mut whole: Vec<(usize, usize)> = Vec::new();
         let mut threads: Vec<(ExecutionCursor, usize)> = Vec::new();
@@ -2130,6 +2235,8 @@ impl Simulator {
         self.queue
             .retain(|cursor| doomed.contains(&cursor.block) || cancelled.contains(cursor));
         self.round
+            .retain(|cursor| !doomed.contains(&cursor.block) && !cancelled.contains(cursor));
+        self.settling
             .retain(|cursor| !doomed.contains(&cursor.block) && !cancelled.contains(cursor));
         self.waiting.retain(|waiting| {
             !doomed.contains(&waiting.cursor.block) && !cancelled.contains(&waiting.cursor)
@@ -2246,6 +2353,12 @@ impl Simulator {
                         self.queue.insert(self.now, ExecutionCursor::new(id, 0));
                         None
                     }
+                    // An edge-triggered block that runs off its end is back at
+                    // its event control, listening again from now.
+                    None if self.blocks[id].kind == BlockKind::Always => {
+                        self.armed_at[id] = self.next_arming();
+                        None
+                    }
                     None => None,
                 };
                 Ok((pending, true, next))
@@ -2267,10 +2380,12 @@ impl Simulator {
                     WaitReason::Condition => None,
                     WaitReason::Event(control) => Some(EventWatch::arm(control, &self.state)),
                 };
+                let armed_at = self.next_arming();
                 self.waiting.push(Waiting {
                     cursor: ExecutionCursor { pc, ..cursor },
                     watch,
                     arming: None,
+                    armed_at,
                 });
                 Ok((pending, false, None))
             }
@@ -8988,6 +9103,90 @@ mod tests {
                 "default[                  50]",
                 "us[   0.005000 us]",
                 "ps[5000 ps]",
+            ]
+        );
+    }
+
+    /// Blocks one edge wakes run most recently armed first, and blocks woken by
+    /// different writes run in the order the writes were made. Every line here
+    /// is iverilog 12.0's, in its order.
+    #[test]
+    fn test_blocks_woken_together_run_in_iverilogs_order() {
+        let source = r#"
+            module t;
+                reg clk = 0;
+                reg a, b;
+                always @(posedge clk) $display("%0t A", $time);
+                always @(posedge clk) $display("%0t B", $time);
+                initial begin
+                    #2 @(posedge clk) $display("%0t I", $time);
+                    @(posedge clk) $display("%0t I again", $time);
+                end
+                always @(posedge clk) $display("%0t C", $time);
+                always @(b) $display("%0t b", $time);
+                always @(a) $display("%0t a", $time);
+                initial begin repeat (3) begin #1 clk = 1; #1 clk = 0; end end
+                initial #7 begin a = 1; b = 1; end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "t");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "1 C",
+                "1 B",
+                "1 A",
+                "3 I",
+                "3 A",
+                "3 B",
+                "3 C",
+                "5 C",
+                "5 B",
+                "5 A",
+                "5 I again",
+                "7 a",
+                "7 b",
+            ]
+        );
+    }
+
+    /// A named block's locals inside a function live in the call's frame, and
+    /// so do a `for` loop's own variable and an unnamed block's declarations,
+    /// which both lower to one. The numbering runs through the module, so the
+    /// unnamed block in `g` is the first and its loop the first loop; iverilog
+    /// 12.0 prints exactly these three lines.
+    #[test]
+    fn test_block_scoped_variables_in_functions_loops_and_unnamed_blocks() {
+        let source = r#"
+            module t;
+                function [7:0] f; input [7:0] a;
+                    begin : blk integer i; f = 0; for (i = 0; i < 3; i = i + 1) f = f + a; end
+                endfunction
+                function [7:0] g; input [7:0] a;
+                    begin g = 0; for (integer i = 0; i < 2; i = i + 1) g = g + a; end
+                endfunction
+                initial begin
+                    integer i;
+                    i = 3;
+                    $display("%0d %0d", f(2), g(5));
+                    $display("%m i=%0d", i);
+                    for (int k = 0; k < 1; k++) $display("%m k=%0d", k);
+                end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "t");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "6 10",
+                "t.$unm_blk_2 i=3",
+                "t.$unm_blk_2.$ivl_for_loop1 k=0"
             ]
         );
     }
