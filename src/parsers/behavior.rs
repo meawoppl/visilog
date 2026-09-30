@@ -302,12 +302,16 @@ pub enum ProceduralBlock {
 pub fn procedural_statement(input: &str) -> IResult<&str, ProceduralStatements> {
     alt((
         map(parse_if_statement, |i| ProceduralStatements::If(i)),
+        map(parse_assert_statement, ProceduralStatements::If),
         map(parse_case_statement, |c| ProceduralStatements::Case(c)),
         // `for` is a prefix of `forever`, so the longer keyword is tried first.
-        parse_forever_statement,
-        map(parse_for_statement, |f| ProceduralStatements::For(f)),
-        map(parse_while_statement, |w| ProceduralStatements::While(w)),
-        map(parse_repeat_statement, |r| ProceduralStatements::Repeat(r)),
+        alt((
+            parse_forever_statement,
+            parse_for_statement_with_declaration,
+            map(parse_for_statement, ProceduralStatements::For),
+            map(parse_while_statement, ProceduralStatements::While),
+            map(parse_repeat_statement, ProceduralStatements::Repeat),
+        )),
         map(parse_wait_statement, |w| ProceduralStatements::Wait(w)),
         // A block nested inside another one is a statement like any other, and
         // a named one is a scope with variables of its own.
@@ -563,6 +567,44 @@ pub fn parse_system_task(input: &str) -> IResult<&str, SystemTaskCall> {
     ))
 }
 
+/// `assert (c) pass else fail;` — SystemVerilog's immediate assertion.
+///
+/// It is an `if` whose missing `else` is a bare `$error`, which is exactly what
+/// iverilog 12.0 does with one: `assert (a == 4);` failing prints an `ERROR:`
+/// with an empty message, and a condition that is `x` fails like a false one.
+/// Both arms are optional and either may be a null statement, so
+/// `assert (c) else $error(…);` and `assert (c);` are the usual spellings.
+/// Lowering it here means nothing past the parser learns it was written.
+/// `assert` is a SystemVerilog keyword rather than a 1364 one, so it carries a
+/// word boundary and needs its `(`; no scored corpus file names anything
+/// `assert`.
+fn parse_assert_statement(input: &str) -> IResult<&str, IfStatement> {
+    let (input, _) = keyword(input, "assert")?;
+    let (input, condition) = parenthesized_expression(input)?;
+    let (input, then_statements) = opt(statement_body)(input)?;
+    let (input, else_statements) = opt(preceded(|i| keyword(i, "else"), statement_body))(input)?;
+    if then_statements.is_none() && else_statements.is_none() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let failure = else_statements.unwrap_or_else(|| {
+        vec![ProceduralStatements::SystemTask(SystemTaskCall {
+            name: "error".to_string(),
+            arguments: Vec::new(),
+        })]
+    });
+    Ok((
+        input,
+        IfStatement {
+            condition,
+            then_statements: then_statements.unwrap_or_default(),
+            else_statements: Some(failure),
+        },
+    ))
+}
+
 pub fn parse_if_statement(input: &str) -> IResult<&str, IfStatement> {
     let (input, _) = ws(tag("if"))(input)?;
     let (input, condition) = parenthesized_expression(input)?;
@@ -670,9 +712,74 @@ fn for_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
 }
 
 /// `for (i = 0; i < 4; i = i + 1) <statement>`.
+thread_local! {
+    /// How many loop-variable declarations the module being parsed has had,
+    /// which is what numbers their scopes. Reset by
+    /// [`reset_for_loop_scopes`] at the top of every module.
+    static FOR_LOOP_SCOPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Starts numbering loop-variable scopes from zero again, as iverilog does for
+/// every module.
+pub fn reset_for_loop_scopes() {
+    FOR_LOOP_SCOPES.with(|count| count.set(0));
+}
+
+/// `for (integer i = 0; …)` — a `for` that declares its own loop variable,
+/// which SystemVerilog allows and every widlar testbench writes.
+///
+/// The variable belongs to a scope of its own around the loop, and iverilog
+/// 12.0 names that scope `$ivl_for_loop<N>`, counted through the module —
+/// `%m` inside the body prints `t.$ivl_for_loop0`. So it is lowered here to a
+/// named block with that name declaring the variable, and nothing downstream
+/// learns the loop was written any differently. A `$` cannot begin a design's
+/// own identifier, so the name meets nothing; a numbering skipped by the
+/// parser backtracking over a loop would leave a gap, never a duplicate.
+fn parse_for_statement_with_declaration(input: &str) -> IResult<&str, ProceduralStatements> {
+    let (input, _) = keyword(input, "for")?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, declared) = declared_type(input)?;
+    if !declared.explicit {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let (input, rest) = for_statement_tail(input)?;
+    let Expression::Identifier(name) = rest.initializer.lhs() else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    };
+    let LocalDeclaration::Variables(locals) = declared.variables(vec![(name.clone(), None)]) else {
+        unreachable!("a declared type declares variables");
+    };
+    let index = FOR_LOOP_SCOPES.with(|count| {
+        let index = count.get();
+        count.set(index + 1);
+        index
+    });
+    Ok((
+        input,
+        ProceduralStatements::Block(BlockStatement {
+            name: Some(Identifier::new(format!("$ivl_for_loop{}", index))),
+            locals,
+            parameters: Vec::new(),
+            events: Vec::new(),
+            statements: vec![ProceduralStatements::For(rest)],
+        }),
+    ))
+}
+
 pub fn parse_for_statement(input: &str) -> IResult<&str, ForStatement> {
     let (input, _) = keyword(input, "for")?;
     let (input, _) = ws(char('('))(input)?;
+    for_statement_tail(input)
+}
+
+/// Everything in a `for` after its `(`.
+fn for_statement_tail(input: &str) -> IResult<&str, ForStatement> {
     let (input, initializer) = for_assignment(input)?;
     let (input, _) = ws(char(';'))(input)?;
     let (input, condition) = verilog_expression(input)?;
@@ -1139,7 +1246,9 @@ fn declared_type(input: &str) -> IResult<&str, DeclaredType> {
         value(false, |i| keyword(i, "wire")),
         value(true, |i| keyword(i, "time")),
     )))(input)?;
-    let (input, integer) = opt(|i| keyword(i, "integer"))(input)?;
+    // SystemVerilog's `int` is read as an `integer`: the same thirty-two
+    // signed bits, and nothing here models the two-state difference.
+    let (input, integer) = opt(alt((|i| keyword(i, "integer"), |i| keyword(i, "int"))))(input)?;
     // `realtime` is `real` under a longer name, so the longer keyword is tried
     // first — otherwise `real` matches and leaves `time` looking like a name.
     let (input, is_real) = opt(alt((|i| keyword(i, "realtime"), |i| keyword(i, "real"))))(input)?;
@@ -2166,6 +2275,60 @@ mod tests {
     #[test]
     fn test_a_for_header_assignment_carries_no_semicolon() {
         assert!(parse_for_statement("for (i = 0; i < 4; i = i + 1;) a = i;").is_err());
+    }
+
+    #[test]
+    fn test_a_for_that_declares_its_variable_is_a_scope_around_it() {
+        reset_for_loop_scopes();
+        for source in [
+            "for (integer i = 0; i < 4; i = i + 1) a = i;",
+            "for (int i = 0; i < 4; i++) a = i;",
+        ] {
+            let ProceduralStatements::Block(block) = assert_parses(procedural_statement, source)
+            else {
+                panic!("a declaring for is a named block");
+            };
+            assert!(block.name.unwrap().name.starts_with("$ivl_for_loop"));
+            assert_eq!(block.locals.len(), 1);
+            assert_eq!(block.locals[0].name.name, "i");
+            assert!(block.locals[0].signed);
+            assert!(matches!(
+                block.statements.as_slice(),
+                [ProceduralStatements::For(_)]
+            ));
+        }
+    }
+
+    #[test]
+    fn test_assert_lowers_to_an_if_whose_default_else_is_error() {
+        let ProceduralStatements::If(statement) =
+            assert_parses(procedural_statement, "assert (a == 4);")
+        else {
+            panic!("an assert is an if");
+        };
+        assert!(statement.then_statements.is_empty());
+        assert!(matches!(
+            statement.else_statements.as_deref(),
+            Some([ProceduralStatements::SystemTask(call)]) if call.name == "error"
+        ));
+
+        let ProceduralStatements::If(statement) = assert_parses(
+            procedural_statement,
+            "assert (a) else $error(\"bad %0d\", a);",
+        ) else {
+            panic!("an assert is an if");
+        };
+        assert!(statement.then_statements.is_empty());
+
+        let ProceduralStatements::If(statement) = assert_parses(
+            procedural_statement,
+            "assert (a) $display(\"ok\"); else $display(\"no\");",
+        ) else {
+            panic!("an assert is an if");
+        };
+        assert_eq!(statement.then_statements.len(), 1);
+        assert!(procedural_statement("assert_ok = 1;")
+            .is_ok_and(|(_, s)| matches!(s, ProceduralStatements::Assignment(_))));
     }
 
     #[test]

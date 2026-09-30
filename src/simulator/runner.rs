@@ -192,6 +192,12 @@ pub enum SimulationError {
     /// running is a legitimate no-op — disabling one that does not exist is a
     /// design that thinks it cancelled something.
     UnknownScope(String),
+    /// Simulated time went past what the clock can count. The clock is a
+    /// signed sixty-four bit count of the finest precision, so a `1s` design
+    /// read beside a `1ps` cell library runs out after about 107 days of
+    /// simulated time — where iverilog's unsigned clock goes twice as far.
+    /// Wrapping would carry on at a negative time and look like a run.
+    TimeOverflow,
 }
 
 impl fmt::Display for SimulationError {
@@ -282,6 +288,11 @@ impl fmt::Display for SimulationError {
             SimulationError::UnknownScope(scope) => {
                 write!(f, "`disable {}` names no block or task in the design", scope)
             }
+            SimulationError::TimeOverflow => write!(
+                f,
+                "simulated time went past the {} clock ticks the clock can count",
+                i64::MAX
+            ),
             SimulationError::GateTerminals { gate, found } => write!(
                 f,
                 "gate `{}` cannot be instantiated with {} terminals",
@@ -740,6 +751,12 @@ pub struct Simulator {
     /// `search_paths` is: [`Simulator::setup`] builds a new `StateStore` and
     /// what the caller configured outlives any one elaboration.
     plusargs: Vec<String>,
+}
+
+/// The instant `delay` ticks after `now`, or [`SimulationError::TimeOverflow`]
+/// when the clock cannot count that far.
+fn later(now: i64, delay: i64) -> Result<i64, SimulationError> {
+    now.checked_add(delay).ok_or(SimulationError::TimeOverflow)
 }
 
 impl Simulator {
@@ -1442,6 +1459,24 @@ impl Simulator {
             .min(i64::MAX as u64) as i64
     }
 
+    /// The name of the module elaborated as the root of the design.
+    pub fn top(&self) -> &str {
+        &self.top
+    }
+
+    /// How many `$error`s, `$fatal`s and failed assertions the design has
+    /// reported.
+    pub fn assertion_failures(&self) -> u64 {
+        self.tasks.failures()
+    }
+
+    /// How long one tick of the simulation clock is, in femtoseconds — the
+    /// finest precision any module declared, or a second when none did. It is
+    /// what turns [`now`](Simulator::now) into physical time.
+    pub fn tick_femtoseconds(&self) -> u64 {
+        clock_precision(&self.modules).femtoseconds()
+    }
+
     /// Everything the design has printed with `$display` and `$write`.
     ///
     /// System task output is buffered rather than written to stdout, which is
@@ -1508,7 +1543,7 @@ impl Simulator {
             let _ = self.settle();
         }
 
-        let target = self.now + duration;
+        let target = later(self.now, duration)?;
         while let Some(time) = self.next_time() {
             if time > target {
                 break;
@@ -2218,7 +2253,7 @@ impl Simulator {
             Resume::Suspended { pc, delay, pending } => {
                 if !finished {
                     self.queue
-                        .insert(self.now + delay, ExecutionCursor { pc, ..cursor });
+                        .insert(later(self.now, delay)?, ExecutionCursor { pc, ..cursor });
                 }
                 Ok((pending, false, None))
             }
@@ -2390,7 +2425,7 @@ impl Simulator {
                                 drive.applied = Some(value);
                                 drive.pending = None;
                             } else {
-                                drive.pending = Some((self.now + ticks, value));
+                                drive.pending = Some((later(self.now, ticks)?, value));
                             }
                         }
                         match &drive.applied {
@@ -2457,7 +2492,7 @@ impl Simulator {
                                 drive.applied = Some(value);
                                 drive.pending = None;
                             } else {
-                                drive.pending = Some((self.now + ticks, value));
+                                drive.pending = Some((later(self.now, ticks)?, value));
                             }
                         }
                         match &drive.applied {
@@ -2520,7 +2555,7 @@ impl Simulator {
                                 drive.applied = Some(value);
                                 drive.pending = None;
                             } else {
-                                drive.pending = Some((self.now + ticks, value));
+                                drive.pending = Some((later(self.now, ticks)?, value));
                             }
                         }
                         match &drive.applied {
@@ -8955,6 +8990,58 @@ mod tests {
                 "ps[5000 ps]",
             ]
         );
+    }
+
+    /// A delay that would carry the clock past what an `i64` counts is a named
+    /// error rather than a jump to a negative time (fpga-tesla's `led_tb`,
+    /// which waits 10⁷ seconds beside a `1ps` cell library).
+    #[test]
+    fn test_time_past_the_end_of_the_clock_is_a_named_error() {
+        let source = r#"
+            module tb;
+                initial begin #10000000; #10000000 $display("wrapped"); end
+            endmodule
+            `timescale 1ps/1ps
+            module fine; endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "tb");
+        simulator.setup().expect("design should elaborate");
+        let mut outcome = Ok(());
+        while let (Ok(()), Some(next)) = (&outcome, simulator.next_time()) {
+            outcome = simulator.advance(next - simulator.now());
+        }
+        assert_eq!(outcome, Err(SimulationError::TimeOverflow));
+        assert!(simulator.output().lines().is_empty());
+    }
+
+    /// A module with no `` `timescale `` beside a `1ps` one counts seconds,
+    /// which is 10¹² clock ticks a unit — more than thirty-two bits. iverilog
+    /// 12.0 prints `n=3 at 5`; with the unit stamped as an unsized literal the
+    /// count was truncated and this printed `n=3 at 1402` (MagicSchoolBus's
+    /// testbenches beside yosys's `cells_sim.v`).
+    #[test]
+    fn test_time_in_a_second_scale_module_under_a_picosecond_clock() {
+        let source = r#"
+            module tb;
+                reg clk = 0;
+                integer n = 0;
+                always #1 clk = ~clk;
+                always @(posedge clk) begin
+                    n = n + 1;
+                    if (n == 3) $display("n=%0d at %0d", n, $time);
+                end
+            endmodule
+            `timescale 1ps/1ps
+            module fine; endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "tb");
+        simulator.setup().expect("design should elaborate");
+        simulator
+            .advance(6 * simulator.ticks_per_unit())
+            .expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["n=3 at 5"]);
     }
 
     /// The error a design stops elaborating with, for the constructs the

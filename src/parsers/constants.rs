@@ -93,6 +93,13 @@ impl VerilogConstant {
         }
     }
 
+    /// A sixty-four bit unsigned decimal. An unsized literal is thirty-two
+    /// bits, which is too narrow for a count of clock ticks: a second is
+    /// 10¹² ticks of a `1ps` clock.
+    pub fn from_u64(value: u64) -> Self {
+        VerilogConstant::new(Some(64), VerilogBaseType::Decimal, value.to_string())
+    }
+
     /// The same literal, written with a base designator — `'d1` rather than
     /// `1`. See [`VerilogConstant::based`].
     fn with_base(mut self) -> Self {

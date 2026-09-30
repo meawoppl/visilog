@@ -236,9 +236,33 @@ pub enum SystemTask {
     /// End the simulation. `$stop` is the same thing here — see
     /// [`resolve_task`].
     Finish,
+    /// `$info`, `$warning`, `$error` and `$fatal` — SystemVerilog's severity
+    /// tasks, and what a failed `assert` lowers to.
+    Report(ReportLevel),
     /// The current simulated time. Meaningful as an argument; as a statement of
     /// its own the value has nowhere to go.
     Time,
+}
+
+/// How serious a severity task says a report is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportLevel {
+    Info,
+    Warning,
+    Error,
+    /// Reported like an error, then ends the simulation.
+    Fatal,
+}
+
+impl ReportLevel {
+    fn label(self) -> &'static str {
+        match self {
+            ReportLevel::Info => "INFO",
+            ReportLevel::Warning => "WARNING",
+            ReportLevel::Error => "ERROR",
+            ReportLevel::Fatal => "FATAL",
+        }
+    }
 }
 
 /// One argument of a compiled task call.
@@ -458,6 +482,11 @@ fn resolve_task(name: &str) -> Result<SystemTask, SimulationError> {
         "dumpall" => return Ok(SystemTask::Dump(Control::All)),
         "dumpflush" => return Ok(SystemTask::DumpFlush),
         "dumplimit" => return Ok(SystemTask::DumpLimit),
+        // `$fatal` begins with an `f` that is not the descriptor prefix.
+        "info" => return Ok(SystemTask::Report(ReportLevel::Info)),
+        "warning" => return Ok(SystemTask::Report(ReportLevel::Warning)),
+        "error" => return Ok(SystemTask::Report(ReportLevel::Error)),
+        "fatal" => return Ok(SystemTask::Report(ReportLevel::Fatal)),
         _ => {}
     }
 
@@ -683,6 +712,11 @@ impl Monitor {
 pub struct TaskContext {
     output: Output,
     finished: bool,
+    /// How many `$error`s and `$fatal`s have run — which includes every failed
+    /// `assert`, since that lowers to one. A run record reports it so a caller
+    /// can tell a design that finished cleanly from one that finished having
+    /// said something was wrong, without reading the text.
+    failures: u64,
     /// The `$strobe` calls made in the current timestep, in the order they were
     /// made. Rendered by [`TaskContext::flush`] rather than when they ran,
     /// which is the whole difference between `$strobe` and `$display`.
@@ -750,6 +784,12 @@ impl TaskContext {
     /// Whether the design has called `$finish`.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// How many `$error`s and `$fatal`s — failed assertions among them — the
+    /// design has reported.
+    pub fn failures(&self) -> u64 {
+        self.failures
     }
 
     /// Records what the design is called and what a tick of its clock is —
@@ -821,6 +861,7 @@ impl TaskContext {
         // `Output` would leave the two pointing at different strings.
         self.output.clear();
         self.finished = false;
+        self.failures = 0;
         self.strobes.clear();
         self.monitor = None;
         self.time_format = TimeFormat::default();
@@ -1004,7 +1045,54 @@ impl TaskContext {
             // the simulator should report about itself on the way out.
             SystemTask::PrintTimescale => self.print_timescale(call, store)?,
             SystemTask::Finish => self.finished = true,
+            SystemTask::Report(level) => self.report(level, call, store)?,
             SystemTask::Time => {}
+        }
+        Ok(())
+    }
+
+    /// `$info` / `$warning` / `$error` / `$fatal`: the message the way
+    /// `$display` formats it, under a severity label, then the time and scope.
+    ///
+    /// iverilog 12.0 prints
+    ///
+    /// ```text
+    /// ERROR: sev.v:7: err 3
+    ///        Time: 5  Scope: t
+    /// ```
+    ///
+    /// with the second line indented under the message. visilog has no source
+    /// lines to name, so the `file:line:` is left out and the rest is kept.
+    /// `$fatal` may be given a finish number first, which says how much the
+    /// simulator reports about itself on the way out and changes nothing here.
+    fn report(
+        &mut self,
+        level: ReportLevel,
+        call: &TaskCall,
+        store: &StateStore,
+    ) -> Result<(), SimulationError> {
+        let arguments = match (level, call.arguments.first()) {
+            (ReportLevel::Fatal, Some(TaskArgument::Value(_))) => &call.arguments[1..],
+            _ => &call.arguments[..],
+        };
+        let message = self.render(arguments, store, Radix::Decimal, &call.scope)?;
+        let label = level.label();
+        let now = u128::from(store.time().max(0) as u64) * self.default_time_units()
+            / self.tick_fs(&call.scope);
+        self.output.push(&format!(
+            "{}: {}\n{:indent$}Time: {}  Scope: {}\n",
+            label,
+            message,
+            "",
+            now,
+            self.enclosing_instance(&call.scope),
+            indent = label.len() + 2,
+        ));
+        if matches!(level, ReportLevel::Error | ReportLevel::Fatal) {
+            self.failures += 1;
+        }
+        if level == ReportLevel::Fatal {
+            self.finished = true;
         }
         Ok(())
     }
