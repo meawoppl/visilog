@@ -226,10 +226,17 @@ fn normalised_output(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many `$error`/`$fatal` reports — failed assertions among them — a run
+/// printed. A severity task's report is its label line followed by an
+/// indented `Time: … Scope: …` line; a testbench that `$display`s its own
+/// text starting `ERROR:` has no such line and is not one.
 fn reported_failures(lines: &[String]) -> usize {
     lines
-        .iter()
-        .filter(|line| line.starts_with("ERROR: ") || line.starts_with("FATAL: "))
+        .windows(2)
+        .filter(|pair| {
+            (pair[0].starts_with("ERROR: ") || pair[0].starts_with("FATAL: "))
+                && pair[1].trim_start().starts_with("Time: ")
+        })
         .count()
 }
 
@@ -582,5 +589,10 @@ fn output_normalisation_drops_what_only_iverilog_can_print() {
         normalised_output("ERROR: expected 4 bytes, got 8"),
         vec!["ERROR: expected 4 bytes, got 8"],
         "a message with a colon in it is not a location"
+    );
+    assert_eq!(
+        reported_failures(&normalised_output("ERROR: expected 4 bytes, got 8\ndone")),
+        0,
+        "a $display that starts with ERROR is not an $error"
     );
 }
