@@ -769,6 +769,12 @@ pub struct Simulator {
     /// `search_paths` is: [`Simulator::setup`] builds a new `StateStore` and
     /// what the caller configured outlives any one elaboration.
     plusargs: Vec<String>,
+    /// The store entries written since [`Simulator::take_written`] last
+    /// emptied it, or `None` when nobody asked — see
+    /// [`Simulator::tap_writes`]. Filled from the same journal the delta
+    /// cycles take their edges from, so a design nobody inspects pays one
+    /// `Option` check per settle round.
+    written: Option<HashSet<String>>,
 }
 
 /// The instant `delay` ticks after `now`, or [`SimulationError::TimeOverflow`]
@@ -830,6 +836,7 @@ impl Simulator {
             output_directory: None,
             search_paths: Vec::new(),
             plusargs: Vec::new(),
+            written: None,
         }
     }
 
@@ -1163,6 +1170,10 @@ impl Simulator {
             if self.tasks.is_dumping() {
                 self.tasks
                     .note_changes(changes.iter().map(|(name, _)| name.as_str()));
+            }
+            // An inspecting client measures a timestep the way the dump does.
+            if let Some(written) = &mut self.written {
+                written.extend(changes.iter().map(|(name, _)| name.clone()));
             }
             let mut edges = events::edges_from_changes(changes, &self.state);
             // A memory keeps a journal of its own, since one displaced
@@ -1499,6 +1510,43 @@ impl Simulator {
             self.tasks.close_dump(&self.state, self.now);
         }
         Ok(())
+    }
+
+    /// Starts (`true`) or stops (`false`) recording which store entries the
+    /// design writes, for [`Simulator::take_written`].
+    ///
+    /// The names come from the change journal each delta cycle already takes,
+    /// so recording costs the signals *written* rather than the signals in the
+    /// design, and leaving it off costs one `Option` check per settle round.
+    /// A memory word is not recorded: only the signal map's names are.
+    pub fn tap_writes(&mut self, on: bool) {
+        match (on, self.written.is_some()) {
+            (true, false) => self.written = Some(HashSet::new()),
+            (false, true) => self.written = None,
+            _ => {}
+        }
+    }
+
+    /// The store entries written since the last call, including ones written
+    /// back to the value they already held — the caller compares. Empty when
+    /// [`Simulator::tap_writes`] is off.
+    pub fn take_written(&mut self) -> HashSet<String> {
+        match &mut self.written {
+            Some(written) => std::mem::take(written),
+            None => HashSet::new(),
+        }
+    }
+
+    /// The flat store every signal lives in, for reading a design's state
+    /// without going through a name at a time.
+    pub fn store(&self) -> &StateStore {
+        &self.state
+    }
+
+    /// Instance ports aliased onto their parent's signal: the port's flat name
+    /// → the store entry it shares. Empty before [`Simulator::setup`].
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
     }
 
     /// The current simulated time, in ticks of the simulation clock.

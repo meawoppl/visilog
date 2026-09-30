@@ -3134,7 +3134,7 @@ fn logic_bit(bit: u8) -> Register {
 
 /// A register used as a condition: any `1` bit is true, all-zero is false, and
 /// anything else (only unknown bits and zeros) is unknown.
-fn truth(register: &Register) -> Option<bool> {
+pub fn truth(register: &Register) -> Option<bool> {
     if register.has_one() {
         // Every real with a bit set is true except `-0.0`, whose sign bit is
         // the one place the bits answer differently from the number. Asking

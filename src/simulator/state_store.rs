@@ -2276,6 +2276,20 @@ impl StateStore {
         names.sort();
         names
     }
+
+    /// Every memory name, sorted.
+    pub fn memory_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.name_to_memory.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// Every named event, sorted.
+    pub fn event_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.events.iter().map(|k| k.as_str()).collect();
+        names.sort();
+        names
+    }
 }
 
 /// One call's place on the stack, which it gives back when it is dropped.

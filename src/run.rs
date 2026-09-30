@@ -144,6 +144,10 @@ pub enum StopReason {
     StepLimit,
     /// The caller asked the run to stop.
     Cancelled,
+    /// A breakpoint an interactive
+    /// [`Session`](crate::inspect::Session) was watching for was hit. A
+    /// [`run`] sets none, so its record never says this.
+    Breakpoint,
     /// A source could not be read.
     Io,
     /// The preprocessor or the grammar rejected a source.
@@ -224,6 +228,7 @@ impl RunRecord {
     /// | 4 | elaboration or the run itself raised an error |
     /// | 5 | a time or step limit was reached |
     /// | 6 | cancelled |
+    /// | 7 | stopped at a breakpoint (an interactive session only) |
     pub fn exit_status(&self) -> i32 {
         match self.stop {
             StopReason::Finished | StopReason::Quiescent => {
@@ -238,17 +243,14 @@ impl RunRecord {
             StopReason::Elaboration | StopReason::Runtime => 4,
             StopReason::TimeLimit | StopReason::StepLimit => 5,
             StopReason::Cancelled => 6,
+            StopReason::Breakpoint => 7,
         }
     }
 
     fn fail(&mut self, stop: StopReason, code: &str, message: String, location: Option<String>) {
         self.stop = stop;
-        self.diagnostics.push(Diagnostic {
-            severity: Severity::Error,
-            code: code.to_string(),
-            message,
-            location,
-        });
+        self.diagnostics
+            .push(error_diagnostic(code, message, location));
     }
 }
 
@@ -275,33 +277,15 @@ pub fn run(config: &RunConfig, cancel: Option<&AtomicBool>) -> RunRecord {
         capabilities: None,
     };
 
-    let mut texts = Vec::with_capacity(config.sources.len());
-    for path in &config.sources {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                record.sources.push(SourceRecord {
-                    path: path.clone(),
-                    bytes: text.len(),
-                    sha256: sha256_hex(text.as_bytes()),
-                });
-                texts.push(text);
-            }
-            Err(error) => {
-                record.fail(
-                    StopReason::Io,
-                    "io",
-                    format!("cannot read {}: {}", path.display(), error),
-                    None,
-                );
-                return record;
-            }
+    let mut simulator = match load(config) {
+        Ok(loaded) => {
+            record.sources = loaded.sources;
+            loaded.simulator
         }
-    }
-
-    let mut simulator = match build(config, &texts) {
-        Ok(simulator) => simulator,
-        Err((stop, code, message, location)) => {
-            record.fail(stop, code, message, location);
+        Err(error) => {
+            record.sources = error.sources;
+            record.stop = error.stop;
+            record.diagnostics.push(error.diagnostic);
             return record;
         }
     };
@@ -419,6 +403,83 @@ fn disclose_timing(record: &mut RunRecord, omissions: &[TimingOmission], strict:
     });
 }
 
+/// A design [`load`] read and parsed, ready for [`Simulator::setup`].
+pub struct Loaded {
+    pub simulator: Simulator,
+    /// Every source as it was read.
+    pub sources: Vec<SourceRecord>,
+}
+
+/// Why [`load`] could not produce a [`Simulator`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadError {
+    /// [`StopReason::Io`] or [`StopReason::Compile`] from [`load`];
+    /// [`Session::new`](crate::inspect::Session::new), which also sets the
+    /// design up, may add [`StopReason::Elaboration`] and
+    /// [`StopReason::Unsupported`].
+    pub stop: StopReason,
+    pub diagnostic: Diagnostic,
+    /// The sources read before the failure, including the one that failed
+    /// to compile.
+    pub sources: Vec<SourceRecord>,
+}
+
+/// Reads, preprocesses and parses the design `config` describes, picks its
+/// top and configures a [`Simulator`] for it — everything short of
+/// [`Simulator::setup`], which is the caller's so that it can tell an
+/// elaboration failure from a compile one.
+///
+/// This is the one way a [`RunConfig`] becomes a design: [`run`] goes through
+/// it, and so does an interactive [`Session`](crate::inspect::Session).
+pub fn load(config: &RunConfig) -> Result<Loaded, LoadError> {
+    let mut sources = Vec::with_capacity(config.sources.len());
+    let mut texts = Vec::with_capacity(config.sources.len());
+    for path in &config.sources {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                sources.push(SourceRecord {
+                    path: path.clone(),
+                    bytes: text.len(),
+                    sha256: sha256_hex(text.as_bytes()),
+                });
+                texts.push(text);
+            }
+            Err(error) => {
+                return Err(LoadError {
+                    stop: StopReason::Io,
+                    diagnostic: error_diagnostic(
+                        "io",
+                        format!("cannot read {}: {}", path.display(), error),
+                        None,
+                    ),
+                    sources,
+                })
+            }
+        }
+    }
+    match build(config, &texts) {
+        Ok(simulator) => Ok(Loaded { simulator, sources }),
+        Err((stop, code, message, location)) => Err(LoadError {
+            stop,
+            diagnostic: error_diagnostic(code, message, location),
+            sources,
+        }),
+    }
+}
+
+pub(crate) fn error_diagnostic(
+    code: &str,
+    message: String,
+    location: Option<String>,
+) -> Diagnostic {
+    Diagnostic {
+        severity: Severity::Error,
+        code: code.to_string(),
+        message,
+        location,
+    }
+}
+
 type BuildError = (StopReason, &'static str, String, Option<String>);
 
 /// Preprocesses and parses the sources and picks the top.
@@ -532,7 +593,7 @@ fn drive(
 
 /// Which stop an error is: something the simulator names as unsupported is
 /// told apart from a design it refused.
-fn error_stop(error: &SimulationError, otherwise: StopReason) -> StopReason {
+pub(crate) fn error_stop(error: &SimulationError, otherwise: StopReason) -> StopReason {
     if is_unsupported(error) {
         StopReason::Unsupported
     } else {
@@ -549,7 +610,7 @@ fn is_unsupported(error: &SimulationError) -> bool {
     )
 }
 
-fn stop_code(stop: StopReason) -> &'static str {
+pub(crate) fn stop_code(stop: StopReason) -> &'static str {
     match stop {
         StopReason::Unsupported => "unsupported",
         StopReason::Elaboration => "elaboration",
@@ -560,7 +621,8 @@ fn stop_code(stop: StopReason) -> &'static str {
         | StopReason::Quiescent
         | StopReason::TimeLimit
         | StopReason::StepLimit
-        | StopReason::Cancelled => "stop",
+        | StopReason::Cancelled
+        | StopReason::Breakpoint => "stop",
     }
 }
 

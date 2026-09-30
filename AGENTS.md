@@ -37,6 +37,8 @@ src/
   main.rs              stub binary, currently empty
   git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
   register.rs          4-state (0/1/x/z) value type, packed into two bit planes
+  inspect.rs           Session — signal enumeration, change batches, stepping and
+                       breakpoints for interactive clients; see "Inspecting a run"
   parsers/             the Verilog front end — see below
   simulator/           elaboration and the event-driven run loop — see below
   verilog/examples/    sample .v files, walked by two corpus tests
@@ -2422,13 +2424,66 @@ and that one flag) rather than as a bare `Register`.
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Instruction::AutomaticEnable` / `Program::activation`, which start a `task automatic` as a thread over a renamed copy of its body instead, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `AutomaticTask` / `start_activation()` / `return_from_activation()`, the activations of a `task automatic`, and `resume_thread()`, the turn of the trampoline `resume_block()` runs them on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `AutomaticTask` / `start_activation()` / `return_from_activation()`, the activations of a `task automatic`, and `resume_thread()`, the turn of the trampoline `resume_block()` runs them on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression, and `tap_writes()` / `take_written()` / `store()` / `aliases()`, what `inspect::Session` reads the design through |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, the `scope_storage` / `install_scope` pair that gives each activation of a `task automatic` storage of its own, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
 | `vcd.rs` | `VcdDump` — the value change dump: `add` resolves `$dumpvars` targets into variables, `note_changes` marks the ones the change journal says were written, `flush` writes the header, the opening block and each timestep's section, and `trimmed` / `identifier` are the iverilog-measured vector trimming and identifier alphabet |
+
+### Inspecting a run: `src/inspect.rs`
+
+`inspect::Session` is what an interactive client — a waveform viewer, a debugger, a
+structural browser — drives. It wraps a set-up `Simulator`, built either from a
+`RunConfig` (`Session::new`, through `run::load`, the same front end `run::run` uses) or
+from a `Simulator` a caller already has (`Session::from_simulator`). Nothing in it knows
+about a browser or a wire format; the types derive `serde` so a client can pick one.
+
+**An ID is the full hierarchical name, top module included** — `tb.dut.count`. That is
+exactly what a VCD `$scope` path gives a variable and the key `waveform::Waveform::traces`
+reads it back under, so an ID names the same trace in a dump the design wrote; a test
+checks every listed net, variable and real against the traces of a real dump. The flat
+`StateStore` key is the ID without its leading top segment. `Session::signals` lists every
+signal, memory and named event sorted by ID, with its scope, kind
+(`Net`/`Variable`/`Real`/`Memory`/`Event`), width, declared range, signedness and a
+memory's address ranges. A port aliased onto its parent's signal is listed under **its own**
+ID with `SignalInfo::storage` naming the ID it shares (`tb.dut.q` → `tb.count`). A key with
+a segment starting `$` (`$repeat$`, `$hold$`, an activation's `.$3.`) is left out, which is
+the rule `vcd.rs` follows. The list is fixed at elaboration.
+
+**Change batches ride on the journal the delta cycles already take.** `subscribe` turns on
+`Simulator::tap_writes`, which makes `delta_rounds` add each round's written names to a
+set — the same point the VCD's `note_changes` is fed from — and after each timestamp the
+session compares only the *written* subscribed entries against what it last reported.
+With nothing subscribed the tap is `None` and the settle loop pays one `Option` check per
+round (`bench tick/*` did not move). `take_changes` returns a `ChangeBatch` capped by
+`set_change_capacity` (default 65,536); past the cap changes are counted in `dropped`
+rather than buffered, and `Session::value` is how a client catches up.
+
+**The timing contract: everything happens at a settled timestamp boundary.** A session
+advances one timestamp per step (`next_time`, then `advance` to exactly it), and a
+timestamp ends only when every delta cycle has run, the non-blocking updates have landed
+and the continuous assignments have settled — the moment `$strobe`, `$monitor` and the
+dump report at. That is the only moment a change is recorded, a breakpoint is evaluated,
+or a run stops. So `a = 1; a = 0;` inside one timestamp is no change, and a condition true
+only mid-timestamp never fires. A breakpoint (`Condition::Changes`, `Equals`, or an
+`Expression` parsed with `verilog_expression`, its names — IDs or flat keys — resolved to
+store keys and evaluated with `eval`) fires on the boundary where it **becomes** true
+relative to the previous boundary, so resuming from a hit does not stop again at once.
+`run(limits, cancel)` checks, before each timestamp: `$finish` (`Finished`), the
+cancellation flag (`Cancelled`), nothing scheduled (`Quiescent`), `Limits::until`
+(`TimeLimit`) and `Limits::steps` (`StepLimit`); after it, the breakpoints (`Breakpoint`,
+added to `run::StopReason` for this). An error stops with `Runtime`/`Unsupported` and every
+later run reports it again. Time zero is the first step. Because a stop is only ever at a
+boundary, pausing and resuming is exact: a test runs one design whole and again with
+every kind of pause interleaved, and compares the output, every value, the change batches
+and the VCD body.
+
+Still not covered: a memory or an event cannot be subscribed (a memory is read a word at a
+time with `Session::word`), a named event's trigger is not reported, a client cannot drive
+an input through the session (`Simulator::poke` is not wrapped), and the signal list does
+not include an automatic task's activations.
 
 ## Measuring progress: the ivtest corpus
 
