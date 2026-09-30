@@ -224,13 +224,16 @@ impl VcdDump {
         self.armed && !self.stopped
     }
 
-    /// Adds a variable, unless its store entry is already in the dump — a
-    /// signal named twice is dumped once, the way iverilog skips a duplicate.
+    /// Adds a variable, unless it is already in the dump under the same
+    /// hierarchical name — a signal named twice is dumped once, the way
+    /// iverilog skips a duplicate. The *scopes* are part of that name: a port
+    /// aliased onto a parent signal of the same leaf name (`tb.clk` and
+    /// `tb.dut.clk`) is a second variable, which iverilog declares too.
     fn declare(&mut self, source: Source, scopes: Vec<String>, name: String, store: &StateStore) {
         if self
             .vars
             .iter()
-            .any(|var| var.source.key() == source.key() && var.name == name)
+            .any(|var| var.source.key() == source.key() && var.name == name && var.scopes == scopes)
         {
             return;
         }
@@ -990,6 +993,36 @@ bx01 \"
 bx010 #
 #15000
 "
+        );
+    }
+
+    /// A port aliased onto a parent signal of the *same* leaf name is still a
+    /// variable of its own scope. iverilog 12.0 declares `tb.dut.clk` beside
+    /// `tb.clk` under one identifier; a duplicate check that compared only the
+    /// leaf name left the port out of the child's scope altogether.
+    #[test]
+    fn test_a_port_named_like_its_parent_signal_is_declared_in_its_scope() {
+        let (_, dump) = dump_of(
+            "samename",
+            r#"
+module samename;
+  reg clk = 0;
+  child dut (clk);
+  initial begin
+    $dumpfile("samename.vcd");
+    $dumpvars(0, samename);
+    #1 $finish;
+  end
+endmodule
+module child (input clk);
+endmodule
+"#,
+            10,
+        );
+        assert!(
+            dump.contains("$scope module dut $end\n$var reg 1 ! clk $end\n$upscope $end"),
+            "{}",
+            dump
         );
     }
 
