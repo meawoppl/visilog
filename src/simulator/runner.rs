@@ -44,7 +44,7 @@ use crate::parsers::{
 };
 use crate::register::Register;
 use crate::simulator::elaborate::{
-    clock_precision, delay_scale, elaborate, BlockKind, PulledNet, TimedBlock,
+    clock_precision, delay_scale, elaborate, BlockKind, PulledNet, TimedBlock, TimingOmission,
 };
 use crate::simulator::eval::{eval, eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
@@ -743,6 +743,9 @@ pub struct Simulator {
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
     aliases: HashMap<String, String>,
+    /// The timing constructs the design wrote that the run will not carry
+    /// out, from the last elaboration — see [`TimingOmission`].
+    timing_omissions: Vec<TimingOmission>,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -818,6 +821,7 @@ impl Simulator {
             automatic: Vec::new(),
             automatic_index: HashMap::new(),
             aliases: HashMap::new(),
+            timing_omissions: Vec::new(),
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -954,6 +958,7 @@ impl Simulator {
         self.expression_events = self.event_values.iter().any(|values| !values.is_empty());
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
+        self.timing_omissions = elaborated.timing_omissions;
         // An aliased port is a *name* the design has and the flat store does
         // not, so a waveform that left them out would show an instance with no
         // ports on it. The dump is the only thing that wants the table by
@@ -1565,6 +1570,13 @@ impl Simulator {
     /// The name of the module elaborated as the root of the design.
     pub fn top(&self) -> &str {
         &self.top
+    }
+
+    /// Every timing construct the design wrote that this simulation records
+    /// and does not carry out — `specify` path delays, timing checks, switch
+    /// delays — one per instance. Empty before [`setup`](Simulator::setup).
+    pub fn timing_omissions(&self) -> &[TimingOmission] {
+        &self.timing_omissions
     }
 
     /// How many `$error`s, `$fatal`s and failed assertions the design has
@@ -9105,6 +9117,28 @@ mod tests {
                 "ps[5000 ps]",
             ]
         );
+    }
+
+    /// An input's default value is what an unconnected port reads, and nothing
+    /// when the port is connected. iverilog 12.0 prints `0 0 1`.
+    #[test]
+    fn test_an_input_default_applies_only_when_unconnected() {
+        let source = r#"
+            module sub(input a = 1'b1, input b = 1'b1, output y); assign y = a & b; endmodule
+            module t;
+                wire y1, y2, y3;
+                reg z = 0;
+                sub s1(.a(z), .b(z), .y(y1));
+                sub s2(.a(z), .y(y2));
+                sub s3(.y(y3));
+                initial #1 $display("%b %b %b", y1, y2, y3);
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "t");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["0 0 1"]);
     }
 
     /// Blocks one edge wakes run most recently armed first, and blocks woken by

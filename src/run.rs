@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::parsers::preprocessor::{Preprocessor, Timescale};
 use crate::parsers::source::{parse_expanded, reachable_modules, root_module, SourceError};
+use crate::simulator::elaborate::{OmissionKind, TimingOmission};
 use crate::simulator::eval::EvalError;
 use crate::simulator::runner::{SimulationError, Simulator};
 
@@ -57,7 +58,52 @@ pub struct RunConfig {
     /// than a span of simulated time — is what bounds a design that never
     /// finishes.
     pub step_limit: Option<u64>,
+    /// Refuse to run a design that asks for timing this simulator does not
+    /// carry out — see [`Capabilities`]. Off, the run goes ahead functionally
+    /// and says what it left out.
+    #[serde(default)]
+    pub strict_timing: bool,
 }
+
+/// What a run simulated and what it did not.
+///
+/// Simulation here is **functional**. The timing a design expresses through
+/// procedural delays, delayed continuous assignments and gate delays is
+/// simulated; the timing a `specify` block expresses is parsed and recorded
+/// and nothing more. A design built on vendor cell models that finishes
+/// cleanly has therefore not been timing-verified, and this is where the
+/// record says so rather than leaving a reader to infer it from silence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// `functional`, or `strict` when [`RunConfig::strict_timing`] was set.
+    pub mode: String,
+    /// The timing semantics this simulator carries out, whatever the design.
+    pub simulated: Vec<String>,
+    /// The timing constructs this design wrote that were not carried out.
+    pub not_simulated: Vec<Omitted>,
+}
+
+/// One kind of timing construct a design wrote that was not carried out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Omitted {
+    /// `specify_path_delay`, `timing_check` or `switch_delay`.
+    pub kind: String,
+    /// How many there were across every instance.
+    pub count: usize,
+    /// The modules they were written in.
+    pub modules: Vec<String>,
+}
+
+/// The timing semantics simulated for every design, for [`Capabilities`].
+const SIMULATED_TIMING: &[&str] = &[
+    "procedural delays (#n, intra-assignment, @, wait)",
+    "continuous assignment delays (inertial, rise/fall/turn-off)",
+    "gate and user-defined primitive delays (inertial, rise/fall/turn-off)",
+    "non-blocking assignment ordering and delta cycles",
+];
+
+/// How many example sites a timing diagnostic names before it summarises.
+const OMISSION_EXAMPLES: usize = 5;
 
 /// The name and version of the tool that produced a record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +208,8 @@ pub struct RunRecord {
     /// Everything the design printed, in order.
     pub output: String,
     pub diagnostics: Vec<Diagnostic>,
+    /// What was simulated and what was not, once the design elaborated.
+    pub capabilities: Option<Capabilities>,
 }
 
 impl RunRecord {
@@ -224,6 +272,7 @@ pub fn run(config: &RunConfig, cancel: Option<&AtomicBool>) -> RunRecord {
         assertion_failures: 0,
         output: String::new(),
         diagnostics: Vec::new(),
+        capabilities: None,
     };
 
     let mut texts = Vec::with_capacity(config.sources.len());
@@ -266,6 +315,16 @@ pub fn run(config: &RunConfig, cancel: Option<&AtomicBool>) -> RunRecord {
     record.tick_femtoseconds = simulator.tick_femtoseconds();
     record.ticks_per_unit = simulator.ticks_per_unit();
 
+    disclose_timing(
+        &mut record,
+        simulator.timing_omissions(),
+        config.strict_timing,
+    );
+    if config.strict_timing && !simulator.timing_omissions().is_empty() {
+        record.stop = StopReason::Unsupported;
+        return record;
+    }
+
     let outcome = drive(&mut simulator, config, cancel, &mut record.steps);
     record.end_ticks = simulator.now();
     record.output = simulator.output().text();
@@ -298,6 +357,66 @@ pub fn run(config: &RunConfig, cancel: Option<&AtomicBool>) -> RunRecord {
         }
     }
     record
+}
+
+/// Fills in [`RunRecord::capabilities`] and adds one diagnostic per kind of
+/// timing the design wrote and the run leaves out: a warning when the run goes
+/// ahead functionally, an error under `strict`. Each names how many there
+/// were and the first few sites, so a netlist of ten thousand cells yields
+/// three diagnostics rather than ten thousand.
+fn disclose_timing(record: &mut RunRecord, omissions: &[TimingOmission], strict: bool) {
+    let mut kinds: Vec<OmissionKind> = omissions.iter().map(|omission| omission.kind).collect();
+    kinds.sort();
+    kinds.dedup();
+    let mut not_simulated = Vec::new();
+    for kind in kinds {
+        let sites: Vec<&TimingOmission> = omissions.iter().filter(|o| o.kind == kind).collect();
+        let mut modules: Vec<String> = sites.iter().map(|site| site.module.clone()).collect();
+        modules.sort();
+        modules.dedup();
+        let examples = sites
+            .iter()
+            .take(OMISSION_EXAMPLES)
+            .map(|site| format!("{} {}", site.instance, site.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let more = sites.len().saturating_sub(OMISSION_EXAMPLES);
+        let what = match kind {
+            OmissionKind::PathDelay => "specify path delays are recorded but not simulated",
+            OmissionKind::TimingCheck => "specify timing checks are recorded but never checked",
+            OmissionKind::SwitchDelay => "bidirectional switch delays are not simulated",
+        };
+        record.diagnostics.push(Diagnostic {
+            severity: if strict {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            code: kind.code().to_string(),
+            message: format!(
+                "{} ({}): {}{}",
+                what,
+                sites.len(),
+                examples,
+                if more > 0 {
+                    format!("; and {} more", more)
+                } else {
+                    String::new()
+                }
+            ),
+            location: None,
+        });
+        not_simulated.push(Omitted {
+            kind: kind.code().to_string(),
+            count: sites.len(),
+            modules,
+        });
+    }
+    record.capabilities = Some(Capabilities {
+        mode: if strict { "strict" } else { "functional" }.to_string(),
+        simulated: SIMULATED_TIMING.iter().map(|s| s.to_string()).collect(),
+        not_simulated,
+    });
 }
 
 type BuildError = (StopReason, &'static str, String, Option<String>);
@@ -449,4 +568,213 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{:02x}", byte))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `files` into a fresh scratch directory and returns a config
+    /// naming them in order, with the directory as the output directory.
+    fn config(test: &str, files: &[(&str, &str)]) -> RunConfig {
+        let dir = std::env::temp_dir().join(format!("visilog-run-{}-{}", test, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        RunConfig {
+            sources: files
+                .iter()
+                .map(|(name, text)| {
+                    let path = dir.join(name);
+                    std::fs::write(&path, text).unwrap();
+                    path
+                })
+                .collect(),
+            output_dir: Some(dir),
+            ..RunConfig::default()
+        }
+    }
+
+    const SPECIFIED: &str = "
+        module buffer_cell(input a, output z);
+            assign z = a;
+            specify
+                (a => z) = (1, 2);
+                $setup(a, posedge z, 1);
+            endspecify
+        endmodule
+        module tb;
+            reg a = 0;
+            wire z;
+            buffer_cell c1(a, z);
+            buffer_cell c2(a, );
+            initial begin #1 a = 1; #1 $display(\"z=%b\", z); $finish; end
+        endmodule
+    ";
+
+    #[test]
+    fn test_a_clean_run_finishes_with_status_zero_and_hashes_its_sources() {
+        let config = config(
+            "clean",
+            &[
+                ("defs.v", "`define MSG \"hello\"\n`timescale 1ns/1ps\n"),
+                ("tb.v", "module tb; initial #5 $display(`MSG); endmodule\n"),
+            ],
+        );
+        let record = run(&config, None);
+        assert_eq!(record.stop, StopReason::Quiescent);
+        assert_eq!(record.exit_status(), 0);
+        assert_eq!(record.output, "hello\n");
+        assert_eq!(record.top.as_deref(), Some("tb"));
+        assert_eq!(record.end_ticks, 5000, "5ns counted in 1ps ticks");
+        assert_eq!(record.tick_femtoseconds, 1000);
+        assert_eq!(record.sources.len(), 2);
+        assert_eq!(record.sources[0].sha256.len(), 64);
+        let capabilities = record.capabilities.expect("the design elaborated");
+        assert_eq!(capabilities.mode, "functional");
+        assert!(capabilities.not_simulated.is_empty());
+    }
+
+    #[test]
+    fn test_each_way_a_run_ends_has_its_own_stop_and_status() {
+        let failing = run(
+            &config(
+                "fail",
+                &[(
+                    "t.v",
+                    "module t; initial begin assert (0); $finish; end endmodule",
+                )],
+            ),
+            None,
+        );
+        assert_eq!(
+            (failing.stop, failing.exit_status()),
+            (StopReason::Finished, 1)
+        );
+        assert_eq!(failing.assertion_failures, 1);
+
+        let broken = run(
+            &config("parse", &[("t.v", "module t; initial begin endmodule")]),
+            None,
+        );
+        assert_eq!(
+            (broken.stop, broken.exit_status()),
+            (StopReason::Compile, 2)
+        );
+        assert!(broken.diagnostics[0].location.is_some());
+
+        let mut forever = config(
+            "limit",
+            &[("t.v", "module t; reg c = 0; always #1 c = ~c; endmodule")],
+        );
+        forever.time_limit = Some(10);
+        let limited = run(&forever, None);
+        assert_eq!(
+            (limited.stop, limited.exit_status()),
+            (StopReason::TimeLimit, 5)
+        );
+        assert_eq!(limited.end_ticks, 10);
+
+        forever.time_limit = None;
+        forever.step_limit = Some(3);
+        let stepped = run(&forever, None);
+        assert_eq!((stepped.stop, stepped.steps), (StopReason::StepLimit, 3));
+
+        forever.step_limit = None;
+        let cancel = AtomicBool::new(true);
+        let cancelled = run(&forever, Some(&cancel));
+        assert_eq!(
+            (cancelled.stop, cancelled.exit_status()),
+            (StopReason::Cancelled, 6)
+        );
+
+        let missing = RunConfig {
+            sources: vec![PathBuf::from("/nonexistent/visilog.v")],
+            ..RunConfig::default()
+        };
+        assert_eq!(run(&missing, None).exit_status(), 2);
+    }
+
+    #[test]
+    fn test_specify_timing_is_disclosed_and_the_run_still_goes_ahead() {
+        let record = run(&config("specify", &[("t.v", SPECIFIED)]), None);
+        assert_eq!(record.stop, StopReason::Finished);
+        assert_eq!(record.output, "z=1\n", "functionally the path is a wire");
+        let capabilities = record.capabilities.unwrap();
+        let kinds: Vec<(&str, usize)> = capabilities
+            .not_simulated
+            .iter()
+            .map(|omitted| (omitted.kind.as_str(), omitted.count))
+            .collect();
+        assert_eq!(kinds, vec![("specify_path_delay", 2), ("timing_check", 2)]);
+        assert_eq!(capabilities.not_simulated[0].modules, vec!["buffer_cell"]);
+        let warnings: Vec<&Diagnostic> = record
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings[0].message.contains("tb.c1 (a => z)"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(warnings[1].message.contains("$setup"));
+    }
+
+    #[test]
+    fn test_strict_timing_refuses_what_would_not_be_simulated() {
+        let mut strict = config("strict", &[("t.v", SPECIFIED)]);
+        strict.strict_timing = true;
+        let record = run(&strict, None);
+        assert_eq!(
+            (record.stop, record.exit_status()),
+            (StopReason::Unsupported, 3)
+        );
+        assert!(record.output.is_empty(), "nothing ran");
+        assert!(record
+            .diagnostics
+            .iter()
+            .all(|d| d.severity == Severity::Error));
+        assert_eq!(record.capabilities.unwrap().mode, "strict");
+
+        // Procedural, continuous and gate delays are simulated, so strict mode
+        // has nothing to refuse in a design that uses only those.
+        let mut delays = config(
+            "strict-ok",
+            &[(
+                "t.v",
+                "module t; reg a = 0; wire b, c; assign #2 b = a; buf #(1, 2) g(c, a);
+                 initial begin #1 a = 1; #5 $display(\"%b%b\", b, c); end endmodule",
+            )],
+        );
+        delays.strict_timing = true;
+        let record = run(&delays, None);
+        assert_eq!(record.stop, StopReason::Quiescent);
+        assert_eq!(record.output, "11\n");
+    }
+
+    #[test]
+    fn test_a_switch_delay_is_disclosed() {
+        let record = run(
+            &config(
+                "switch",
+                &[(
+                    "t.v",
+                    "module t; wire a, b; reg g = 1; tranif1 #(5) s(a, b, g); endmodule",
+                )],
+            ),
+            None,
+        );
+        let capabilities = record.capabilities.unwrap();
+        assert_eq!(capabilities.not_simulated[0].kind, "switch_delay");
+        assert!(record.diagnostics[0].message.contains("tranif1 #(…)"));
+    }
+
+    #[test]
+    fn test_a_record_round_trips_through_json() {
+        let record = run(&config("json", &[("t.v", SPECIFIED)]), None);
+        let json = serde_json::to_string(&record).unwrap();
+        let back: RunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, record);
+        assert!(json.contains("\"stop\":\"finished\""));
+    }
 }

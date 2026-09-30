@@ -32,6 +32,9 @@ options:
   --step-limit <n>          stop after this many timesteps
   --record <file>           where to write the JSON run record
                             (default: <out>/visilog-run.json when --out is given)
+  --strict-timing           refuse a design whose `specify` timing or switch
+                            delays would not be simulated (exit 3), rather
+                            than running it functionally with a warning
   -q, --quiet               do not print the design's output
 ";
 
@@ -92,6 +95,7 @@ fn parse_run(args: &[String]) -> Result<Invocation, String> {
             "--step-limit" => config.step_limit = Some(number(arg, &value(arg)?)?),
             "--record" => record = Some(value(arg)?.into()),
             "-q" | "--quiet" => quiet = true,
+            "--strict-timing" => config.strict_timing = true,
             // iverilog's spellings with the value attached.
             _ if arg.starts_with("-I") && arg.len() > 2 => {
                 config.include_dirs.push(arg[2..].into())
