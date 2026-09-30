@@ -46,8 +46,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::parsers::{
     assignment::ContinuousAssignment,
     behavior::{
-        Event, EventControl, FunctionDeclaration, FunctionVariable, ProceduralStatements,
-        TaskDeclaration,
+        BlockStatement, Event, EventControl, FunctionDeclaration, FunctionVariable,
+        ProceduralStatements, TaskDeclaration,
     },
     constants::VerilogConstant,
     delay::{Delay, DelayScale, GateDelay},
@@ -1649,57 +1649,17 @@ impl<'m> Elaborator<'m> {
         scope: &Scope,
         block: &str,
     ) -> Result<(), SimulationError> {
-        for statement in statements {
-            match statement {
-                ProceduralStatements::Block(inner) | ProceduralStatements::Fork(inner) => {
-                    let nested = match &inner.name {
-                        Some(name) => block_scope(block, &name.name),
-                        None => block.to_string(),
-                    };
-                    // The constants go in first: a local's width may be made of
-                    // one, exactly as a module's parameters precede its own
-                    // declarations.
-                    self.declare_scope(
-                        &inner.parameters,
-                        inner.locals.iter(),
-                        &inner.events,
-                        scope,
-                        &nested,
-                    )?;
-                    self.declare_block_locals(&inner.statements, scope, &nested)?;
-                }
-                ProceduralStatements::If(conditional) => {
-                    self.declare_block_locals(&conditional.then_statements, scope, block)?;
-                    if let Some(otherwise) = &conditional.else_statements {
-                        self.declare_block_locals(otherwise, scope, block)?;
-                    }
-                }
-                ProceduralStatements::Case(case) => {
-                    for item in &case.items {
-                        self.declare_block_locals(&item.statements, scope, block)?;
-                    }
-                }
-                ProceduralStatements::For(loop_) => {
-                    self.declare_block_locals(&loop_.statements, scope, block)?
-                }
-                ProceduralStatements::While(loop_) => {
-                    self.declare_block_locals(&loop_.statements, scope, block)?
-                }
-                ProceduralStatements::Repeat(loop_) => {
-                    self.declare_block_locals(&loop_.statements, scope, block)?
-                }
-                ProceduralStatements::Wait(statement) => {
-                    self.declare_block_locals(&statement.statements, scope, block)?
-                }
-                ProceduralStatements::Forever(statements)
-                | ProceduralStatements::Delayed { statements, .. }
-                | ProceduralStatements::EventControlled { statements, .. } => {
-                    self.declare_block_locals(statements, scope, block)?
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        for_each_block(statements, block, &mut |inner, nested| {
+            // The constants go in first: a local's width may be made of one,
+            // exactly as a module's parameters precede its own declarations.
+            self.declare_scope(
+                &inner.parameters,
+                inner.locals.iter(),
+                &inner.events,
+                scope,
+                nested,
+            )
+        })
     }
 
     /// Compiles every function this module declares and puts it in the store
@@ -1757,8 +1717,8 @@ impl<'m> Elaborator<'m> {
 
         // The function's own name is the variable its body assigns to return a
         // value, so it is a frame variable like the arguments and the locals.
-        let mut frame_names: HashMap<&str, String> = HashMap::new();
-        frame_names.insert(function.name.name.as_str(), qualified.clone());
+        let mut frame_names: HashMap<String, String> = HashMap::new();
+        frame_names.insert(function.name.name.clone(), qualified.clone());
 
         // A width inside the function may be made of one of its own constants,
         // which `declare_functions` has already put in the store.
@@ -1796,7 +1756,7 @@ impl<'m> Elaborator<'m> {
             .iter()
             .map(variable)
             .collect::<Result<_, SimulationError>>()?;
-        let locals: Vec<FrameVariable> = function
+        let mut locals: Vec<FrameVariable> = function
             .locals
             .iter()
             .map(variable)
@@ -1807,7 +1767,24 @@ impl<'m> Elaborator<'m> {
             .chain(&function.locals)
             .zip(arguments.iter().chain(&locals))
         {
-            frame_names.insert(declared.name.name.as_str(), frame.name.clone());
+            frame_names.insert(declared.name.name.clone(), frame.name.clone());
+        }
+        // A named block in the body declares variables of its own, and the
+        // body is compiled with them renamed to `blk.i`. They live in the frame
+        // like any other local — `for (integer i = …)` is one of these too,
+        // since it lowers to a block around the loop (widlar's `check_words`).
+        let mut block_locals: Vec<(String, &FunctionVariable)> = Vec::new();
+        for_each_block(&function.statements, "", &mut |block, prefix| {
+            for local in &block.locals {
+                block_locals.push((format!("{}{}", prefix, local.name.name), local));
+            }
+            Ok(())
+        })?;
+        for (spelled, declared) in block_locals {
+            let mut frame = variable(declared)?;
+            frame.name = format!("{}.{}", qualified, spelled);
+            frame_names.insert(spelled, frame.name.clone());
+            locals.push(frame);
         }
 
         // What the *frame* holds is settled here, before the constants and the
@@ -1821,7 +1798,7 @@ impl<'m> Elaborator<'m> {
             .map(|parameter| parameter.name.name.as_str())
             .chain(function.events.iter().map(|event| event.name.as_str()))
         {
-            frame_names.insert(local, format!("{}.{}", qualified, local));
+            frame_names.insert(local.to_string(), format!("{}.{}", qualified, local));
         }
 
         let mut program = Program::compile(&function.statements, tasks)?;
@@ -4693,6 +4670,57 @@ pub fn rename_expression(expression: &mut Expression, resolve: &dyn Fn(&str) -> 
             }
         }
     }
+}
+
+/// Calls `visit` with every `begin` or `fork` block in `statements`, however
+/// deeply nested, and the scope prefix its locals take — `blk.` for
+/// `begin : blk`, `outer.inner.` for one inside another, and the enclosing
+/// prefix unchanged for an unnamed block.
+///
+/// This is the one walk that says which named blocks a statement tree holds,
+/// so a block's locals are declared under the same names whether the tree is
+/// an `initial` body, a task's or a function's.
+fn for_each_block<'a>(
+    statements: &'a [ProceduralStatements],
+    block: &str,
+    visit: &mut dyn FnMut(&'a BlockStatement, &str) -> Result<(), SimulationError>,
+) -> Result<(), SimulationError> {
+    for statement in statements {
+        match statement {
+            ProceduralStatements::Block(inner) | ProceduralStatements::Fork(inner) => {
+                let nested = match &inner.name {
+                    Some(name) => block_scope(block, &name.name),
+                    None => block.to_string(),
+                };
+                visit(inner, &nested)?;
+                for_each_block(&inner.statements, &nested, visit)?;
+            }
+            ProceduralStatements::If(conditional) => {
+                for_each_block(&conditional.then_statements, block, visit)?;
+                if let Some(otherwise) = &conditional.else_statements {
+                    for_each_block(otherwise, block, visit)?;
+                }
+            }
+            ProceduralStatements::Case(case) => {
+                for item in &case.items {
+                    for_each_block(&item.statements, block, visit)?;
+                }
+            }
+            ProceduralStatements::For(loop_) => for_each_block(&loop_.statements, block, visit)?,
+            ProceduralStatements::While(loop_) => for_each_block(&loop_.statements, block, visit)?,
+            ProceduralStatements::Repeat(loop_) => for_each_block(&loop_.statements, block, visit)?,
+            ProceduralStatements::Wait(statement) => {
+                for_each_block(&statement.statements, block, visit)?
+            }
+            ProceduralStatements::Forever(statements)
+            | ProceduralStatements::Delayed { statements, .. }
+            | ProceduralStatements::EventControlled { statements, .. } => {
+                for_each_block(statements, block, visit)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

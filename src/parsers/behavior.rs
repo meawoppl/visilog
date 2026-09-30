@@ -161,9 +161,11 @@ pub struct RepeatStatement {
 /// `block_id.tmp` the way a task's are `load.data`.
 #[derive(Debug, PartialEq)]
 pub struct BlockStatement {
-    /// `None` for a plain `begin`…`end` nested inside another block.
+    /// `None` for a plain `begin`…`end` nested inside another block. An
+    /// unnamed block that declares something is given iverilog's name for
+    /// it, `$unm_blk_<n>`, because a declaration makes it a scope.
     pub name: Option<Identifier>,
-    /// The variables the block declares, which only a named block may have.
+    /// The variables the block declares.
     pub locals: Vec<FunctionVariable>,
     /// The constants it declares, in the order they were written: a later one
     /// may be made of an earlier one.
@@ -717,12 +719,17 @@ thread_local! {
     /// which is what numbers their scopes. Reset by
     /// [`reset_for_loop_scopes`] at the top of every module.
     static FOR_LOOP_SCOPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many unnamed `begin` blocks the module being parsed has opened,
+    /// which is what numbers the ones that declare something.
+    static UNNAMED_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Starts numbering loop-variable scopes from zero again, as iverilog does for
-/// every module.
-pub fn reset_for_loop_scopes() {
+/// Starts numbering the scopes the parser names — loop-variable scopes and
+/// declaring unnamed blocks — from the start again, as iverilog does for every
+/// module.
+pub fn reset_generated_scopes() {
     FOR_LOOP_SCOPES.with(|count| count.set(0));
+    UNNAMED_BLOCKS.with(|count| count.set(0));
 }
 
 /// `for (integer i = 0; …)` — a `for` that declares its own loop variable,
@@ -986,12 +993,23 @@ fn block_between<'a>(
     close: &'static str,
 ) -> IResult<&'a str, BlockStatement> {
     let (input, _) = keyword(input, open)?;
-    let (input, name) = opt(preceded(ws(char(':')), ws(identifier)))(input)?;
-    // Only a named block is a scope, and only a scope may declare anything.
-    let (input, items) = match &name {
-        Some(_) => many0(block_item)(input)?,
-        None => (input, Vec::new()),
-    };
+    let (input, mut name) = opt(preceded(ws(char(':')), ws(identifier)))(input)?;
+    // Every unnamed `begin` takes a number as it opens, whether or not it
+    // declares anything — iverilog 12.0 names the third one in a module
+    // `$unm_blk_3` even when the first two declared nothing.
+    let unnamed = (name.is_none() && open == "begin").then(|| {
+        UNNAMED_BLOCKS.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        })
+    });
+    let (input, items) = many0(block_item)(input)?;
+    // A declaration makes a scope of a block, and SystemVerilog lets an
+    // unnamed one declare: memory_tb's `task automatic spi_write` opens
+    // `begin integer i; …`. It is given iverilog's name for it.
+    if let (Some(number), false) = (unnamed, items.is_empty()) {
+        name = Some(Identifier::new(format!("$unm_blk_{}", number)));
+    }
     let mut locals = Vec::new();
     let mut parameters = Vec::new();
     let mut events = Vec::new();
@@ -2279,7 +2297,7 @@ mod tests {
 
     #[test]
     fn test_a_for_that_declares_its_variable_is_a_scope_around_it() {
-        reset_for_loop_scopes();
+        reset_generated_scopes();
         for source in [
             "for (integer i = 0; i < 4; i = i + 1) a = i;",
             "for (int i = 0; i < 4; i++) a = i;",

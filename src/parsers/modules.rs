@@ -723,7 +723,7 @@ fn range_width((high, low): (i64, i64)) -> i64 {
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = ws(tag("module"))(input)?;
     let (input, mod_identifier) = ws(identifier)(input)?;
-    crate::parsers::behavior::reset_for_loop_scopes();
+    crate::parsers::behavior::reset_generated_scopes();
     // `module m #(parameter W = 8) (…);` — an ANSI parameter port list. It
     // becomes ordinary parameter *statements* below, so nothing downstream can
     // tell one declared here from one declared in the body.
