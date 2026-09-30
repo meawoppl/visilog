@@ -11,12 +11,14 @@
 //! Nothing here prints. The design's own output is in the record, and the
 //! caller decides where it goes.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::parsers::modules::VerilogModule;
 use crate::parsers::preprocessor::{Preprocessor, Timescale};
 use crate::parsers::source::{parse_expanded, reachable_modules, root_module, SourceError};
 use crate::simulator::elaborate::{OmissionKind, TimingOmission};
@@ -424,14 +426,67 @@ pub struct LoadError {
     pub sources: Vec<SourceRecord>,
 }
 
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.diagnostic.location {
+            Some(at) => write!(f, "{}: {}", at, self.diagnostic.message),
+            None => write!(f, "{}", self.diagnostic.message),
+        }
+    }
+}
+
+impl LoadError {
+    fn compile(code: &str, message: String, location: Option<String>) -> LoadError {
+        LoadError {
+            stop: StopReason::Compile,
+            diagnostic: error_diagnostic(code, message, location),
+            sources: Vec::new(),
+        }
+    }
+}
+
+/// A design read, preprocessed and parsed, with its top chosen — everything a
+/// run needs before elaboration, and all a [`design_graph`](crate::graph) needs.
+#[derive(Debug)]
+pub struct Design {
+    /// The modules that make up the design. With a named top, only what it
+    /// reaches.
+    pub modules: Vec<VerilogModule>,
+    pub top: String,
+    /// Every source as it was read.
+    pub sources: Vec<SourceRecord>,
+}
+
 /// Reads, preprocesses and parses the design `config` describes, picks its
 /// top and configures a [`Simulator`] for it — everything short of
 /// [`Simulator::setup`], which is the caller's so that it can tell an
 /// elaboration failure from a compile one.
 ///
-/// This is the one way a [`RunConfig`] becomes a design: [`run`] goes through
-/// it, and so does an interactive [`Session`](crate::inspect::Session).
+/// This is the one way a [`RunConfig`] becomes a simulation: [`run`] goes
+/// through it, and so does an interactive
+/// [`Session`](crate::inspect::Session).
 pub fn load(config: &RunConfig) -> Result<Loaded, LoadError> {
+    let design = load_design(config)?;
+    let mut simulator = Simulator::with_modules(design.modules, design.top);
+    for directory in &config.search_paths {
+        simulator.add_search_path(directory.clone());
+    }
+    for plusarg in &config.plusargs {
+        simulator.add_plusarg(plusarg);
+    }
+    if let Some(dir) = &config.output_dir {
+        simulator.set_output_directory(dir.clone());
+    }
+    Ok(Loaded {
+        simulator,
+        sources: design.sources,
+    })
+}
+
+/// Reads, preprocesses and parses the sources `config` names and picks the
+/// top: the half of [`load`] a [`design_graph`](crate::graph::design_graph)
+/// needs, since it elaborates without ever building a [`Simulator`].
+pub fn load_design(config: &RunConfig) -> Result<Design, LoadError> {
     let mut sources = Vec::with_capacity(config.sources.len());
     let mut texts = Vec::with_capacity(config.sources.len());
     for path in &config.sources {
@@ -453,17 +508,17 @@ pub fn load(config: &RunConfig) -> Result<Loaded, LoadError> {
                         None,
                     ),
                     sources,
-                })
+                });
             }
         }
     }
-    match build(config, &texts) {
-        Ok(simulator) => Ok(Loaded { simulator, sources }),
-        Err((stop, code, message, location)) => Err(LoadError {
-            stop,
-            diagnostic: error_diagnostic(code, message, location),
+    match parse(config, &texts) {
+        Ok((modules, top)) => Ok(Design {
+            modules,
+            top,
             sources,
         }),
+        Err(error) => Err(LoadError { sources, ..error }),
     }
 }
 
@@ -480,10 +535,8 @@ pub(crate) fn error_diagnostic(
     }
 }
 
-type BuildError = (StopReason, &'static str, String, Option<String>);
-
 /// Preprocesses and parses the sources and picks the top.
-fn build(config: &RunConfig, texts: &[String]) -> Result<Simulator, BuildError> {
+fn parse(config: &RunConfig, texts: &[String]) -> Result<(Vec<VerilogModule>, String), LoadError> {
     let mut preprocessor = Preprocessor::new();
     for dir in &config.include_dirs {
         preprocessor = preprocessor.with_include_dir(dir.clone());
@@ -499,8 +552,7 @@ fn build(config: &RunConfig, texts: &[String]) -> Result<Simulator, BuildError> 
     }
     if let Some(text) = &config.default_timescale {
         let timescale = Timescale::parse(text).map_err(|why| {
-            (
-                StopReason::Compile,
+            LoadError::compile(
                 "config",
                 format!("default timescale `{}`: {}", text, why),
                 None,
@@ -521,10 +573,10 @@ fn build(config: &RunConfig, texts: &[String]) -> Result<Simulator, BuildError> 
         .collect();
     let expanded = preprocessor
         .preprocess_files(&files)
-        .map_err(|error| (StopReason::Compile, "preprocess", error.to_string(), None))?;
+        .map_err(|error| LoadError::compile("preprocess", error.to_string(), None))?;
     let parsed = parse_expanded(expanded).map_err(|error| match error {
-        SourceError::Parse { at, detail } => (StopReason::Compile, "parse", detail, Some(at)),
-        other => (StopReason::Compile, "preprocess", other.to_string(), None),
+        SourceError::Parse { at, detail } => LoadError::compile("parse", detail, Some(at)),
+        other => LoadError::compile("preprocess", other.to_string(), None),
     })?;
 
     // A named top is iverilog's `-s`: only what it reaches is the design.
@@ -534,8 +586,7 @@ fn build(config: &RunConfig, texts: &[String]) -> Result<Simulator, BuildError> 
         Some(top) => (top.clone(), reachable_modules(parsed.modules, top)),
         None => {
             let top = root_module(&parsed.modules).ok_or_else(|| {
-                (
-                    StopReason::Compile,
+                LoadError::compile(
                     "no_modules",
                     "the sources declare no module".to_string(),
                     None,
@@ -544,17 +595,7 @@ fn build(config: &RunConfig, texts: &[String]) -> Result<Simulator, BuildError> 
             (top, parsed.modules)
         }
     };
-    let mut simulator = Simulator::with_modules(modules, top);
-    for directory in &config.search_paths {
-        simulator.add_search_path(directory.clone());
-    }
-    for plusarg in &config.plusargs {
-        simulator.add_plusarg(plusarg);
-    }
-    if let Some(dir) = &config.output_dir {
-        simulator.set_output_directory(dir.clone());
-    }
-    Ok(simulator)
+    Ok((modules, top))
 }
 
 /// Steps the design from one scheduled timestamp to the next until it ends,
