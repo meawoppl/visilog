@@ -1,0 +1,94 @@
+name: Project qualification
+
+# Runs the real-project differential benches in qualification/benches.json
+# under iverilog and under visilog, and fails when a bench the manifest expects
+# to agree with iverilog does not (#378).
+#
+# The projects are private repositories, so this needs a token that can read
+# them: a fine-grained personal access token with read-only Contents access to
+# meawoppl/MagicSchoolBus, coup-de-foudre/widlar and coup-de-foudre/fpga-tesla,
+# stored as the repository secret QUALIFICATION_TOKEN. Without it — a fork, or
+# before the secret is set — every step after the check is skipped and the job
+# passes, saying so in its summary. It is a job of its own, apart from
+# rust.yml, for the reason closure.yml is: it depends on repositories outside
+# this one.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    env:
+      QUALIFICATION_TOKEN: ${{ secrets.QUALIFICATION_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for the projects token
+        id: token
+        run: |
+          if [ -z "$QUALIFICATION_TOKEN" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "## Project qualification skipped: no QUALIFICATION_TOKEN secret" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install iverilog and the yosys ice40 cell library
+        if: steps.token.outputs.available == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog yosys jq
+          iverilog -V | head -1
+
+      - name: Rust Cache
+        if: steps.token.outputs.available == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-projects"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Each project at exactly the revision the manifest pins.
+      - name: Fetch the projects
+        if: steps.token.outputs.available == 'true'
+        run: |
+          mkdir -p ~/projects
+          jq -r '.projects | to_entries[] | "\(.key) \(.value.repo) \(.value.rev)"' \
+            qualification/benches.json |
+          while read -r name repo rev; do
+            git init -q ~/projects/"$name"
+            git -C ~/projects/"$name" fetch -q --depth 1 \
+              "https://x-access-token:${QUALIFICATION_TOKEN}@github.com/${repo}" "$rev"
+            git -C ~/projects/"$name" checkout -q FETCH_HEAD
+            echo "$name $(git -C ~/projects/"$name" rev-parse HEAD)"
+          done
+
+      - name: Qualify
+        if: steps.token.outputs.available == 'true'
+        run: |
+          VISILOG_PROJECTS=~/projects \
+          VISILOG_ICE40_CELLS=$(yosys-config --datdir)/ice40/cells_sim.v \
+            cargo test --release --test project_qualification project_qualification \
+              -- --ignored --nocapture | tee qualification.log
+          {
+            echo "## Project qualification"
+            echo '```'
+            grep -E '^(msb|widlar|tesla)/|^    |^QUALIFICATION_METRICS|^not what' qualification.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the artifacts
+        if: always() && steps.token.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification
+          path: target/qualification
