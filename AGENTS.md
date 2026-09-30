@@ -21,12 +21,13 @@ after every change. `tests/` holds the two external-measurement harnesses, both
 `#[ignore]`d: the ivtest corpus and the real-project qualification.
 
 **The crate is a library plus a thin CLI.** `src/lib.rs` exports the modules; `src/main.rs`
-turns arguments into a `run::RunConfig`, calls `run::run`, prints what the design printed
-and writes the `RunRecord` as JSON — every decision about a run lives in the library, so an
+is a hand-rolled CLI over `run::run`, `graph::design_graph` and `waveform::compare` — it
+turns arguments into a `run::RunConfig`, and every decision lives in the library, so an
 embedding client gets exactly what the command line gets:
 
 ```bash
 cargo run --release -- run -s tb -I inc -DSIM +seed=3 -o out tb.v dut.v   # exits 0..7
+cargo run --release -- graph -s tb tb.v dut.v                            # JSON design graph
 cargo run --release -- compare reference.vcd candidate.vcd               # JSON, exit 0/1
 ```
 
@@ -42,7 +43,8 @@ on the simulator should leave it alone.
 ```
 src/
   lib.rs               the library root; exports everything below
-  main.rs              the `visilog` CLI — `run` and `compare` — over run.rs / waveform.rs
+  main.rs              the `visilog` CLI: `run`, `graph` and `compare`
+  graph.rs             the versioned JSON design graph — see "The design graph" below
   git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
   register.rs          4-state (0/1/x/z) value type, packed into two bit planes
   run.rs               RunConfig → RunRecord: one reproducible run; see "Running a design"
@@ -2613,6 +2615,55 @@ Still not covered: a memory or an event cannot be subscribed (a memory is read a
 time with `Session::word`), a named event's trigger is not reported, a client cannot drive
 an input through the session (`Simulator::poke` is not wrapped), and the signal list does
 not include an automatic task's activations.
+
+### The design graph
+
+`graph::design_graph(modules, top)` elaborates a design exactly as `Simulator::setup` does
+and reports what elaboration built as a renderer-independent `DesignGraph` — the contract a
+web workbench's structure, source and waveform views key into (#380). `visilog graph
+[run's options] <source.v>…` prints it as JSON, going through `run::load_design` (read,
+preprocess, parse, pick the top) — the front half of the `run::load` `visilog run` uses. The layout is versioned by
+`GRAPH_SCHEMA` (`"schema": 1`): it moves when a field changes meaning or goes away, and
+adding a field does not move it.
+
+**The ID convention is shared with the inspection API, so do not bend it.** A signal's ID
+is its hierarchical name *with the top module's name first* — `tb.dut.count` — which is
+exactly what a VCD `$scope` path gives it and the key `waveform::Waveform::traces` uses; the
+flat `StateStore` key is the same name without the top segment. An instance's ID is its
+path (`tb`, `tb.dut`, `tb.stage[0].u`, `tb.u[3]` for an arrayed one), and a process is
+`<instance>/<kind><n>` (`tb.dut/always0`, `tb/assign2`). A port aliased onto its parent's
+signal keeps its own ID and names the entry it shares in `Signal::storage`.
+
+**What it holds**: every module with the file and line of its `module` keyword; every
+instance with its parent, children, and its `parameter`/`localparam` values *as resolved*
+after every `#(...)` and `defparam`; every port with its direction and resolved range;
+every net, variable, parameter, memory and event, each assigned to the instance whose
+store prefix is the longest match (a generate block's `stage[0].q` belongs to the module
+instance around it); every connection with its binding (`alias` / `driven` / `driving` /
+`bonded`) and its bits as `segments`, most significant first — a signal slice, a constant,
+or an opaque expression with the signals it reads; and every `initial`/`always` block,
+continuous assignment, gate, UDP and switch with the signals it reads and writes, the
+sensitivity list of an `always`, and a `port_connection` flag on the assignments
+elaboration added itself to carry a port across an instance boundary.
+
+**How it is captured, and why nothing on a hot path sees it.** `Elaborated::hierarchy` is
+recorded as elaboration goes and dropped by `setup`: `instantiate` pushes an
+`InstanceRecord` with each port's connection resolved through
+`Scope::resolve_structural` — `resolve` without following a port alias, so a connection
+inside `mid` names `mid.p` rather than the top-level entry it shares — and `walk` ends by
+`claim`ing every block, assignment, gate, UDP and switch its instance added that no child
+already claimed. `reconcile_port_widths` rewrites a connection's recorded binding when it
+turns an alias into an assignment, so the graph says what elaboration made of it rather
+than what the parent wrote. Measured closure is unchanged (1370).
+
+**What it deliberately does not claim.** It is the **behavioural RTL** — a process is an
+`always` block and its reads and writes are the names its statements mention (a system
+task's arguments are not counted), not a synthesised gate netlist or a bit-accurate
+dataflow. A process's reads and writes name *store entries*, so a port alias is already
+followed there, where a connection keeps the structural name. There are no coordinates.
+Source spans are one line per module: the parser keeps no spans on its AST, and finer ones
+(per port, per statement) are future work. A parameter declared inside a generate block or
+a named block is listed as a variable, not a parameter.
 
 ## Measuring progress: the ivtest corpus
 

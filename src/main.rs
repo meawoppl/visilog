@@ -1,4 +1,4 @@
-//! `visilog` — the command line over [`visilog::run`].
+//! `visilog` — the command line over [`visilog::run`] and [`visilog::graph`].
 //!
 //! It is deliberately thin: it turns arguments into a [`RunConfig`], runs it,
 //! prints what the design printed, and writes the [`RunRecord`] as JSON. Every
@@ -7,18 +7,24 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use visilog::run::{run, RunConfig, RunRecord, Severity};
+use visilog::graph::design_graph;
+use visilog::run::{load_design, run, RunConfig, RunRecord, Severity};
 use visilog::waveform::{compare, Waveform};
 
 const USAGE: &str = "\
 usage: visilog run [options] <source.v>...
+       visilog graph [options] <source.v>...
        visilog compare <reference.vcd> <candidate.vcd>
        visilog --version
 
-Runs a design and exits with a status saying how it ended:
+`run` runs a design and exits with a status saying how it ended:
   0 completed   1 assertion failure   2 read or compile error
   3 unsupported construct   4 elaboration or runtime error
   5 time or step limit   6 cancelled   64 usage error
+
+`graph` elaborates the design and prints its hierarchical design graph as
+JSON — instances, ports, signals, connections and processes — without running
+it. It takes the same options; only -s, -I, -D and --timescale matter.
 
 options:
   -s, --top <module>        the module to elaborate (default: the root)
@@ -54,6 +60,10 @@ fn main() -> ExitCode {
         }
         Some("run") => match parse_run(&args[1..]) {
             Ok(invocation) => execute(invocation),
+            Err(problem) => usage_error(&problem),
+        },
+        Some("graph") => match parse_run(&args[1..]) {
+            Ok(invocation) => graph(&invocation.config),
             Err(problem) => usage_error(&problem),
         },
         Some("compare") => match &args[1..] {
@@ -154,6 +164,31 @@ fn execute(invocation: Invocation) -> ExitCode {
         }
     }
     ExitCode::from(record.exit_status() as u8)
+}
+
+/// Elaborates the design and prints its graph as JSON. Exits 0 when it did, and
+/// with the status a run would have stopped with when it did not.
+fn graph(config: &RunConfig) -> ExitCode {
+    let design = match load_design(config) {
+        Ok(design) => design,
+        Err(error) => {
+            eprintln!("visilog: error: [{}] {}", error.diagnostic.code, error);
+            return ExitCode::from(2);
+        }
+    };
+    match design_graph(&design.modules, &design.top) {
+        Ok(graph) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&graph).expect("a design graph serialises")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("visilog: error: [elaboration] {}", error);
+            ExitCode::from(4)
+        }
+    }
 }
 
 /// Compares two value change dumps and prints the result as JSON. Exits 0 when

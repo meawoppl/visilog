@@ -277,6 +277,10 @@ pub struct Elaborated {
     /// does not carry out, one per instance that has it — see
     /// [`TimingOmission`].
     pub timing_omissions: Vec<TimingOmission>,
+    /// The instance tree and who owns what in the flat collections, kept for
+    /// [`design_graph`](crate::graph::design_graph) and nothing else — the
+    /// simulator drops it at setup, so nothing on a hot path can reach it.
+    pub hierarchy: Hierarchy,
 }
 
 /// A timing construct a design wrote that this simulator parses, records and
@@ -322,6 +326,83 @@ impl OmissionKind {
             OmissionKind::SwitchDelay => "switch_delay",
         }
     }
+}
+
+/// What flattening would otherwise throw away about the instance tree: every
+/// instance, its parent, what its ports were bound to, and which instance each
+/// block, assignment, gate and user-defined primitive in the flat lists came
+/// from. Recorded as elaboration goes, because none of it can be recovered
+/// from the flat store afterwards.
+#[derive(Debug, Clone, Default)]
+pub struct Hierarchy {
+    /// Every module instance, the top first, each before its children.
+    pub instances: Vec<InstanceRecord>,
+    /// For each entry of [`Elaborated::blocks`], the index of its instance.
+    pub block_owner: Vec<usize>,
+    /// The same for [`Elaborated::assignments`].
+    pub assignment_owner: Vec<usize>,
+    /// The same for [`Elaborated::gates`].
+    pub gate_owner: Vec<usize>,
+    /// The same for [`Elaborated::udps`].
+    pub udp_owner: Vec<usize>,
+    /// The same for [`Elaborated::pass_switches`].
+    pub switch_owner: Vec<usize>,
+    /// The indices into [`Elaborated::assignments`] that elaboration added to
+    /// carry a port connection across an instance boundary, rather than ones
+    /// the design wrote.
+    pub port_assignments: HashSet<usize>,
+}
+
+/// One module instance as elaboration made it.
+#[derive(Debug, Clone)]
+pub struct InstanceRecord {
+    /// The hierarchical name, the top module's own name first — `tb`,
+    /// `tb.dut`, `tb.stage[0].u`.
+    pub path: String,
+    /// What the instance's store entries are prefixed with: `""` for the top,
+    /// `"dut."`, `"stage[0].u."`.
+    pub prefix: String,
+    /// The instance name as the parent wrote it (or as an arrayed or unnamed
+    /// instance was given it): `dut`, `u[3]`, `$BUFG1`. The top module's own
+    /// name for the top.
+    pub name: String,
+    /// Index of the module in the list elaboration was handed.
+    pub module: usize,
+    /// Index of the parent instance; `None` for the top.
+    pub parent: Option<usize>,
+    /// The ports the parent connected, in port order. A port left out was not
+    /// connected.
+    pub connections: Vec<PortConnection>,
+}
+
+/// What one port of an instance was bound to.
+#[derive(Debug, Clone)]
+pub struct PortConnection {
+    pub port: String,
+    pub direction: PortDirection,
+    pub binding: BindingKind,
+    /// The connection with every name resolved into the flat name space of
+    /// the *parent*, an aliased port of the parent kept under its own name
+    /// rather than collapsed onto the entry it shares — see
+    /// `Scope::resolve_structural`.
+    pub connection: Expression,
+}
+
+/// How a port was carried across the instance boundary, which is
+/// elaboration's own `Binding` without the expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// The port and a parent signal are one store entry.
+    Alias,
+    /// An input with an entry of its own, driven from the parent by a
+    /// continuous assignment.
+    Driven,
+    /// An output with an entry of its own, driving a writable select or
+    /// concatenation of the parent's by a continuous assignment.
+    Driving,
+    /// An `inout` with an entry of its own, each bit joined to the matching
+    /// bit of the connection by a port bond.
+    Bonded,
 }
 
 /// A net that drives itself, and the bit and strength it drives at.
@@ -402,6 +483,17 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
             automatic_tasks: HashMap::new(),
             timing_omissions: Vec::new(),
+            hierarchy: Hierarchy {
+                instances: vec![InstanceRecord {
+                    path: modules[top].identifier.name.clone(),
+                    prefix: String::new(),
+                    name: modules[top].identifier.name.clone(),
+                    module: top,
+                    parent: None,
+                    connections: Vec::new(),
+                }],
+                ..Hierarchy::default()
+            },
         },
         stack: Vec::new(),
         walked: 0,
@@ -502,11 +594,15 @@ struct Scope {
     /// parameter override. `None` for an ordinary module, which reads the same
     /// tokens as `overrides`.
     primitive_delay: Option<GateDelay>,
+    /// The index into [`Hierarchy::instances`] of the module instance this
+    /// scope belongs to — a generate block shares its instance's.
+    instance: usize,
 }
 
 impl Scope {
     fn root(module: &str) -> Self {
         Scope {
+            instance: 0,
             prefix: String::new(),
             module_prefix: String::new(),
             bindings: HashMap::new(),
@@ -549,9 +645,22 @@ impl Scope {
     /// connections collapses to the single signal at the top of it. Everything
     /// else is local to the module and takes the instance's prefix.
     fn resolve(&self, local: &str) -> String {
+        self.resolve_with(local, true)
+    }
+
+    /// [`resolve`](Scope::resolve) without following an aliased port to the
+    /// signal it shares an entry with: `p` inside instance `mid` is `mid.p`
+    /// whether or not `p` has an entry of its own. That is the *structural*
+    /// name a design graph connects through, where the store only has the
+    /// entry at the top of the chain.
+    fn resolve_structural(&self, local: &str) -> String {
+        self.resolve_with(local, false)
+    }
+
+    fn resolve_with(&self, local: &str, follow_aliases: bool) -> String {
         if local.contains("[ ") {
             if let Some(indexed) = computed_path_indices(local, &self.genvars) {
-                return self.resolve(&indexed);
+                return self.resolve_with(&indexed, follow_aliases);
             }
         }
         if !self.locals.is_empty() {
@@ -570,7 +679,7 @@ impl Scope {
             return rest.to_string();
         }
         match self.bindings.get(local) {
-            Some(Binding::Alias(outer)) => outer.clone(),
+            Some(Binding::Alias(outer)) if follow_aliases => outer.clone(),
             _ => {
                 let mut name = String::with_capacity(self.module_prefix.len() + local.len());
                 name.push_str(&self.module_prefix);
@@ -649,6 +758,7 @@ impl<'m> Elaborator<'m> {
         // put in theirs.
         let first_block = self.out.blocks.len();
         let first_started = self.out.start_order.len();
+        let first_owned = self.owned_lengths();
 
         // A user-defined primitive is a module as far as instantiation and port
         // binding go, and nothing else: its whole body is the table, so none of
@@ -658,6 +768,7 @@ impl<'m> Elaborator<'m> {
                 self.declare_port(port, scope, module.unconnected_drive)?;
             }
             self.build_udp(module, table, scope)?;
+            self.claim(first_owned, scope.instance);
             self.stack.pop();
             return Ok(());
         }
@@ -805,9 +916,47 @@ impl<'m> Elaborator<'m> {
             .filter(|id| !children.contains(id))
             .collect();
         self.out.start_order.extend(own);
+        self.claim(first_owned, scope.instance);
 
         self.stack.pop();
         Ok(())
+    }
+
+    /// Records `instance` as the owner of everything the flat collections
+    /// gained since `first` that no child instance already claimed. A child's
+    /// walk ends before its parent's, so what is still unclaimed here is this
+    /// instance's own.
+    fn claim(&mut self, first: [usize; 5], instance: usize) {
+        let lengths = self.owned_lengths();
+        let hierarchy = &mut self.out.hierarchy;
+        let owners = [
+            &mut hierarchy.block_owner,
+            &mut hierarchy.assignment_owner,
+            &mut hierarchy.gate_owner,
+            &mut hierarchy.udp_owner,
+            &mut hierarchy.switch_owner,
+        ];
+        for ((owner, from), to) in owners.into_iter().zip(first).zip(lengths) {
+            owner.resize(to, usize::MAX);
+            for slot in &mut owner[from..to] {
+                if *slot == usize::MAX {
+                    *slot = instance;
+                }
+            }
+        }
+    }
+
+    /// [`collection_lengths`](Elaborator::collection_lengths) and the pass
+    /// switches, which are the collections [`Hierarchy`] records an owner for.
+    fn owned_lengths(&self) -> [usize; 5] {
+        let [blocks, assignments, gates, udps] = self.collection_lengths();
+        [
+            blocks,
+            assignments,
+            gates,
+            udps,
+            self.out.pass_switches.len(),
+        ]
     }
 
     /// How long each flat collection a walk can add to is, which is where a
@@ -1283,6 +1432,17 @@ impl<'m> Elaborator<'m> {
                     Binding::Driving(Expression::Identifier(Identifier::new(outer)))
                 }
             };
+            let kind = match binding {
+                Binding::Driven(_) => BindingKind::Driven,
+                _ => BindingKind::Driving,
+            };
+            if let Some(connection) = self.out.hierarchy.instances[scope.instance]
+                .connections
+                .iter_mut()
+                .find(|connection| &connection.port == local)
+            {
+                connection.binding = kind;
+            }
             scope.bindings.insert(local.clone(), binding);
             self.out
                 .aliases
@@ -1348,6 +1508,10 @@ impl<'m> Elaborator<'m> {
                 let name = scope.qualified(local);
                 let range = self.resolve_range(&port.range, scope)?;
                 self.out.state.declare_net(name.clone(), range, port.signed);
+                self.out
+                    .hierarchy
+                    .port_assignments
+                    .insert(self.out.assignments.len());
                 self.out.assignments.push(ContinuousAssignment::new(
                     Expression::Identifier(Identifier::new(name)),
                     expression.clone(),
@@ -1369,6 +1533,10 @@ impl<'m> Elaborator<'m> {
                 } else {
                     self.out.state.declare_net(name.clone(), range, port.signed);
                 }
+                self.out
+                    .hierarchy
+                    .port_assignments
+                    .insert(self.out.assignments.len());
                 self.out.assignments.push(ContinuousAssignment::new(
                     target.clone(),
                     Expression::Identifier(Identifier::new(name)),
@@ -3429,10 +3597,17 @@ impl<'m> Elaborator<'m> {
         // the store prefix with the top module's own name in front: the top is
         // the root of the flat name space and carries no prefix, but a design
         // still calls it `top`.
-        self.out.instances.push((
-            scope.hierarchy(instance_name(instantiation)),
-            child.timescale,
-        ));
+        let path = scope.hierarchy(instance_name(instantiation));
+        self.out.instances.push((path.clone(), child.timescale));
+        let record = self.out.hierarchy.instances.len();
+        self.out.hierarchy.instances.push(InstanceRecord {
+            path,
+            prefix: prefix.clone(),
+            name: instance_name(instantiation).to_string(),
+            module: index,
+            parent: Some(scope.instance),
+            connections: Vec::new(),
+        });
         // `BUFG #5 bg(out, in);` reads as a parameter override, because that
         // is what `#(...)` means on a module instantiation — but a primitive
         // has no parameters and the tokens are a *delay*. Only the module being
@@ -3452,6 +3627,7 @@ impl<'m> Elaborator<'m> {
             genvars: HashMap::new(),
             root_name: scope.root_name.clone(),
             primitive_delay,
+            instance: record,
         };
 
         for (port, connection) in connections(child, &instantiation.arguments)? {
@@ -3505,6 +3681,19 @@ impl<'m> Elaborator<'m> {
                     })
                 }
             };
+            self.out.hierarchy.instances[record]
+                .connections
+                .push(PortConnection {
+                    port: local.clone(),
+                    direction: port.direction,
+                    binding: match binding {
+                        Binding::Alias(_) => BindingKind::Alias,
+                        Binding::Driven(_) => BindingKind::Driven,
+                        Binding::Driving(_) => BindingKind::Driving,
+                        Binding::Bonded(_) => BindingKind::Bonded,
+                    },
+                    connection: structural(&connection, scope),
+                });
             inner.bindings.insert(local.clone(), binding);
         }
 
@@ -4007,6 +4196,30 @@ fn collect_written_names(target: &Expression, names: &mut BTreeSet<String>) {
     }
 }
 
+/// Every signal a compiled body writes and every one an expression in it
+/// reads — the coarse dependencies a design graph reports for a block. A
+/// system task's arguments are not counted as reads.
+pub(crate) fn program_names(program: &Program) -> (BTreeSet<String>, BTreeSet<String>) {
+    (BodyNames::of(program).reads, written_names(program))
+}
+
+/// Every signal `expression` reads, and — read as an assignment target — every
+/// signal it writes. The reads of a target are only its indices.
+pub(crate) fn expression_names(
+    expression: &Expression,
+    as_target: bool,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut body = BodyNames::default();
+    let mut writes = BTreeSet::new();
+    if as_target {
+        body.target(expression);
+        collect_written_names(expression, &mut writes);
+    } else {
+        body.expression(expression);
+    }
+    (body.reads, writes)
+}
+
 /// The names a compiled body uses, gathered in one walk.
 ///
 /// The three are collected together because they all come out of the same
@@ -4399,6 +4612,20 @@ fn renamed(expression: &Expression, scope: &Scope) -> Expression {
     }
     if scope.needs_renaming() {
         rename_expression(&mut copy, &|name| scope.resolve(name));
+    }
+    copy
+}
+
+/// [`renamed`], but with an aliased port left under its own qualified name
+/// rather than collapsed onto the signal it shares an entry with — see
+/// [`Scope::resolve_structural`].
+fn structural(expression: &Expression, scope: &Scope) -> Expression {
+    let mut copy = expression.clone();
+    if !scope.genvars.is_empty() {
+        substitute_genvars(&mut copy, &scope.genvars);
+    }
+    if scope.needs_renaming() {
+        rename_expression(&mut copy, &|name| scope.resolve_structural(name));
     }
     copy
 }
