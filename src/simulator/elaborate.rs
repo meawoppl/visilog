@@ -273,6 +273,55 @@ pub struct Elaborated {
     /// Empty for a design with no automatic task, which is all that design
     /// pays.
     pub automatic_tasks: HashMap<String, TaskDefinition>,
+    /// Every timing construct the design wrote that the simulation records and
+    /// does not carry out, one per instance that has it — see
+    /// [`TimingOmission`].
+    pub timing_omissions: Vec<TimingOmission>,
+}
+
+/// A timing construct a design wrote that this simulator parses, records and
+/// does **not** carry out.
+///
+/// Simulation here is functional: a procedural `#delay`, a delayed `assign`
+/// and a gate's `#(rise, fall, turn_off)` are simulated, but a `specify`
+/// block's path delays move an edge in time with no model behind them and its
+/// timing checks report violations of constraints nothing measures. A design
+/// that loads a vendor cell model and runs cleanly has therefore *not* been
+/// timing-verified, and a caller needs to be told so rather than infer it
+/// from silence. Each of these is one such thing, where it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimingOmission {
+    pub kind: OmissionKind,
+    /// The hierarchical instance it belongs to — `tb`, `tb.dut`.
+    pub instance: String,
+    /// The module that instance is of.
+    pub module: String,
+    /// The construct as written, near enough to find it: `(A => Z)`,
+    /// `$setup`, `tranif0 #(…)`.
+    pub detail: String,
+}
+
+/// What kind of timing a [`TimingOmission`] leaves out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OmissionKind {
+    /// A `specify` module path delay, `(A => Z) = (1, 2);`.
+    PathDelay,
+    /// A `specify` timing check — `$setup`, `$hold`, `$width`, ….
+    TimingCheck,
+    /// A delay on a bidirectional switch, which would move the instant it
+    /// opens or closes.
+    SwitchDelay,
+}
+
+impl OmissionKind {
+    /// A stable machine-readable name.
+    pub fn code(self) -> &'static str {
+        match self {
+            OmissionKind::PathDelay => "specify_path_delay",
+            OmissionKind::TimingCheck => "timing_check",
+            OmissionKind::SwitchDelay => "switch_delay",
+        }
+    }
 }
 
 /// A net that drives itself, and the bit and strength it drives at.
@@ -352,6 +401,7 @@ pub fn elaborate(modules: &[VerilogModule], top: usize) -> Result<Elaborated, Si
             aliases: HashMap::new(),
             instances: vec![(modules[top].identifier.name.clone(), modules[top].timescale)],
             automatic_tasks: HashMap::new(),
+            timing_omissions: Vec::new(),
         },
         stack: Vec::new(),
         walked: 0,
@@ -1246,10 +1296,23 @@ impl<'m> Elaborator<'m> {
     /// A port's default value, `output reg [31:0] x = 1;`: a variable takes
     /// it once, a net takes it as a continuous assignment — the split a body
     /// declaration's initialiser already makes.
+    ///
+    /// On an **input** it is SystemVerilog's default port value (IEEE 1800
+    /// §23.2.2.4): what the port reads when the instantiation leaves it
+    /// unconnected, and nothing at all when it is connected. Driving it anyway
+    /// puts a second driver on a connected input — yosys's `ice40/cells_sim.v`
+    /// declares every `SB_LUT4` input `= 1'b0`, and a LUT whose `I0` was
+    /// driven to `1` read `x`-resolved garbage where iverilog 12.0 reads the
+    /// `1`.
     fn initialise_port(&mut self, port: &Port, scope: &Scope) -> Result<(), SimulationError> {
         let Some(init) = &port.init else {
             return Ok(());
         };
+        if port.direction == PortDirection::Input
+            && scope.bindings.contains_key(&port.identifier.name)
+        {
+            return Ok(());
+        }
         if port_is_variable(port) {
             self.initialise(&port.identifier.name, init, scope)?;
         } else {
@@ -1982,6 +2045,25 @@ impl<'m> Elaborator<'m> {
                 for parameter in &block.specparams {
                     self.declare_specparam(parameter, scope)?;
                 }
+                for path in &block.paths {
+                    let side = |terminals: &[Expression]| {
+                        terminals
+                            .iter()
+                            .map(Expression::to_contracted_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let detail = format!(
+                        "({} {} {})",
+                        side(&path.inputs),
+                        if path.full { "*>" } else { "=>" },
+                        side(&path.outputs)
+                    );
+                    self.omit_timing(OmissionKind::PathDelay, scope, detail);
+                }
+                for check in &block.checks {
+                    self.omit_timing(OmissionKind::TimingCheck, scope, format!("${}", check.name));
+                }
             }
             _ => {}
         }
@@ -2413,6 +2495,13 @@ impl<'m> Elaborator<'m> {
             }
             delay
         });
+        // A bidirectional switch carries values rather than driving them, so
+        // its delay — which moves the instant it opens or closes — has nothing
+        // to ride on and is dropped. Said so rather than silently.
+        if gate.kind.is_bidirectional() && delay.is_some() {
+            let detail = format!("{} #(…)", gate.kind.keyword());
+            self.omit_timing(OmissionKind::SwitchDelay, scope, detail);
+        }
         let Some(range) = &gate.instance.range else {
             return self.push_primitive(gate.kind, strength, terminals, delay);
         };
@@ -2427,6 +2516,22 @@ impl<'m> Elaborator<'m> {
             self.push_primitive(gate.kind, strength, sliced, delay.clone())?;
         }
         Ok(())
+    }
+
+    /// Notes a timing construct in `scope` that the simulation will not carry
+    /// out — see [`TimingOmission`].
+    fn omit_timing(&mut self, kind: OmissionKind, scope: &Scope, detail: String) {
+        let module = self
+            .stack
+            .last()
+            .map(|&index| self.modules[index].identifier.name.clone())
+            .unwrap_or_default();
+        self.out.timing_omissions.push(TimingOmission {
+            kind,
+            instance: scope.hierarchy(""),
+            module,
+            detail,
+        });
     }
 
     /// Records one primitive instance, as whichever of the two shapes its
