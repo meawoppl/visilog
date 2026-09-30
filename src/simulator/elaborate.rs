@@ -300,6 +300,9 @@ pub struct TimingOmission {
     pub instance: String,
     /// The module that instance is of.
     pub module: String,
+    /// `file:line` of that module's `module` keyword, when it was parsed from
+    /// a file. The parser keeps no finer span than a module's.
+    pub location: Option<String>,
     /// The construct as written, near enough to find it: `(A => Z)`,
     /// `$setup`, `tranif0 #(…)`.
     pub detail: String,
@@ -2689,15 +2692,18 @@ impl<'m> Elaborator<'m> {
     /// Notes a timing construct in `scope` that the simulation will not carry
     /// out — see [`TimingOmission`].
     fn omit_timing(&mut self, kind: OmissionKind, scope: &Scope, detail: String) {
-        let module = self
-            .stack
-            .last()
-            .map(|&index| self.modules[index].identifier.name.clone())
+        let declared = self.stack.last().map(|&index| &self.modules[index]);
+        let module = declared
+            .map(|module| module.identifier.name.clone())
             .unwrap_or_default();
+        let location = declared
+            .and_then(|module| module.source.as_ref())
+            .map(|at| format!("{}:{}", at.file, at.line));
         self.out.timing_omissions.push(TimingOmission {
             kind,
             instance: scope.hierarchy(""),
             module,
+            location,
             detail,
         });
     }

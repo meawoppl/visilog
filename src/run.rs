@@ -94,6 +94,8 @@ pub struct Omitted {
     pub count: usize,
     /// The modules they were written in.
     pub modules: Vec<String>,
+    /// `file:line` of each of those modules, where it was parsed from a file.
+    pub locations: Vec<String>,
 }
 
 /// The timing semantics simulated for every design, for [`Capabilities`].
@@ -360,6 +362,12 @@ fn disclose_timing(record: &mut RunRecord, omissions: &[TimingOmission], strict:
         let mut modules: Vec<String> = sites.iter().map(|site| site.module.clone()).collect();
         modules.sort();
         modules.dedup();
+        let mut locations: Vec<String> = sites
+            .iter()
+            .filter_map(|site| site.location.clone())
+            .collect();
+        locations.sort();
+        locations.dedup();
         let examples = sites
             .iter()
             .take(OMISSION_EXAMPLES)
@@ -390,12 +398,13 @@ fn disclose_timing(record: &mut RunRecord, omissions: &[TimingOmission], strict:
                     String::new()
                 }
             ),
-            location: None,
+            location: sites[0].location.clone(),
         });
         not_simulated.push(Omitted {
             kind: kind.code().to_string(),
             count: sites.len(),
             modules,
+            locations,
         });
     }
     record.capabilities = Some(Capabilities {
@@ -810,6 +819,12 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec![("specify_path_delay", 2), ("timing_check", 2)]);
         assert_eq!(capabilities.not_simulated[0].modules, vec!["buffer_cell"]);
+        let location = &capabilities.not_simulated[0].locations[0];
+        assert!(
+            location.ends_with("t.v:2"),
+            "the module's own line: {}",
+            location
+        );
         let warnings: Vec<&Diagnostic> = record
             .diagnostics
             .iter()
