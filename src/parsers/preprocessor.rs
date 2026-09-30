@@ -271,6 +271,31 @@ impl fmt::Display for Location<'_> {
     }
 }
 
+impl Location<'_> {
+    /// This location with its own copy of the names, so it can outlive the
+    /// [`SourceMap`] it came from.
+    pub fn to_owned_location(&self) -> SourceLocation {
+        SourceLocation {
+            file: self.file.to_string(),
+            line: self.line,
+            expansion_of: self.expansion_of.map(str::to_string),
+        }
+    }
+}
+
+/// A [`Location`] that owns its names — what a parsed module keeps of where it
+/// was written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceLocation {
+    pub file: String,
+    /// One-based.
+    pub line: usize,
+    /// The macro the text was expanded from, when it was; `line` then names
+    /// the invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion_of: Option<String>,
+}
+
 /// Maps an offset in the expanded text back to its origin.
 ///
 /// Built as the text is emitted rather than reconstructed afterwards: once a

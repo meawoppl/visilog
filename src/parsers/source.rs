@@ -122,6 +122,10 @@ pub fn parse_expanded(expanded: Preprocessed) -> Result<ParsedSource, SourceErro
         .map(|(at, mut module)| {
             module.timescale = expanded.timescale_at(at);
             module.unconnected_drive = expanded.unconnected_drive_at(at);
+            module.source = expanded
+                .map
+                .locate(at)
+                .map(|location| location.to_owned_location());
             module
         })
         .collect();
@@ -575,6 +579,27 @@ mod tests {
                 ("plain", None),
             ]
         );
+    }
+
+    /// Where a module was written is stamped the way its `timescale` is: the
+    /// line of its `module` keyword in the original file, past comments,
+    /// directives and a macro that expanded to several lines above it.
+    #[test]
+    fn test_each_module_carries_the_line_it_was_written_at() {
+        let source = "// header\n`define TWO_LINES wire a;\\\nwire b;\n\
+                      `timescale 1ns/1ps\n\nmodule top;\n`TWO_LINES\nendmodule\n\
+                      /* between */\n  primitive p (q, a);\n output q; input a;\n\
+                      table 0 : 0 ; endtable\n endprimitive\n";
+        let parsed = parse_source(source).unwrap();
+        let lines: Vec<_> = parsed
+            .modules
+            .iter()
+            .map(|module| {
+                let at = module.source.as_ref().unwrap();
+                (module.identifier.name.as_str(), at.file.as_str(), at.line)
+            })
+            .collect();
+        assert_eq!(lines, vec![("top", "<source>", 6), ("p", "<source>", 10)]);
     }
 
     #[test]
