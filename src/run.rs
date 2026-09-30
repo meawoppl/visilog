@@ -544,6 +544,7 @@ fn is_unsupported(error: &SimulationError) -> bool {
     matches!(
         error,
         SimulationError::Unsupported(_)
+            | SimulationError::TimeOverflow
             | SimulationError::Eval(EvalError::UnsupportedFunctionCall(_))
     )
 }
