@@ -28,11 +28,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use visilog::parsers::generate::GenerateItem;
-use visilog::parsers::modules::VerilogModule;
 use visilog::parsers::preprocessor::{Preprocessor, Timescale};
-use visilog::parsers::source::{parse_expanded, parse_verilog_source, ParsedSource, SourceError};
-use visilog::parsers::statements::ModuleStatement;
+use visilog::parsers::source::{
+    parse_expanded, parse_verilog_source, root_module, ParsedSource, SourceError,
+};
 use visilog::simulator::runner::{SimulationError, Simulator};
 use visilog::simulator::tasks::is_supported_system_name;
 
@@ -426,83 +425,6 @@ fn run_to_completion(simulator: &mut Simulator) -> Result<(), SimulationError> {
     Ok(())
 }
 
-/// The module to elaborate: one that nothing else instantiates.
-///
-/// A corpus file is a self-contained testbench plus the modules it exercises,
-/// with no marker saying which is which. The testbench is the one at the root
-/// of the instantiation graph. Ties are broken by the conventional names, then
-/// by source order, which matters because picking a leaf module would elaborate
-/// a design with no stimulus and score it as silent.
-///
-/// An instantiation inside a `generate` region counts as much as one written
-/// in the body: `for (…) begin : addbit add1 bit(…); end` is how a ripple
-/// adder instantiates its cells, and missing it made the *cell* a root — and,
-/// being last in the file, the one elaborated (corpus `pr1676071`,
-/// `pr1758122`, which then ran their leaf and printed nothing).
-fn top_module(modules: &[VerilogModule]) -> Option<String> {
-    let mut instantiated: Vec<&str> = Vec::new();
-    for module in modules {
-        instantiated_modules(&module.statements, &mut instantiated);
-    }
-
-    let roots: Vec<&str> = modules
-        .iter()
-        .map(|module| module.identifier.name.as_str())
-        .filter(|name| !instantiated.contains(name))
-        .collect();
-
-    for conventional in ["main", "top", "test", "tb", "bench"] {
-        if roots.contains(&conventional) {
-            return Some(conventional.to_string());
-        }
-    }
-    roots
-        .last()
-        .map(|name| name.to_string())
-        .or_else(|| modules.last().map(|m| m.identifier.name.clone()))
-}
-
-/// Every module `statements` instantiate, reaching into `generate` regions.
-fn instantiated_modules<'a>(statements: &'a [ModuleStatement], found: &mut Vec<&'a str>) {
-    for statement in statements {
-        match statement {
-            // Every instance in one statement names the same module.
-            ModuleStatement::ModuleInstantiation(instances) => found.extend(
-                instances
-                    .first()
-                    .map(|instance| instance.module_name.name.as_str()),
-            ),
-            ModuleStatement::GenerateRegion(items) => generated_modules(items, found),
-            _ => {}
-        }
-    }
-}
-
-fn generated_modules<'a>(items: &'a [GenerateItem], found: &mut Vec<&'a str>) {
-    for item in items {
-        match item {
-            GenerateItem::Item(statement) => {
-                instantiated_modules(std::slice::from_ref(statement), found)
-            }
-            GenerateItem::Block(block) => generated_modules(&block.items, found),
-            GenerateItem::Loop(generate_loop) => {
-                generated_modules(&generate_loop.body.items, found)
-            }
-            GenerateItem::If(generate_if) => {
-                generated_modules(&generate_if.then_block.items, found);
-                if let Some(block) = &generate_if.else_block {
-                    generated_modules(&block.items, found);
-                }
-            }
-            GenerateItem::Case(generate_case) => {
-                for arm in &generate_case.items {
-                    generated_modules(&arm.block.items, found);
-                }
-            }
-        }
-    }
-}
-
 /// What became of one corpus file.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Outcome {
@@ -602,7 +524,7 @@ fn judge_with(
         return Outcome::ParseFailed;
     };
     let modules = parsed.modules;
-    let Some(top) = top_module(&modules) else {
+    let Some(top) = root_module(&modules) else {
         return Outcome::ParseFailed;
     };
 
@@ -980,7 +902,7 @@ fn harness_finds_the_top_past_an_instance_in_a_generate_loop() {
         endmodule
     "#;
     let modules = parse_verilog_source(source).expect("parses").1;
-    assert_eq!(top_module(&modules).as_deref(), Some("bench"));
+    assert_eq!(root_module(&modules).as_deref(), Some("bench"));
     assert_eq!(judge(source), Outcome::Passed);
 }
 
@@ -1296,7 +1218,7 @@ fn probe_output(
         return "<parse failed>\n".to_string();
     };
     let modules = parsed.modules;
-    let Some(top) = top_module(&modules) else {
+    let Some(top) = root_module(&modules) else {
         return "<no top module>\n".to_string();
     };
     let mut simulator = Simulator::with_modules(modules, top);

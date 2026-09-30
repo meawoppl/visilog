@@ -10,10 +10,12 @@ use nom::{
 };
 
 use super::{
+    generate::GenerateItem,
     modules::{parse_module_declaration, VerilogModule},
     preprocessor::{PreprocessError, Preprocessed, Preprocessor, SourceMap, Timescale},
     primitive::parse_primitive_declaration,
     simple::ws_and_comments,
+    statements::ModuleStatement,
 };
 
 /// Parse a whole source file: zero or more module or primitive declarations,
@@ -144,6 +146,109 @@ fn locate(text: &str, map: &SourceMap, error: nom::Err<nom::error::Error<&str>>)
     SourceError::Parse {
         at: map.describe(offset),
         detail: format!("unexpected input ({})", detail),
+    }
+}
+
+/// The module to elaborate when nobody named one: one that nothing else
+/// instantiates.
+///
+/// A testbench is the module at the root of the instantiation graph. Ties are
+/// broken by the conventional names, then by source order — picking a leaf
+/// would elaborate a design with no stimulus. An instantiation inside a
+/// `generate` region counts as much as one in the body: a ripple adder's cells
+/// are instantiated from a loop, and missing that made the *cell* a root
+/// (corpus `pr1676071`, `pr1758122`).
+pub fn root_module(modules: &[VerilogModule]) -> Option<String> {
+    let mut instantiated: Vec<&str> = Vec::new();
+    for module in modules {
+        instantiated_modules(&module.statements, &mut instantiated);
+    }
+
+    let roots: Vec<&str> = modules
+        .iter()
+        .map(|module| module.identifier.name.as_str())
+        .filter(|name| !instantiated.contains(name))
+        .collect();
+
+    for conventional in ["main", "top", "test", "tb", "bench"] {
+        if roots.contains(&conventional) {
+            return Some(conventional.to_string());
+        }
+    }
+    roots
+        .last()
+        .map(|name| name.to_string())
+        .or_else(|| modules.last().map(|m| m.identifier.name.clone()))
+}
+
+/// The modules `top` reaches through its instantiations, `top` included, in
+/// their original order.
+///
+/// This is what iverilog's `-s top` elaborates: a module nothing under the top
+/// instantiates is not part of the design, so it contributes nothing — not
+/// even its `` `timescale `` to the precision the clock counts in. A cell
+/// library read beside a testbench is the usual case: yosys's
+/// `ice40/cells_sim.v` declares `1ps` precision, and a testbench that uses
+/// none of its cells still runs at the one second it was written at.
+pub fn reachable_modules(modules: Vec<VerilogModule>, top: &str) -> Vec<VerilogModule> {
+    let mut wanted: Vec<String> = vec![top.to_string()];
+    let mut index = 0;
+    while index < wanted.len() {
+        if let Some(module) = modules.iter().find(|m| m.identifier.name == wanted[index]) {
+            let mut found = Vec::new();
+            instantiated_modules(&module.statements, &mut found);
+            for name in found {
+                if !wanted.iter().any(|w| w == name) {
+                    wanted.push(name.to_string());
+                }
+            }
+        }
+        index += 1;
+    }
+    modules
+        .into_iter()
+        .filter(|module| wanted.contains(&module.identifier.name))
+        .collect()
+}
+
+/// Every module `statements` instantiate, reaching into `generate` regions.
+fn instantiated_modules<'a>(statements: &'a [ModuleStatement], found: &mut Vec<&'a str>) {
+    for statement in statements {
+        match statement {
+            // Every instance in one statement names the same module.
+            ModuleStatement::ModuleInstantiation(instances) => found.extend(
+                instances
+                    .first()
+                    .map(|instance| instance.module_name.name.as_str()),
+            ),
+            ModuleStatement::GenerateRegion(items) => generated_modules(items, found),
+            _ => {}
+        }
+    }
+}
+
+fn generated_modules<'a>(items: &'a [GenerateItem], found: &mut Vec<&'a str>) {
+    for item in items {
+        match item {
+            GenerateItem::Item(statement) => {
+                instantiated_modules(std::slice::from_ref(statement), found)
+            }
+            GenerateItem::Block(block) => generated_modules(&block.items, found),
+            GenerateItem::Loop(generate_loop) => {
+                generated_modules(&generate_loop.body.items, found)
+            }
+            GenerateItem::If(generate_if) => {
+                generated_modules(&generate_if.then_block.items, found);
+                if let Some(block) = &generate_if.else_block {
+                    generated_modules(&block.items, found);
+                }
+            }
+            GenerateItem::Case(generate_case) => {
+                for arm in &generate_case.items {
+                    generated_modules(&arm.block.items, found);
+                }
+            }
+        }
     }
 }
 

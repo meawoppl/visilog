@@ -7,4 +7,6 @@
 pub mod git_utils;
 pub mod parsers;
 pub mod register;
+pub mod run;
 pub mod simulator;
+pub mod waveform;

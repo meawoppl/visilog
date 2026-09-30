@@ -1513,7 +1513,9 @@ pub fn stamp_system_time(expression: &mut Expression, ticks_per_unit: u64) {
     match expression {
         Expression::SystemFunctionCall(name, arguments) => {
             if arguments.is_empty() && matches!(name.as_str(), "time" | "stime" | "realtime") {
-                let unit = VerilogConstant::from_int(ticks_per_unit.min(i64::MAX as u64) as i64);
+                // Sized: a `1s` module over a `1ps` clock is 10¹² ticks a unit,
+                // which an unsized — thirty-two bit — literal would truncate.
+                let unit = VerilogConstant::from_u64(ticks_per_unit);
                 arguments.push(Expression::SystemFunctionCall(
                     TICKS_PER_UNIT.to_string(),
                     vec![Expression::Constant(unit)],
