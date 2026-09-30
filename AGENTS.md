@@ -16,14 +16,22 @@ cargo fmt            # format — run before every push
 cargo fmt --check    # what CI enforces
 ```
 
-All tests are inline `#[cfg(test)]` modules; there is no integration-test directory. The
-suite runs in well under a second — run it after every change.
+Unit tests are inline `#[cfg(test)]` modules and run in well under a second — run them
+after every change. `tests/` holds the two external-measurement harnesses, both
+`#[ignore]`d: the ivtest corpus and the real-project qualification.
 
-**The crate is a library plus a stub binary.** `src/lib.rs` exports the modules; `src/main.rs`
-is still an empty `fn main() {}`, so `cargo run` does nothing and there is no CLI yet.
-Verify work through tests. The lib target is what lets `benches/` import the crate, and it
-is also why `cargo build` emits only a handful of warnings — before it existed, every
-public item read as dead code and the count was over 250.
+**The crate is a library plus a thin CLI.** `src/lib.rs` exports the modules; `src/main.rs`
+turns arguments into a `run::RunConfig`, calls `run::run`, prints what the design printed
+and writes the `RunRecord` as JSON — every decision about a run lives in the library, so an
+embedding client gets exactly what the command line gets:
+
+```bash
+cargo run --release -- run -s tb -I inc -DSIM +seed=3 -o out tb.v dut.v   # exits 0..7
+cargo run --release -- compare reference.vcd candidate.vcd               # JSON, exit 0/1
+```
+
+The lib target is also why `cargo build` emits only a handful of warnings — before it
+existed, every public item read as dead code and the count was over 250.
 
 **Performance is a stated goal, so measure changes.** `cargo bench` covers ticking whole
 designs, expression evaluation, and parsing. `parse/*` is there as a regression guard: work
@@ -34,9 +42,11 @@ on the simulator should leave it alone.
 ```
 src/
   lib.rs               the library root; exports everything below
-  main.rs              stub binary, currently empty
+  main.rs              the `visilog` CLI — `run` and `compare` — over run.rs / waveform.rs
   git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
   register.rs          4-state (0/1/x/z) value type, packed into two bit planes
+  run.rs               RunConfig → RunRecord: one reproducible run; see "Running a design"
+  waveform.rs          VCD read back into normalised traces, and compared
   inspect.rs           Session — signal enumeration, change batches, stepping and
                        breakpoints for interactive clients; see "Inspecting a run"
   parsers/             the Verilog front end — see below
@@ -44,6 +54,13 @@ src/
   verilog/examples/    sample .v files, walked by two corpus tests
 benches/
   simulation.rs        criterion throughput benchmarks
+tests/
+  ivtest_corpus.rs     Icarus's regression suite — see "Measuring progress"
+  project_qualification.rs
+                       real designs under iverilog and visilog — see "Qualifying on real
+                       projects"
+qualification/
+  benches.json         the pinned projects and benches that harness runs
 ```
 
 ### `src/parsers/`
@@ -222,8 +239,41 @@ blocks is measured, not reasoned**: a list naming a `posedge` or `negedge` anywh
 named event, misses the earlier write; a list of plain signals (`@(b)`, `@(c or d)`) and
 `@*` hear it whichever side of the `initial` they are written (`armed_at_its_turn`). A
 trigger fired before the turn is skipped by count, since a trigger has no value to
-snapshot. Among blocks woken at the same instant iverilog's order still differs from
-ours.
+snapshot.
+
+**Blocks one settle round wakes run in iverilog's order: by the write that woke them,
+then most recently armed first.** vvp keeps one wait list per event and pushes a process
+onto its *front* when the process reaches the event control, and it schedules the waiters
+on a signal the moment the signal is written. So three `always @(posedge clk)` blocks
+armed A, B, C at time zero run C, B, A at the first edge, A, B, C at the next (each
+re-armed as it finished), and an `initial` that reached `@(posedge clk)` after all three
+last ran goes first; while four `always @(x)` blocks over four registers written in turn
+run in the order of the writes (corpus `vector`). A testbench that drives an input with a
+blocking assignment on the edge its design samples it on depends on exactly this —
+widlar's `PulseGenerator_tb` diverged from iverilog until it was modelled. Three pieces
+carry it:
+
+- **The change journal keeps write order.** `StateStore::take_changes` hands changes back
+  in the order each name was first written, where it used to sort them by name.
+- **`Simulator::next_arming` stamps every arming** — an edge-triggered `always` running off
+  its end, a time-zero `arm`, a `@` part way through a block — and `delta_rounds` decides
+  *every* wake of the round first (the `always` loop and `take_satisfied_waiters`), then
+  sorts by `(wake_rank, newest arming first)` and runs them. `wake_rank` is the position
+  in the journal of the write that fired the block: the shortest prefix of the offered
+  edges that still fires it, found by binary search since firing is monotonic.
+- **The ranking is skipped when a round wakes one block**, which is nearly every round;
+  measured against `main` that is within noise on `bench tick/*`, where ranking every
+  wake cost 5%.
+
+The not-yet-run list is `Simulator::settling`, a field for the reason `round` is one: the
+block that runs first may `disable` one further down (corpus `disable_cleanup`).
+
+What is still different: vvp propagates *some* continuous assignments synchronously at the
+write — a net declaration assignment and an arithmetic or concatenation functor do, a
+logic `&` functor schedules itself — where visilog settles every continuous assignment
+between rounds. A testbench that writes an input and has another block read a wire built
+from it at the same edge sees the difference; widlar's `spi_tb` is that race, and the LRM
+leaves it open.
 
 **A `#0` yields to the blocks the design just woke, and not to their non-blocking
 updates.** It re-queues a block at the same instant, in what IEEE 1364-2005 calls the
@@ -2432,6 +2482,85 @@ and that one flag) rather than as a bare `Register`.
 | `validator.rs` | `validate_module` / `gather_definitions` |
 | `vcd.rs` | `VcdDump` — the value change dump: `add` resolves `$dumpvars` targets into variables, `note_changes` marks the ones the change journal says were written, `flush` writes the header, the opening block and each timestep's section, and `trimmed` / `identifier` are the iverilog-measured vector trimming and identifier alphabet |
 
+### Running a design: `src/run.rs`
+
+`run::run(&RunConfig, cancel)` is one reproducible run. The config names everything the
+run depends on — the sources **in order**, the top, include directories, `-D` defines,
+plus-args, the directories data files are read from (`search_paths`) and written to
+(`output_dir`), the default `` `timescale ``, and optional time and step limits — and the
+`RunRecord` it returns says how it ended and carries the tool version and a SHA-256 of
+every source, so two records can be compared and one repeated. `run::load` is the front
+half (read, preprocess, parse, pick the top, configure a `Simulator`), shared with
+`inspect::Session`. `RUN_RECORD_SCHEMA` moves only when a field changes meaning; adding
+one does not move it.
+
+**The sources are one compilation unit.** `Preprocessor::preprocess_files` expands them in
+order with one macro table and one `` `timescale ``, which is what iverilog does with a
+command line of files — a `` `define `` in one is visible in the next — and each file must
+still balance its own `` `ifdef ``s. `Preprocessor::with_define` is `-D`, a bare name being
+`1`. Each source's own directory is added to the include path, as iverilog does.
+
+**A named top prunes the design to what it reaches**, which is iverilog's `-s`
+(`source::reachable_modules`). It matters beyond speed: a module nothing under the top
+instantiates contributes nothing, not even its `` `timescale `` to the clock's precision.
+yosys's `ice40/cells_sim.v` declares `1ps`, and a testbench read beside it that uses none of
+its cells still runs at the one second it was written at. Without a top every module is a
+root, and `source::root_module` — the picker the corpus harness has always used, moved into
+the library — chooses which one runs.
+
+**One `StopReason`, one exit status.** `Finished` and `Quiescent` are the two ways a design
+ends on its own terms (0, or 1 when it reported an assertion failure); `Io`/`Compile` 2,
+`Unsupported` 3, `Elaboration`/`Runtime` 4, `TimeLimit`/`StepLimit` 5, `Cancelled` 6,
+`Breakpoint` 7. `Unsupported` is a `SimulationError::Unsupported`, an unimplemented
+function, or `TimeOverflow` (below) — the constructs a caller should read as "not yet",
+not as "your design is wrong". The drive loop steps from one `next_time` to the next, so a
+step limit counts timesteps, and cancellation is polled between them and always leaves the
+design at a settled timestamp. With no limit a run goes until the design finishes or has
+nothing scheduled, as iverilog does.
+
+**`assertion_failures` counts `$error`, `$fatal` and failed `assert`s**, from
+`TaskContext::failures`, so a caller can tell a clean finish from one that reported a
+problem without reading the text. The severity tasks print iverilog 12.0's layout —
+`ERROR: <message>` then `       Time: <ticks>  Scope: <%m>` — less the `file:line:` it puts
+after the label, since there are no source lines to name. The time is raw clock ticks and
+the scope the call's own `%m` (a task's name included), both measured.
+
+**The clock is a signed sixty-four bit count, and running past it is
+`SimulationError::TimeOverflow`**, never a wrap to a negative time. iverilog's is unsigned
+and goes twice as far: fpga-tesla's `led_tb` waits 10⁷ seconds beside a `1ps` cell library,
+10¹⁹ ticks, which iverilog reaches and visilog names. `runner::later` is the one checked
+addition every schedule goes through.
+
+### Comparing waveforms: `src/waveform.rs`
+
+`Waveform::parse` reads a VCD back into what the design did: every variable by its
+hierarchical name (top included, the same IDs `inspect` uses) and width, and its value from
+each instant of **physical** time in femtoseconds, with consecutive equal values collapsed.
+Identifier codes, `$date`, declaration order, `wire`/`reg`/`integer` kinds, trimmed leading
+digits (re-extended the way a reader does) and the `$timescale` all normalise away, so a
+visilog dump and an iverilog dump of the same run compare equal. A variable inside a scope
+whose name starts with `$` (iverilog's `$ivl_for_loop0`) and a `$var parameter` are left
+out, since only one side writes them. `waveform::compare` walks every variable both dumps
+hold up to where the shorter one ends and reports the earliest disagreement per signal,
+plus the width mismatches and the names only one side has. `visilog compare ref.vcd
+cand.vcd` is the same thing on the command line.
+
+### What is not simulated: timing disclosure
+
+Simulation is **functional**. Procedural delays, delayed continuous assignments and gate
+and UDP delays are simulated; a `specify` block's path delays and timing checks, and a
+bidirectional switch's delay, are parsed and dropped. A design built on vendor cell models
+that finishes cleanly has therefore not been timing-verified, and the run says so rather
+than leaving it to be inferred from silence. `Elaborator::omit_timing` records a
+`TimingOmission` (kind, instance, module, the construct as written) wherever one is
+dropped; `Simulator::timing_omissions` hands them over; `run` summarises them in
+`RunRecord::capabilities` — what is always simulated, and a count and the modules for each
+kind that was not — and adds one diagnostic per kind naming the first few sites, a warning
+in functional mode. `RunConfig::strict_timing` (`--strict-timing`) makes each an error and
+stops with `Unsupported` before running. A design whose delays are all of the simulated
+kinds passes strict mode untouched. Note that iverilog ignores `specify` too unless given
+`-gspecify`, so a differential run against its default agrees with visilog here.
+
 ### Inspecting a run: `src/inspect.rs`
 
 `inspect::Session` is what an interactive client — a waveform viewer, a debugger, a
@@ -2619,7 +2748,8 @@ relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
 path; `judge_with` is the one that takes the configured preprocessor and the gold text.
 
 **The harness picks one top, and a module is a root only if *nothing* instantiates it —
-including from inside a `generate` region.** `top_module` walks every region, loop, branch
+including from inside a `generate` region.** `source::root_module` (shared with
+`run::run`, which uses it when no top is named) walks every region, loop, branch
 and case arm (`instantiated_modules`), because a ripple adder written as `for (…) begin :
 addbit add1 bit(…); end` otherwise leaves its cell looking like a root, and the cell is
 last in the file, which is the tie-break. The design then runs its leaf and prints nothing
@@ -2651,6 +2781,42 @@ diagnostics. **They go stale as features land** — a row counting files that *c
 construct cannot move once that construct is supported. Prune a row when its feature ships;
 the "sample of unexplained rejections" exists to point at whatever the heuristics no longer
 explain.
+
+**The corpus score is not a defect count.** iverilog itself fails 125 of the 1514 `normal`
+entries (#248), and several of visilog's wrong answers are byte-identical to iverilog's. A
+failure list is triaged against a live iverilog run before anything in it is called a bug.
+
+## Qualifying on real projects
+
+`tests/project_qualification.rs` runs real, maintained designs — MagicSchoolBus,
+widlar's Tesla-coil controller, fpga-tesla — under iverilog and visilog with identical
+sources, defines and top, and compares them three ways: normalised VCD
+(`waveform::compare`), printed output with iverilog's `file:line:` and `$finish called at`
+lines taken out, and the count of `ERROR:`/`FATAL:` reports. The projects are **private**,
+so they are fetched and never vendored; `qualification/benches.json` pins each by full
+commit hash and lists every bench with its exact source files, top and expected class:
+
+```bash
+VISILOG_PROJECTS=~/repos cargo test --release --test project_qualification \
+    -- --ignored --nocapture                  # VISILOG_QUAL_ONLY=widlar/spi for one
+```
+
+**Whether the reference passes is a separate question from whether visilog agrees with
+it**, and only the second qualifies visilog. Several of these testbenches fail their own
+checks under iverilog too (`CameraSPIReader`, `memory`, `spi`), and three do not compile
+under iverilog 12.0 at all (a superfluous port comma, a name declared twice) — a whole-
+project compile of either repository fails for the same reasons, which is why every bench
+names only the files its testbench reaches. `summary.json` records both answers, with the
+commands, the iverilog version, the checked-out revision and every source hash; the gate is
+that each bench the manifest expects to `agree` does. A bench expected to `diverge` or be
+`unsupported` must say why in its `note`, and `the_manifest_is_well_formed` checks that it
+does. `.github/workflows/projects.yml` runs it when the `QUALIFICATION_TOKEN` secret — a
+read-only token for the three repositories — is set, and skips cleanly when it is not.
+
+The projects' own runners compile with `-g2012 -gassertions -DNO_ICE40_DEFAULT_ASSIGNMENTS`
+plus yosys's `ice40/cells_sim.v`, so the harness does too. That is where immediate
+`assert (c) else $error(…)`, `for (integer i = …)`, declarations in an unnamed `begin`, and
+SystemVerilog default port values came from — see the Gotchas.
 
 ## Conventions
 
@@ -2687,10 +2853,8 @@ tripwire.
 
 ## Gotchas
 
-- **`cargo build` emits ~160 warnings**, nearly all `dead_code` — the parser and simulator
-  types have no non-test consumer yet because `main.rs` is a stub. This is expected and
-  not something to "fix" by deleting code. It does mean a genuine new warning is easy to
-  miss; check the warning count or grep for your file specifically.
+- **`cargo build` emits a handful of warnings.** A genuine new one is easy to miss among
+  them; check the count or grep for your file specifically.
 - **Duplicate definitions exist.** `NetType` is defined in *both* `parsers/nets.rs` and
   `parsers/modules.rs`. Check which one is in scope before assuming a change took effect.
   (The former duplicate `Register` in `state_store.rs` is gone — there is now one
@@ -3374,6 +3538,34 @@ tripwire.
   one never-inlined `packed_eval` call cost one slot instead of four. Anything added to
   that function's arms should be weighed the same way.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
+- **`assert (c) pass else fail;` lowers to an `if` whose missing `else` is a bare
+  `$error`**, in the parser, so nothing downstream learns it was written. Both arms are
+  optional; `assert` carries a word boundary and needs its `(`, so `assert_ok = 1;` is an
+  assignment. It is SystemVerilog, and no scored corpus file names anything `assert`.
+- **The parser names two kinds of scope, numbered through the module the way iverilog
+  numbers them.** `for (integer i = …)` lowers to a named block `$ivl_for_loop<N>` declaring
+  `i` around the loop, and an unnamed `begin` that declares something becomes
+  `$unm_blk_<N>` — where *every* unnamed `begin` takes a number as it opens, declaring or
+  not, so the third is `$unm_blk_3` even when the first two declared nothing. `%m` inside
+  either prints iverilog 12.0's exact path. The counters are thread-locals reset by
+  `behavior::reset_generated_scopes` at each `module`; a parse that backtracks over one
+  leaves a gap, never a duplicate. A `$` cannot begin a design identifier, and a scope that
+  begins with one is left out of the dump. `int` is read as `integer`.
+- **A function body's named-block locals live in the call's frame.** `Program::compile`
+  renames a block local to `blk.i`, so `compile_function` walks the body with
+  `elaborate::for_each_block` — the one walk that says which blocks a statement tree holds,
+  which `declare_block_locals` also uses — and declares each as a frame variable under
+  that spelling. A lowered `for (integer i …)` inside a function is one of these.
+- **An input's default value applies only when the port is unconnected.**
+  `input I0 = 1'b0` is SystemVerilog's default port value (IEEE 1800 §23.2.2.4), not a
+  net declaration assignment; driving it on a connected port put a second driver on every
+  input of yosys's `SB_LUT4`. An output's or a variable port's initialiser is unchanged.
+- **A `timing check` limit may be `min:typ:max`** — it is a `PathDelay`, the same shape a
+  path delay's value is (`$setuphold(posedge CLK, posedge I0, 378:418:470, 0:0:0);`).
+- **A comment may follow a `` `timescale `` on its line**, and is not part of it.
+- **The unit a `$time` call is stamped with is a sized 64 bit literal**
+  (`VerilogConstant::from_u64`). An unsized one is thirty-two bits, and a `1s` module over
+  a `1ps` clock is 10¹² ticks a unit — `$time` printed 1402 where iverilog prints 5.
 
 ## Git workflow
 
