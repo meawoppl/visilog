@@ -152,7 +152,10 @@ pub struct TimingCheck {
 #[derive(Debug, PartialEq)]
 pub struct TimingCheckArgument {
     pub edge: Option<EventTriggers>,
-    pub value: DelayTerm,
+    /// A limit may be a `min:typ:max` triple like a path delay — yosys's
+    /// `ice40/cells_sim.v` writes `$setuphold(posedge CLK, posedge I0,
+    /// 378:418:470, 0:0:0);` — so it is the same shape.
+    pub value: PathDelay,
     pub condition: Option<Expression>,
 }
 
@@ -357,7 +360,7 @@ fn timing_check_name(input: &str) -> IResult<&str, String> {
 fn timing_check_argument(input: &str) -> IResult<&str, Option<TimingCheckArgument>> {
     let (input, _) = ws_and_comments(input)?;
     let (input, edge) = opt(ws(edge_identifier))(input)?;
-    let (input, value) = opt(delay_term)(input)?;
+    let (input, value) = opt(path_delay)(input)?;
     let Some(value) = value else {
         // A blank argument keeps its place: which argument a timing check is
         // reading is decided by position.
@@ -590,9 +593,12 @@ mod tests {
                $setup(posedge d, posedge clk &&& enable, 10, notifier);
                $width(posedge clk, 5);
                $period(negedge clk, 20);
+               $setuphold(posedge CLK, posedge I0, 378:418:470, 0:0:0);
              endspecify",
         );
-        assert_eq!(parsed.checks.len(), 3);
+        assert_eq!(parsed.checks.len(), 4);
+        let limit = parsed.checks[3].arguments[2].as_ref().unwrap();
+        assert_eq!(limit.value.terms.len(), 3, "a min:typ:max limit");
         assert_eq!(parsed.checks[0].name, "setup");
         assert_eq!(parsed.checks[0].arguments.len(), 4);
         let reference = parsed.checks[0].arguments[1].as_ref().unwrap();

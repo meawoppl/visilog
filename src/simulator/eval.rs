@@ -1513,7 +1513,9 @@ pub fn stamp_system_time(expression: &mut Expression, ticks_per_unit: u64) {
     match expression {
         Expression::SystemFunctionCall(name, arguments) => {
             if arguments.is_empty() && matches!(name.as_str(), "time" | "stime" | "realtime") {
-                let unit = VerilogConstant::from_int(ticks_per_unit.min(i64::MAX as u64) as i64);
+                // Sized: a `1s` module over a `1ps` clock is 10¹² ticks a unit,
+                // which an unsized — thirty-two bit — literal would truncate.
+                let unit = VerilogConstant::from_u64(ticks_per_unit);
                 arguments.push(Expression::SystemFunctionCall(
                     TICKS_PER_UNIT.to_string(),
                     vec![Expression::Constant(unit)],
@@ -2517,8 +2519,11 @@ pub fn select_index(value: &Register) -> Result<Option<i64>, EvalError> {
 // ---------------------------------------------------------------------------
 
 fn eval_constant(constant: &VerilogConstant, signed_context: bool) -> Result<Register, EvalError> {
-    let bits = constant_bits(constant.size(), constant.base_type(), constant.digits())?;
-    Ok(bits.with_signedness(signed_context && constant.is_signed()))
+    let bits = constant
+        .cached_bits(|| constant_bits(constant.size(), constant.base_type(), constant.digits()))?;
+    Ok(bits
+        .clone()
+        .with_signedness(signed_context && constant.is_signed()))
 }
 
 /// Converts the pieces of a literal — its optional size, its base and its
@@ -3132,7 +3137,7 @@ fn logic_bit(bit: u8) -> Register {
 
 /// A register used as a condition: any `1` bit is true, all-zero is false, and
 /// anything else (only unknown bits and zeros) is unknown.
-fn truth(register: &Register) -> Option<bool> {
+pub fn truth(register: &Register) -> Option<bool> {
     if register.has_one() {
         // Every real with a bit set is true except `-0.0`, whose sign bit is
         // the one place the bits answer differently from the number. Asking

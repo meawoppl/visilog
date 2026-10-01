@@ -271,6 +271,31 @@ impl fmt::Display for Location<'_> {
     }
 }
 
+impl Location<'_> {
+    /// This location with its own copy of the names, so it can outlive the
+    /// [`SourceMap`] it came from.
+    pub fn to_owned_location(&self) -> SourceLocation {
+        SourceLocation {
+            file: self.file.to_string(),
+            line: self.line,
+            expansion_of: self.expansion_of.map(str::to_string),
+        }
+    }
+}
+
+/// A [`Location`] that owns its names — what a parsed module keeps of where it
+/// was written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceLocation {
+    pub file: String,
+    /// One-based.
+    pub line: usize,
+    /// The macro the text was expanded from, when it was; `line` then names
+    /// the invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion_of: Option<String>,
+}
+
 /// Maps an offset in the expanded text back to its origin.
 ///
 /// Built as the text is emitted rather than reconstructed afterwards: once a
@@ -393,6 +418,8 @@ pub struct Preprocessor {
     /// `1s / 1s`; iverilog's `+timescale+1ns/1ps` sets it to something else,
     /// and the answer a design gets from `$printtimescale` changes with it.
     default_timescale: Option<Timescale>,
+    /// Macros defined before the first file is read — iverilog's `-D`.
+    defines: Vec<(String, String)>,
 }
 
 impl Preprocessor {
@@ -417,11 +444,49 @@ impl Preprocessor {
         self
     }
 
+    /// Define an object-like macro before any file is read, which is
+    /// iverilog's `-DNAME=value`. A bare `-DNAME` is the value `1`, as it is
+    /// there, and a later `` `define `` of the same name replaces it.
+    pub fn with_define(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Preprocessor {
+        self.defines.push((name.into(), value.into()));
+        self
+    }
+
     /// Expand `source`, which is reported as coming from the file `name`.
     pub fn preprocess(&self, source: &str, name: &str) -> Result<Preprocessed, PreprocessError> {
+        self.preprocess_files(&[(name, source)])
+    }
+
+    /// Expand several files as one compilation unit, in order.
+    ///
+    /// That is how iverilog reads a command line of sources: a `` `define ``
+    /// in one file is visible in every file after it, and so is a
+    /// `` `timescale ``. Each file must balance its own conditionals, and a
+    /// newline separates one file's text from the next so the last token of
+    /// one cannot run into the first of the next.
+    pub fn preprocess_files(
+        &self,
+        files: &[(&str, &str)],
+    ) -> Result<Preprocessed, PreprocessError> {
         let mut run = Run {
             config: self,
-            macros: HashMap::new(),
+            macros: self
+                .defines
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        MacroDef {
+                            params: None,
+                            body: value.clone(),
+                        },
+                    )
+                })
+                .collect(),
             names: Vec::new(),
             ids: HashMap::new(),
             out: Emitter::default(),
@@ -435,23 +500,29 @@ impl Preprocessor {
             },
             unconnected_drives: Vec::new(),
         };
-        let file = run.intern(name);
-        run.scan(source, Origin::File(file))?;
-
-        if !run.conds.is_empty() {
-            let at = run.at(Loc {
+        for (name, source) in files {
+            let file = run.intern(name);
+            let last = Loc {
                 file,
                 line: source.lines().count().max(1),
                 expansion: None,
-            });
-            let open = run.conds.len();
-            return Err(PreprocessError {
-                kind: ErrorKind::UnbalancedConditional(format!(
-                    "{} `ifdef without a matching `endif",
-                    open
-                )),
-                at,
-            });
+            };
+            run.scan(source, Origin::File(file))?;
+
+            if !run.conds.is_empty() {
+                let at = run.at(last);
+                let open = run.conds.len();
+                return Err(PreprocessError {
+                    kind: ErrorKind::UnbalancedConditional(format!(
+                        "{} `ifdef without a matching `endif",
+                        open
+                    )),
+                    at,
+                });
+            }
+            if files.len() > 1 {
+                run.out.emit(last, "\n");
+            }
         }
 
         Ok(Preprocessed {
@@ -812,6 +883,16 @@ impl Run<'_> {
             "timescale" => {
                 let rest = take_line(text, i);
                 if emitting {
+                    // A comment may follow the directive on its line:
+                    // `` `timescale 1 ns / 10 ps  // 48Mhz clock base `` is
+                    // widlar's `memory_tb.v`, which iverilog 12.0 accepts.
+                    let rest = rest.split("//").next().unwrap_or_default();
+                    let rest = match (rest.find("/*"), rest.find("*/")) {
+                        (Some(open), Some(close)) if open < close => {
+                            format!("{}{}", &rest[..open], &rest[close + 2..])
+                        }
+                        _ => rest.to_string(),
+                    };
                     let timescale = Timescale::parse(rest.trim())
                         .map_err(|detail| self.malformed(loc, "timescale", detail))?;
                     self.timescale = Some(timescale);
@@ -1705,6 +1786,17 @@ mod tests {
         assert_eq!(result.text.trim(), "module m; endmodule");
     }
 
+    #[test]
+    fn test_a_comment_after_a_timescale_is_not_part_of_it() {
+        for source in [
+            "`timescale 1 ns / 10 ps  // 48Mhz clock base\n",
+            "`timescale 1ns/10ps /* base */\n",
+        ] {
+            let result = Preprocessor::new().preprocess(source, "t.v").unwrap();
+            assert_eq!(result.timescale.unwrap().to_string(), "1ns/10ps");
+        }
+    }
+
     /// A `` `timescale `` applies to the modules that *follow* it, so one file
     /// may hold several at several scales — which is what `$printtimescale`
     /// reports and what the single `timescale` field could not say.
@@ -2036,5 +2128,37 @@ mod tests {
     #[test]
     fn test_a_macro_defined_with_no_parameters_takes_none() {
         assert_eq!(expand("`define f() 1\nx = `f();\n"), "\nx = 1;\n");
+    }
+
+    #[test]
+    fn test_a_command_line_define_is_seen_by_ifdef_and_expanded() {
+        let out = Preprocessor::new()
+            .with_define("SIM", "1")
+            .with_define("WIDTH", "8")
+            .preprocess("`ifdef SIM\nx = `WIDTH;\n`endif\n", "t.v")
+            .unwrap();
+        assert_eq!(out.text, "\nx = 8;\n\n");
+    }
+
+    #[test]
+    fn test_a_define_in_one_file_is_visible_in_the_next() {
+        let out = Preprocessor::new()
+            .preprocess_files(&[
+                ("a.v", "`define N 3\n`timescale 1ns/1ps\n"),
+                ("b.v", "x = `N;"),
+            ])
+            .unwrap();
+        assert_eq!(out.text.trim(), "x = 3;");
+        assert!(out.timescale.is_some(), "a timescale carries across files");
+        let at = out.text.find('x').unwrap();
+        assert_eq!(out.map.locate(at).unwrap().file, "b.v");
+    }
+
+    #[test]
+    fn test_each_file_must_balance_its_own_conditionals() {
+        let err = Preprocessor::new()
+            .preprocess_files(&[("a.v", "`ifdef X\n"), ("b.v", "`endif\n")])
+            .unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::UnbalancedConditional(_)));
     }
 }

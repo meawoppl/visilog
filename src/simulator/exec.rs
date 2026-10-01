@@ -813,11 +813,8 @@ pub fn drive_at(
                     if kept.is_empty() {
                         return Ok(false);
                     }
-                    let value = value.coerced(indices.len());
-                    let codes: Vec<u8> = kept
-                        .iter()
-                        .map(|(offset, _)| value.get_raw()[*offset])
-                        .collect();
+                    let all = value.coerced(indices.len()).get_raw();
+                    let codes: Vec<u8> = kept.iter().map(|(offset, _)| all[*offset]).collect();
                     let kept: Vec<i64> = kept.into_iter().map(|(_, index)| index).collect();
                     return drive_bits(state, name, &kept, &Register::from_bits(codes));
                 }
@@ -1029,13 +1026,13 @@ fn drive_bits(
     indices: &[i64],
     value: &Register,
 ) -> Result<bool, SimulationError> {
-    let value = value.coerced(indices.len());
+    let codes = value.coerced(indices.len()).get_raw();
     let signal = state
         .get_signal_mut(name)
         .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
     let mut changed = false;
-    for (offset, &index) in indices.iter().enumerate() {
-        changed |= signal.set_bit(index, value.get_raw()[offset]);
+    for (&index, &code) in indices.iter().zip(codes.iter()) {
+        changed |= signal.set_bit(index, code);
     }
     Ok(changed)
 }

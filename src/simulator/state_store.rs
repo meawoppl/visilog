@@ -14,6 +14,17 @@ use crate::simulator::gates::Strength;
 use crate::simulator::program::FunctionDefinition;
 use crate::simulator::tasks::Output;
 
+/// A map keyed by signal name, hashed with FxHash rather than the standard
+/// library's SipHash.
+///
+/// Every read, write and journal entry in a run looks a name up, and SipHash
+/// — built to resist an attacker choosing the keys, which a design cannot —
+/// was nearly a fifth of `CameraSetup_tb`'s run on its own. The keys are the
+/// design's own names, so a fast non-cryptographic hash is the right one.
+pub type FastMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
+/// The set counterpart of [`FastMap`].
+pub type FastSet<K> = HashSet<K, rustc_hash::FxBuildHasher>;
+
 /// What the `$random` stream starts from.
 ///
 /// Zero is what iverilog's unseeded `$random` starts from, and
@@ -892,7 +903,7 @@ pub struct ScopeStorage {
 
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
-    name_to_signal: HashMap<String, SignalState>,
+    name_to_signal: FastMap<String, SignalState>,
     /// Whether the design calls `$countdrivers` anywhere. It is what turns the
     /// driver tally on, so a design that never asks never builds one.
     counts_drivers: bool,
@@ -909,7 +920,7 @@ pub struct StateStore {
     /// every bit select goes through is the hot path. A name is in one map or
     /// the other, so an ordinary select still costs one hash and only a miss
     /// looks here.
-    name_to_memory: HashMap<String, Memory>,
+    name_to_memory: FastMap<String, Memory>,
     /// Every memory word written since the last marker, in the order written.
     /// See [`set_word`](StateStore::set_word).
     ///
@@ -925,10 +936,12 @@ pub struct StateStore {
     /// by an address costs a design with no memory in it ~4.5% on
     /// `bench tick/counter_4bit`.
     round_words: Vec<MemoryChange>,
-    /// For every signal written since the last marker, the value it held at
-    /// that marker. `None` records a name that did not exist yet, which makes
-    /// the write a declaration rather than a change.
-    journal: HashMap<String, Option<Register>>,
+    /// For every signal written since the last marker, when it was first
+    /// written — a count of journal entries, so the writes can be handed back
+    /// in the order they were made — and the value it held at that marker.
+    /// `None` records a name that did not exist yet, which makes the write a
+    /// declaration rather than a change.
+    journal: FastMap<String, (usize, Option<Register>)>,
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
@@ -975,7 +988,7 @@ pub struct StateStore {
     /// namespace beside the signals and the memories rather than a zero-width
     /// entry in either. That is what makes reading one a named error instead
     /// of a plausible pattern of bits.
-    events: HashSet<String>,
+    events: FastSet<String>,
     /// The parameters whose value was written as **text** — `parameter p =
     /// "PASSED";` — which a `$display` prints as the string it is, and takes
     /// as a format string, exactly as it would the literal. Their bits are an
@@ -1008,6 +1021,17 @@ pub struct StateStore {
     /// installing one goes through [`Rc::make_mut`], the same way the function
     /// table does.
     drives: Rc<Vec<Drive>>,
+    /// Which continuous assignments read each signal, by their index in the
+    /// simulator's list — see [`StateStore::watch_readers`]. Empty for a store
+    /// nothing watches, which is what keeps a write costing one `is_empty`.
+    readers: FastMap<String, Vec<usize>>,
+    /// One flag per continuous assignment: whether something it reads has
+    /// been written since it was last evaluated.
+    stale: Vec<bool>,
+    /// Whether a drive has been installed or taken away since the last
+    /// [`StateStore::take_drives_moved`] — a `release` puts the assignments
+    /// beneath it back in charge, whether or not anything they read moved.
+    drives_moved: bool,
     /// The right hand sides an intra-assignment timing control is holding on
     /// to, keyed by the hidden slot the instruction that evaluated them named.
     ///
@@ -1016,7 +1040,7 @@ pub struct StateStore {
     /// the value has to outlive the return from `resume`, exactly as a
     /// `repeat` count does. It is deliberately not a signal: nothing in the
     /// design can name it, so journalling it would only manufacture edges.
-    holds: HashMap<String, Register>,
+    holds: FastMap<String, Register>,
     /// The files `$fopen` has opened, and the directory a relative path is
     /// written into. See [`FileTable`].
     files: FileTable,
@@ -1167,16 +1191,16 @@ impl StateStore {
     /// from it is rejected when it is elaborated.
     pub fn frame(&self) -> StateStore {
         StateStore {
-            name_to_signal: HashMap::new(),
+            name_to_signal: FastMap::default(),
             // A frame holds no net, so it resolves nothing and tallies
             // nothing; the alias table rides along because a body may read a
             // design signal under a port's name.
             counts_drivers: false,
             aliases: Rc::clone(&self.aliases),
-            name_to_memory: HashMap::new(),
+            name_to_memory: FastMap::default(),
             memory_journal: Vec::new(),
             round_words: Vec::new(),
-            journal: HashMap::new(),
+            journal: FastMap::default(),
             time: self.time,
             random: RandomStream::default(),
             functions: Rc::clone(&self.functions),
@@ -1185,14 +1209,18 @@ impl StateStore {
             any_signed: false,
             any_real: false,
             any_memory: false,
-            events: HashSet::new(),
+            events: FastSet::default(),
             texts: Rc::clone(&self.texts),
             packed: Rc::clone(&self.packed),
             triggers: Vec::new(),
             // A frame holds only the call's own variables, and a function body
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
-            holds: HashMap::new(),
+            // A frame drives no continuous assignment.
+            readers: FastMap::default(),
+            stale: Vec::new(),
+            drives_moved: false,
+            holds: FastMap::default(),
             // Shared, not fresh: `$fopen` is an expression, so it can be
             // called from a function body, and a file it opened there has to
             // outlive the frame the way a file opened anywhere else does.
@@ -1532,6 +1560,52 @@ impl StateStore {
         !self.drives.is_empty()
     }
 
+    /// Starts tracking which of `count` continuous assignments are stale:
+    /// `readers` names, for each signal, the assignments that read it. Every
+    /// assignment starts stale, so the first settle evaluates them all.
+    ///
+    /// This is what lets the propagation fixpoint skip an assignment nothing
+    /// it reads has moved since it last ran. Measured on MagicSchoolBus's
+    /// `CameraSetup_tb`, 99.4% of continuous-assignment evaluations recomputed
+    /// a value that had not changed, and they were most of the run.
+    pub fn watch_readers(&mut self, readers: FastMap<String, Vec<usize>>, count: usize) {
+        self.readers = readers;
+        self.stale = vec![true; count];
+    }
+
+    /// Marks every assignment that reads `name` stale.
+    #[inline]
+    fn mark_readers(&mut self, name: &str) {
+        if self.readers.is_empty() {
+            return;
+        }
+        if let Some(readers) = self.readers.get(name) {
+            for &reader in readers {
+                self.stale[reader] = true;
+            }
+        }
+    }
+
+    /// Whether assignment `index` has to be evaluated, clearing the mark: a
+    /// write it causes to something it reads marks it again. An assignment
+    /// nothing is tracking is always stale.
+    pub fn take_stale(&mut self, index: usize) -> bool {
+        match self.stale.get_mut(index) {
+            Some(stale) => std::mem::replace(stale, false),
+            None => true,
+        }
+    }
+
+    /// Marks every tracked assignment stale.
+    pub fn mark_all_stale(&mut self) {
+        self.stale.fill(true);
+    }
+
+    /// Whether a drive was installed or taken away since the last call.
+    pub fn take_drives_moved(&mut self) -> bool {
+        std::mem::replace(&mut self.drives_moved, false)
+    }
+
     /// How many drives are installed, which is how many more rounds the
     /// continuous-assignment fixpoint may need.
     pub fn drive_count(&self) -> usize {
@@ -1565,6 +1639,7 @@ impl StateStore {
     /// one is applied last and wins — which is the rule the LRM asks for,
     /// falling out of the order rather than needing one of its own.
     pub fn install_drive(&mut self, drive: Drive) {
+        self.drives_moved = true;
         let drives = Rc::make_mut(&mut self.drives);
         match drives.iter_mut().find(|existing| {
             existing.names == drive.names
@@ -1587,6 +1662,7 @@ impl StateStore {
         if keep.iter().all(|keep| *keep) {
             return;
         }
+        self.drives_moved = true;
         let mut index = 0;
         Rc::make_mut(&mut self.drives).retain(|_| {
             let kept = keep.get(index).copied().unwrap_or(true);
@@ -1659,6 +1735,9 @@ impl StateStore {
     /// overwrite the value the round actually started from, and it is that
     /// value an edge has to be measured against.
     fn record(&mut self, name: &str) {
+        // Before the early return below: a second write in one round still
+        // has to reach an assignment that was re-evaluated after the first.
+        self.mark_readers(name);
         if self.journal.contains_key(name) {
             return;
         }
@@ -1666,12 +1745,18 @@ impl StateStore {
             .name_to_signal
             .get(name)
             .map(|signal| signal.register().clone());
-        self.journal.insert(name.to_string(), previous);
+        let order = self.journal.len();
+        self.journal.insert(name.to_string(), (order, previous));
     }
 
     /// The name and pre-write value of every signal written since the last
-    /// call, sorted by name, clearing the journal so the next round is measured
-    /// from here.
+    /// call, in the order each was first written, clearing the journal so the
+    /// next round is measured from here.
+    ///
+    /// The order is the one iverilog wakes the blocks in: it schedules the
+    /// waiters on a signal the moment the signal is written, so two blocks
+    /// woken by two writes run in the order the writes were made (corpus
+    /// `vector`).
     ///
     /// A name that did not exist at the last call is left out: it was declared
     /// rather than changed, and declaring a signal is not a simulation event.
@@ -1680,13 +1765,16 @@ impl StateStore {
     /// caller compares.
     pub fn take_changes(&mut self) -> Vec<(String, Register)> {
         let mut changes = Vec::with_capacity(self.journal.len());
-        for (name, previous) in self.journal.drain() {
+        for (name, (order, previous)) in self.journal.drain() {
             if let Some(previous) = previous {
-                changes.push((name, previous));
+                changes.push((order, name, previous));
             }
         }
-        changes.sort_by(|left, right| left.0.cmp(&right.0));
+        changes.sort_unstable_by_key(|(order, _, _)| *order);
         changes
+            .into_iter()
+            .map(|(_, name, previous)| (name, previous))
+            .collect()
     }
 
     /// Rewrites every journalled starting value that was entirely `z` as `x`.
@@ -1697,7 +1785,10 @@ impl StateStore {
     /// the rule iverilog follows, and which a `z` baseline gets wrong in the
     /// direction of waking blocks on a value nobody set.
     pub fn treat_undriven_start_as_unknown(&mut self) {
-        for previous in self.journal.values_mut().flatten() {
+        for (_, previous) in self.journal.values_mut() {
+            let Some(previous) = previous else {
+                continue;
+            };
             if *previous == Register::high_impedance(previous.width()) {
                 *previous = Register::unknown(previous.width());
             }
@@ -1984,6 +2075,7 @@ impl StateStore {
         let after = memory.word(Some(address));
         // A write that moved a word named a word, so it has a position.
         let position = memory.word_position(address)?;
+        self.mark_readers(name);
         match self.memory_journal.last_mut() {
             Some(last) if last.position == position && last.name == name => last.after = after,
             _ => self.memory_journal.push(MemoryChange {
@@ -2012,9 +2104,9 @@ impl StateStore {
     ) -> Option<bool> {
         let memory = self.name_to_memory.get(name)?;
         let mut word = memory.word(Some(address));
-        let value = value.coerced(indices.len());
-        for (offset, &index) in indices.iter().enumerate() {
-            word = memory.with_bit_of(word, index, value.get_raw()[offset]);
+        let codes = value.coerced(indices.len()).get_raw();
+        for (&index, &code) in indices.iter().zip(codes.iter()) {
+            word = memory.with_bit_of(word, index, code);
         }
         self.set_word(name, address, &word)
     }
@@ -2259,6 +2351,20 @@ impl StateStore {
     /// Every signal name, sorted.
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.name_to_signal.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// Every memory name, sorted.
+    pub fn memory_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.name_to_memory.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// Every named event, sorted.
+    pub fn event_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.events.iter().map(|k| k.as_str()).collect();
         names.sort();
         names
     }
