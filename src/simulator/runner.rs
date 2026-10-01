@@ -746,6 +746,13 @@ pub struct Simulator {
     /// The timing constructs the design wrote that the run will not carry
     /// out, from the last elaboration — see [`TimingOmission`].
     timing_omissions: Vec<TimingOmission>,
+    /// One flag per continuous assignment: whether it is evaluated on every
+    /// propagation pass rather than only when something it reads moved — see
+    /// [`Simulator::watch_assignment_reads`].
+    always_evaluate: Vec<bool>,
+    /// Set while a propagation is under way and cleared when it settles, so a
+    /// propagation that stopped on an error is visible to the next one.
+    propagating: bool,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -828,6 +835,8 @@ impl Simulator {
             automatic_index: HashMap::new(),
             aliases: HashMap::new(),
             timing_omissions: Vec::new(),
+            always_evaluate: Vec::new(),
+            propagating: false,
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -1019,6 +1028,8 @@ impl Simulator {
                 self.queue.insert(0, ExecutionCursor::new(id, 0));
             }
         }
+
+        self.watch_assignment_reads();
 
         // Declaring every signal journalled it, and a declaration is not a
         // change anything should wake on. Clearing here leaves the journal
@@ -2538,6 +2549,16 @@ impl Simulator {
         // of times. That is refused by name, on exactly the terms an
         // outstanding `$sscanf` fill already is — one length compare per pass.
         let printed = self.state.output().len();
+        // A drive installed or taken away puts every assignment beneath it
+        // back in question: a `release` hands a net back to its drivers
+        // whether or not anything they read moved.
+        // And so does a pass that stopped on an error part way through: an
+        // assignment whose evaluation failed had its mark taken already, and
+        // skipping it as settled would make the error disappear.
+        if self.state.take_drives_moved() || self.propagating {
+            self.state.mark_all_stale();
+        }
+        self.propagating = true;
         for pass in 1..=limit {
             let mut changed = false;
             let mut contributions: Vec<Contribution> = Vec::new();
@@ -2562,6 +2583,13 @@ impl Simulator {
                 });
             }
             for (index, assignment) in self.assignments.iter().enumerate() {
+                // Nothing this one reads has moved since it last ran, so it
+                // would drive exactly what it drove then.
+                if !self.always_evaluate.get(index).copied().unwrap_or(true)
+                    && !self.state.take_stale(index)
+                {
+                    continue;
+                }
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
                 // target is resolved before the right hand side is evaluated.
@@ -2791,6 +2819,7 @@ impl Simulator {
             changed |= self.resolve_contributions(contributions, &switches)?;
             changed |= self.apply_drives()?;
             if !changed {
+                self.propagating = false;
                 return Ok(pass);
             }
         }
@@ -2833,6 +2862,38 @@ impl Simulator {
     ///
     /// A design with no gates in it answers without hashing the name, the same
     /// shape `StateStore::any_signed` and `any_memory` use.
+    /// Works out which continuous assignments the propagation fixpoint may
+    /// skip while nothing they read moves, and hands the store the table that
+    /// marks them stale when something does.
+    ///
+    /// Three kinds are evaluated on every pass, as they always were: one whose
+    /// right hand side calls a function or a system function (a function reads
+    /// whatever its body reads, and `$time` moves on its own), one with a
+    /// delay (what it drives moves when its transaction lands, not when its
+    /// inputs do), and one onto a *resolved* net or through a select (a
+    /// resolved net is settled from every driver's contribution each pass, so
+    /// none of them may sit one out, and a select's index is itself a read).
+    /// Everything else is evaluated once something it reads has been written
+    /// since it last ran.
+    fn watch_assignment_reads(&mut self) {
+        let mut readers: HashMap<String, Vec<usize>> = HashMap::new();
+        self.always_evaluate = Vec::with_capacity(self.assignments.len());
+        for (index, assignment) in self.assignments.iter().enumerate() {
+            let plain_target = match assignment.lhs() {
+                Expression::Identifier(id) => !self.is_resolved(&id.name),
+                _ => false,
+            };
+            let reads = (plain_target && assignment.delay().is_none())
+                .then(|| events::exact_reads(assignment.rhs()))
+                .flatten();
+            self.always_evaluate.push(reads.is_none());
+            for name in reads.into_iter().flatten() {
+                readers.entry(name).or_default().push(index);
+            }
+        }
+        self.state.watch_readers(readers, self.assignments.len());
+    }
+
     fn is_resolved(&self, name: &str) -> bool {
         !self.resolved_nets.is_empty() && self.resolved_nets.contains(name)
     }
