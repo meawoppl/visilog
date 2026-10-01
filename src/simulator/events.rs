@@ -297,9 +297,23 @@ pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge], state: &Sta
 /// over-approximates — `posedge (a & b)` fires on a `posedge` of either operand
 /// — so a block may be woken more often than it should, never less.
 fn event_fires(event: &Event, edges: &[SignalEdge], state: &StateStore) -> bool {
-    let names = event_signals(&event.expression);
+    // `posedge clk` names one signal, and that is nearly every entry: it is
+    // compared directly rather than through a set of cloned names built on
+    // every settle round, which was an allocation per entry per round.
+    let single = match &event.expression {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        _ => None,
+    };
+    let names = match single {
+        Some(_) => BTreeSet::new(),
+        None => event_signals(&event.expression),
+    };
     edges.iter().any(|edge| {
-        if !names.contains(&edge.name) {
+        let named = match single {
+            Some(name) => edge.name == name,
+            None => names.contains(&edge.name),
+        };
+        if !named {
             return false;
         }
         match narrowed(&event.expression, edge, state) {
