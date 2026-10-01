@@ -2519,8 +2519,11 @@ pub fn select_index(value: &Register) -> Result<Option<i64>, EvalError> {
 // ---------------------------------------------------------------------------
 
 fn eval_constant(constant: &VerilogConstant, signed_context: bool) -> Result<Register, EvalError> {
-    let bits = constant_bits(constant.size(), constant.base_type(), constant.digits())?;
-    Ok(bits.with_signedness(signed_context && constant.is_signed()))
+    let bits = constant
+        .cached_bits(|| constant_bits(constant.size(), constant.base_type(), constant.digits()))?;
+    Ok(bits
+        .clone()
+        .with_signedness(signed_context && constant.is_signed()))
 }
 
 /// Converts the pieces of a literal — its optional size, its base and its

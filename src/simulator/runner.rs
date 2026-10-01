@@ -753,6 +753,12 @@ pub struct Simulator {
     /// Set while a propagation is under way and cleared when it settles, so a
     /// propagation that stopped on an error is visible to the next one.
     propagating: bool,
+    /// See [`Simulator::set_flush_each_advance`].
+    flush_each_advance: bool,
+    /// What every resolved net's drivers contributed on the last pass that
+    /// resolved them, so a pass where none moved can skip resolving. `None`
+    /// whenever a net may have been written some other way since.
+    last_contributions: Option<Vec<Contribution>>,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -837,6 +843,8 @@ impl Simulator {
             timing_omissions: Vec::new(),
             always_evaluate: Vec::new(),
             propagating: false,
+            flush_each_advance: true,
+            last_contributions: None,
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -1070,6 +1078,9 @@ impl Simulator {
             .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
         let (width, range) = (signal.width(), signal.range());
         self.state.set_ranged(name, value.resize(width), range);
+        // Written from outside, so a resolved net may no longer hold what its
+        // drivers last settled it to.
+        self.last_contributions = None;
         Ok(())
     }
 
@@ -1834,8 +1845,27 @@ impl Simulator {
         // Once per call rather than once per timestep: a waveform read after
         // `advance` returns is the whole of the run so far, and a design that
         // dumps nothing pays one branch for it.
-        self.tasks.flush_dump_file(&self.state);
+        if self.flush_each_advance {
+            self.tasks.flush_dump_file(&self.state);
+        }
         Ok(())
+    }
+
+    /// Whether [`advance`](Simulator::advance) pushes the waveform file out to
+    /// the operating system before it returns, which it does unless told
+    /// otherwise.
+    ///
+    /// A caller that steps one timestamp per call — `run::run` does — would
+    /// otherwise make a system call per timestep: a tenth of
+    /// `CameraSetup_tb`'s run was flushing its dump. Such a caller turns this
+    /// off and calls [`flush_outputs`](Simulator::flush_outputs) when it stops.
+    pub fn set_flush_each_advance(&mut self, flush: bool) {
+        self.flush_each_advance = flush;
+    }
+
+    /// Pushes the waveform file out to the operating system now.
+    pub fn flush_outputs(&self) {
+        self.tasks.flush_dump_file(&self.state);
     }
 
     /// The next instant the design has something to do at: a queued block
@@ -2557,6 +2587,7 @@ impl Simulator {
         // skipping it as settled would make the error disappear.
         if self.state.take_drives_moved() || self.propagating {
             self.state.mark_all_stale();
+            self.last_contributions = None;
         }
         self.propagating = true;
         for pass in 1..=limit {
@@ -2816,7 +2847,17 @@ impl Simulator {
             // during the run, and corpus `tran-keeper` gates a switch on the
             // very net it is holding up.
             let switches = self.switch_bits()?;
-            changed |= self.resolve_contributions(contributions, &switches)?;
+            // Every driver contributing exactly what it did last pass, with no
+            // switch carrying anything across, resolves to exactly what it
+            // resolved to then — so the nets already hold it. Resolution on
+            // every pass regardless was the largest cost left in
+            // `CameraSetup_tb` once unchanged assignments stopped re-running.
+            let unchanged =
+                switches.is_empty() && self.last_contributions.as_ref() == Some(&contributions);
+            if !unchanged {
+                changed |= self.resolve_contributions(&contributions, &switches)?;
+                self.last_contributions = Some(contributions);
+            }
             changed |= self.apply_drives()?;
             if !changed {
                 self.propagating = false;
@@ -2878,6 +2919,8 @@ impl Simulator {
     fn watch_assignment_reads(&mut self) {
         let mut readers: FastMap<String, Vec<usize>> = FastMap::default();
         self.always_evaluate = Vec::with_capacity(self.assignments.len());
+        self.last_contributions = None;
+        self.propagating = false;
         for (index, assignment) in self.assignments.iter().enumerate() {
             let plain_target = match assignment.lhs() {
                 Expression::Identifier(id) => !self.is_resolved(&id.name),
@@ -2921,7 +2964,7 @@ impl Simulator {
     /// has four drivers and two driver *lists*, and they must not be pooled.
     fn resolve_contributions(
         &mut self,
-        contributions: Vec<Contribution>,
+        contributions: &[Contribution],
         switches: &[SwitchBits],
     ) -> Result<bool, SimulationError> {
         if contributions.is_empty() && switches.is_empty() {
@@ -2930,7 +2973,7 @@ impl Simulator {
         // Grouped by net, in the order the drivers were written, so a design
         // resolves the same way twice.
         let mut nets: Vec<(&str, Option<&[i64]>)> = Vec::new();
-        for contribution in &contributions {
+        for contribution in contributions {
             let net = (
                 contribution.target.name(),
                 contribution.target.word_address(),
@@ -2998,7 +3041,7 @@ impl Simulator {
             }
             // Bits run most significant first, the way a `Register` is written.
             let mut driven: Vec<Vec<BitDriver>> = vec![Vec::new(); width];
-            for contribution in &contributions {
+            for contribution in contributions {
                 if contribution.target.name() != name
                     || contribution.target.word_address() != address
                 {
@@ -3531,6 +3574,7 @@ fn contribute_whole(
 }
 
 /// One continuous driver's claim on a net for one propagation pass.
+#[derive(Clone, PartialEq)]
 struct Contribution {
     target: ResolvedTarget,
     value: Register,
