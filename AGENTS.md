@@ -36,7 +36,33 @@ existed, every public item read as dead code and the count was over 250.
 
 **Performance is a stated goal, so measure changes.** `cargo bench` covers ticking whole
 designs, expression evaluation, and parsing. `parse/*` is there as a regression guard: work
-on the simulator should leave it alone.
+on the simulator should leave it alone. The micro-benchmarks are not the whole story, so
+also time a real design — MagicSchoolBus's `CameraSetup_tb` (6.3M timesteps, see
+"Qualifying on real projects") is the reference workload — and profile rather than guess:
+`perf record -g --call-graph dwarf` on a `CARGO_PROFILE_RELEASE_DEBUG=true` build works
+once `kernel.perf_event_paranoid` is at most 1. Benchmarks are meaningless while another
+session is compiling on the machine; check `uptime` before believing a number.
+
+**What the hot path relies on** (each measured on `CameraSetup_tb`, which went 117s → 27s):
+
+- **A continuous assignment is re-evaluated only when something it reads was written.**
+  `Simulator::watch_assignment_reads` gives the store a signal → assignments table, and
+  `StateStore::record` (every signal write) and `set_word` (every memory write) mark the
+  readers stale. **A new write path into the store must go through one of those two**, or
+  the assignments reading what it writes silently stop following it. Calls, delays,
+  resolved-net targets and select targets are always evaluated; a drive installed or
+  released, and a propagation that errored, mark everything stale. 99.4% of evaluations
+  had been recomputing an unchanged value.
+- **Resolution is skipped when every driver contributes what it did last pass**
+  (`last_contributions`), and with no switch involved. Anything that writes a resolved net
+  some other way has to clear it — `set_input` does.
+- **The store's name-keyed maps use FxHash** (`state_store::FastMap`), not SipHash.
+- **A literal's bits are cached on the literal** (`constants::BitsCache`), outside its
+  equality.
+- **`run::run` flushes the dump once at the end** (`Simulator::set_flush_each_advance`),
+  not once per `advance`.
+- **`Register::get_raw` builds a fresh byte per bit on every call.** Expand once outside a
+  per-bit loop; calling it inside one made net resolution quadratic in the net's width.
 
 ## Layout
 
