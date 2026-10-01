@@ -63,8 +63,13 @@ pub struct VerilogConstant {
 /// `CameraSetup_tb`'s run, for a value that can never change. It is not part
 /// of the literal's identity: two literals are equal whether or not either has
 /// been evaluated.
+///
+/// Boxed, so the field is one pointer wide: an inline `Register` made every
+/// literal — and so every `Expression` — some eighty bytes larger, and the
+/// parser, which moves expressions around constantly, measured 17% slower on
+/// `bench parse/spi_controller`.
 #[derive(Clone, Default)]
-pub struct BitsCache(std::cell::OnceCell<Register>);
+pub struct BitsCache(std::cell::OnceCell<Box<Register>>);
 
 impl BitsCache {
     /// The cached bits, computing them with `make` the first time.
@@ -76,7 +81,7 @@ impl BitsCache {
             return Ok(bits);
         }
         let bits = make()?;
-        Ok(self.0.get_or_init(|| bits))
+        Ok(self.0.get_or_init(|| Box::new(bits)))
     }
 }
 
