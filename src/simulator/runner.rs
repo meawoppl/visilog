@@ -2911,6 +2911,30 @@ impl Simulator {
                     (signal.width(), signal.register().get_raw().to_vec())
                 }
             };
+            // One driver of the whole net, with no switch to carry anything in
+            // and no tally to keep, resolves bit by bit against nothing else.
+            if switches.is_empty() && !self.state.counts_drivers() {
+                let mut mine = contributions.iter().filter(|contribution| {
+                    contribution.target.name() == name
+                        && contribution.target.word_address() == address
+                });
+                if let (Some(only), None) = (mine.next(), mine.next()) {
+                    if matches!(only.target, ResolvedTarget::Whole(_)) {
+                        let codes = only.value.coerced(width).get_raw();
+                        resolving.push(NetDrivers {
+                            name: name.to_string(),
+                            address: None,
+                            bits,
+                            driven: Vec::new(),
+                            single: Some(
+                                codes.iter().map(|&code| only.strength.of(code)).collect(),
+                            ),
+                            through: Vec::new(),
+                        });
+                        continue;
+                    }
+                }
+            }
             // Bits run most significant first, the way a `Register` is written.
             let mut driven: Vec<Vec<BitDriver>> = vec![Vec::new(); width];
             for contribution in &contributions {
@@ -2932,13 +2956,13 @@ impl Simulator {
                             .state
                             .get_signal(name)
                             .expect("a bit select's signal was just looked up");
-                        let value = contribution.value.coerced(indices.len());
+                        let codes = contribution.value.coerced(indices.len()).get_raw();
                         for (offset, index) in indices.iter().enumerate() {
                             let Some(position) = signal.bit_position(*index) else {
                                 continue;
                             };
                             driven[position].push(BitDriver {
-                                strength: contribution.strength.of(value.get_raw()[offset]),
+                                strength: contribution.strength.of(codes[offset]),
                                 counted: contribution.counted,
                             });
                         }
@@ -2952,13 +2976,13 @@ impl Simulator {
                             .state
                             .memory(name)
                             .expect("a word select's memory was just looked up");
-                        let value = contribution.value.coerced(indices.len());
+                        let codes = contribution.value.coerced(indices.len()).get_raw();
                         for (offset, index) in indices.iter().enumerate() {
                             let Some(position) = bit_position_in(memory.range(), *index) else {
                                 continue;
                             };
                             driven[position].push(BitDriver {
-                                strength: contribution.strength.of(value.get_raw()[offset]),
+                                strength: contribution.strength.of(codes[offset]),
                                 counted: contribution.counted,
                             });
                         }
@@ -2976,6 +3000,7 @@ impl Simulator {
                 address: address.map(<[i64]>::to_vec),
                 bits,
                 driven,
+                single: None,
                 through: Vec::new(),
             });
         }
@@ -2999,6 +3024,16 @@ impl Simulator {
             } else {
                 self.wired_nets.get(net.name.as_str()).copied()
             };
+            if let Some(strengths) = &net.single {
+                for (position, &strength) in strengths.iter().enumerate() {
+                    let resolved = match wired {
+                        Some(kind) => resolve_wired(kind, std::iter::once(strength)),
+                        None => resolve_strength(std::iter::once(strength)),
+                    };
+                    bits[position] = resolved.value();
+                    levels[position] = resolved;
+                }
+            }
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
                     let strengths = drivers.iter().map(|d| d.strength);
@@ -3151,6 +3186,12 @@ struct NetDrivers {
     bits: Vec<u8>,
     /// The drivers of each bit, most significant first.
     driven: Vec<Vec<BitDriver>>,
+    /// The one driver's strength for each bit, when a single driver writes
+    /// the whole net and nothing else can reach it — `driven` is then empty.
+    /// A port bound to a net of another width is exactly that, and building a
+    /// list per bit to resolve one entry each cost a 576-bit net five
+    /// hundred allocations a pass (widlar's `memory_tb`).
+    single: Option<Vec<Strength>>,
     /// The conducting switches `$countdrivers` counts as drivers of a bit, each
     /// as the bit's position and the code the far terminal resolved to. Empty
     /// for a net no switch reaches.
@@ -3417,10 +3458,12 @@ fn contribute_whole(
     strength: Driven,
     counted: bool,
 ) {
-    let value = value.coerced(driven.len());
-    for (offset, slot) in driven.iter_mut().enumerate() {
+    // Expanded once: `get_raw` builds a fresh byte per bit every time it is
+    // called, so calling it per bit made a pass quadratic in the net's width.
+    let codes = value.coerced(driven.len()).get_raw();
+    for (slot, &code) in driven.iter_mut().zip(codes.iter()) {
         slot.push(BitDriver {
-            strength: strength.of(value.get_raw()[offset]),
+            strength: strength.of(code),
             counted,
         });
     }
