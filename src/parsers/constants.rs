@@ -11,6 +11,7 @@ use nom::{
 use super::base::RawToken;
 use super::numbers::{based_digits, unsigned_number};
 use super::simple::ws_and_comments;
+use crate::register::Register;
 use nom::character::complete::char;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +51,45 @@ pub struct VerilogConstant {
     /// [`VerilogConstant::new`] reads it off the size and only an unsized one
     /// has to say so.
     based: bool,
+    /// The bits the literal stands for, worked out the first time it is
+    /// evaluated and reused after — see [`BitsCache`].
+    bits: BitsCache,
+}
+
+/// The bits a literal stands for, once something has asked.
+///
+/// A literal is kept as the text it was written as, and turning `8'hFF` into
+/// bits means walking that text. Doing it on every evaluation was a tenth of
+/// `CameraSetup_tb`'s run, for a value that can never change. It is not part
+/// of the literal's identity: two literals are equal whether or not either has
+/// been evaluated.
+#[derive(Clone, Default)]
+pub struct BitsCache(std::cell::OnceCell<Register>);
+
+impl BitsCache {
+    /// The cached bits, computing them with `make` the first time.
+    pub fn get_or_try<E>(
+        &self,
+        make: impl FnOnce() -> Result<Register, E>,
+    ) -> Result<&Register, E> {
+        if let Some(bits) = self.0.get() {
+            return Ok(bits);
+        }
+        let bits = make()?;
+        Ok(self.0.get_or_init(|| bits))
+    }
+}
+
+impl PartialEq for BitsCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl fmt::Debug for BitsCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BitsCache")
+    }
 }
 
 /// The optional `s` that makes a based literal signed: `4'sd12`, `8'SH0F`.
@@ -90,6 +130,7 @@ impl VerilogConstant {
             base_type,
             value,
             signed: false,
+            bits: BitsCache::default(),
         }
     }
 
@@ -123,7 +164,16 @@ impl VerilogConstant {
             // reaches `-1`, and an unsigned `-1` is `4294967295`, which makes
             // `i >= 0` true for ever and the loop never end.
             signed: value < 0,
+            bits: BitsCache::default(),
         }
+    }
+
+    /// The literal's bits, from the cache once something has computed them.
+    pub fn cached_bits<E>(
+        &self,
+        make: impl FnOnce() -> Result<Register, E>,
+    ) -> Result<&Register, E> {
+        self.bits.get_or_try(make)
     }
 
     /// Whether the literal is a two's complement number.

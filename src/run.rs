@@ -313,7 +313,11 @@ pub fn run(config: &RunConfig, cancel: Option<&AtomicBool>) -> RunRecord {
         return record;
     }
 
+    // One timestamp per `advance`, so the dump is flushed once at the end
+    // rather than once a step.
+    simulator.set_flush_each_advance(false);
     let outcome = drive(&mut simulator, config, cancel, &mut record.steps);
+    simulator.flush_outputs();
     record.end_ticks = simulator.now();
     record.output = simulator.output().text();
     record.assertion_failures = simulator.assertion_failures();
