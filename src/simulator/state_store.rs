@@ -2026,9 +2026,9 @@ impl StateStore {
     ) -> Option<bool> {
         let memory = self.name_to_memory.get(name)?;
         let mut word = memory.word(Some(address));
-        let value = value.coerced(indices.len());
-        for (offset, &index) in indices.iter().enumerate() {
-            word = memory.with_bit_of(word, index, value.get_raw()[offset]);
+        let codes = value.coerced(indices.len()).get_raw();
+        for (&index, &code) in indices.iter().zip(codes.iter()) {
+            word = memory.with_bit_of(word, index, code);
         }
         self.set_word(name, address, &word)
     }
