@@ -14,6 +14,17 @@ use crate::simulator::gates::Strength;
 use crate::simulator::program::FunctionDefinition;
 use crate::simulator::tasks::Output;
 
+/// A map keyed by signal name, hashed with FxHash rather than the standard
+/// library's SipHash.
+///
+/// Every read, write and journal entry in a run looks a name up, and SipHash
+/// — built to resist an attacker choosing the keys, which a design cannot —
+/// was nearly a fifth of `CameraSetup_tb`'s run on its own. The keys are the
+/// design's own names, so a fast non-cryptographic hash is the right one.
+pub type FastMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
+/// The set counterpart of [`FastMap`].
+pub type FastSet<K> = HashSet<K, rustc_hash::FxBuildHasher>;
+
 /// What the `$random` stream starts from.
 ///
 /// Zero is what iverilog's unseeded `$random` starts from, and
@@ -892,7 +903,7 @@ pub struct ScopeStorage {
 
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
-    name_to_signal: HashMap<String, SignalState>,
+    name_to_signal: FastMap<String, SignalState>,
     /// Whether the design calls `$countdrivers` anywhere. It is what turns the
     /// driver tally on, so a design that never asks never builds one.
     counts_drivers: bool,
@@ -909,7 +920,7 @@ pub struct StateStore {
     /// every bit select goes through is the hot path. A name is in one map or
     /// the other, so an ordinary select still costs one hash and only a miss
     /// looks here.
-    name_to_memory: HashMap<String, Memory>,
+    name_to_memory: FastMap<String, Memory>,
     /// Every memory word written since the last marker, in the order written.
     /// See [`set_word`](StateStore::set_word).
     ///
@@ -930,7 +941,7 @@ pub struct StateStore {
     /// in the order they were made — and the value it held at that marker.
     /// `None` records a name that did not exist yet, which makes the write a
     /// declaration rather than a change.
-    journal: HashMap<String, (usize, Option<Register>)>,
+    journal: FastMap<String, (usize, Option<Register>)>,
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
@@ -977,7 +988,7 @@ pub struct StateStore {
     /// namespace beside the signals and the memories rather than a zero-width
     /// entry in either. That is what makes reading one a named error instead
     /// of a plausible pattern of bits.
-    events: HashSet<String>,
+    events: FastSet<String>,
     /// The parameters whose value was written as **text** — `parameter p =
     /// "PASSED";` — which a `$display` prints as the string it is, and takes
     /// as a format string, exactly as it would the literal. Their bits are an
@@ -1013,7 +1024,7 @@ pub struct StateStore {
     /// Which continuous assignments read each signal, by their index in the
     /// simulator's list — see [`StateStore::watch_readers`]. Empty for a store
     /// nothing watches, which is what keeps a write costing one `is_empty`.
-    readers: HashMap<String, Vec<usize>>,
+    readers: FastMap<String, Vec<usize>>,
     /// One flag per continuous assignment: whether something it reads has
     /// been written since it was last evaluated.
     stale: Vec<bool>,
@@ -1029,7 +1040,7 @@ pub struct StateStore {
     /// the value has to outlive the return from `resume`, exactly as a
     /// `repeat` count does. It is deliberately not a signal: nothing in the
     /// design can name it, so journalling it would only manufacture edges.
-    holds: HashMap<String, Register>,
+    holds: FastMap<String, Register>,
     /// The files `$fopen` has opened, and the directory a relative path is
     /// written into. See [`FileTable`].
     files: FileTable,
@@ -1180,16 +1191,16 @@ impl StateStore {
     /// from it is rejected when it is elaborated.
     pub fn frame(&self) -> StateStore {
         StateStore {
-            name_to_signal: HashMap::new(),
+            name_to_signal: FastMap::default(),
             // A frame holds no net, so it resolves nothing and tallies
             // nothing; the alias table rides along because a body may read a
             // design signal under a port's name.
             counts_drivers: false,
             aliases: Rc::clone(&self.aliases),
-            name_to_memory: HashMap::new(),
+            name_to_memory: FastMap::default(),
             memory_journal: Vec::new(),
             round_words: Vec::new(),
-            journal: HashMap::new(),
+            journal: FastMap::default(),
             time: self.time,
             random: RandomStream::default(),
             functions: Rc::clone(&self.functions),
@@ -1198,7 +1209,7 @@ impl StateStore {
             any_signed: false,
             any_real: false,
             any_memory: false,
-            events: HashSet::new(),
+            events: FastSet::default(),
             texts: Rc::clone(&self.texts),
             packed: Rc::clone(&self.packed),
             triggers: Vec::new(),
@@ -1206,10 +1217,10 @@ impl StateStore {
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
             // A frame drives no continuous assignment.
-            readers: HashMap::new(),
+            readers: FastMap::default(),
             stale: Vec::new(),
             drives_moved: false,
-            holds: HashMap::new(),
+            holds: FastMap::default(),
             // Shared, not fresh: `$fopen` is an expression, so it can be
             // called from a function body, and a file it opened there has to
             // outlive the frame the way a file opened anywhere else does.
@@ -1557,7 +1568,7 @@ impl StateStore {
     /// it reads has moved since it last ran. Measured on MagicSchoolBus's
     /// `CameraSetup_tb`, 99.4% of continuous-assignment evaluations recomputed
     /// a value that had not changed, and they were most of the run.
-    pub fn watch_readers(&mut self, readers: HashMap<String, Vec<usize>>, count: usize) {
+    pub fn watch_readers(&mut self, readers: FastMap<String, Vec<usize>>, count: usize) {
         self.readers = readers;
         self.stale = vec![true; count];
     }

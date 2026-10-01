@@ -713,11 +713,10 @@ fn for_assignment(input: &str) -> IResult<&str, ProceduralAssignment> {
     assignment_body(input)
 }
 
-/// `for (i = 0; i < 4; i = i + 1) <statement>`.
 thread_local! {
     /// How many loop-variable declarations the module being parsed has had,
     /// which is what numbers their scopes. Reset by
-    /// [`reset_for_loop_scopes`] at the top of every module.
+    /// [`reset_generated_scopes`] at the top of every module.
     static FOR_LOOP_SCOPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many unnamed `begin` blocks the module being parsed has opened,
     /// which is what numbers the ones that declare something.
@@ -779,6 +778,7 @@ fn parse_for_statement_with_declaration(input: &str) -> IResult<&str, Procedural
     ))
 }
 
+/// `for (i = 0; i < 4; i = i + 1) <statement>`.
 pub fn parse_for_statement(input: &str) -> IResult<&str, ForStatement> {
     let (input, _) = keyword(input, "for")?;
     let (input, _) = ws(char('('))(input)?;

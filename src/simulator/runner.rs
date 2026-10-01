@@ -59,7 +59,7 @@ use crate::simulator::program::{
     self, Instruction, Resume, TaskDefinition, WaitReason, FORK_TIMING_UNSUPPORTED,
 };
 use crate::simulator::state_store::DriverTally;
-use crate::simulator::state_store::{bit_position_in, ScopeStorage, StateStore};
+use crate::simulator::state_store::{bit_position_in, FastMap, FastSet, ScopeStorage, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
 use std::rc::Rc;
@@ -677,7 +677,7 @@ pub struct Simulator {
     /// The nets a gate drives, which are resolved between all their continuous
     /// drivers rather than written by whichever one ran last. Empty for a
     /// design with no gates, which is what keeps the question off the hot path.
-    resolved_nets: HashSet<String>,
+    resolved_nets: FastSet<String>,
     /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
     pulled_nets: Vec<PulledNet>,
     /// The `wand`/`wor` nets, whose drivers combine by a logic function rather
@@ -818,7 +818,7 @@ impl Simulator {
             gates: Vec::new(),
             udps: Vec::new(),
             pass_switches: Vec::new(),
-            resolved_nets: HashSet::new(),
+            resolved_nets: FastSet::default(),
             pulled_nets: Vec::new(),
             wired_nets: HashMap::new(),
             blocks: Vec::new(),
@@ -936,7 +936,7 @@ impl Simulator {
             Vec::new()
         };
         self.pass_switches = elaborated.pass_switches;
-        self.resolved_nets = elaborated.resolved_nets;
+        self.resolved_nets = elaborated.resolved_nets.into_iter().collect();
         self.pulled_nets = elaborated.pulled_nets;
         self.wired_nets = elaborated.wired_nets;
         self.blocks = elaborated.blocks;
@@ -2876,7 +2876,7 @@ impl Simulator {
     /// Everything else is evaluated once something it reads has been written
     /// since it last ran.
     fn watch_assignment_reads(&mut self) {
-        let mut readers: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut readers: FastMap<String, Vec<usize>> = FastMap::default();
         self.always_evaluate = Vec::with_capacity(self.assignments.len());
         for (index, assignment) in self.assignments.iter().enumerate() {
             let plain_target = match assignment.lhs() {
