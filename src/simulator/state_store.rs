@@ -1010,6 +1010,17 @@ pub struct StateStore {
     /// installing one goes through [`Rc::make_mut`], the same way the function
     /// table does.
     drives: Rc<Vec<Drive>>,
+    /// Which continuous assignments read each signal, by their index in the
+    /// simulator's list — see [`StateStore::watch_readers`]. Empty for a store
+    /// nothing watches, which is what keeps a write costing one `is_empty`.
+    readers: HashMap<String, Vec<usize>>,
+    /// One flag per continuous assignment: whether something it reads has
+    /// been written since it was last evaluated.
+    stale: Vec<bool>,
+    /// Whether a drive has been installed or taken away since the last
+    /// [`StateStore::take_drives_moved`] — a `release` puts the assignments
+    /// beneath it back in charge, whether or not anything they read moved.
+    drives_moved: bool,
     /// The right hand sides an intra-assignment timing control is holding on
     /// to, keyed by the hidden slot the instruction that evaluated them named.
     ///
@@ -1194,6 +1205,10 @@ impl StateStore {
             // A frame holds only the call's own variables, and a function body
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
+            // A frame drives no continuous assignment.
+            readers: HashMap::new(),
+            stale: Vec::new(),
+            drives_moved: false,
             holds: HashMap::new(),
             // Shared, not fresh: `$fopen` is an expression, so it can be
             // called from a function body, and a file it opened there has to
@@ -1534,6 +1549,52 @@ impl StateStore {
         !self.drives.is_empty()
     }
 
+    /// Starts tracking which of `count` continuous assignments are stale:
+    /// `readers` names, for each signal, the assignments that read it. Every
+    /// assignment starts stale, so the first settle evaluates them all.
+    ///
+    /// This is what lets the propagation fixpoint skip an assignment nothing
+    /// it reads has moved since it last ran. Measured on MagicSchoolBus's
+    /// `CameraSetup_tb`, 99.4% of continuous-assignment evaluations recomputed
+    /// a value that had not changed, and they were most of the run.
+    pub fn watch_readers(&mut self, readers: HashMap<String, Vec<usize>>, count: usize) {
+        self.readers = readers;
+        self.stale = vec![true; count];
+    }
+
+    /// Marks every assignment that reads `name` stale.
+    #[inline]
+    fn mark_readers(&mut self, name: &str) {
+        if self.readers.is_empty() {
+            return;
+        }
+        if let Some(readers) = self.readers.get(name) {
+            for &reader in readers {
+                self.stale[reader] = true;
+            }
+        }
+    }
+
+    /// Whether assignment `index` has to be evaluated, clearing the mark: a
+    /// write it causes to something it reads marks it again. An assignment
+    /// nothing is tracking is always stale.
+    pub fn take_stale(&mut self, index: usize) -> bool {
+        match self.stale.get_mut(index) {
+            Some(stale) => std::mem::replace(stale, false),
+            None => true,
+        }
+    }
+
+    /// Marks every tracked assignment stale.
+    pub fn mark_all_stale(&mut self) {
+        self.stale.fill(true);
+    }
+
+    /// Whether a drive was installed or taken away since the last call.
+    pub fn take_drives_moved(&mut self) -> bool {
+        std::mem::replace(&mut self.drives_moved, false)
+    }
+
     /// How many drives are installed, which is how many more rounds the
     /// continuous-assignment fixpoint may need.
     pub fn drive_count(&self) -> usize {
@@ -1567,6 +1628,7 @@ impl StateStore {
     /// one is applied last and wins — which is the rule the LRM asks for,
     /// falling out of the order rather than needing one of its own.
     pub fn install_drive(&mut self, drive: Drive) {
+        self.drives_moved = true;
         let drives = Rc::make_mut(&mut self.drives);
         match drives.iter_mut().find(|existing| {
             existing.names == drive.names
@@ -1589,6 +1651,7 @@ impl StateStore {
         if keep.iter().all(|keep| *keep) {
             return;
         }
+        self.drives_moved = true;
         let mut index = 0;
         Rc::make_mut(&mut self.drives).retain(|_| {
             let kept = keep.get(index).copied().unwrap_or(true);
@@ -1661,6 +1724,9 @@ impl StateStore {
     /// overwrite the value the round actually started from, and it is that
     /// value an edge has to be measured against.
     fn record(&mut self, name: &str) {
+        // Before the early return below: a second write in one round still
+        // has to reach an assignment that was re-evaluated after the first.
+        self.mark_readers(name);
         if self.journal.contains_key(name) {
             return;
         }
@@ -1998,6 +2064,7 @@ impl StateStore {
         let after = memory.word(Some(address));
         // A write that moved a word named a word, so it has a position.
         let position = memory.word_position(address)?;
+        self.mark_readers(name);
         match self.memory_journal.last_mut() {
             Some(last) if last.position == position && last.name == name => last.after = after,
             _ => self.memory_journal.push(MemoryChange {

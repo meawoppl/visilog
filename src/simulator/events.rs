@@ -598,6 +598,49 @@ fn collect_target_reads(target: &Expression, names: &mut BTreeSet<String>) {
     }
 }
 
+/// Every signal `expression` reads, or `None` when that cannot be known from
+/// the expression alone: a call to one of the design's functions reads
+/// whatever its body reads, and a system function like `$time` or `$random`
+/// moves with nothing the design wrote.
+pub fn exact_reads(expression: &Expression) -> Option<BTreeSet<String>> {
+    if calls_anything(expression) {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    collect_expression_reads(expression, &mut names);
+    Some(names)
+}
+
+fn calls_anything(expression: &Expression) -> bool {
+    match expression {
+        Expression::FunctionCall(..) | Expression::SystemFunctionCall(..) => true,
+        Expression::Constant(_)
+        | Expression::RealLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::Identifier(_) => false,
+        Expression::Unary(_, inner) | Expression::Parenthetical(inner) => calls_anything(inner),
+        Expression::Binary(lhs, _, rhs) => calls_anything(lhs) || calls_anything(rhs),
+        Expression::Conditional(condition, yes, no) => {
+            calls_anything(condition) || calls_anything(yes) || calls_anything(no)
+        }
+        Expression::Concatenation(parts) => parts.iter().any(calls_anything),
+        Expression::Replication(count, parts) => {
+            calls_anything(count) || parts.iter().any(calls_anything)
+        }
+        Expression::BitSelect(_, index) => calls_anything(index),
+        Expression::PartSelect(_, msb, lsb) => calls_anything(msb) || calls_anything(lsb),
+        Expression::IndexedPartSelect { base, width, .. } => {
+            calls_anything(base) || calls_anything(width)
+        }
+        Expression::WordSelect {
+            indices, select, ..
+        } => {
+            indices.iter().any(calls_anything)
+                || select.expressions().into_iter().any(calls_anything)
+        }
+    }
+}
+
 fn collect_expression_reads(expression: &Expression, names: &mut BTreeSet<String>) {
     match expression {
         Expression::Constant(_) | Expression::RealLiteral(_) | Expression::StringLiteral(_) => {}
