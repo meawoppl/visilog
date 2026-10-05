@@ -2599,9 +2599,20 @@ impl Simulator {
             self.last_contributions = None;
         }
         self.propagating = true;
+        // When continuous assignments are the only contributors — no gate,
+        // primitive, switch, self-driving net or drive — a pass whose
+        // assignments all contribute what they did last time needs no list at
+        // all: nothing to build, compare or resolve. Building one anyway was
+        // a clone and a drop of every cached contribution on every pass.
+        let assignments_only = self.pulled_nets.is_empty()
+            && self.gates.is_empty()
+            && self.udps.is_empty()
+            && self.pass_switches.is_empty()
+            && self.state.drive_count() == 0;
         for pass in 1..=limit {
             let mut changed = false;
             let mut contributions: Vec<Contribution> = Vec::new();
+            let mut contribution_moved = false;
             // A `supply` or `tri0`/`tri1` net drives itself, every pass, at its
             // own strength. Seeding it as the first contribution is what makes
             // `tri0 c; assign c = d;` read `0` while `d` is `z` and `1` once
@@ -2629,8 +2640,10 @@ impl Simulator {
                 if !self.always_evaluate.get(index).copied().unwrap_or(true)
                     && !self.state.take_stale(index)
                 {
-                    if let Some(Some(cached)) = self.cached_contributions.get(index) {
-                        contributions.push(cached.clone());
+                    if !assignments_only {
+                        if let Some(Some(cached)) = self.cached_contributions.get(index) {
+                            contributions.push(cached.clone());
+                        }
                     }
                     continue;
                 }
@@ -2709,18 +2722,27 @@ impl Simulator {
                 // `assign (pull1, pull0) x = y;` saying otherwise is this one
                 // value coming off the assignment instead of the constant.
                 if resolved {
-                    let contribution = Contribution {
-                        target: target.clone(),
-                        value,
-                        counted: true,
-                        strength: Driven::Declared(
-                            assignment.strength().unwrap_or(DriveStrength::STRONG),
-                        ),
-                    };
-                    if let Some(slot) = self.cached_contributions.get_mut(index) {
-                        *slot = Some(contribution.clone());
+                    let strength =
+                        Driven::Declared(assignment.strength().unwrap_or(DriveStrength::STRONG));
+                    let slot = &mut self.cached_contributions[index];
+                    let same = slot.as_ref().is_some_and(|cached| {
+                        cached.value == value
+                            && cached.strength == strength
+                            && &cached.target == target
+                    });
+                    if !same {
+                        contribution_moved = true;
+                        *slot = Some(Contribution {
+                            target: target.clone(),
+                            value,
+                            counted: true,
+                            strength,
+                        });
                     }
-                    contributions.push(contribution);
+                    if !assignments_only {
+                        let cached = slot.as_ref().expect("the slot was just filled");
+                        contributions.push(cached.clone());
+                    }
                 } else {
                     changed |= drive_resolved(&mut self.state, target, &value)?;
                 }
@@ -2891,11 +2913,26 @@ impl Simulator {
             // resolved to then — so the nets already hold it. Resolution on
             // every pass regardless was the largest cost left in
             // `CameraSetup_tb` once unchanged assignments stopped re-running.
-            let unchanged =
-                switches.is_empty() && self.last_contributions.as_ref() == Some(&contributions);
-            if !unchanged {
-                changed |= self.resolve_contributions(&contributions, &switches)?;
-                self.last_contributions = Some(contributions);
+            if assignments_only {
+                // Nothing moved and nothing has written a resolved net since
+                // the last resolution: the nets hold what resolving would give.
+                if contribution_moved || self.last_contributions.is_none() {
+                    let contributions: Vec<Contribution> = self
+                        .cached_contributions
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    changed |= self.resolve_contributions(&contributions, &switches)?;
+                    self.last_contributions = Some(contributions);
+                }
+            } else {
+                let unchanged =
+                    switches.is_empty() && self.last_contributions.as_ref() == Some(&contributions);
+                if !unchanged {
+                    changed |= self.resolve_contributions(&contributions, &switches)?;
+                    self.last_contributions = Some(contributions);
+                }
             }
             changed |= self.apply_drives()?;
             if !changed {
