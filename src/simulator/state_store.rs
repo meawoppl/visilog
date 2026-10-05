@@ -594,6 +594,25 @@ pub struct Memory {
     range: (i64, i64),
 }
 
+/// `register` as a declaration that is `signed` and `real` reads it, and
+/// whether the result is signed.
+///
+/// A real declaration *converts* rather than re-stamps: the bits of a double
+/// are not the bits of the integer that denotes the same number, so a write of
+/// `3` into a `real` has to become `3.0` and a write of `2.5` into an
+/// `integer` has to become `3`. Everything else only re-stamps.
+fn conformed(register: Register, signed: bool, real: bool) -> (Register, bool) {
+    if real != register.is_real() {
+        let converted = if real {
+            Register::from_f64(register.to_f64())
+        } else {
+            Register::integer_from_f64(register.to_f64().round(), register.width())
+        };
+        return (converted.with_signedness(signed), signed);
+    }
+    (register.with_signedness(signed).with_realness(real), signed)
+}
+
 /// Where a declared bit index sits in a vector declared over `range`, counted
 /// from the *most significant* end — the order Verilog writes bits in.
 ///
@@ -2169,23 +2188,11 @@ impl StateStore {
         }
     }
 
-    /// `register` as the declaration of `name` says it is to be read.
-    ///
-    /// A real declaration *converts* rather than re-stamps: the bits of a
-    /// double are not the bits of the integer that denotes the same number, so
-    /// a write of `3` into a `real` has to become `3.0` and a write of `2.5`
-    /// into an `integer` has to become `3`. Everything else only re-stamps.
+    /// `register` as the declaration of `name` says it is to be read — see
+    /// [`conformed`].
     fn as_declared(&self, name: &str, register: Register) -> (Register, bool) {
         let (signed, real) = self.declared_reading(name, &register);
-        if real != register.is_real() {
-            let converted = if real {
-                Register::from_f64(register.to_f64())
-            } else {
-                Register::integer_from_f64(register.to_f64().round(), register.width())
-            };
-            return (converted.with_signedness(signed), signed);
-        }
-        (register.with_signedness(signed).with_realness(real), signed)
+        conformed(register, signed, real)
     }
 
     /// Sets a signal's value. A previously declared range is preserved when the
@@ -2215,17 +2222,25 @@ impl StateStore {
 
     /// Sets a signal's value and declared range in one step.
     pub fn set_ranged(&mut self, name: impl Into<String>, register: Register, range: (i64, i64)) {
-        let name = name.into();
-        self.record(&name);
-        let (register, signed) = self.as_declared(&name, register);
-        self.any_signed |= signed;
-        self.any_real |= register.is_real();
-        // Every whole-signal write in the simulator lands here, so the entry
-        // is overwritten in place: one lookup finds it, keeps its declared net
-        // flag and replaces the rest, where asking for the flag and then
-        // inserting would hash the name twice.
-        match self.name_to_signal.get_mut(&name) {
+        self.write_ranged(&name.into(), register, range);
+    }
+
+    /// [`set_ranged`](StateStore::set_ranged) for a name the caller already
+    /// holds as a `&str`, which is every write the simulator makes.
+    ///
+    /// Every whole-signal write lands here, so it costs as few lookups as it
+    /// can: the entry is found once and supplies both the declared reading
+    /// the value is conformed to and the slot it is written into, and a name
+    /// that is already declared is never copied. Asking for the reading, then
+    /// for the entry, with an owned name each time, was a tenth of a busy
+    /// design's run.
+    pub fn write_ranged(&mut self, name: &str, register: Register, range: (i64, i64)) {
+        self.record(name);
+        match self.name_to_signal.get_mut(name) {
             Some(signal) => {
+                let (register, signed) = conformed(register, signal.is_signed(), signal.is_real());
+                self.any_signed |= signed;
+                self.any_real |= register.is_real();
                 let net = signal.is_net();
                 // The strength each bit was resolved at and the drivers that
                 // reached it describe *who drives the signal*, which a write
@@ -2240,8 +2255,12 @@ impl StateStore {
                 signal.drivers = drivers;
             }
             None => {
+                let (signed, real) = (register.is_signed(), register.is_real());
+                let (register, signed) = conformed(register, signed, real);
+                self.any_signed |= signed;
+                self.any_real |= register.is_real();
                 self.name_to_signal
-                    .insert(name, SignalState::with_range(register, range));
+                    .insert(name.to_string(), SignalState::with_range(register, range));
             }
         }
     }
