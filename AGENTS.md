@@ -43,7 +43,9 @@ also time a real design — MagicSchoolBus's `CameraSetup_tb` (6.3M timesteps, s
 once `kernel.perf_event_paranoid` is at most 1. Benchmarks are meaningless while another
 session is compiling on the machine; check `uptime` before believing a number.
 
-**What the hot path relies on** (each measured on `CameraSetup_tb`, which went 117s → 27s):
+**What the hot path relies on** (each measured on `CameraSetup_tb`, which went 117s → about
+16s — roughly 1.8× iverilog's `vvp` on the same machine, timed interleaved; the harness's
+own iverilog figure includes the compile, so compare against `vvp -n` alone):
 
 - **A continuous assignment is re-evaluated only when something it reads was written.**
   `Simulator::watch_assignment_reads` gives the store a signal → assignments table, and
@@ -56,6 +58,17 @@ session is compiling on the machine; check `uptime` before believing a number.
 - **Resolution is skipped when every driver contributes what it did last pass**
   (`last_contributions`), and with no switch involved. Anything that writes a resolved net
   some other way has to clear it — `set_input` does.
+- **An assignment onto a resolved net is dirty-tracked too**: while clean it contributes
+  its `cached_contributions` entry rather than being evaluated. When continuous
+  assignments are a design's only contributors (no gate, UDP, switch, pulled net or
+  drive), a pass where none of them changed what it contributes builds no list at all —
+  the open-drain `assign pin = en ? 1'bz : 1'b0;` on an `inout` is the common case.
+- **A plain assignment target is resolved once** (`fixed_targets`): a whole net named by
+  a bare identifier is the same store entry, width and resolved-or-not for the run.
+- **A whole-signal write is `StateStore::write_ranged(&str, …)`**, one entry lookup and no
+  name copy. `set_ranged` takes an owned name for the many callers that are not hot.
+- **The dump renders into one reused buffer** (`vcd::render_into`, `VcdDump::scratch`);
+  `trim_start` is the IEEE 1364 trimming rule over digits by position.
 - **The store's name-keyed maps use FxHash** (`state_store::FastMap`), not SipHash.
 - **A literal's bits are cached on the literal** (`constants::BitsCache`), outside its
   equality.
