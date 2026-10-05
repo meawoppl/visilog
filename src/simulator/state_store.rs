@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use crate::parsers::expr::Expression;
 use crate::parsers::gates::DriveStrength;
+use crate::parsers::identifier::Identifier;
 use crate::register::{Register, REAL_WIDTH, X};
 use crate::simulator::exec::ResolvedTarget;
 use crate::simulator::gates::Strength;
@@ -24,6 +25,112 @@ use crate::simulator::tasks::Output;
 pub type FastMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
 /// The set counterpart of [`FastMap`].
 pub type FastSet<K> = HashSet<K, rustc_hash::FxBuildHasher>;
+
+/// The design's signals, each at a stable position: a name is looked up once
+/// and its position — a [`SignalId`] — is good for the life of the store,
+/// because a signal is never taken out of one. Everything that asks by name
+/// still can; the hot paths ask by position instead and skip the hash and the
+/// string comparison a name lookup costs (see [`Identifier::slot`]).
+///
+/// [`Identifier::slot`]: crate::parsers::identifier::Identifier
+#[derive(Clone, Debug, Default)]
+struct SignalTable {
+    index: FastMap<String, SignalId>,
+    names: Vec<String>,
+    signals: Vec<SignalState>,
+}
+
+/// A signal's position in its store's [`SignalTable`].
+pub type SignalId = u32;
+
+impl SignalTable {
+    fn id(&self, name: &str) -> Option<SignalId> {
+        self.index.get(name).copied()
+    }
+
+    fn get(&self, name: &str) -> Option<&SignalState> {
+        self.id(name).map(|id| &self.signals[id as usize])
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut SignalState> {
+        let id = self.id(name)?;
+        Some(&mut self.signals[id as usize])
+    }
+
+    /// Puts `signal` under `name`, in the place the name already has if it
+    /// has one — which is what keeps every [`SignalId`] handed out valid.
+    fn insert(&mut self, name: String, signal: SignalState) -> SignalId {
+        match self.index.get(&name) {
+            Some(&id) => {
+                self.signals[id as usize] = signal;
+                id
+            }
+            None => {
+                let id = self.signals.len() as SignalId;
+                self.index.insert(name.clone(), id);
+                self.names.push(name);
+                self.signals.push(signal);
+                id
+            }
+        }
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    fn len(&self) -> usize {
+        self.signals.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.names.iter()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &SignalState)> {
+        self.names.iter().zip(&self.signals)
+    }
+}
+
+impl std::ops::Index<&str> for SignalTable {
+    type Output = SignalState;
+
+    fn index(&self, name: &str) -> &SignalState {
+        self.get(name).expect("a signal the table holds")
+    }
+}
+
+/// Which store a cached [`SignalId`] belongs to.
+///
+/// Fresh for every store, including a clone and a function call's frame, so a
+/// position cached against one store is never read against another — where
+/// it would name a different signal, or none.
+#[derive(Debug)]
+struct StoreUid(u32);
+
+static NEXT_STORE_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+impl StoreUid {
+    fn fresh() -> StoreUid {
+        StoreUid(NEXT_STORE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for StoreUid {
+    fn default() -> StoreUid {
+        StoreUid::fresh()
+    }
+}
+
+impl Clone for StoreUid {
+    fn clone(&self) -> StoreUid {
+        StoreUid::fresh()
+    }
+}
 
 /// What the `$random` stream starts from.
 ///
@@ -922,7 +1029,11 @@ pub struct ScopeStorage {
 
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
-    name_to_signal: FastMap<String, SignalState>,
+    name_to_signal: SignalTable,
+    /// Which store this is, for an [`Identifier`]'s cached position.
+    ///
+    /// [`Identifier`]: crate::parsers::identifier::Identifier
+    uid: StoreUid,
     /// Whether the design calls `$countdrivers` anywhere. It is what turns the
     /// driver tally on, so a design that never asks never builds one.
     counts_drivers: bool,
@@ -955,12 +1066,17 @@ pub struct StateStore {
     /// by an address costs a design with no memory in it ~4.5% on
     /// `bench tick/counter_4bit`.
     round_words: Vec<MemoryChange>,
-    /// For every signal written since the last marker, when it was first
-    /// written — a count of journal entries, so the writes can be handed back
-    /// in the order they were made — and the value it held at that marker.
-    /// `None` records a name that did not exist yet, which makes the write a
-    /// declaration rather than a change.
-    journal: FastMap<String, (usize, Option<Register>)>,
+    /// Every signal written since the last marker, in the order each was first
+    /// written, with the value it held at the marker — by position, so a write
+    /// journals itself without hashing or copying its name.
+    journal: Vec<(SignalId, Register)>,
+    /// Whether a signal is in `journal`, by position; grown as signals are.
+    journaled: Vec<bool>,
+    /// Names written this round before they existed — a declaration, not a
+    /// change, and a write to one later in the same round is not a change
+    /// either. Empty but for a round that declares something, which at run
+    /// time is an automatic task's storage being laid down.
+    declaring: FastSet<String>,
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
@@ -1041,9 +1157,13 @@ pub struct StateStore {
     /// table does.
     drives: Rc<Vec<Drive>>,
     /// Which continuous assignments read each signal, by their index in the
-    /// simulator's list — see [`StateStore::watch_readers`]. Empty for a store
-    /// nothing watches, which is what keeps a write costing one `is_empty`.
-    readers: FastMap<String, Vec<usize>>,
+    /// simulator's list and indexed by the signal's position — see
+    /// [`StateStore::watch_readers`]. Empty for a store nothing watches, which
+    /// is what keeps a write costing one `is_empty`.
+    readers: Vec<Vec<usize>>,
+    /// The same for a *memory*, which is not in the signal table and so has
+    /// no position: the assignments that read a word of it, by its name.
+    memory_readers: FastMap<String, Vec<usize>>,
     /// One flag per continuous assignment: whether something it reads has
     /// been written since it was last evaluated.
     stale: Vec<bool>,
@@ -1210,7 +1330,8 @@ impl StateStore {
     /// from it is rejected when it is elaborated.
     pub fn frame(&self) -> StateStore {
         StateStore {
-            name_to_signal: FastMap::default(),
+            name_to_signal: SignalTable::default(),
+            uid: StoreUid::fresh(),
             // A frame holds no net, so it resolves nothing and tallies
             // nothing; the alias table rides along because a body may read a
             // design signal under a port's name.
@@ -1219,7 +1340,9 @@ impl StateStore {
             name_to_memory: FastMap::default(),
             memory_journal: Vec::new(),
             round_words: Vec::new(),
-            journal: FastMap::default(),
+            journal: Vec::new(),
+            journaled: Vec::new(),
+            declaring: FastSet::default(),
             time: self.time,
             random: RandomStream::default(),
             functions: Rc::clone(&self.functions),
@@ -1236,7 +1359,8 @@ impl StateStore {
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
             // A frame drives no continuous assignment.
-            readers: FastMap::default(),
+            readers: Vec::new(),
+            memory_readers: FastMap::default(),
             stale: Vec::new(),
             drives_moved: false,
             holds: FastMap::default(),
@@ -1588,17 +1712,35 @@ impl StateStore {
     /// `CameraSetup_tb`, 99.4% of continuous-assignment evaluations recomputed
     /// a value that had not changed, and they were most of the run.
     pub fn watch_readers(&mut self, readers: FastMap<String, Vec<usize>>, count: usize) {
-        self.readers = readers;
+        self.readers = vec![Vec::new(); self.name_to_signal.len()];
+        self.memory_readers = FastMap::default();
+        for (name, assignments) in readers {
+            match self.name_to_signal.id(&name) {
+                Some(id) => self.readers[id as usize] = assignments,
+                None => {
+                    self.memory_readers.insert(name, assignments);
+                }
+            }
+        }
         self.stale = vec![true; count];
     }
 
-    /// Marks every assignment that reads `name` stale.
+    /// Marks every assignment that reads the signal at `id` stale.
     #[inline]
-    fn mark_readers(&mut self, name: &str) {
-        if self.readers.is_empty() {
+    fn mark_readers(&mut self, id: SignalId) {
+        if let Some(readers) = self.readers.get(id as usize) {
+            for &reader in readers {
+                self.stale[reader] = true;
+            }
+        }
+    }
+
+    /// Marks every assignment that reads a word of memory `name` stale.
+    fn mark_memory_readers(&mut self, name: &str) {
+        if self.memory_readers.is_empty() {
             return;
         }
-        if let Some(readers) = self.readers.get(name) {
+        if let Some(readers) = self.memory_readers.get(name) {
             for &reader in readers {
                 self.stale[reader] = true;
             }
@@ -1754,18 +1896,35 @@ impl StateStore {
     /// overwrite the value the round actually started from, and it is that
     /// value an edge has to be measured against.
     fn record(&mut self, name: &str) {
+        match self.name_to_signal.id(name) {
+            Some(id) => self.record_id(id, name),
+            // Written before it exists: a declaration, which is no change, and
+            // which makes a later write to it this round none either.
+            None => {
+                self.declaring.insert(name.to_string());
+            }
+        }
+    }
+
+    /// [`record`](StateStore::record) for a signal whose position is known.
+    #[inline]
+    fn record_id(&mut self, id: SignalId, name: &str) {
         // Before the early return below: a second write in one round still
         // has to reach an assignment that was re-evaluated after the first.
-        self.mark_readers(name);
-        if self.journal.contains_key(name) {
+        self.mark_readers(id);
+        let slot = id as usize;
+        if self.journaled.len() <= slot {
+            self.journaled.resize(self.name_to_signal.len(), false);
+        }
+        if self.journaled[slot] {
             return;
         }
-        let previous = self
-            .name_to_signal
-            .get(name)
-            .map(|signal| signal.register().clone());
-        let order = self.journal.len();
-        self.journal.insert(name.to_string(), (order, previous));
+        if !self.declaring.is_empty() && self.declaring.contains(name) {
+            return;
+        }
+        self.journaled[slot] = true;
+        let previous = self.name_to_signal.signals[slot].register().clone();
+        self.journal.push((id, previous));
     }
 
     /// The name and pre-write value of every signal written since the last
@@ -1783,17 +1942,13 @@ impl StateStore {
     /// journal records what was displaced, not whether it differed — so the
     /// caller compares.
     pub fn take_changes(&mut self) -> Vec<(String, Register)> {
+        self.declaring.clear();
         let mut changes = Vec::with_capacity(self.journal.len());
-        for (name, (order, previous)) in self.journal.drain() {
-            if let Some(previous) = previous {
-                changes.push((order, name, previous));
-            }
+        for (id, previous) in self.journal.drain(..) {
+            self.journaled[id as usize] = false;
+            changes.push((self.name_to_signal.names[id as usize].clone(), previous));
         }
-        changes.sort_unstable_by_key(|(order, _, _)| *order);
         changes
-            .into_iter()
-            .map(|(_, name, previous)| (name, previous))
-            .collect()
     }
 
     /// Rewrites every journalled starting value that was entirely `z` as `x`.
@@ -1804,10 +1959,7 @@ impl StateStore {
     /// the rule iverilog follows, and which a `z` baseline gets wrong in the
     /// direction of waking blocks on a value nobody set.
     pub fn treat_undriven_start_as_unknown(&mut self) {
-        for (_, previous) in self.journal.values_mut() {
-            let Some(previous) = previous else {
-                continue;
-            };
+        for (_, previous) in self.journal.iter_mut() {
             if *previous == Register::high_impedance(previous.width()) {
                 *previous = Register::unknown(previous.width());
             }
@@ -1817,7 +1969,10 @@ impl StateStore {
     /// Forgets every recorded change, making now the point later changes are
     /// measured against.
     pub fn clear_changes(&mut self) {
-        self.journal.clear();
+        for (id, _) in self.journal.drain(..) {
+            self.journaled[id as usize] = false;
+        }
+        self.declaring.clear();
         self.memory_journal.clear();
         self.triggers.clear();
     }
@@ -2094,7 +2249,7 @@ impl StateStore {
         let after = memory.word(Some(address));
         // A write that moved a word named a word, so it has a position.
         let position = memory.word_position(address)?;
-        self.mark_readers(name);
+        self.mark_memory_readers(name);
         match self.memory_journal.last_mut() {
             Some(last) if last.position == position && last.name == name => last.after = after,
             _ => self.memory_journal.push(MemoryChange {
@@ -2235,8 +2390,12 @@ impl StateStore {
     /// for the entry, with an owned name each time, was a tenth of a busy
     /// design's run.
     pub fn write_ranged(&mut self, name: &str, register: Register, range: (i64, i64)) {
-        self.record(name);
-        match self.name_to_signal.get_mut(name) {
+        let id = self.name_to_signal.id(name);
+        match id {
+            Some(id) => self.record_id(id, name),
+            None => self.record(name),
+        }
+        match id.map(|id| &mut self.name_to_signal.signals[id as usize]) {
             Some(signal) => {
                 let (register, signed) = conformed(register, signal.is_signed(), signal.is_real());
                 self.any_signed |= signed;
@@ -2267,6 +2426,31 @@ impl StateStore {
 
     pub fn get(&self, name: &str) -> Option<&Register> {
         self.name_to_signal.get(name).map(|s| s.register())
+    }
+
+    /// The signal an identifier names, through the position cached on it.
+    ///
+    /// The first time an identifier is looked up in this store, its name is
+    /// hashed and the position it was found at is written onto the
+    /// identifier; every later lookup reads the vector at that position. A
+    /// position is good for the store's whole life, since a signal is never
+    /// taken out, and is never read against another store, since every store
+    /// is numbered apart ([`StoreUid`]).
+    #[inline]
+    pub fn signal_of(&self, id: &Identifier) -> Option<&SignalState> {
+        if let Some(position) = id.slot.cached(self.uid.0) {
+            return self.name_to_signal.signals.get(position as usize);
+        }
+        let position = self.name_to_signal.id(&id.name)?;
+        id.slot.cache(self.uid.0, position);
+        Some(&self.name_to_signal.signals[position as usize])
+    }
+
+    /// The value an identifier names — [`StateStore::get`] through the
+    /// identifier's cached position.
+    #[inline]
+    pub fn get_by(&self, id: &Identifier) -> Option<&Register> {
+        self.signal_of(id).map(SignalState::register)
     }
 
     pub fn get_signal(&self, name: &str) -> Option<&SignalState> {

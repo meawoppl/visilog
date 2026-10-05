@@ -345,7 +345,7 @@ fn eval_in_context(
         // make it read unsigned.
         Expression::RealLiteral(value) => Ok(Register::from_f64(*value)),
         Expression::Identifier(id) => {
-            let value = match store.get(&id.name) {
+            let value = match store.get_by(id) {
                 Some(value) => value.clone(),
                 None => return Err(unresolved(&id.name, store)),
             };
@@ -502,7 +502,7 @@ fn eval_in_context(
             // An index that is unknown, or too far from zero to be a bit
             // number, selects `x`.
             let index = select_index(&eval(index, store)?)?;
-            let value = match store.get_signal(&id.name) {
+            let value = match store.signal_of(id) {
                 // `a[3]` where `a` is a vector: one bit of it.
                 Some(signal) => match index {
                     Some(index) => logic_bit(signal.bit(index)),
@@ -534,7 +534,7 @@ fn eval_in_context(
             Ok(widened(value, width))
         }
         Expression::PartSelect(id, first, second) => {
-            let Some(signal) = store.get_signal(&id.name) else {
+            let Some(signal) = store.signal_of(id) else {
                 return Err(unresolved(&id.name, store));
             };
             let first = select_bound(first, store)?;
@@ -559,7 +559,7 @@ fn eval_in_context(
             width: selected,
             upward,
         } => {
-            let Some(signal) = store.get_signal(&id.name) else {
+            let Some(signal) = store.signal_of(id) else {
                 return Err(unresolved(&id.name, store));
             };
             let span = indexed_select_width(selected, store)?;
@@ -1036,10 +1036,7 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
         // The store's hint first: looking a name up costs a hash of it, and in
         // a design that declares nothing signed the answer is already known.
         Expression::Identifier(id) => {
-            store.any_signed()
-                && store
-                    .get_signal(&id.name)
-                    .is_some_and(|signal| signal.is_signed())
+            store.any_signed() && store.signal_of(id).is_some_and(|signal| signal.is_signed())
         }
         Expression::Parenthetical(inner) => expression_is_signed(inner, store),
         Expression::Unary(op, operand) => {
@@ -1106,10 +1103,7 @@ fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
         // need not be hashed. A real **literal** is not covered by it, which is
         // why the flag cannot stand in for this walk at the callers.
         Expression::Identifier(id) => {
-            store.any_real()
-                && store
-                    .get_signal(&id.name)
-                    .is_some_and(|signal| signal.is_real())
+            store.any_real() && store.signal_of(id).is_some_and(|signal| signal.is_real())
         }
         // A word of an array of reals is one, and the array is the only place
         // the declaration is recorded.
@@ -1282,9 +1276,7 @@ pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
             }
         },
         Expression::RealLiteral(_) => REAL_WIDTH,
-        Expression::Identifier(id) => store
-            .get_signal(&id.name)
-            .map_or(1, |signal| signal.width()),
+        Expression::Identifier(id) => store.signal_of(id).map_or(1, |signal| signal.width()),
         Expression::Parenthetical(inner) => expression_width(inner, store),
         // `+ - ~` are as wide as what they act on; a reduction and `!` answer
         // in one bit.
