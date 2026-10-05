@@ -763,6 +763,9 @@ pub struct Simulator {
     /// made the last time it was evaluated — what it hands in on a pass where
     /// nothing it reads has moved. `None` for every other assignment.
     cached_contributions: Vec<Option<Contribution>>,
+    /// For each continuous assignment onto a whole net named plainly, its
+    /// target resolved once — see the propagation loop.
+    fixed_targets: Vec<Option<FixedTarget>>,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -850,6 +853,7 @@ impl Simulator {
             flush_each_advance: true,
             last_contributions: None,
             cached_contributions: Vec::new(),
+            fixed_targets: Vec::new(),
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -2633,8 +2637,30 @@ impl Simulator {
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
                 // target is resolved before the right hand side is evaluated.
-                let target = resolve_target(&self.state, assignment.lhs())?;
-                let width = target.width(&self.state);
+                // A whole net named plainly is the same target every time, so
+                // it is resolved once and kept — re-resolving it by name on
+                // every evaluation was a seventh of `CameraSetup_tb`.
+                if matches!(self.fixed_targets.get(index), Some(None))
+                    && matches!(assignment.lhs(), Expression::Identifier(_))
+                {
+                    let target = resolve_target(&self.state, assignment.lhs())?;
+                    if matches!(target, ResolvedTarget::Whole(_)) {
+                        self.fixed_targets[index] = Some(FixedTarget {
+                            width: target.width(&self.state),
+                            resolved: self.target_is_resolved(&target),
+                            target,
+                        });
+                    }
+                }
+                let fresh;
+                let (target, width, resolved) = match self.fixed_targets.get(index) {
+                    Some(Some(fixed)) => (&fixed.target, fixed.width, fixed.resolved),
+                    _ => {
+                        fresh = resolve_target(&self.state, assignment.lhs())?;
+                        let width = fresh.width(&self.state);
+                        (&fresh, width, self.target_is_resolved(&fresh))
+                    }
+                };
                 let value = eval_sized(assignment.rhs(), &self.state, width)?;
                 // A delay does not stop the assignment being a continuous
                 // driver — it only changes which value it drives. The fresh
@@ -2682,9 +2708,9 @@ impl Simulator {
                 // `assign` drives at `strong` unless it says otherwise, and
                 // `assign (pull1, pull0) x = y;` saying otherwise is this one
                 // value coming off the assignment instead of the constant.
-                if self.target_is_resolved(&target) {
+                if resolved {
                     let contribution = Contribution {
-                        target,
+                        target: target.clone(),
                         value,
                         counted: true,
                         strength: Driven::Declared(
@@ -2696,7 +2722,7 @@ impl Simulator {
                     }
                     contributions.push(contribution);
                 } else {
-                    changed |= drive_resolved(&mut self.state, &target, &value)?;
+                    changed |= drive_resolved(&mut self.state, target, &value)?;
                 }
             }
             // A continuous assignment is re-evaluated on every pass, so one
@@ -2934,6 +2960,7 @@ impl Simulator {
         let mut readers: FastMap<String, Vec<usize>> = FastMap::default();
         self.always_evaluate = Vec::with_capacity(self.assignments.len());
         self.cached_contributions = vec![None; self.assignments.len()];
+        self.fixed_targets = vec![None; self.assignments.len()];
         self.last_contributions = None;
         self.propagating = false;
         for (index, assignment) in self.assignments.iter().enumerate() {
@@ -3588,6 +3615,16 @@ fn contribute_whole(
             counted,
         });
     }
+}
+
+/// A continuous assignment's target, resolved once: a whole net named
+/// plainly is the same store entry, the same width and the same resolved-or-
+/// not for the whole run.
+#[derive(Clone)]
+struct FixedTarget {
+    target: ResolvedTarget,
+    width: usize,
+    resolved: bool,
 }
 
 /// One continuous driver's claim on a net for one propagation pass.
