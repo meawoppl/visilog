@@ -44,7 +44,7 @@ once `kernel.perf_event_paranoid` is at most 1. Benchmarks are meaningless while
 session is compiling on the machine; check `uptime` before believing a number.
 
 **What the hot path relies on** (each measured on `CameraSetup_tb`, which went 117s → about
-16s — roughly 1.8× iverilog's `vvp` on the same machine, timed interleaved; the harness's
+13s — roughly 1.6× iverilog's `vvp` on the same machine, timed interleaved; the harness's
 own iverilog figure includes the compile, so compare against `vvp -n` alone):
 
 - **A continuous assignment is re-evaluated only when something it reads was written.**
@@ -69,6 +69,21 @@ own iverilog figure includes the compile, so compare against `vvp -n` alone):
   name copy. `set_ranged` takes an owned name for the many callers that are not hot.
 - **The dump renders into one reused buffer** (`vcd::render_into`, `VcdDump::scratch`);
   `trim_start` is the IEEE 1364 trimming rule over digits by position.
+- **Signals live at stable positions, and an identifier caches its position.** The
+  store's `SignalTable` keeps every signal at a `SignalId` that never changes — a signal
+  is never removed — and `Identifier::slot` remembers where its name was found, tagged
+  with the store's `StoreUid`, which is fresh for every store *and every clone*, so a
+  cached position is never read against the wrong store (a function call's frame simply
+  misses and looks the name up). `StateStore::signal_of` / `get_by` / `position_of` are
+  the cached lookups; prefer them to the `&str` ones on any per-evaluation path.
+  `ResolvedTarget::Whole` holds the `Identifier` for the same reason, and
+  `write_ranged_by` writes through it.
+- **The change journal is by position**: `record_id` marks the readers and journals a
+  signal with no hash, `take_edges` builds each edge by position (carrying
+  `SignalEdge::id`) and drops a write that put the same value back, and `event_fires`
+  matches a single-signal entry by position (`SignalEdge::is_of`). A name written before
+  it exists is a declaration, held in `declaring` for the rest of the round so a later
+  write to it in the same round is not an edge either.
 - **The store's name-keyed maps use FxHash** (`state_store::FastMap`), not SipHash.
 - **A literal's bits are cached on the literal** (`constants::BitsCache`), outside its
   equality.
