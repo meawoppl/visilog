@@ -796,7 +796,7 @@ pub fn drive_at(
             if signal.register() == &value {
                 return Ok(false);
             }
-            state.set_ranged(name.clone(), value, range);
+            state.write_ranged(name, value, range);
             Ok(true)
         }
         ResolvedTarget::Bits { name, indices } => {
