@@ -759,6 +759,10 @@ pub struct Simulator {
     /// resolved them, so a pass where none moved can skip resolving. `None`
     /// whenever a net may have been written some other way since.
     last_contributions: Option<Vec<Contribution>>,
+    /// For each continuous assignment onto a resolved net, the contribution it
+    /// made the last time it was evaluated — what it hands in on a pass where
+    /// nothing it reads has moved. `None` for every other assignment.
+    cached_contributions: Vec<Option<Contribution>>,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -845,6 +849,7 @@ impl Simulator {
             propagating: false,
             flush_each_advance: true,
             last_contributions: None,
+            cached_contributions: Vec::new(),
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -2615,10 +2620,14 @@ impl Simulator {
             }
             for (index, assignment) in self.assignments.iter().enumerate() {
                 // Nothing this one reads has moved since it last ran, so it
-                // would drive exactly what it drove then.
+                // would drive exactly what it drove then — and onto a resolved
+                // net, that is the contribution it made then.
                 if !self.always_evaluate.get(index).copied().unwrap_or(true)
                     && !self.state.take_stale(index)
                 {
+                    if let Some(Some(cached)) = self.cached_contributions.get(index) {
+                        contributions.push(cached.clone());
+                    }
                     continue;
                 }
                 // The net being driven sizes the expression driving it, the
@@ -2674,14 +2683,18 @@ impl Simulator {
                 // `assign (pull1, pull0) x = y;` saying otherwise is this one
                 // value coming off the assignment instead of the constant.
                 if self.target_is_resolved(&target) {
-                    contributions.push(Contribution {
+                    let contribution = Contribution {
                         target,
                         value,
                         counted: true,
                         strength: Driven::Declared(
                             assignment.strength().unwrap_or(DriveStrength::STRONG),
                         ),
-                    });
+                    };
+                    if let Some(slot) = self.cached_contributions.get_mut(index) {
+                        *slot = Some(contribution.clone());
+                    }
+                    contributions.push(contribution);
                 } else {
                     changed |= drive_resolved(&mut self.state, &target, &value)?;
                 }
@@ -2898,11 +2911,6 @@ impl Simulator {
         self.resolved_nets.extend(driven);
     }
 
-    /// Whether a net has to be resolved between its drivers rather than simply
-    /// written.
-    ///
-    /// A design with no gates in it answers without hashing the name, the same
-    /// shape `StateStore::any_signed` and `any_memory` use.
     /// Works out which continuous assignments the propagation fixpoint may
     /// skip while nothing they read moves, and hands the store the table that
     /// marks them stale when something does.
@@ -2911,21 +2919,25 @@ impl Simulator {
     /// right hand side calls a function or a system function (a function reads
     /// whatever its body reads, and `$time` moves on its own), one with a
     /// delay (what it drives moves when its transaction lands, not when its
-    /// inputs do), and one onto a *resolved* net or through a select (a
-    /// resolved net is settled from every driver's contribution each pass, so
-    /// none of them may sit one out, and a select's index is itself a read).
+    /// inputs do), and one through a select (whose index is itself a read).
     /// Everything else is evaluated once something it reads has been written
     /// since it last ran.
+    ///
+    /// One onto a *resolved* net is tracked too, although its net is settled
+    /// from every driver's contribution on every pass: while it is clean it
+    /// hands in the contribution it made last time
+    /// ([`Simulator::cached_contributions`]), which is exactly what evaluating
+    /// it again would produce. An open-drain `assign pin = en ? 1'bz : 1'b0;`
+    /// on an `inout` is this shape, and evaluating it every pass was most of
+    /// what was left of `propagate` in `CameraSetup_tb`.
     fn watch_assignment_reads(&mut self) {
         let mut readers: FastMap<String, Vec<usize>> = FastMap::default();
         self.always_evaluate = Vec::with_capacity(self.assignments.len());
+        self.cached_contributions = vec![None; self.assignments.len()];
         self.last_contributions = None;
         self.propagating = false;
         for (index, assignment) in self.assignments.iter().enumerate() {
-            let plain_target = match assignment.lhs() {
-                Expression::Identifier(id) => !self.is_resolved(&id.name),
-                _ => false,
-            };
+            let plain_target = matches!(assignment.lhs(), Expression::Identifier(_));
             let reads = (plain_target && assignment.delay().is_none())
                 .then(|| events::exact_reads(assignment.rhs()))
                 .flatten();
@@ -2937,6 +2949,11 @@ impl Simulator {
         self.state.watch_readers(readers, self.assignments.len());
     }
 
+    /// Whether a net has to be resolved between its drivers rather than simply
+    /// written.
+    ///
+    /// A design with no gates in it answers without hashing the name, the same
+    /// shape `StateStore::any_signed` and `any_memory` use.
     fn is_resolved(&self, name: &str) -> bool {
         !self.resolved_nets.is_empty() && self.resolved_nets.contains(name)
     }
