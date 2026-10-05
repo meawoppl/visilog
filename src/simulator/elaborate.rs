@@ -3048,7 +3048,8 @@ impl<'m> Elaborator<'m> {
             )
         };
         match target {
-            ResolvedTarget::Whole(name) => {
+            ResolvedTarget::Whole(id) => {
+                let name = &id.name;
                 let signal = self
                     .out
                     .state

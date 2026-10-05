@@ -479,7 +479,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, width)| Slot {
-                target: ResolvedTarget::Whole(format!("s{}", index)),
+                target: ResolvedTarget::whole(format!("s{}", index)),
                 width: *width,
             })
             .collect()
