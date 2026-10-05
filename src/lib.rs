@@ -5,6 +5,11 @@
 //! [`simulator`] that elaborates a parsed module and runs it.
 
 pub mod git_utils;
+pub mod graph;
+pub mod inspect;
 pub mod parsers;
 pub mod register;
+pub mod run;
+pub mod serve;
 pub mod simulator;
+pub mod waveform;

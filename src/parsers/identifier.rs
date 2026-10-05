@@ -15,15 +15,69 @@ use super::{
     simple::{raw_pos_int, ws, ws_and_comments},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Identifier {
     pub name: String,
+    /// Where the name was last found in a simulation's store — see
+    /// [`Slot`]. Not part of the identifier: two identifiers with one name
+    /// are equal whether or not either has been looked up.
+    pub slot: Slot,
 }
 
 impl Identifier {
     pub fn new(name: String) -> Self {
-        Identifier { name }
+        Identifier {
+            name,
+            slot: Slot::default(),
+        }
     }
+}
+
+impl std::fmt::Debug for Identifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identifier")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// A cached store position for the identifier's name: which store it was
+/// found in, and where in it, packed into one word so it adds eight bytes to
+/// an expression rather than sixteen. Zero is "not looked up", which no store
+/// ever is — their numbering starts at one.
+///
+/// Every evaluation of a name used to hash it and compare it against the
+/// store's key, which was a fifth of a busy design's run; with this, the
+/// first evaluation does that and every later one reads a vector. Equality
+/// and hashing ignore it.
+#[derive(Clone, Default)]
+pub struct Slot(std::cell::Cell<u64>);
+
+impl Slot {
+    /// The position cached for the store numbered `store`, if any.
+    #[inline]
+    pub fn cached(&self, store: u32) -> Option<u32> {
+        let packed = self.0.get();
+        ((packed >> 32) as u32 == store).then_some(packed as u32)
+    }
+
+    /// Caches `position` for the store numbered `store`.
+    #[inline]
+    pub fn cache(&self, store: u32, position: u32) {
+        self.0.set(((store as u64) << 32) | position as u64);
+    }
+}
+
+impl PartialEq for Slot {
+    fn eq(&self, _: &Slot) -> bool {
+        true
+    }
+}
+
+impl Eq for Slot {}
+
+impl std::hash::Hash for Slot {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 impl RawToken for Identifier {

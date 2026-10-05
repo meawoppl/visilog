@@ -61,6 +61,31 @@ fn bench_tick(criterion: &mut Criterion) {
             bencher.iter(|| simulator.tick("clk").expect("tick should run"));
         });
     }
+    // A port bound to a net of another width becomes a resolved net with one
+    // driver, resolved bit by bit on every pass. widlar's `memory_tb` binds a
+    // 320-bit output to a 576-bit net, and resolution there was quadratic in
+    // the width until #383 — a 3000ns slice took 20 seconds.
+    group.bench_function(
+        BenchmarkId::from_parameter("wide_port_mismatch"),
+        |bencher| {
+            let source = "
+            module child(input clk, output reg [319:0] r);
+                initial r = 0;
+                always @(posedge clk) r[15:0] <= r[15:0] + 1;
+            endmodule
+            module top(input clk, input rst);
+                wire [575:0] w;
+                child c(clk, w);
+            endmodule
+        ";
+            let parsed =
+                visilog::parsers::source::parse_source(source).expect("design should parse");
+            let mut simulator = Simulator::with_modules(parsed.modules, "top");
+            simulator.setup().expect("design should set up");
+            reset(&mut simulator);
+            bencher.iter(|| simulator.tick("clk").expect("tick should run"));
+        },
+    );
     group.finish();
 }
 

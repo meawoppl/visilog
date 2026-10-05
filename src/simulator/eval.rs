@@ -345,7 +345,7 @@ fn eval_in_context(
         // make it read unsigned.
         Expression::RealLiteral(value) => Ok(Register::from_f64(*value)),
         Expression::Identifier(id) => {
-            let value = match store.get(&id.name) {
+            let value = match store.get_by(id) {
                 Some(value) => value.clone(),
                 None => return Err(unresolved(&id.name, store)),
             };
@@ -502,7 +502,7 @@ fn eval_in_context(
             // An index that is unknown, or too far from zero to be a bit
             // number, selects `x`.
             let index = select_index(&eval(index, store)?)?;
-            let value = match store.get_signal(&id.name) {
+            let value = match store.signal_of(id) {
                 // `a[3]` where `a` is a vector: one bit of it.
                 Some(signal) => match index {
                     Some(index) => logic_bit(signal.bit(index)),
@@ -534,7 +534,7 @@ fn eval_in_context(
             Ok(widened(value, width))
         }
         Expression::PartSelect(id, first, second) => {
-            let Some(signal) = store.get_signal(&id.name) else {
+            let Some(signal) = store.signal_of(id) else {
                 return Err(unresolved(&id.name, store));
             };
             let first = select_bound(first, store)?;
@@ -559,7 +559,7 @@ fn eval_in_context(
             width: selected,
             upward,
         } => {
-            let Some(signal) = store.get_signal(&id.name) else {
+            let Some(signal) = store.signal_of(id) else {
                 return Err(unresolved(&id.name, store));
             };
             let span = indexed_select_width(selected, store)?;
@@ -1036,10 +1036,7 @@ fn expression_is_signed(expr: &Expression, store: &StateStore) -> bool {
         // The store's hint first: looking a name up costs a hash of it, and in
         // a design that declares nothing signed the answer is already known.
         Expression::Identifier(id) => {
-            store.any_signed()
-                && store
-                    .get_signal(&id.name)
-                    .is_some_and(|signal| signal.is_signed())
+            store.any_signed() && store.signal_of(id).is_some_and(|signal| signal.is_signed())
         }
         Expression::Parenthetical(inner) => expression_is_signed(inner, store),
         Expression::Unary(op, operand) => {
@@ -1106,10 +1103,7 @@ fn expression_is_real(expr: &Expression, store: &StateStore) -> bool {
         // need not be hashed. A real **literal** is not covered by it, which is
         // why the flag cannot stand in for this walk at the callers.
         Expression::Identifier(id) => {
-            store.any_real()
-                && store
-                    .get_signal(&id.name)
-                    .is_some_and(|signal| signal.is_real())
+            store.any_real() && store.signal_of(id).is_some_and(|signal| signal.is_real())
         }
         // A word of an array of reals is one, and the array is the only place
         // the declaration is recorded.
@@ -1282,9 +1276,7 @@ pub(crate) fn expression_width(expr: &Expression, store: &StateStore) -> usize {
             }
         },
         Expression::RealLiteral(_) => REAL_WIDTH,
-        Expression::Identifier(id) => store
-            .get_signal(&id.name)
-            .map_or(1, |signal| signal.width()),
+        Expression::Identifier(id) => store.signal_of(id).map_or(1, |signal| signal.width()),
         Expression::Parenthetical(inner) => expression_width(inner, store),
         // `+ - ~` are as wide as what they act on; a reduction and `!` answer
         // in one bit.
@@ -1513,7 +1505,9 @@ pub fn stamp_system_time(expression: &mut Expression, ticks_per_unit: u64) {
     match expression {
         Expression::SystemFunctionCall(name, arguments) => {
             if arguments.is_empty() && matches!(name.as_str(), "time" | "stime" | "realtime") {
-                let unit = VerilogConstant::from_int(ticks_per_unit.min(i64::MAX as u64) as i64);
+                // Sized: a `1s` module over a `1ps` clock is 10¹² ticks a unit,
+                // which an unsized — thirty-two bit — literal would truncate.
+                let unit = VerilogConstant::from_u64(ticks_per_unit);
                 arguments.push(Expression::SystemFunctionCall(
                     TICKS_PER_UNIT.to_string(),
                     vec![Expression::Constant(unit)],
@@ -2003,7 +1997,7 @@ fn eval_system_function_bits(
             let target = resolve_target(store, argument)
                 .map_err(|error| EvalError::RandomSeed(error.to_string()))?;
             let owed = match &target {
-                ResolvedTarget::Whole(name) => store.pending_fill(name),
+                ResolvedTarget::Whole(id) => store.pending_fill(&id.name),
                 _ => None,
             };
             let seed = match owed {
@@ -2517,8 +2511,11 @@ pub fn select_index(value: &Register) -> Result<Option<i64>, EvalError> {
 // ---------------------------------------------------------------------------
 
 fn eval_constant(constant: &VerilogConstant, signed_context: bool) -> Result<Register, EvalError> {
-    let bits = constant_bits(constant.size(), constant.base_type(), constant.digits())?;
-    Ok(bits.with_signedness(signed_context && constant.is_signed()))
+    let bits = constant
+        .cached_bits(|| constant_bits(constant.size(), constant.base_type(), constant.digits()))?;
+    Ok(bits
+        .clone()
+        .with_signedness(signed_context && constant.is_signed()))
 }
 
 /// Converts the pieces of a literal — its optional size, its base and its
@@ -3132,7 +3129,7 @@ fn logic_bit(bit: u8) -> Register {
 
 /// A register used as a condition: any `1` bit is true, all-zero is false, and
 /// anything else (only unknown bits and zeros) is unknown.
-fn truth(register: &Register) -> Option<bool> {
+pub fn truth(register: &Register) -> Option<bool> {
     if register.has_one() {
         // Every real with a bit set is true except `-0.0`, whose sign bit is
         // the one place the bits answer differently from the number. Asking

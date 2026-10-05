@@ -19,7 +19,7 @@ use super::{
     identifier::{identifier, Identifier},
     keywords::is_reserved_word,
     parameter::parse_parameter_port_list,
-    preprocessor::Timescale,
+    preprocessor::{SourceLocation, Timescale},
     simple::{range, signedness, ws, ws_and_comments, Range},
     statements::{parse_module_statement, ModuleStatement},
 };
@@ -49,6 +49,12 @@ pub struct VerilogModule {
     /// one. It belongs to the module's *declaration* rather than to the
     /// instantiation, which is what IEEE 1364-2005 §19.9 asks for.
     pub unconnected_drive: Option<bool>,
+    /// Where the `module` (or `primitive`) keyword was written, stamped by
+    /// [`parse_expanded`](crate::parsers::source::parse_expanded) from the
+    /// preprocessor's source map exactly the way
+    /// [`VerilogModule::timescale`] is. `None` for a module built by a test or
+    /// parsed from text that never went through the preprocessor.
+    pub source: Option<SourceLocation>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -723,6 +729,7 @@ fn range_width((high, low): (i64, i64)) -> i64 {
 pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
     let (input, _) = ws(tag("module"))(input)?;
     let (input, mod_identifier) = ws(identifier)(input)?;
+    crate::parsers::behavior::reset_generated_scopes();
     // `module m #(parameter W = 8) (…);` — an ANSI parameter port list. It
     // becomes ordinary parameter *statements* below, so nothing downstream can
     // tell one declared here from one declared in the body.
@@ -785,6 +792,7 @@ pub fn parse_module_declaration(input: &str) -> IResult<&str, VerilogModule> {
             statements,
             timescale: None,
             unconnected_drive: None,
+            source: None,
         },
     ))
 }

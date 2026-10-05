@@ -16,32 +16,110 @@ cargo fmt            # format — run before every push
 cargo fmt --check    # what CI enforces
 ```
 
-All tests are inline `#[cfg(test)]` modules; there is no integration-test directory. The
-suite runs in well under a second — run it after every change.
+Unit tests are inline `#[cfg(test)]` modules and run in well under a second — run them
+after every change. `tests/` holds the two external-measurement harnesses, both
+`#[ignore]`d: the ivtest corpus and the real-project qualification.
 
-**The crate is a library plus a stub binary.** `src/lib.rs` exports the modules; `src/main.rs`
-is still an empty `fn main() {}`, so `cargo run` does nothing and there is no CLI yet.
-Verify work through tests. The lib target is what lets `benches/` import the crate, and it
-is also why `cargo build` emits only a handful of warnings — before it existed, every
-public item read as dead code and the count was over 250.
+**The crate is a library plus a thin CLI.** `src/lib.rs` exports the modules; `src/main.rs`
+is a hand-rolled CLI over `run::run`, `graph::design_graph` and `waveform::compare` — it
+turns arguments into a `run::RunConfig`, and every decision lives in the library, so an
+embedding client gets exactly what the command line gets:
+
+```bash
+cargo run --release -- run -s tb -I inc -DSIM +seed=3 -o out tb.v dut.v   # exits 0..7
+cargo run --release -- graph -s tb tb.v dut.v                            # JSON design graph
+cargo run --release -- compare reference.vcd candidate.vcd               # JSON, exit 0/1
+```
+
+The lib target is also why `cargo build` emits only a handful of warnings — before it
+existed, every public item read as dead code and the count was over 250.
 
 **Performance is a stated goal, so measure changes.** `cargo bench` covers ticking whole
 designs, expression evaluation, and parsing. `parse/*` is there as a regression guard: work
-on the simulator should leave it alone.
+on the simulator should leave it alone. The micro-benchmarks are not the whole story, so
+also time a real design — MagicSchoolBus's `CameraSetup_tb` (6.3M timesteps, see
+"Qualifying on real projects") is the reference workload — and profile rather than guess:
+`perf record -g --call-graph dwarf` on a `CARGO_PROFILE_RELEASE_DEBUG=true` build works
+once `kernel.perf_event_paranoid` is at most 1. Benchmarks are meaningless while another
+session is compiling on the machine; check `uptime` before believing a number.
+
+**What the hot path relies on** (each measured on `CameraSetup_tb`, which went 117s → about
+13s — roughly 1.6× iverilog's `vvp` on the same machine, timed interleaved; the harness's
+own iverilog figure includes the compile, so compare against `vvp -n` alone):
+
+- **A continuous assignment is re-evaluated only when something it reads was written.**
+  `Simulator::watch_assignment_reads` gives the store a signal → assignments table, and
+  `StateStore::record` (every signal write) and `set_word` (every memory write) mark the
+  readers stale. **A new write path into the store must go through one of those two**, or
+  the assignments reading what it writes silently stop following it. Calls, delays,
+  resolved-net targets and select targets are always evaluated; a drive installed or
+  released, and a propagation that errored, mark everything stale. 99.4% of evaluations
+  had been recomputing an unchanged value.
+- **Resolution is skipped when every driver contributes what it did last pass**
+  (`last_contributions`), and with no switch involved. Anything that writes a resolved net
+  some other way has to clear it — `set_input` does.
+- **An assignment onto a resolved net is dirty-tracked too**: while clean it contributes
+  its `cached_contributions` entry rather than being evaluated. When continuous
+  assignments are a design's only contributors (no gate, UDP, switch, pulled net or
+  drive), a pass where none of them changed what it contributes builds no list at all —
+  the open-drain `assign pin = en ? 1'bz : 1'b0;` on an `inout` is the common case.
+- **A plain assignment target is resolved once** (`fixed_targets`): a whole net named by
+  a bare identifier is the same store entry, width and resolved-or-not for the run.
+- **A whole-signal write is `StateStore::write_ranged(&str, …)`**, one entry lookup and no
+  name copy. `set_ranged` takes an owned name for the many callers that are not hot.
+- **The dump renders into one reused buffer** (`vcd::render_into`, `VcdDump::scratch`);
+  `trim_start` is the IEEE 1364 trimming rule over digits by position.
+- **Signals live at stable positions, and an identifier caches its position.** The
+  store's `SignalTable` keeps every signal at a `SignalId` that never changes — a signal
+  is never removed — and `Identifier::slot` remembers where its name was found, tagged
+  with the store's `StoreUid`, which is fresh for every store *and every clone*, so a
+  cached position is never read against the wrong store (a function call's frame simply
+  misses and looks the name up). `StateStore::signal_of` / `get_by` / `position_of` are
+  the cached lookups; prefer them to the `&str` ones on any per-evaluation path.
+  `ResolvedTarget::Whole` holds the `Identifier` for the same reason, and
+  `write_ranged_by` writes through it.
+- **The change journal is by position**: `record_id` marks the readers and journals a
+  signal with no hash, `take_edges` builds each edge by position (carrying
+  `SignalEdge::id`) and drops a write that put the same value back, and `event_fires`
+  matches a single-signal entry by position (`SignalEdge::is_of`). A name written before
+  it exists is a declaration, held in `declaring` for the rest of the round so a later
+  write to it in the same round is not an edge either.
+- **The store's name-keyed maps use FxHash** (`state_store::FastMap`), not SipHash.
+- **A literal's bits are cached on the literal** (`constants::BitsCache`), outside its
+  equality.
+- **`run::run` flushes the dump once at the end** (`Simulator::set_flush_each_advance`),
+  not once per `advance`.
+- **`Register::get_raw` builds a fresh byte per bit on every call.** Expand once outside a
+  per-bit loop; calling it inside one made net resolution quadratic in the net's width.
 
 ## Layout
 
 ```
 src/
   lib.rs               the library root; exports everything below
-  main.rs              stub binary, currently empty
+  main.rs              the `visilog` CLI: `run`, `graph`, `serve` and `compare`
+  graph.rs             the versioned JSON design graph — see "The design graph" below
   git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
   register.rs          4-state (0/1/x/z) value type, packed into two bit planes
+  run.rs               RunConfig → RunRecord: one reproducible run; see "Running a design"
+  waveform.rs          VCD read back into normalised traces, and compared
+  inspect.rs           Session — signal enumeration, change batches, stepping and
+                       breakpoints for interactive clients; see "Inspecting a run"
+  serve.rs             `visilog serve`: a Session plus the design graph behind a tiny
+                       local HTTP server; see "The visual debugger"
+  viewer/              its single-page front end — index.html, viewer.js, viewer.css
   parsers/             the Verilog front end — see below
   simulator/           elaboration and the event-driven run loop — see below
   verilog/examples/    sample .v files, walked by two corpus tests
 benches/
   simulation.rs        criterion throughput benchmarks
+tests/
+  ivtest_corpus.rs     Icarus's regression suite — see "Measuring progress"
+  project_qualification.rs
+                       real designs under iverilog and visilog — see "Qualifying on real
+                       projects"
+qualification/
+  benches.json         the pinned projects and benches that harness runs
 ```
 
 ### `src/parsers/`
@@ -220,8 +298,41 @@ blocks is measured, not reasoned**: a list naming a `posedge` or `negedge` anywh
 named event, misses the earlier write; a list of plain signals (`@(b)`, `@(c or d)`) and
 `@*` hear it whichever side of the `initial` they are written (`armed_at_its_turn`). A
 trigger fired before the turn is skipped by count, since a trigger has no value to
-snapshot. Among blocks woken at the same instant iverilog's order still differs from
-ours.
+snapshot.
+
+**Blocks one settle round wakes run in iverilog's order: by the write that woke them,
+then most recently armed first.** vvp keeps one wait list per event and pushes a process
+onto its *front* when the process reaches the event control, and it schedules the waiters
+on a signal the moment the signal is written. So three `always @(posedge clk)` blocks
+armed A, B, C at time zero run C, B, A at the first edge, A, B, C at the next (each
+re-armed as it finished), and an `initial` that reached `@(posedge clk)` after all three
+last ran goes first; while four `always @(x)` blocks over four registers written in turn
+run in the order of the writes (corpus `vector`). A testbench that drives an input with a
+blocking assignment on the edge its design samples it on depends on exactly this —
+widlar's `PulseGenerator_tb` diverged from iverilog until it was modelled. Three pieces
+carry it:
+
+- **The change journal keeps write order.** `StateStore::take_changes` hands changes back
+  in the order each name was first written, where it used to sort them by name.
+- **`Simulator::next_arming` stamps every arming** — an edge-triggered `always` running off
+  its end, a time-zero `arm`, a `@` part way through a block — and `delta_rounds` decides
+  *every* wake of the round first (the `always` loop and `take_satisfied_waiters`), then
+  sorts by `(wake_rank, newest arming first)` and runs them. `wake_rank` is the position
+  in the journal of the write that fired the block: the shortest prefix of the offered
+  edges that still fires it, found by binary search since firing is monotonic.
+- **The ranking is skipped when a round wakes one block**, which is nearly every round;
+  measured against `main` that is within noise on `bench tick/*`, where ranking every
+  wake cost 5%.
+
+The not-yet-run list is `Simulator::settling`, a field for the reason `round` is one: the
+block that runs first may `disable` one further down (corpus `disable_cleanup`).
+
+What is still different: vvp propagates *some* continuous assignments synchronously at the
+write — a net declaration assignment and an arithmetic or concatenation functor do, a
+logic `&` functor schedules itself — where visilog settles every continuous assignment
+between rounds. A testbench that writes an input and has another block read a wire built
+from it at the same edge sees the difference; widlar's `spi_tb` is that race, and the LRM
+leaves it open.
 
 **A `#0` yields to the blocks the design just woke, and not to their non-blocking
 updates.** It re-queues a block at the same instant, in what IEEE 1364-2005 calls the
@@ -2422,13 +2533,236 @@ and that one flag) rather than as a bare `Register`.
 | `udp.rs` | `Udp` — one elaborated *user-defined* primitive instance, a continuous driver beside the gates |
 | `exec.rs` | `execute_statements` / `commit_updates` — the run-to-completion entry point, plus `PendingUpdate` and the shared `drive` / `resolve_target` helpers; also `drive_at`, where drive precedence is enforced, and `install_drive` / `apply_drive` / `release_drive` / `deassign_drive` |
 | `program.rs` | `Program::compile` / `resume` — statement trees flattened to jump-threaded instructions, so a block can suspend on a `#delay`, a `wait` or an event control and resume by program counter; also `FunctionDefinition::call`, which runs one of those programs against a frame, `TaskDefinition` / `Program::splice`, which inlines one into another, `Instruction::HierarchicalEnable` / `link_hierarchical_enables`, which do the same for another instance's task once the hierarchy is walked, `Instruction::AutomaticEnable` / `Program::activation`, which start a `task automatic` as a thread over a renamed copy of its body instead, `Program::calls_system_function`, the one question asked of a compiled block before it runs, `Program::compile_block` / `rename_range`, which give a named block's variables their scope, `ScopeRange` / `rename_scopes` / `scope_end_containing`, which are what a `disable` jumps by, and `compile_fork` / `Instruction::Fork` / `JoinBranch`, which lay a time-consuming `fork` out as one thread per branch |
-| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `AutomaticTask` / `start_activation()` / `return_from_activation()`, the activations of a `task automatic`, and `resume_thread()`, the turn of the trampoline `resume_block()` runs them on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, and `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression |
+| `runner.rs` | `Simulator` — `new()` / `with_modules()` / `setup()` / `set_input()` / `poke()` / `run()` / `advance()` / `get()` / `add_search_path()` / `set_output_directory()` / `ticks_per_unit()` / `add_plusarg()`, the driver, plus `end_of_timestep()`, the slot the deferred tasks report in, `wake_waiting()` / `EventWatch`, which resume the blocks suspended on the design rather than on the clock, `cancel_scope()`, which is `disable` reaching another block, `DelayedDrive` / `next_time()` / `land_due_drives()`, the inertial delay on a continuous assignment, `ForkJoin` / `branch_arrived()` / `is_forking()`, the join barrier a `fork` suspends on, `AutomaticTask` / `start_activation()` / `return_from_activation()`, the activations of a `task automatic`, and `resume_thread()`, the turn of the trampoline `resume_block()` runs them on, `switch_bits()` / `bond_nodes()` / `relax_switches()`, which pool the drivers of a port bond and carry each net's resolution across a `tran`, reduced, `block_fires()` / `snapshot_event_values()`, which keep the last value of a sensitivity entry that is an expression, and `tap_writes()` / `take_written()` / `store()` / `aliases()`, what `inspect::Session` reads the design through |
 | `tasks.rs` | `TaskCall` / `TaskContext` / `Output` / `TimeFormat` — system tasks, their format strings (including the `%f`/`%e`/`%g` real conversions, `%c`, `%v` and the `%m` scope name), the buffer they print into — shared with the `StateStore`, so a function body's `$display` lands in it where it ran — the descriptor mask that decides which files a `$f…` task writes to beside it, `$sformat` / `$swrite`, which format into a register instead, the deferred `$strobe` queue and the one armed `$monitor`, the `$readmemh` / `$writememh` memory file format, and the `$dump…` family, which it resolves and hands to the `VcdDump` it owns |
 | `state_store.rs` | `StateStore` — signal name → `SignalState` (value, declared range, declared signedness, declared realness, whether it was declared a net, the per-bit `Strength` a resolved net was last settled at, and the `DriverTally` `$countdrivers` reports), backed by `register::Register`; memory name → `Memory`, in a second map, which is the whole bit-versus-word disambiguation; event name in a third, valueless namespace with the trigger journal `trigger_event` / `take_triggers`; plus the change journal `take_changes` / `clear_changes` drive, the memory journal `take_memory_changes`, the simulated clock `$time` reads, the `$random` stream (`next_random` over `random_from_seed`, IEEE 1364-2005's generator), the `FileTable` `$fopen` opens into together with the directory a relative write path hangs off and the search path a read is resolved through, the plus-args the two `$…plusargs` functions read, the `Reader` a read-mode descriptor holds, the fill queue (`owe_fill` / `take_fills` / `pending_fill`) a scan writes its arguments through, a `$random(seed)` writes its next seed back through, and a function hands its side effects back through, the `Output` handle a `$display` inside a function body prints into, the design's `FunctionDefinition`s, the `frame()` a call runs in together with the `adopt_memory` that seeds an array into one, the `scope_storage` / `install_scope` pair that gives each activation of a `task automatic` storage of its own, and the installed `Drive`s with the `DriveLevel` precedence rule `exec::held_bits` answers |
 | `event_queue.rs` | time-ordered `EventQueue` of `ExecutionCursor`s: `insert` / `pop` / `peek_time` / `retain` / `cursors`, FIFO within one timestamp. A cursor carries the `fork` it is a branch of, if it is one |
 | `signals.rs` | `Signal` trait plus `FiniteSignal` / `InfiniteSignal` test stimulus |
 | `validator.rs` | `validate_module` / `gather_definitions` |
 | `vcd.rs` | `VcdDump` — the value change dump: `add` resolves `$dumpvars` targets into variables, `note_changes` marks the ones the change journal says were written, `flush` writes the header, the opening block and each timestep's section, and `trimmed` / `identifier` are the iverilog-measured vector trimming and identifier alphabet |
+
+### Running a design: `src/run.rs`
+
+`run::run(&RunConfig, cancel)` is one reproducible run. The config names everything the
+run depends on — the sources **in order**, the top, include directories, `-D` defines,
+plus-args, the directories data files are read from (`search_paths`) and written to
+(`output_dir`), the default `` `timescale ``, and optional time and step limits — and the
+`RunRecord` it returns says how it ended and carries the tool version and a SHA-256 of
+every source, so two records can be compared and one repeated. `run::load` is the front
+half (read, preprocess, parse, pick the top, configure a `Simulator`), shared with
+`inspect::Session`. `RUN_RECORD_SCHEMA` moves only when a field changes meaning; adding
+one does not move it.
+
+**The sources are one compilation unit.** `Preprocessor::preprocess_files` expands them in
+order with one macro table and one `` `timescale ``, which is what iverilog does with a
+command line of files — a `` `define `` in one is visible in the next — and each file must
+still balance its own `` `ifdef ``s. `Preprocessor::with_define` is `-D`, a bare name being
+`1`. Each source's own directory is added to the include path, as iverilog does.
+
+**A named top prunes the design to what it reaches**, which is iverilog's `-s`
+(`source::reachable_modules`). It matters beyond speed: a module nothing under the top
+instantiates contributes nothing, not even its `` `timescale `` to the clock's precision.
+yosys's `ice40/cells_sim.v` declares `1ps`, and a testbench read beside it that uses none of
+its cells still runs at the one second it was written at. Without a top every module is a
+root, and `source::root_module` — the picker the corpus harness has always used, moved into
+the library — chooses which one runs.
+
+**One `StopReason`, one exit status.** `Finished` and `Quiescent` are the two ways a design
+ends on its own terms (0, or 1 when it reported an assertion failure); `Io`/`Compile` 2,
+`Unsupported` 3, `Elaboration`/`Runtime` 4, `TimeLimit`/`StepLimit` 5, `Cancelled` 6,
+`Breakpoint` 7. `Unsupported` is a `SimulationError::Unsupported`, an unimplemented
+function, or `TimeOverflow` (below) — the constructs a caller should read as "not yet",
+not as "your design is wrong". The drive loop steps from one `next_time` to the next, so a
+step limit counts timesteps, and cancellation is polled between them and always leaves the
+design at a settled timestamp. With no limit a run goes until the design finishes or has
+nothing scheduled, as iverilog does.
+
+**`assertion_failures` counts `$error`, `$fatal` and failed `assert`s**, from
+`TaskContext::failures`, so a caller can tell a clean finish from one that reported a
+problem without reading the text. The severity tasks print iverilog 12.0's layout —
+`ERROR: <message>` then `       Time: <ticks>  Scope: <%m>` — less the `file:line:` it puts
+after the label, since there are no source lines to name. The time is raw clock ticks and
+the scope the call's own `%m` (a task's name included), both measured.
+
+**The clock is a signed sixty-four bit count, and running past it is
+`SimulationError::TimeOverflow`**, never a wrap to a negative time. iverilog's is unsigned
+and goes twice as far: fpga-tesla's `led_tb` waits 10⁷ seconds beside a `1ps` cell library,
+10¹⁹ ticks, which iverilog reaches and visilog names. `runner::later` is the one checked
+addition every schedule goes through.
+
+### Comparing waveforms: `src/waveform.rs`
+
+`Waveform::parse` reads a VCD back into what the design did: every variable by its
+hierarchical name (top included, the same IDs `inspect` uses) and width, and its value from
+each instant of **physical** time in femtoseconds, with consecutive equal values collapsed.
+Identifier codes, `$date`, declaration order, `wire`/`reg`/`integer` kinds, trimmed leading
+digits (re-extended the way a reader does) and the `$timescale` all normalise away, so a
+visilog dump and an iverilog dump of the same run compare equal. A variable inside a scope
+whose name starts with `$` (iverilog's `$ivl_for_loop0`) and a `$var parameter` are left
+out, since only one side writes them. `waveform::compare` walks every variable both dumps
+hold up to where the shorter one ends and reports the earliest disagreement per signal,
+plus the width mismatches and the names only one side has. `visilog compare ref.vcd
+cand.vcd` is the same thing on the command line.
+
+### What is not simulated: timing disclosure
+
+Simulation is **functional**. Procedural delays, delayed continuous assignments and gate
+and UDP delays are simulated; a `specify` block's path delays and timing checks, and a
+bidirectional switch's delay, are parsed and dropped. A design built on vendor cell models
+that finishes cleanly has therefore not been timing-verified, and the run says so rather
+than leaving it to be inferred from silence. `Elaborator::omit_timing` records a
+`TimingOmission` (kind, instance, module, the construct as written) wherever one is
+dropped; `Simulator::timing_omissions` hands them over; `run` summarises them in
+`RunRecord::capabilities` — what is always simulated, and a count and the modules for each
+kind that was not — and adds one diagnostic per kind naming the first few sites, a warning
+in functional mode. `RunConfig::strict_timing` (`--strict-timing`) makes each an error and
+stops with `Unsupported` before running. A design whose delays are all of the simulated
+kinds passes strict mode untouched. Note that iverilog ignores `specify` too unless given
+`-gspecify`, so a differential run against its default agrees with visilog here.
+
+### Inspecting a run: `src/inspect.rs`
+
+`inspect::Session` is what an interactive client — a waveform viewer, a debugger, a
+structural browser — drives. It wraps a set-up `Simulator`, built either from a
+`RunConfig` (`Session::new`, through `run::load`, the same front end `run::run` uses) or
+from a `Simulator` a caller already has (`Session::from_simulator`). Nothing in it knows
+about a browser or a wire format; the types derive `serde` so a client can pick one.
+
+**An ID is the full hierarchical name, top module included** — `tb.dut.count`. That is
+exactly what a VCD `$scope` path gives a variable and the key `waveform::Waveform::traces`
+reads it back under, so an ID names the same trace in a dump the design wrote; a test
+checks every listed net, variable and real against the traces of a real dump. The flat
+`StateStore` key is the ID without its leading top segment. `Session::signals` lists every
+signal, memory and named event sorted by ID, with its scope, kind
+(`Net`/`Variable`/`Real`/`Memory`/`Event`), width, declared range, signedness and a
+memory's address ranges. A port aliased onto its parent's signal is listed under **its own**
+ID with `SignalInfo::storage` naming the ID it shares (`tb.dut.q` → `tb.count`). A key with
+a segment starting `$` (`$repeat$`, `$hold$`, an activation's `.$3.`) is left out, which is
+the rule `vcd.rs` follows. The list is fixed at elaboration.
+
+**Change batches ride on the journal the delta cycles already take.** `subscribe` turns on
+`Simulator::tap_writes`, which makes `delta_rounds` add each round's written names to a
+set — the same point the VCD's `note_changes` is fed from — and after each timestamp the
+session compares only the *written* subscribed entries against what it last reported.
+With nothing subscribed the tap is `None` and the settle loop pays one `Option` check per
+round (`bench tick/*` did not move). `take_changes` returns a `ChangeBatch` capped by
+`set_change_capacity` (default 65,536); past the cap changes are counted in `dropped`
+rather than buffered, and `Session::value` is how a client catches up.
+
+**The timing contract: everything happens at a settled timestamp boundary.** A session
+advances one timestamp per step (`next_time`, then `advance` to exactly it), and a
+timestamp ends only when every delta cycle has run, the non-blocking updates have landed
+and the continuous assignments have settled — the moment `$strobe`, `$monitor` and the
+dump report at. That is the only moment a change is recorded, a breakpoint is evaluated,
+or a run stops. So `a = 1; a = 0;` inside one timestamp is no change, and a condition true
+only mid-timestamp never fires. A breakpoint (`Condition::Changes`, `Equals`, or an
+`Expression` parsed with `verilog_expression`, its names — IDs or flat keys — resolved to
+store keys and evaluated with `eval`) fires on the boundary where it **becomes** true
+relative to the previous boundary, so resuming from a hit does not stop again at once.
+`run(limits, cancel)` checks, before each timestamp: `$finish` (`Finished`), the
+cancellation flag (`Cancelled`), nothing scheduled (`Quiescent`), `Limits::until`
+(`TimeLimit`) and `Limits::steps` (`StepLimit`); after it, the breakpoints (`Breakpoint`,
+added to `run::StopReason` for this). An error stops with `Runtime`/`Unsupported` and every
+later run reports it again. Time zero is the first step. Because a stop is only ever at a
+boundary, pausing and resuming is exact: a test runs one design whole and again with
+every kind of pause interleaved, and compares the output, every value, the change batches
+and the VCD body.
+
+Still not covered: a memory or an event cannot be subscribed (a memory is read a word at a
+time with `Session::word`), a named event's trigger is not reported, a client cannot drive
+an input through the session (`Simulator::poke` is not wrapped), and the signal list does
+not include an automatic task's activations.
+
+### The design graph
+
+`graph::design_graph(modules, top)` elaborates a design exactly as `Simulator::setup` does
+and reports what elaboration built as a renderer-independent `DesignGraph` — the contract a
+web workbench's structure, source and waveform views key into (#380). `visilog graph
+[run's options] <source.v>…` prints it as JSON, going through `run::load_design` (read,
+preprocess, parse, pick the top) — the front half of the `run::load` `visilog run` uses. The layout is versioned by
+`GRAPH_SCHEMA` (`"schema": 1`): it moves when a field changes meaning or goes away, and
+adding a field does not move it.
+
+**The ID convention is shared with the inspection API, so do not bend it.** A signal's ID
+is its hierarchical name *with the top module's name first* — `tb.dut.count` — which is
+exactly what a VCD `$scope` path gives it and the key `waveform::Waveform::traces` uses; the
+flat `StateStore` key is the same name without the top segment. An instance's ID is its
+path (`tb`, `tb.dut`, `tb.stage[0].u`, `tb.u[3]` for an arrayed one), and a process is
+`<instance>/<kind><n>` (`tb.dut/always0`, `tb/assign2`). A port aliased onto its parent's
+signal keeps its own ID and names the entry it shares in `Signal::storage`.
+
+**What it holds**: every module with the file and line of its `module` keyword; every
+instance with its parent, children, and its `parameter`/`localparam` values *as resolved*
+after every `#(...)` and `defparam`; every port with its direction and resolved range;
+every net, variable, parameter, memory and event, each assigned to the instance whose
+store prefix is the longest match (a generate block's `stage[0].q` belongs to the module
+instance around it); every connection with its binding (`alias` / `driven` / `driving` /
+`bonded`) and its bits as `segments`, most significant first — a signal slice, a constant,
+or an opaque expression with the signals it reads; and every `initial`/`always` block,
+continuous assignment, gate, UDP and switch with the signals it reads and writes, the
+sensitivity list of an `always`, and a `port_connection` flag on the assignments
+elaboration added itself to carry a port across an instance boundary.
+
+**How it is captured, and why nothing on a hot path sees it.** `Elaborated::hierarchy` is
+recorded as elaboration goes and dropped by `setup`: `instantiate` pushes an
+`InstanceRecord` with each port's connection resolved through
+`Scope::resolve_structural` — `resolve` without following a port alias, so a connection
+inside `mid` names `mid.p` rather than the top-level entry it shares — and `walk` ends by
+`claim`ing every block, assignment, gate, UDP and switch its instance added that no child
+already claimed. `reconcile_port_widths` rewrites a connection's recorded binding when it
+turns an alias into an assignment, so the graph says what elaboration made of it rather
+than what the parent wrote. Measured closure is unchanged (1370).
+
+**What it deliberately does not claim.** It is the **behavioural RTL** — a process is an
+`always` block and its reads and writes are the names its statements mention (a system
+task's arguments are not counted), not a synthesised gate netlist or a bit-accurate
+dataflow. A process's reads and writes name *store entries*, so a port alias is already
+followed there, where a connection keeps the structural name. There are no coordinates.
+Source spans are one line per module: the parser keeps no spans on its AST, and finer ones
+(per port, per statement) are future work. A parameter declared inside a generate block or
+a named block is listed as a variable, not a parameter.
+
+### The visual debugger: `src/serve.rs` and `src/viewer/`
+
+`visilog serve [--port 8417] <run options> <sources>` loads a design exactly as `run` does
+and serves a viewer on `127.0.0.1` — the module hierarchy as nested boxes, each holding its
+own registers and nets with live values and one chip per process, wired port to port, with
+a toolbar that steps, runs to an edge of a one-bit signal, runs to a breakpoint expression
+or runs to the end, and a waveform strip of pinned signals with a time cursor. It is a
+**client** of the two machine-readable surfaces rather than a third model of the design:
+the boxes, ports and wires are the design graph, the values and stepping are an
+`inspect::Session`, and neither learned anything for it.
+
+**History is recorded server-side, every change of every signal, from the first step.**
+`Viewer::new` subscribes to every valued signal with an unbounded queue and `record` drains
+it after each run into one `(time, value)` list per signal, so the cursor can move to any
+earlier time (`/api/values?t=`) and a waveform can be pinned *after* the interesting part
+has happened. That is the reason a session cannot simply be asked: it holds the present
+only. `HISTORY_LIMIT` (four million changes) stops recording rather than growing for ever —
+the run goes on, the badge says "history full" — and `STEPS_PER_REQUEST` bounds one HTTP
+request, so "Run all" on a design that never finishes comes back and can be asked again.
+
+**The server is deliberately minimal**: `std::net` only, HTTP/1.1, one request at a time,
+bound to loopback, no dependency added. The three assets are `include_str!`ed, so the
+binary is the whole tool; the page loads `elkjs` from a CDN for the layout. `/api/source`
+serves only the files the `RunConfig` named, because a path parameter is otherwise a file
+read of the whole disk.
+
+**Layout is ELK's `layered` algorithm with `INCLUDE_CHILDREN`, run twice.** One graph
+holds every unfolded instance, so a wire may cross a box boundary and the ports line up
+with what they drive. ELK will not keep a compound node's ports below its header and its
+register rows — `portsSurrounding` and `portAlignment` are honoured for a leaf and ignored
+for a box with children — so the first pass only sizes each box and the second pins every
+port (`FIXED_POS`) beneath the contents: inputs west, outputs east, `inout` south. A wire
+is a parent-side signal that two or more ports reach — the parent's own and its children's,
+keyed by **store entry** (`storage`), since an aliased port and the signal it is bound to
+are spelled differently in the graph. A big design starts with everything below depth two
+folded.
+
+The visible feedback is in the CSS: a one-bit wire is green at `1`, dark at `0`, red at `x`
+and dashed teal at `z`; a value that moved since the last paint flashes; hovering a process
+chip lights what it reads (blue) and writes (amber). Measured on `CameraSetup_tb`: six
+instances lay out in well under a second and 3000 steps record and render without a pause.
 
 ## Measuring progress: the ivtest corpus
 
@@ -2564,7 +2898,8 @@ relative to `ivtest/` and `ivtest/ivltests/`. `judge` keeps its bare
 path; `judge_with` is the one that takes the configured preprocessor and the gold text.
 
 **The harness picks one top, and a module is a root only if *nothing* instantiates it —
-including from inside a `generate` region.** `top_module` walks every region, loop, branch
+including from inside a `generate` region.** `source::root_module` (shared with
+`run::run`, which uses it when no top is named) walks every region, loop, branch
 and case arm (`instantiated_modules`), because a ripple adder written as `for (…) begin :
 addbit add1 bit(…); end` otherwise leaves its cell looking like a root, and the cell is
 last in the file, which is the tie-break. The design then runs its leaf and prints nothing
@@ -2596,6 +2931,42 @@ diagnostics. **They go stale as features land** — a row counting files that *c
 construct cannot move once that construct is supported. Prune a row when its feature ships;
 the "sample of unexplained rejections" exists to point at whatever the heuristics no longer
 explain.
+
+**The corpus score is not a defect count.** iverilog itself fails 125 of the 1514 `normal`
+entries (#248), and several of visilog's wrong answers are byte-identical to iverilog's. A
+failure list is triaged against a live iverilog run before anything in it is called a bug.
+
+## Qualifying on real projects
+
+`tests/project_qualification.rs` runs real, maintained designs — MagicSchoolBus,
+widlar's Tesla-coil controller, fpga-tesla — under iverilog and visilog with identical
+sources, defines and top, and compares them three ways: normalised VCD
+(`waveform::compare`), printed output with iverilog's `file:line:` and `$finish called at`
+lines taken out, and the count of `ERROR:`/`FATAL:` reports. The projects are **private**,
+so they are fetched and never vendored; `qualification/benches.json` pins each by full
+commit hash and lists every bench with its exact source files, top and expected class:
+
+```bash
+VISILOG_PROJECTS=~/repos cargo test --release --test project_qualification \
+    -- --ignored --nocapture                  # VISILOG_QUAL_ONLY=widlar/spi for one
+```
+
+**Whether the reference passes is a separate question from whether visilog agrees with
+it**, and only the second qualifies visilog. Several of these testbenches fail their own
+checks under iverilog too (`CameraSPIReader`, `memory`, `spi`), and three do not compile
+under iverilog 12.0 at all (a superfluous port comma, a name declared twice) — a whole-
+project compile of either repository fails for the same reasons, which is why every bench
+names only the files its testbench reaches. `summary.json` records both answers, with the
+commands, the iverilog version, the checked-out revision and every source hash; the gate is
+that each bench the manifest expects to `agree` does. A bench expected to `diverge` or be
+`unsupported` must say why in its `note`, and `the_manifest_is_well_formed` checks that it
+does. `.github/workflows/projects.yml` runs it when the `QUALIFICATION_TOKEN` secret — a
+read-only token for the three repositories — is set, and skips cleanly when it is not.
+
+The projects' own runners compile with `-g2012 -gassertions -DNO_ICE40_DEFAULT_ASSIGNMENTS`
+plus yosys's `ice40/cells_sim.v`, so the harness does too. That is where immediate
+`assert (c) else $error(…)`, `for (integer i = …)`, declarations in an unnamed `begin`, and
+SystemVerilog default port values came from — see the Gotchas.
 
 ## Conventions
 
@@ -2632,10 +3003,8 @@ tripwire.
 
 ## Gotchas
 
-- **`cargo build` emits ~160 warnings**, nearly all `dead_code` — the parser and simulator
-  types have no non-test consumer yet because `main.rs` is a stub. This is expected and
-  not something to "fix" by deleting code. It does mean a genuine new warning is easy to
-  miss; check the warning count or grep for your file specifically.
+- **`cargo build` emits a handful of warnings.** A genuine new one is easy to miss among
+  them; check the count or grep for your file specifically.
 - **Duplicate definitions exist.** `NetType` is defined in *both* `parsers/nets.rs` and
   `parsers/modules.rs`. Check which one is in scope before assuming a change took effect.
   (The former duplicate `Register` in `state_store.rs` is gone — there is now one
@@ -3319,6 +3688,34 @@ tripwire.
   one never-inlined `packed_eval` call cost one slot instead of four. Anything added to
   that function's arms should be weighed the same way.
 - **`nom` is pinned to 7.x.** The 8.x API differs substantially; don't upgrade casually.
+- **`assert (c) pass else fail;` lowers to an `if` whose missing `else` is a bare
+  `$error`**, in the parser, so nothing downstream learns it was written. Both arms are
+  optional; `assert` carries a word boundary and needs its `(`, so `assert_ok = 1;` is an
+  assignment. It is SystemVerilog, and no scored corpus file names anything `assert`.
+- **The parser names two kinds of scope, numbered through the module the way iverilog
+  numbers them.** `for (integer i = …)` lowers to a named block `$ivl_for_loop<N>` declaring
+  `i` around the loop, and an unnamed `begin` that declares something becomes
+  `$unm_blk_<N>` — where *every* unnamed `begin` takes a number as it opens, declaring or
+  not, so the third is `$unm_blk_3` even when the first two declared nothing. `%m` inside
+  either prints iverilog 12.0's exact path. The counters are thread-locals reset by
+  `behavior::reset_generated_scopes` at each `module`; a parse that backtracks over one
+  leaves a gap, never a duplicate. A `$` cannot begin a design identifier, and a scope that
+  begins with one is left out of the dump. `int` is read as `integer`.
+- **A function body's named-block locals live in the call's frame.** `Program::compile`
+  renames a block local to `blk.i`, so `compile_function` walks the body with
+  `elaborate::for_each_block` — the one walk that says which blocks a statement tree holds,
+  which `declare_block_locals` also uses — and declares each as a frame variable under
+  that spelling. A lowered `for (integer i …)` inside a function is one of these.
+- **An input's default value applies only when the port is unconnected.**
+  `input I0 = 1'b0` is SystemVerilog's default port value (IEEE 1800 §23.2.2.4), not a
+  net declaration assignment; driving it on a connected port put a second driver on every
+  input of yosys's `SB_LUT4`. An output's or a variable port's initialiser is unchanged.
+- **A `timing check` limit may be `min:typ:max`** — it is a `PathDelay`, the same shape a
+  path delay's value is (`$setuphold(posedge CLK, posedge I0, 378:418:470, 0:0:0);`).
+- **A comment may follow a `` `timescale `` on its line**, and is not part of it.
+- **The unit a `$time` call is stamped with is a sized 64 bit literal**
+  (`VerilogConstant::from_u64`). An unsized one is thirty-two bits, and a `1s` module over
+  a `1ps` clock is 10¹² ticks a unit — `$time` printed 1402 where iverilog prints 5.
 
 ## Git workflow
 

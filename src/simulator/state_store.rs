@@ -8,11 +8,130 @@ use std::rc::Rc;
 
 use crate::parsers::expr::Expression;
 use crate::parsers::gates::DriveStrength;
+use crate::parsers::identifier::Identifier;
 use crate::register::{Register, REAL_WIDTH, X};
+use crate::simulator::events::SignalEdge;
 use crate::simulator::exec::ResolvedTarget;
 use crate::simulator::gates::Strength;
 use crate::simulator::program::FunctionDefinition;
 use crate::simulator::tasks::Output;
+
+/// A map keyed by signal name, hashed with FxHash rather than the standard
+/// library's SipHash.
+///
+/// Every read, write and journal entry in a run looks a name up, and SipHash
+/// — built to resist an attacker choosing the keys, which a design cannot —
+/// was nearly a fifth of `CameraSetup_tb`'s run on its own. The keys are the
+/// design's own names, so a fast non-cryptographic hash is the right one.
+pub type FastMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
+/// The set counterpart of [`FastMap`].
+pub type FastSet<K> = HashSet<K, rustc_hash::FxBuildHasher>;
+
+/// The design's signals, each at a stable position: a name is looked up once
+/// and its position — a [`SignalId`] — is good for the life of the store,
+/// because a signal is never taken out of one. Everything that asks by name
+/// still can; the hot paths ask by position instead and skip the hash and the
+/// string comparison a name lookup costs (see [`Identifier::slot`]).
+///
+/// [`Identifier::slot`]: crate::parsers::identifier::Identifier
+#[derive(Clone, Debug, Default)]
+struct SignalTable {
+    index: FastMap<String, SignalId>,
+    names: Vec<String>,
+    signals: Vec<SignalState>,
+}
+
+/// A signal's position in its store's [`SignalTable`].
+pub type SignalId = u32;
+
+impl SignalTable {
+    fn id(&self, name: &str) -> Option<SignalId> {
+        self.index.get(name).copied()
+    }
+
+    fn get(&self, name: &str) -> Option<&SignalState> {
+        self.id(name).map(|id| &self.signals[id as usize])
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut SignalState> {
+        let id = self.id(name)?;
+        Some(&mut self.signals[id as usize])
+    }
+
+    /// Puts `signal` under `name`, in the place the name already has if it
+    /// has one — which is what keeps every [`SignalId`] handed out valid.
+    fn insert(&mut self, name: String, signal: SignalState) -> SignalId {
+        match self.index.get(&name) {
+            Some(&id) => {
+                self.signals[id as usize] = signal;
+                id
+            }
+            None => {
+                let id = self.signals.len() as SignalId;
+                self.index.insert(name.clone(), id);
+                self.names.push(name);
+                self.signals.push(signal);
+                id
+            }
+        }
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    fn len(&self) -> usize {
+        self.signals.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.names.iter()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &SignalState)> {
+        self.names.iter().zip(&self.signals)
+    }
+}
+
+impl std::ops::Index<&str> for SignalTable {
+    type Output = SignalState;
+
+    fn index(&self, name: &str) -> &SignalState {
+        self.get(name).expect("a signal the table holds")
+    }
+}
+
+/// Which store a cached [`SignalId`] belongs to.
+///
+/// Fresh for every store, including a clone and a function call's frame, so a
+/// position cached against one store is never read against another — where
+/// it would name a different signal, or none.
+#[derive(Debug)]
+struct StoreUid(u32);
+
+static NEXT_STORE_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+impl StoreUid {
+    fn fresh() -> StoreUid {
+        StoreUid(NEXT_STORE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for StoreUid {
+    fn default() -> StoreUid {
+        StoreUid::fresh()
+    }
+}
+
+impl Clone for StoreUid {
+    fn clone(&self) -> StoreUid {
+        StoreUid::fresh()
+    }
+}
 
 /// What the `$random` stream starts from.
 ///
@@ -583,6 +702,25 @@ pub struct Memory {
     range: (i64, i64),
 }
 
+/// `register` as a declaration that is `signed` and `real` reads it, and
+/// whether the result is signed.
+///
+/// A real declaration *converts* rather than re-stamps: the bits of a double
+/// are not the bits of the integer that denotes the same number, so a write of
+/// `3` into a `real` has to become `3.0` and a write of `2.5` into an
+/// `integer` has to become `3`. Everything else only re-stamps.
+fn conformed(register: Register, signed: bool, real: bool) -> (Register, bool) {
+    if real != register.is_real() {
+        let converted = if real {
+            Register::from_f64(register.to_f64())
+        } else {
+            Register::integer_from_f64(register.to_f64().round(), register.width())
+        };
+        return (converted.with_signedness(signed), signed);
+    }
+    (register.with_signedness(signed).with_realness(real), signed)
+}
+
 /// Where a declared bit index sits in a vector declared over `range`, counted
 /// from the *most significant* end — the order Verilog writes bits in.
 ///
@@ -892,7 +1030,11 @@ pub struct ScopeStorage {
 
 #[derive(Clone, Debug, Default)]
 pub struct StateStore {
-    name_to_signal: HashMap<String, SignalState>,
+    name_to_signal: SignalTable,
+    /// Which store this is, for an [`Identifier`]'s cached position.
+    ///
+    /// [`Identifier`]: crate::parsers::identifier::Identifier
+    uid: StoreUid,
     /// Whether the design calls `$countdrivers` anywhere. It is what turns the
     /// driver tally on, so a design that never asks never builds one.
     counts_drivers: bool,
@@ -909,7 +1051,7 @@ pub struct StateStore {
     /// every bit select goes through is the hot path. A name is in one map or
     /// the other, so an ordinary select still costs one hash and only a miss
     /// looks here.
-    name_to_memory: HashMap<String, Memory>,
+    name_to_memory: FastMap<String, Memory>,
     /// Every memory word written since the last marker, in the order written.
     /// See [`set_word`](StateStore::set_word).
     ///
@@ -925,10 +1067,17 @@ pub struct StateStore {
     /// by an address costs a design with no memory in it ~4.5% on
     /// `bench tick/counter_4bit`.
     round_words: Vec<MemoryChange>,
-    /// For every signal written since the last marker, the value it held at
-    /// that marker. `None` records a name that did not exist yet, which makes
-    /// the write a declaration rather than a change.
-    journal: HashMap<String, Option<Register>>,
+    /// Every signal written since the last marker, in the order each was first
+    /// written, with the value it held at the marker — by position, so a write
+    /// journals itself without hashing or copying its name.
+    journal: Vec<(SignalId, Register)>,
+    /// Whether a signal is in `journal`, by position; grown as signals are.
+    journaled: Vec<bool>,
+    /// Names written this round before they existed — a declaration, not a
+    /// change, and a write to one later in the same round is not a change
+    /// either. Empty but for a round that declares something, which at run
+    /// time is an automatic task's storage being laid down.
+    declaring: FastSet<String>,
     /// What `$time` reads. The driver moves it as simulated time moves.
     time: i64,
     random: RandomStream,
@@ -975,7 +1124,7 @@ pub struct StateStore {
     /// namespace beside the signals and the memories rather than a zero-width
     /// entry in either. That is what makes reading one a named error instead
     /// of a plausible pattern of bits.
-    events: HashSet<String>,
+    events: FastSet<String>,
     /// The parameters whose value was written as **text** — `parameter p =
     /// "PASSED";` — which a `$display` prints as the string it is, and takes
     /// as a format string, exactly as it would the literal. Their bits are an
@@ -1008,6 +1157,21 @@ pub struct StateStore {
     /// installing one goes through [`Rc::make_mut`], the same way the function
     /// table does.
     drives: Rc<Vec<Drive>>,
+    /// Which continuous assignments read each signal, by their index in the
+    /// simulator's list and indexed by the signal's position — see
+    /// [`StateStore::watch_readers`]. Empty for a store nothing watches, which
+    /// is what keeps a write costing one `is_empty`.
+    readers: Vec<Vec<usize>>,
+    /// The same for a *memory*, which is not in the signal table and so has
+    /// no position: the assignments that read a word of it, by its name.
+    memory_readers: FastMap<String, Vec<usize>>,
+    /// One flag per continuous assignment: whether something it reads has
+    /// been written since it was last evaluated.
+    stale: Vec<bool>,
+    /// Whether a drive has been installed or taken away since the last
+    /// [`StateStore::take_drives_moved`] — a `release` puts the assignments
+    /// beneath it back in charge, whether or not anything they read moved.
+    drives_moved: bool,
     /// The right hand sides an intra-assignment timing control is holding on
     /// to, keyed by the hidden slot the instruction that evaluated them named.
     ///
@@ -1016,7 +1180,7 @@ pub struct StateStore {
     /// the value has to outlive the return from `resume`, exactly as a
     /// `repeat` count does. It is deliberately not a signal: nothing in the
     /// design can name it, so journalling it would only manufacture edges.
-    holds: HashMap<String, Register>,
+    holds: FastMap<String, Register>,
     /// The files `$fopen` has opened, and the directory a relative path is
     /// written into. See [`FileTable`].
     files: FileTable,
@@ -1167,16 +1331,19 @@ impl StateStore {
     /// from it is rejected when it is elaborated.
     pub fn frame(&self) -> StateStore {
         StateStore {
-            name_to_signal: HashMap::new(),
+            name_to_signal: SignalTable::default(),
+            uid: StoreUid::fresh(),
             // A frame holds no net, so it resolves nothing and tallies
             // nothing; the alias table rides along because a body may read a
             // design signal under a port's name.
             counts_drivers: false,
             aliases: Rc::clone(&self.aliases),
-            name_to_memory: HashMap::new(),
+            name_to_memory: FastMap::default(),
             memory_journal: Vec::new(),
             round_words: Vec::new(),
-            journal: HashMap::new(),
+            journal: Vec::new(),
+            journaled: Vec::new(),
+            declaring: FastSet::default(),
             time: self.time,
             random: RandomStream::default(),
             functions: Rc::clone(&self.functions),
@@ -1185,14 +1352,19 @@ impl StateStore {
             any_signed: false,
             any_real: false,
             any_memory: false,
-            events: HashSet::new(),
+            events: FastSet::default(),
             texts: Rc::clone(&self.texts),
             packed: Rc::clone(&self.packed),
             triggers: Vec::new(),
             // A frame holds only the call's own variables, and a function body
             // may not install a drive — nothing here can be forced.
             drives: Rc::new(Vec::new()),
-            holds: HashMap::new(),
+            // A frame drives no continuous assignment.
+            readers: Vec::new(),
+            memory_readers: FastMap::default(),
+            stale: Vec::new(),
+            drives_moved: false,
+            holds: FastMap::default(),
             // Shared, not fresh: `$fopen` is an expression, so it can be
             // called from a function body, and a file it opened there has to
             // outlive the frame the way a file opened anywhere else does.
@@ -1255,7 +1427,7 @@ impl StateStore {
             .iter()
             .rev()
             .find_map(|(target, value)| match target {
-                ResolvedTarget::Whole(written) if written == name => Some(value.clone()),
+                ResolvedTarget::Whole(written) if written.name == name => Some(value.clone()),
                 _ => None,
             })
     }
@@ -1532,6 +1704,70 @@ impl StateStore {
         !self.drives.is_empty()
     }
 
+    /// Starts tracking which of `count` continuous assignments are stale:
+    /// `readers` names, for each signal, the assignments that read it. Every
+    /// assignment starts stale, so the first settle evaluates them all.
+    ///
+    /// This is what lets the propagation fixpoint skip an assignment nothing
+    /// it reads has moved since it last ran. Measured on MagicSchoolBus's
+    /// `CameraSetup_tb`, 99.4% of continuous-assignment evaluations recomputed
+    /// a value that had not changed, and they were most of the run.
+    pub fn watch_readers(&mut self, readers: FastMap<String, Vec<usize>>, count: usize) {
+        self.readers = vec![Vec::new(); self.name_to_signal.len()];
+        self.memory_readers = FastMap::default();
+        for (name, assignments) in readers {
+            match self.name_to_signal.id(&name) {
+                Some(id) => self.readers[id as usize] = assignments,
+                None => {
+                    self.memory_readers.insert(name, assignments);
+                }
+            }
+        }
+        self.stale = vec![true; count];
+    }
+
+    /// Marks every assignment that reads the signal at `id` stale.
+    #[inline]
+    fn mark_readers(&mut self, id: SignalId) {
+        if let Some(readers) = self.readers.get(id as usize) {
+            for &reader in readers {
+                self.stale[reader] = true;
+            }
+        }
+    }
+
+    /// Marks every assignment that reads a word of memory `name` stale.
+    fn mark_memory_readers(&mut self, name: &str) {
+        if self.memory_readers.is_empty() {
+            return;
+        }
+        if let Some(readers) = self.memory_readers.get(name) {
+            for &reader in readers {
+                self.stale[reader] = true;
+            }
+        }
+    }
+
+    /// Whether assignment `index` has to be evaluated, clearing the mark: a
+    /// write it causes to something it reads marks it again. An assignment
+    /// nothing is tracking is always stale.
+    pub fn take_stale(&mut self, index: usize) -> bool {
+        match self.stale.get_mut(index) {
+            Some(stale) => std::mem::replace(stale, false),
+            None => true,
+        }
+    }
+
+    /// Marks every tracked assignment stale.
+    pub fn mark_all_stale(&mut self) {
+        self.stale.fill(true);
+    }
+
+    /// Whether a drive was installed or taken away since the last call.
+    pub fn take_drives_moved(&mut self) -> bool {
+        std::mem::replace(&mut self.drives_moved, false)
+    }
+
     /// How many drives are installed, which is how many more rounds the
     /// continuous-assignment fixpoint may need.
     pub fn drive_count(&self) -> usize {
@@ -1565,6 +1801,7 @@ impl StateStore {
     /// one is applied last and wins — which is the rule the LRM asks for,
     /// falling out of the order rather than needing one of its own.
     pub fn install_drive(&mut self, drive: Drive) {
+        self.drives_moved = true;
         let drives = Rc::make_mut(&mut self.drives);
         match drives.iter_mut().find(|existing| {
             existing.names == drive.names
@@ -1587,6 +1824,7 @@ impl StateStore {
         if keep.iter().all(|keep| *keep) {
             return;
         }
+        self.drives_moved = true;
         let mut index = 0;
         Rc::make_mut(&mut self.drives).retain(|_| {
             let kept = keep.get(index).copied().unwrap_or(true);
@@ -1659,34 +1897,84 @@ impl StateStore {
     /// overwrite the value the round actually started from, and it is that
     /// value an edge has to be measured against.
     fn record(&mut self, name: &str) {
-        if self.journal.contains_key(name) {
-            return;
+        match self.name_to_signal.id(name) {
+            Some(id) => self.record_id(id, name),
+            // Written before it exists: a declaration, which is no change, and
+            // which makes a later write to it this round none either.
+            None => {
+                self.declaring.insert(name.to_string());
+            }
         }
-        let previous = self
-            .name_to_signal
-            .get(name)
-            .map(|signal| signal.register().clone());
-        self.journal.insert(name.to_string(), previous);
     }
 
-    /// The name and pre-write value of every signal written since the last
-    /// call, sorted by name, clearing the journal so the next round is measured
-    /// from here.
+    /// [`record`](StateStore::record) for a signal whose position is known.
+    #[inline]
+    fn record_id(&mut self, id: SignalId, name: &str) {
+        // Before the early return below: a second write in one round still
+        // has to reach an assignment that was re-evaluated after the first.
+        self.mark_readers(id);
+        let slot = id as usize;
+        if self.journaled.len() <= slot {
+            self.journaled.resize(self.name_to_signal.len(), false);
+        }
+        if self.journaled[slot] {
+            return;
+        }
+        if !self.declaring.is_empty() && self.declaring.contains(name) {
+            return;
+        }
+        self.journaled[slot] = true;
+        let previous = self.name_to_signal.signals[slot].register().clone();
+        self.journal.push((id, previous));
+    }
+
+    /// Every signal that moved since the last call, in the order each was
+    /// first written, clearing the journal so the next round is measured from
+    /// here.
+    ///
+    /// The order is the one iverilog wakes the blocks in: it schedules the
+    /// waiters on a signal the moment the signal is written, so two blocks
+    /// woken by two writes run in the order the writes were made (corpus
+    /// `vector`).
     ///
     /// A name that did not exist at the last call is left out: it was declared
     /// rather than changed, and declaring a signal is not a simulation event.
-    /// Writes that put back the value already there are still reported — the
-    /// journal records what was displaced, not whether it differed — so the
-    /// caller compares.
-    pub fn take_changes(&mut self) -> Vec<(String, Register)> {
-        let mut changes = Vec::with_capacity(self.journal.len());
-        for (name, previous) in self.journal.drain() {
-            if let Some(previous) = previous {
-                changes.push((name, previous));
+    ///
+    /// Each comes back as the edge it made: the value at the marker against
+    /// the value now, read by position. That is identical to diffing a
+    /// snapshot taken at the marker against the store now, because a signal
+    /// nobody wrote cannot have moved — and it costs the signals written
+    /// rather than the signals in the design. A write that put the same value
+    /// back is no edge and is left out.
+    pub fn take_edges(&mut self) -> Vec<SignalEdge> {
+        self.declaring.clear();
+        let mut edges = Vec::with_capacity(self.journal.len());
+        for (id, before) in self.journal.drain(..) {
+            self.journaled[id as usize] = false;
+            let after = self.name_to_signal.signals[id as usize].register();
+            if after == &before {
+                continue;
             }
+            edges.push(SignalEdge {
+                name: self.name_to_signal.names[id as usize].clone(),
+                id: Some(id),
+                before,
+                after: after.clone(),
+            });
         }
-        changes.sort_by(|left, right| left.0.cmp(&right.0));
-        changes
+        edges
+    }
+
+    /// The position an identifier's signal has in this store, through the
+    /// position cached on the identifier — see [`StateStore::signal_of`].
+    #[inline]
+    pub fn position_of(&self, id: &Identifier) -> Option<SignalId> {
+        if let Some(position) = id.slot.cached(self.uid.0) {
+            return Some(position);
+        }
+        let position = self.name_to_signal.id(&id.name)?;
+        id.slot.cache(self.uid.0, position);
+        Some(position)
     }
 
     /// Rewrites every journalled starting value that was entirely `z` as `x`.
@@ -1697,7 +1985,7 @@ impl StateStore {
     /// the rule iverilog follows, and which a `z` baseline gets wrong in the
     /// direction of waking blocks on a value nobody set.
     pub fn treat_undriven_start_as_unknown(&mut self) {
-        for previous in self.journal.values_mut().flatten() {
+        for (_, previous) in self.journal.iter_mut() {
             if *previous == Register::high_impedance(previous.width()) {
                 *previous = Register::unknown(previous.width());
             }
@@ -1707,7 +1995,10 @@ impl StateStore {
     /// Forgets every recorded change, making now the point later changes are
     /// measured against.
     pub fn clear_changes(&mut self) {
-        self.journal.clear();
+        for (id, _) in self.journal.drain(..) {
+            self.journaled[id as usize] = false;
+        }
+        self.declaring.clear();
         self.memory_journal.clear();
         self.triggers.clear();
     }
@@ -1984,6 +2275,7 @@ impl StateStore {
         let after = memory.word(Some(address));
         // A write that moved a word named a word, so it has a position.
         let position = memory.word_position(address)?;
+        self.mark_memory_readers(name);
         match self.memory_journal.last_mut() {
             Some(last) if last.position == position && last.name == name => last.after = after,
             _ => self.memory_journal.push(MemoryChange {
@@ -2012,9 +2304,9 @@ impl StateStore {
     ) -> Option<bool> {
         let memory = self.name_to_memory.get(name)?;
         let mut word = memory.word(Some(address));
-        let value = value.coerced(indices.len());
-        for (offset, &index) in indices.iter().enumerate() {
-            word = memory.with_bit_of(word, index, value.get_raw()[offset]);
+        let codes = value.coerced(indices.len()).get_raw();
+        for (&index, &code) in indices.iter().zip(codes.iter()) {
+            word = memory.with_bit_of(word, index, code);
         }
         self.set_word(name, address, &word)
     }
@@ -2077,23 +2369,11 @@ impl StateStore {
         }
     }
 
-    /// `register` as the declaration of `name` says it is to be read.
-    ///
-    /// A real declaration *converts* rather than re-stamps: the bits of a
-    /// double are not the bits of the integer that denotes the same number, so
-    /// a write of `3` into a `real` has to become `3.0` and a write of `2.5`
-    /// into an `integer` has to become `3`. Everything else only re-stamps.
+    /// `register` as the declaration of `name` says it is to be read — see
+    /// [`conformed`].
     fn as_declared(&self, name: &str, register: Register) -> (Register, bool) {
         let (signed, real) = self.declared_reading(name, &register);
-        if real != register.is_real() {
-            let converted = if real {
-                Register::from_f64(register.to_f64())
-            } else {
-                Register::integer_from_f64(register.to_f64().round(), register.width())
-            };
-            return (converted.with_signedness(signed), signed);
-        }
-        (register.with_signedness(signed).with_realness(real), signed)
+        conformed(register, signed, real)
     }
 
     /// Sets a signal's value. A previously declared range is preserved when the
@@ -2123,17 +2403,49 @@ impl StateStore {
 
     /// Sets a signal's value and declared range in one step.
     pub fn set_ranged(&mut self, name: impl Into<String>, register: Register, range: (i64, i64)) {
-        let name = name.into();
-        self.record(&name);
-        let (register, signed) = self.as_declared(&name, register);
-        self.any_signed |= signed;
-        self.any_real |= register.is_real();
-        // Every whole-signal write in the simulator lands here, so the entry
-        // is overwritten in place: one lookup finds it, keeps its declared net
-        // flag and replaces the rest, where asking for the flag and then
-        // inserting would hash the name twice.
-        match self.name_to_signal.get_mut(&name) {
+        self.write_ranged(&name.into(), register, range);
+    }
+
+    /// [`set_ranged`](StateStore::set_ranged) for a name the caller already
+    /// holds as a `&str`, which is every write the simulator makes.
+    ///
+    /// Every whole-signal write lands here, so it costs as few lookups as it
+    /// can: the entry is found once and supplies both the declared reading
+    /// the value is conformed to and the slot it is written into, and a name
+    /// that is already declared is never copied. Asking for the reading, then
+    /// for the entry, with an owned name each time, was a tenth of a busy
+    /// design's run.
+    pub fn write_ranged(&mut self, name: &str, register: Register, range: (i64, i64)) {
+        let id = self.name_to_signal.id(name);
+        self.write_at(id, name, register, range);
+    }
+
+    /// [`write_ranged`](StateStore::write_ranged) through an identifier's
+    /// cached position, which is how a procedural write lands: no hash at all
+    /// once the identifier has been looked up in this store.
+    pub fn write_ranged_by(&mut self, target: &Identifier, register: Register, range: (i64, i64)) {
+        let id = self.position_of(target);
+        self.write_at(id, &target.name, register, range);
+    }
+
+    /// The write itself, for a signal at position `id` — `None` when `name` is
+    /// not declared yet, which declares it.
+    fn write_at(
+        &mut self,
+        id: Option<SignalId>,
+        name: &str,
+        register: Register,
+        range: (i64, i64),
+    ) {
+        match id {
+            Some(id) => self.record_id(id, name),
+            None => self.record(name),
+        }
+        match id.map(|id| &mut self.name_to_signal.signals[id as usize]) {
             Some(signal) => {
+                let (register, signed) = conformed(register, signal.is_signed(), signal.is_real());
+                self.any_signed |= signed;
+                self.any_real |= register.is_real();
                 let net = signal.is_net();
                 // The strength each bit was resolved at and the drivers that
                 // reached it describe *who drives the signal*, which a write
@@ -2148,14 +2460,43 @@ impl StateStore {
                 signal.drivers = drivers;
             }
             None => {
+                let (signed, real) = (register.is_signed(), register.is_real());
+                let (register, signed) = conformed(register, signed, real);
+                self.any_signed |= signed;
+                self.any_real |= register.is_real();
                 self.name_to_signal
-                    .insert(name, SignalState::with_range(register, range));
+                    .insert(name.to_string(), SignalState::with_range(register, range));
             }
         }
     }
 
     pub fn get(&self, name: &str) -> Option<&Register> {
         self.name_to_signal.get(name).map(|s| s.register())
+    }
+
+    /// The signal an identifier names, through the position cached on it.
+    ///
+    /// The first time an identifier is looked up in this store, its name is
+    /// hashed and the position it was found at is written onto the
+    /// identifier; every later lookup reads the vector at that position. A
+    /// position is good for the store's whole life, since a signal is never
+    /// taken out, and is never read against another store, since every store
+    /// is numbered apart ([`StoreUid`]).
+    #[inline]
+    pub fn signal_of(&self, id: &Identifier) -> Option<&SignalState> {
+        if let Some(position) = id.slot.cached(self.uid.0) {
+            return self.name_to_signal.signals.get(position as usize);
+        }
+        let position = self.name_to_signal.id(&id.name)?;
+        id.slot.cache(self.uid.0, position);
+        Some(&self.name_to_signal.signals[position as usize])
+    }
+
+    /// The value an identifier names — [`StateStore::get`] through the
+    /// identifier's cached position.
+    #[inline]
+    pub fn get_by(&self, id: &Identifier) -> Option<&Register> {
+        self.signal_of(id).map(SignalState::register)
     }
 
     pub fn get_signal(&self, name: &str) -> Option<&SignalState> {
@@ -2259,6 +2600,20 @@ impl StateStore {
     /// Every signal name, sorted.
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.name_to_signal.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// Every memory name, sorted.
+    pub fn memory_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.name_to_memory.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// Every named event, sorted.
+    pub fn event_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.events.iter().map(|k| k.as_str()).collect();
         names.sort();
         names
     }

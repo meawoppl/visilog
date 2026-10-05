@@ -28,6 +28,7 @@
 
 use crate::parsers::behavior::ProceduralStatements;
 use crate::parsers::expr::{Expression, WordSelectKind};
+use crate::parsers::identifier::Identifier;
 use crate::register::{Register, REAL_WIDTH};
 use crate::simulator::eval::{
     eval, eval_sized, indexed_select_indices, indexed_select_width, packed_select_indices,
@@ -50,8 +51,10 @@ use crate::simulator::tasks::TaskContext;
 /// finished.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedTarget {
-    /// A whole signal, as in `q <= d;`.
-    Whole(String),
+    /// A whole signal, as in `q <= d;`. Held as the identifier the design
+    /// wrote, so the store position cached on it rides along: a write to it
+    /// then finds its signal by position rather than by hashing the name.
+    Whole(Identifier),
     /// A bit or part select, held as the declared bit indices it names, most
     /// significant first: `q[3:1] <= d;` resolves to `[3, 2, 1]`.
     Bits { name: String, indices: Vec<i64> },
@@ -90,9 +93,15 @@ impl ResolvedTarget {
     /// A [`ResolvedTarget::Parts`] names several, so this reports the first —
     /// which is only ever asked of it by a caller that has already established
     /// the target is a single signal. `is_multiple` is how those callers ask.
+    /// A whole signal by name, for a target that has no identifier of its
+    /// own to carry.
+    pub fn whole(name: impl Into<String>) -> ResolvedTarget {
+        ResolvedTarget::Whole(Identifier::new(name.into()))
+    }
+
     pub fn name(&self) -> &str {
         match self {
-            ResolvedTarget::Whole(name) => name,
+            ResolvedTarget::Whole(id) => &id.name,
             ResolvedTarget::Bits { name, .. } => name,
             ResolvedTarget::Word { name, .. } => name,
             ResolvedTarget::WordBits { name, .. } => name,
@@ -169,8 +178,8 @@ impl ResolvedTarget {
             return SELF_DETERMINED;
         }
         match self {
-            ResolvedTarget::Whole(name) => state
-                .get_signal(name)
+            ResolvedTarget::Whole(id) => state
+                .signal_of(id)
                 .map_or(SELF_DETERMINED, |signal| signal.width()),
             ResolvedTarget::Bits { indices, .. } => indices.len(),
             // A word is as wide as the memory's element, which is a property of
@@ -206,9 +215,7 @@ impl ResolvedTarget {
             return false;
         }
         match self {
-            ResolvedTarget::Whole(name) => state
-                .get_signal(name)
-                .is_some_and(|signal| signal.is_real()),
+            ResolvedTarget::Whole(id) => state.signal_of(id).is_some_and(|signal| signal.is_real()),
             ResolvedTarget::Word { name, .. } => {
                 state.memory(name).is_some_and(|memory| memory.is_real())
             }
@@ -403,16 +410,17 @@ pub fn resolve_target(
     }
     match target {
         Expression::Identifier(id) => {
-            if !state.contains(&id.name) {
+            if state.position_of(id).is_none() {
                 // A name that is not a signal may still be a declared event,
                 // which `-> done;` writes to. Only a miss on the signal map
-                // asks, so an ordinary assignment costs the one hash it did.
+                // asks, so an ordinary assignment costs no hash at all once
+                // the identifier has cached where its signal is.
                 if state.is_event(&id.name) {
                     return Ok(ResolvedTarget::Event(id.name.clone()));
                 }
                 return Err(SimulationError::UnknownSignal(id.name.clone()));
             }
-            Ok(ResolvedTarget::Whole(id.name.clone()))
+            Ok(ResolvedTarget::Whole(id.clone()))
         }
         Expression::BitSelect(id, index) => {
             // `a[3] = …` writes a bit and `m[3] = …` writes a word; the syntax
@@ -774,10 +782,10 @@ pub fn drive_at(
         return Ok(false);
     }
     match target {
-        ResolvedTarget::Whole(name) => {
+        ResolvedTarget::Whole(id) => {
             let signal = state
-                .get_signal(name)
-                .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
+                .signal_of(id)
+                .ok_or_else(|| SimulationError::UnknownSignal(id.name.clone()))?;
             let (width, range) = (signal.width(), signal.range());
             let mut value = value.coerced(width);
             // A write over a partly forced signal is *masked*, not refused:
@@ -796,7 +804,7 @@ pub fn drive_at(
             if signal.register() == &value {
                 return Ok(false);
             }
-            state.set_ranged(name.clone(), value, range);
+            state.write_ranged_by(id, value, range);
             Ok(true)
         }
         ResolvedTarget::Bits { name, indices } => {
@@ -813,11 +821,8 @@ pub fn drive_at(
                     if kept.is_empty() {
                         return Ok(false);
                     }
-                    let value = value.coerced(indices.len());
-                    let codes: Vec<u8> = kept
-                        .iter()
-                        .map(|(offset, _)| value.get_raw()[*offset])
-                        .collect();
+                    let all = value.coerced(indices.len()).get_raw();
+                    let codes: Vec<u8> = kept.iter().map(|(offset, _)| all[*offset]).collect();
                     let kept: Vec<i64> = kept.into_iter().map(|(_, index)| index).collect();
                     return drive_bits(state, name, &kept, &Register::from_bits(codes));
                 }
@@ -923,8 +928,8 @@ pub fn release_drive(state: &mut StateStore, target: &Expression) -> Result<(), 
 /// holds only what its drivers give it. A variable keeps what the force left.
 fn floats_when_released(state: &StateStore, target: &ResolvedTarget) -> bool {
     match target {
-        ResolvedTarget::Whole(name) | ResolvedTarget::Bits { name, .. } => state
-            .get_signal(name)
+        ResolvedTarget::Whole(_) | ResolvedTarget::Bits { .. } => state
+            .get_signal(target.name())
             .is_some_and(crate::simulator::state_store::SignalState::is_net),
         _ => false,
     }
@@ -1029,13 +1034,13 @@ fn drive_bits(
     indices: &[i64],
     value: &Register,
 ) -> Result<bool, SimulationError> {
-    let value = value.coerced(indices.len());
+    let codes = value.coerced(indices.len()).get_raw();
     let signal = state
         .get_signal_mut(name)
         .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
     let mut changed = false;
-    for (offset, &index) in indices.iter().enumerate() {
-        changed |= signal.set_bit(index, value.get_raw()[offset]);
+    for (&index, &code) in indices.iter().zip(codes.iter()) {
+        changed |= signal.set_bit(index, code);
     }
     Ok(changed)
 }
@@ -1118,7 +1123,7 @@ mod tests {
         // Nothing has moved until the updates are committed.
         assert_eq!(value(&store, "a"), "0000");
         assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].target(), &ResolvedTarget::Whole("a".to_string()));
+        assert_eq!(pending[0].target(), &ResolvedTarget::whole("a"));
         // The queued value is the raw right hand side; it is resized to the
         // target's width when the update lands.
         assert_eq!(pending[1].value().to_u128(), Some(1));

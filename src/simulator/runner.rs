@@ -29,6 +29,7 @@
 //! was connected to. Hand the simulator more than one module with
 //! [`Simulator::with_modules`].
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ use crate::parsers::{
 };
 use crate::register::Register;
 use crate::simulator::elaborate::{
-    clock_precision, delay_scale, elaborate, BlockKind, PulledNet, TimedBlock,
+    clock_precision, delay_scale, elaborate, BlockKind, PulledNet, TimedBlock, TimingOmission,
 };
 use crate::simulator::eval::{eval, eval_sized, EvalError};
 use crate::simulator::event_queue::{EventQueue, ExecutionCursor};
@@ -58,7 +59,7 @@ use crate::simulator::program::{
     self, Instruction, Resume, TaskDefinition, WaitReason, FORK_TIMING_UNSUPPORTED,
 };
 use crate::simulator::state_store::DriverTally;
-use crate::simulator::state_store::{bit_position_in, ScopeStorage, StateStore};
+use crate::simulator::state_store::{bit_position_in, FastMap, FastSet, ScopeStorage, StateStore};
 use crate::simulator::tasks::{Output, TaskContext};
 use crate::simulator::udp::Udp;
 use std::rc::Rc;
@@ -192,6 +193,12 @@ pub enum SimulationError {
     /// running is a legitimate no-op — disabling one that does not exist is a
     /// design that thinks it cancelled something.
     UnknownScope(String),
+    /// Simulated time went past what the clock can count. The clock is a
+    /// signed sixty-four bit count of the finest precision, so a `1s` design
+    /// read beside a `1ps` cell library runs out after about 107 days of
+    /// simulated time — where iverilog's unsigned clock goes twice as far.
+    /// Wrapping would carry on at a negative time and look like a run.
+    TimeOverflow,
 }
 
 impl fmt::Display for SimulationError {
@@ -282,6 +289,11 @@ impl fmt::Display for SimulationError {
             SimulationError::UnknownScope(scope) => {
                 write!(f, "`disable {}` names no block or task in the design", scope)
             }
+            SimulationError::TimeOverflow => write!(
+                f,
+                "simulated time went past the {} clock ticks the clock can count",
+                i64::MAX
+            ),
             SimulationError::GateTerminals { gate, found } => write!(
                 f,
                 "gate `{}` cannot be instantiated with {} terminals",
@@ -346,6 +358,8 @@ struct Waiting {
     /// already journalled when it was armed, which its first look skips: a
     /// trigger fired before the block was listening is one it missed.
     arming: Option<usize>,
+    /// When the wait was armed — see [`Simulator::next_arming`].
+    armed_at: u64,
 }
 
 /// An event control a block is suspended on, with what the signals it names
@@ -640,6 +654,15 @@ pub struct Simulator {
     /// the round is collected, so [`Simulator::cancel_scope`] looking only at
     /// the queue would find nothing and let it run anyway (corpus `sdw_dsbl`).
     round: VecDeque<ExecutionCursor>,
+    /// The blocks a settle round has decided to wake and has not run yet, in
+    /// the order it will run them. A field for the reason `round` is one: the
+    /// block that runs first may `disable` one further down (corpus
+    /// `disable_cleanup`, where the most recently armed waiter disables the
+    /// other before its turn).
+    settling: VecDeque<ExecutionCursor>,
+    /// The list a settle round collects its wakes into before ordering them —
+    /// empty between rounds, and kept only for its allocation.
+    woken_buffer: Vec<(usize, u64, ExecutionCursor)>,
     /// Whether the continuous assignments have been settled once, before the
     /// first block ran. See [`Simulator::advance`].
     settled_once: bool,
@@ -657,7 +680,7 @@ pub struct Simulator {
     /// The nets a gate drives, which are resolved between all their continuous
     /// drivers rather than written by whichever one ran last. Empty for a
     /// design with no gates, which is what keeps the question off the hot path.
-    resolved_nets: HashSet<String>,
+    resolved_nets: FastSet<String>,
     /// Nets that drive themselves — `supply0`/`supply1` and `tri0`/`tri1`.
     pulled_nets: Vec<PulledNet>,
     /// The `wand`/`wor` nets, whose drivers combine by a logic function rather
@@ -683,6 +706,12 @@ pub struct Simulator {
     /// one so the swap is free and a round costs a `fill` of bytes.
     ran_before: Vec<bool>,
     ran_now: Vec<bool>,
+    /// When each edge-triggered `always` block last reached its event control,
+    /// as a count of armings — see [`Simulator::next_arming`]. Blocks woken
+    /// by one settle round run most recently armed first.
+    armed_at: Vec<u64>,
+    /// How many times any block has armed an event control.
+    arming_clock: u64,
     /// The edge-triggered `always` blocks whose turn in the time-zero round
     /// has not come yet — see [`Simulator::arm`]. Every flag is down once
     /// time zero has run.
@@ -717,6 +746,29 @@ pub struct Simulator {
     /// Qualified names of ports that were aliased onto a parent signal, so they
     /// can still be read back even though they hold no state of their own.
     aliases: HashMap<String, String>,
+    /// The timing constructs the design wrote that the run will not carry
+    /// out, from the last elaboration — see [`TimingOmission`].
+    timing_omissions: Vec<TimingOmission>,
+    /// One flag per continuous assignment: whether it is evaluated on every
+    /// propagation pass rather than only when something it reads moved — see
+    /// [`Simulator::watch_assignment_reads`].
+    always_evaluate: Vec<bool>,
+    /// Set while a propagation is under way and cleared when it settles, so a
+    /// propagation that stopped on an error is visible to the next one.
+    propagating: bool,
+    /// See [`Simulator::set_flush_each_advance`].
+    flush_each_advance: bool,
+    /// What every resolved net's drivers contributed on the last pass that
+    /// resolved them, so a pass where none moved can skip resolving. `None`
+    /// whenever a net may have been written some other way since.
+    last_contributions: Option<Vec<Contribution>>,
+    /// For each continuous assignment onto a resolved net, the contribution it
+    /// made the last time it was evaluated — what it hands in on a pass where
+    /// nothing it reads has moved. `None` for every other assignment.
+    cached_contributions: Vec<Option<Contribution>>,
+    /// For each continuous assignment onto a whole net named plainly, its
+    /// target resolved once — see the propagation loop.
+    fixed_targets: Vec<Option<FixedTarget>>,
     queue: EventQueue,
     now: i64,
     inputs: Vec<String>,
@@ -740,6 +792,18 @@ pub struct Simulator {
     /// `search_paths` is: [`Simulator::setup`] builds a new `StateStore` and
     /// what the caller configured outlives any one elaboration.
     plusargs: Vec<String>,
+    /// The store entries written since [`Simulator::take_written`] last
+    /// emptied it, or `None` when nobody asked — see
+    /// [`Simulator::tap_writes`]. Filled from the same journal the delta
+    /// cycles take their edges from, so a design nobody inspects pays one
+    /// `Option` check per settle round.
+    written: Option<HashSet<String>>,
+}
+
+/// The instant `delay` ticks after `now`, or [`SimulationError::TimeOverflow`]
+/// when the clock cannot count that far.
+fn later(now: i64, delay: i64) -> Result<i64, SimulationError> {
+    now.checked_add(delay).ok_or(SimulationError::TimeOverflow)
 }
 
 impl Simulator {
@@ -765,17 +829,21 @@ impl Simulator {
             udp_delays: Vec::new(),
             scheduled: Vec::new(),
             round: VecDeque::new(),
+            settling: VecDeque::new(),
+            woken_buffer: Vec::new(),
             settled_once: false,
             gates: Vec::new(),
             udps: Vec::new(),
             pass_switches: Vec::new(),
-            resolved_nets: HashSet::new(),
+            resolved_nets: FastSet::default(),
             pulled_nets: Vec::new(),
             wired_nets: HashMap::new(),
             blocks: Vec::new(),
             waiting: Vec::new(),
             ran_before: Vec::new(),
             ran_now: Vec::new(),
+            armed_at: Vec::new(),
+            arming_clock: 0,
             unarmed: Vec::new(),
             event_values: Vec::new(),
             expression_events: false,
@@ -783,6 +851,13 @@ impl Simulator {
             automatic: Vec::new(),
             automatic_index: HashMap::new(),
             aliases: HashMap::new(),
+            timing_omissions: Vec::new(),
+            always_evaluate: Vec::new(),
+            propagating: false,
+            flush_each_advance: true,
+            last_contributions: None,
+            cached_contributions: Vec::new(),
+            fixed_targets: Vec::new(),
             queue: EventQueue::new(),
             now: 0,
             inputs: Vec::new(),
@@ -791,6 +866,7 @@ impl Simulator {
             output_directory: None,
             search_paths: Vec::new(),
             plusargs: Vec::new(),
+            written: None,
         }
     }
 
@@ -881,7 +957,7 @@ impl Simulator {
             Vec::new()
         };
         self.pass_switches = elaborated.pass_switches;
-        self.resolved_nets = elaborated.resolved_nets;
+        self.resolved_nets = elaborated.resolved_nets.into_iter().collect();
         self.pulled_nets = elaborated.pulled_nets;
         self.wired_nets = elaborated.wired_nets;
         self.blocks = elaborated.blocks;
@@ -908,6 +984,8 @@ impl Simulator {
         let start_order = elaborated.start_order;
         self.ran_before = vec![false; self.blocks.len()];
         self.ran_now = vec![false; self.blocks.len()];
+        self.armed_at = vec![0; self.blocks.len()];
+        self.arming_clock = 0;
         self.unarmed = vec![false; self.blocks.len()];
         self.event_values = self
             .blocks
@@ -917,6 +995,7 @@ impl Simulator {
         self.expression_events = self.event_values.iter().any(|values| !values.is_empty());
         self.inputs = elaborated.inputs;
         self.aliases = elaborated.aliases;
+        self.timing_omissions = elaborated.timing_omissions;
         // An aliased port is a *name* the design has and the flat store does
         // not, so a waveform that left them out would show an instance with no
         // ports on it. The dump is the only thing that wants the table by
@@ -971,6 +1050,8 @@ impl Simulator {
             }
         }
 
+        self.watch_assignment_reads();
+
         // Declaring every signal journalled it, and a declaration is not a
         // change anything should wake on. Clearing here leaves the journal
         // holding only what the drivers go on to do to the nets — which *is*
@@ -1010,6 +1091,9 @@ impl Simulator {
             .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
         let (width, range) = (signal.width(), signal.range());
         self.state.set_ranged(name, value.resize(width), range);
+        // Written from outside, so a resolved net may no longer hold what its
+        // drivers last settled it to.
+        self.last_contributions = None;
         Ok(())
     }
 
@@ -1113,16 +1197,19 @@ impl Simulator {
             self.ran_now.fill(false);
             // Taking the changes here, before the blocks run, is what makes the
             // next round's edges exactly what this round moves.
-            let changes = self.state.take_changes();
+            let mut edges = self.state.take_edges();
             // The waveform dump measures a timestep from the same journal the
-            // edges come out of, so it costs the names *written* rather than
-            // the names in the design. A design that dumps nothing asks one
-            // question per round and does nothing else.
+            // edges come out of, so it costs the names that *moved* rather
+            // than the names in the design. A design that dumps nothing asks
+            // one question per round and does nothing else.
             if self.tasks.is_dumping() {
                 self.tasks
-                    .note_changes(changes.iter().map(|(name, _)| name.as_str()));
+                    .note_changes(edges.iter().map(|edge| edge.name.as_str()));
             }
-            let mut edges = events::edges_from_changes(changes, &self.state);
+            // An inspecting client measures a timestep the way the dump does.
+            if let Some(written) = &mut self.written {
+                written.extend(edges.iter().map(|edge| edge.name.clone()));
+            }
             // A memory keeps a journal of its own, since one displaced
             // `Register` per name cannot say which word moved. A design that
             // declares no memory skips it on a flag rather than on a lookup.
@@ -1151,6 +1238,13 @@ impl Simulator {
             }
 
             let mut pending = Vec::new();
+            // Who this round wakes is decided before any of them runs, and
+            // then they run in the order iverilog would have scheduled them:
+            // by which write woke them, in the order the writes were made,
+            // and among the waiters on one write most recently armed first —
+            // see [`Simulator::next_arming`].
+            // Kept between rounds, so a round allocates nothing to hold it.
+            let mut woken = std::mem::take(&mut self.woken_buffer);
             // Hoisted out of the loop: a design with no `posedge (a & b)` in
             // it pays one `bool` for the whole round.
             let expression_events = self.expression_events;
@@ -1182,38 +1276,42 @@ impl Simulator {
                     continue;
                 }
                 // An edge the block made *itself* on its last run through
-                // does not wake it. A block is sensitive only while it is
-                // parked at its event control, so a write it made on its way
-                // to the end happened while it was not listening, and by the
-                // time it comes back the event is in the past. Corpus
-                // `event_list3`, whose block assigns a signal its own
-                // sensitivity list names and runs twice without this.
-                let filtered;
-                let offered = if self.ran_before[id] && !self.blocks[id].writes.is_empty() {
-                    filtered = edges
-                        .iter()
-                        .filter(|edge| !self.blocks[id].writes.contains(&edge.name))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    &filtered[..]
-                } else {
-                    &edges[..]
-                };
+                // does not wake it.
+                let offered = self.offered_edges(id, &edges);
                 let fires = if expression_events {
-                    self.block_fires(id, offered)
+                    self.block_fires(id, &offered)
                 } else {
-                    self.blocks[id].fires(offered, &self.state)
+                    self.blocks[id].fires(&offered, &self.state)
                 };
                 if fires {
-                    let (updates, _) = self.resume_block(ExecutionCursor::new(id, 0))?;
-                    pending.extend(updates);
+                    // Ranked below, and only if the round wakes more than one.
+                    woken.push((usize::MAX, self.armed_at[id], ExecutionCursor::new(id, 0)));
                 }
+            }
+            self.take_satisfied_waiters(&triggers, &edges, &mut woken);
+            // One woken block has nothing to be ordered against, which is the
+            // common round and costs nothing more than it did.
+            if woken.len() > 1 {
+                for entry in woken.iter_mut() {
+                    if entry.0 == usize::MAX {
+                        let id = entry.2.block;
+                        entry.0 = self.wake_rank(id, &self.offered_edges(id, &edges), &edges);
+                    }
+                }
+                // Stable, so blocks that have never armed keep their order.
+                woken.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            }
+            self.settling
+                .extend(woken.drain(..).map(|(_, _, cursor)| cursor));
+            self.woken_buffer = woken;
+            while let Some(cursor) = self.settling.pop_front() {
+                let (updates, _) = self.resume_block(cursor)?;
+                pending.extend(updates);
                 if self.finished() {
+                    self.settling.clear();
                     break;
                 }
             }
-
-            pending.extend(self.wake_waiting(&triggers)?);
 
             match carry.as_deref_mut() {
                 Some(carried) => carried.extend(pending),
@@ -1255,6 +1353,58 @@ impl Simulator {
         fired
     }
 
+    /// The edges block `id` is offered this round: all of them, less the ones
+    /// it made itself on its last run through.
+    ///
+    /// A block is sensitive only while it is parked at its event control, so
+    /// a write it made on its way to the end happened while it was not
+    /// listening, and by the time it comes back the event is in the past.
+    /// Corpus `event_list3`, whose block assigns a signal its own sensitivity
+    /// list names and runs twice without this.
+    fn offered_edges<'a>(&self, id: usize, edges: &'a [SignalEdge]) -> Cow<'a, [SignalEdge]> {
+        if self.ran_before[id] && !self.blocks[id].writes.is_empty() {
+            Cow::Owned(
+                edges
+                    .iter()
+                    .filter(|edge| !self.blocks[id].writes.contains(&edge.name))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(edges)
+        }
+    }
+
+    /// Where in this round's `edges` the write that woke block `id` sits.
+    ///
+    /// iverilog schedules the waiters on a signal the moment the signal is
+    /// written, so blocks woken by different writes run in the order the
+    /// writes were made: four `always @(x)` blocks over four registers an
+    /// `initial` block writes in turn print in that order (corpus `vector`).
+    /// The answer is the shortest prefix of `offered` that still fires the
+    /// block — firing is monotonic in the edges offered, so it is a binary
+    /// search — located back in the round's journal order. A round with one
+    /// edge in it has only one answer and asks nothing.
+    fn wake_rank(&self, id: usize, offered: &[SignalEdge], edges: &[SignalEdge]) -> usize {
+        if edges.len() < 2 || offered.is_empty() {
+            return 0;
+        }
+        let (mut low, mut high) = (0, offered.len() - 1);
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.blocks[id].fires(&offered[..=middle], &self.state) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let name = &offered[low].name;
+        edges
+            .iter()
+            .position(|edge| &edge.name == name)
+            .unwrap_or(0)
+    }
+
     /// Re-measures a block's *expression* sensitivity entries without asking
     /// whether they fire, for the rounds the block is not offered a turn at
     /// all. Nothing to do for a block whose entries all name a signal.
@@ -1284,11 +1434,31 @@ impl Simulator {
         let id = cursor.block;
         self.unarmed[id] = false;
         let watch = EventWatch::arm(self.blocks[id].control.clone(), &self.state);
+        let armed_at = self.next_arming();
+        self.armed_at[id] = armed_at;
         self.waiting.push(Waiting {
             cursor,
             watch: Some(watch),
             arming: Some(self.state.pending_triggers()),
+            armed_at,
         });
+    }
+
+    /// The next arming stamp.
+    ///
+    /// iverilog keeps one wait list per event and pushes a process onto its
+    /// *front* when the process reaches the event control, so the processes a
+    /// single edge wakes run **most recently armed first**. Measured against
+    /// iverilog 12.0: three `always @(posedge clk)` blocks armed at time zero
+    /// in the order A, B, C run C, B, A at the first edge; each re-arms as it
+    /// finishes, so the second edge runs A, B, C; and an `initial` block that
+    /// reached `@(posedge clk)` after all three last ran goes ahead of them.
+    /// A testbench that writes an input with a blocking assignment on the same
+    /// edge its design samples it on depends on exactly this — widlar's
+    /// `spi_tb` and `PulseGenerator_tb` both do.
+    fn next_arming(&mut self) -> u64 {
+        self.arming_clock += 1;
+        self.arming_clock
     }
 
     /// Resumes every waiting block whose wait is now satisfied.
@@ -1303,18 +1473,20 @@ impl Simulator {
     /// are offered to every waiter as they are.
     ///
     /// A block that is still not satisfied goes back on the list, and writes
-    /// nothing, so it cannot keep the settle loop from converging.
-    fn wake_waiting(
+    /// nothing, so it cannot keep the settle loop from converging. The ones
+    /// that are satisfied are handed back in `woken` with their arming stamps,
+    /// for the round to run in its own order.
+    fn take_satisfied_waiters(
         &mut self,
         triggers: &[SignalEdge],
-    ) -> Result<Vec<PendingUpdate>, SimulationError> {
-        let mut pending = Vec::new();
+        round: &[SignalEdge],
+        woken: &mut Vec<(usize, u64, ExecutionCursor)>,
+    ) {
         if self.waiting.is_empty() {
-            return Ok(pending);
+            return;
         }
 
         let mut still_waiting = Vec::new();
-        let mut woken = Vec::new();
         for mut waiting in std::mem::take(&mut self.waiting) {
             let missed = waiting
                 .arming
@@ -1322,6 +1494,10 @@ impl Simulator {
             if let Some(arming) = &mut waiting.arming {
                 *arming = 0;
             }
+            // Where the earliest write it watches sits in the round's journal,
+            // which is when iverilog would have scheduled it — see
+            // [`Simulator::wake_rank`]. A condition has no edge to place.
+            let mut rank = 0;
             let wake = match &mut waiting.watch {
                 None => true,
                 Some(watch) => {
@@ -1330,25 +1506,21 @@ impl Simulator {
                     // it; `watch.fires` then covers a memory-word entry as well
                     // as an ordinary one.
                     edges.extend(triggers[missed..].iter().cloned());
+                    rank = edges
+                        .iter()
+                        .filter_map(|edge| round.iter().position(|seen| seen.name == edge.name))
+                        .min()
+                        .unwrap_or(0);
                     watch.fires(&edges, &self.state)
                 }
             };
             if wake {
-                woken.push(waiting.cursor);
+                woken.push((rank, waiting.armed_at, waiting.cursor));
             } else {
                 still_waiting.push(waiting);
             }
         }
         self.waiting = still_waiting;
-
-        for cursor in woken {
-            let (updates, _) = self.resume_block(cursor)?;
-            pending.extend(updates);
-            if self.finished() {
-                break;
-            }
-        }
-        Ok(pending)
     }
 
     /// Runs whatever the timestep just finished deferred to its end.
@@ -1374,6 +1546,43 @@ impl Simulator {
             self.tasks.close_dump(&self.state, self.now);
         }
         Ok(())
+    }
+
+    /// Starts (`true`) or stops (`false`) recording which store entries the
+    /// design writes, for [`Simulator::take_written`].
+    ///
+    /// The names come from the change journal each delta cycle already takes,
+    /// so recording costs the signals *written* rather than the signals in the
+    /// design, and leaving it off costs one `Option` check per settle round.
+    /// A memory word is not recorded: only the signal map's names are.
+    pub fn tap_writes(&mut self, on: bool) {
+        match (on, self.written.is_some()) {
+            (true, false) => self.written = Some(HashSet::new()),
+            (false, true) => self.written = None,
+            _ => {}
+        }
+    }
+
+    /// The store entries written since the last call, including ones written
+    /// back to the value they already held — the caller compares. Empty when
+    /// [`Simulator::tap_writes`] is off.
+    pub fn take_written(&mut self) -> HashSet<String> {
+        match &mut self.written {
+            Some(written) => std::mem::take(written),
+            None => HashSet::new(),
+        }
+    }
+
+    /// The flat store every signal lives in, for reading a design's state
+    /// without going through a name at a time.
+    pub fn store(&self) -> &StateStore {
+        &self.state
+    }
+
+    /// Instance ports aliased onto their parent's signal: the port's flat name
+    /// → the store entry it shares. Empty before [`Simulator::setup`].
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
     }
 
     /// The current simulated time, in ticks of the simulation clock.
@@ -1442,6 +1651,31 @@ impl Simulator {
             .min(i64::MAX as u64) as i64
     }
 
+    /// The name of the module elaborated as the root of the design.
+    pub fn top(&self) -> &str {
+        &self.top
+    }
+
+    /// Every timing construct the design wrote that this simulation records
+    /// and does not carry out — `specify` path delays, timing checks, switch
+    /// delays — one per instance. Empty before [`setup`](Simulator::setup).
+    pub fn timing_omissions(&self) -> &[TimingOmission] {
+        &self.timing_omissions
+    }
+
+    /// How many `$error`s, `$fatal`s and failed assertions the design has
+    /// reported.
+    pub fn assertion_failures(&self) -> u64 {
+        self.tasks.failures()
+    }
+
+    /// How long one tick of the simulation clock is, in femtoseconds — the
+    /// finest precision any module declared, or a second when none did. It is
+    /// what turns [`now`](Simulator::now) into physical time.
+    pub fn tick_femtoseconds(&self) -> u64 {
+        clock_precision(&self.modules).femtoseconds()
+    }
+
     /// Everything the design has printed with `$display` and `$write`.
     ///
     /// System task output is buffered rather than written to stdout, which is
@@ -1508,7 +1742,7 @@ impl Simulator {
             let _ = self.settle();
         }
 
-        let target = self.now + duration;
+        let target = later(self.now, duration)?;
         while let Some(time) = self.next_time() {
             if time > target {
                 break;
@@ -1625,8 +1859,27 @@ impl Simulator {
         // Once per call rather than once per timestep: a waveform read after
         // `advance` returns is the whole of the run so far, and a design that
         // dumps nothing pays one branch for it.
-        self.tasks.flush_dump_file(&self.state);
+        if self.flush_each_advance {
+            self.tasks.flush_dump_file(&self.state);
+        }
         Ok(())
+    }
+
+    /// Whether [`advance`](Simulator::advance) pushes the waveform file out to
+    /// the operating system before it returns, which it does unless told
+    /// otherwise.
+    ///
+    /// A caller that steps one timestamp per call — `run::run` does — would
+    /// otherwise make a system call per timestep: a tenth of
+    /// `CameraSetup_tb`'s run was flushing its dump. Such a caller turns this
+    /// off and calls [`flush_outputs`](Simulator::flush_outputs) when it stops.
+    pub fn set_flush_each_advance(&mut self, flush: bool) {
+        self.flush_each_advance = flush;
+    }
+
+    /// Pushes the waveform file out to the operating system now.
+    pub fn flush_outputs(&self) {
+        self.tasks.flush_dump_file(&self.state);
     }
 
     /// The next instant the design has something to do at: a queued block
@@ -1929,6 +2182,7 @@ impl Simulator {
         });
         self.ran_before.push(false);
         self.ran_now.push(false);
+        self.armed_at.push(0);
         // An activation is started by its enable, never held back to arm at a
         // time-zero turn, so it is never unarmed.
         self.unarmed.push(false);
@@ -2032,6 +2286,7 @@ impl Simulator {
             .cursors()
             .copied()
             .chain(self.round.iter().copied())
+            .chain(self.settling.iter().copied())
             .chain(self.waiting.iter().map(|waiting| waiting.cursor));
         let mut whole: Vec<(usize, usize)> = Vec::new();
         let mut threads: Vec<(ExecutionCursor, usize)> = Vec::new();
@@ -2095,6 +2350,8 @@ impl Simulator {
         self.queue
             .retain(|cursor| doomed.contains(&cursor.block) || cancelled.contains(cursor));
         self.round
+            .retain(|cursor| !doomed.contains(&cursor.block) && !cancelled.contains(cursor));
+        self.settling
             .retain(|cursor| !doomed.contains(&cursor.block) && !cancelled.contains(cursor));
         self.waiting.retain(|waiting| {
             !doomed.contains(&waiting.cursor.block) && !cancelled.contains(&waiting.cursor)
@@ -2211,6 +2468,12 @@ impl Simulator {
                         self.queue.insert(self.now, ExecutionCursor::new(id, 0));
                         None
                     }
+                    // An edge-triggered block that runs off its end is back at
+                    // its event control, listening again from now.
+                    None if self.blocks[id].kind == BlockKind::Always => {
+                        self.armed_at[id] = self.next_arming();
+                        None
+                    }
                     None => None,
                 };
                 Ok((pending, true, next))
@@ -2218,7 +2481,7 @@ impl Simulator {
             Resume::Suspended { pc, delay, pending } => {
                 if !finished {
                     self.queue
-                        .insert(self.now + delay, ExecutionCursor { pc, ..cursor });
+                        .insert(later(self.now, delay)?, ExecutionCursor { pc, ..cursor });
                 }
                 Ok((pending, false, None))
             }
@@ -2232,10 +2495,12 @@ impl Simulator {
                     WaitReason::Condition => None,
                     WaitReason::Event(control) => Some(EventWatch::arm(control, &self.state)),
                 };
+                let armed_at = self.next_arming();
                 self.waiting.push(Waiting {
                     cursor: ExecutionCursor { pc, ..cursor },
                     watch,
                     arming: None,
+                    armed_at,
                 });
                 Ok((pending, false, None))
             }
@@ -2328,9 +2593,31 @@ impl Simulator {
         // of times. That is refused by name, on exactly the terms an
         // outstanding `$sscanf` fill already is — one length compare per pass.
         let printed = self.state.output().len();
+        // A drive installed or taken away puts every assignment beneath it
+        // back in question: a `release` hands a net back to its drivers
+        // whether or not anything they read moved.
+        // And so does a pass that stopped on an error part way through: an
+        // assignment whose evaluation failed had its mark taken already, and
+        // skipping it as settled would make the error disappear.
+        if self.state.take_drives_moved() || self.propagating {
+            self.state.mark_all_stale();
+            self.last_contributions = None;
+        }
+        self.propagating = true;
+        // When continuous assignments are the only contributors — no gate,
+        // primitive, switch, self-driving net or drive — a pass whose
+        // assignments all contribute what they did last time needs no list at
+        // all: nothing to build, compare or resolve. Building one anyway was
+        // a clone and a drop of every cached contribution on every pass.
+        let assignments_only = self.pulled_nets.is_empty()
+            && self.gates.is_empty()
+            && self.udps.is_empty()
+            && self.pass_switches.is_empty()
+            && self.state.drive_count() == 0;
         for pass in 1..=limit {
             let mut changed = false;
             let mut contributions: Vec<Contribution> = Vec::new();
+            let mut contribution_moved = false;
             // A `supply` or `tri0`/`tri1` net drives itself, every pass, at its
             // own strength. Seeding it as the first contribution is what makes
             // `tri0 c; assign c = d;` read `0` while `d` is `z` and `1` once
@@ -2342,7 +2629,7 @@ impl Simulator {
                     .get_signal(&pulled.name)
                     .map_or(1, |signal| signal.width());
                 contributions.push(Contribution {
-                    target: ResolvedTarget::Whole(pulled.name.clone()),
+                    target: ResolvedTarget::whole(pulled.name.clone()),
                     value: Register::from_bits(vec![pulled.code; width]),
                     counted: true,
                     strength: Driven::Declared(DriveStrength {
@@ -2352,11 +2639,46 @@ impl Simulator {
                 });
             }
             for (index, assignment) in self.assignments.iter().enumerate() {
+                // Nothing this one reads has moved since it last ran, so it
+                // would drive exactly what it drove then — and onto a resolved
+                // net, that is the contribution it made then.
+                if !self.always_evaluate.get(index).copied().unwrap_or(true)
+                    && !self.state.take_stale(index)
+                {
+                    if !assignments_only {
+                        if let Some(Some(cached)) = self.cached_contributions.get(index) {
+                            contributions.push(cached.clone());
+                        }
+                    }
+                    continue;
+                }
                 // The net being driven sizes the expression driving it, the
                 // same way a procedural assignment's target does, so the
                 // target is resolved before the right hand side is evaluated.
-                let target = resolve_target(&self.state, assignment.lhs())?;
-                let width = target.width(&self.state);
+                // A whole net named plainly is the same target every time, so
+                // it is resolved once and kept — re-resolving it by name on
+                // every evaluation was a seventh of `CameraSetup_tb`.
+                if matches!(self.fixed_targets.get(index), Some(None))
+                    && matches!(assignment.lhs(), Expression::Identifier(_))
+                {
+                    let target = resolve_target(&self.state, assignment.lhs())?;
+                    if matches!(target, ResolvedTarget::Whole(_)) {
+                        self.fixed_targets[index] = Some(FixedTarget {
+                            width: target.width(&self.state),
+                            resolved: self.target_is_resolved(&target),
+                            target,
+                        });
+                    }
+                }
+                let fresh;
+                let (target, width, resolved) = match self.fixed_targets.get(index) {
+                    Some(Some(fixed)) => (&fixed.target, fixed.width, fixed.resolved),
+                    _ => {
+                        fresh = resolve_target(&self.state, assignment.lhs())?;
+                        let width = fresh.width(&self.state);
+                        (&fresh, width, self.target_is_resolved(&fresh))
+                    }
+                };
                 let value = eval_sized(assignment.rhs(), &self.state, width)?;
                 // A delay does not stop the assignment being a continuous
                 // driver — it only changes which value it drives. The fresh
@@ -2390,7 +2712,7 @@ impl Simulator {
                                 drive.applied = Some(value);
                                 drive.pending = None;
                             } else {
-                                drive.pending = Some((self.now + ticks, value));
+                                drive.pending = Some((later(self.now, ticks)?, value));
                             }
                         }
                         match &drive.applied {
@@ -2404,17 +2726,30 @@ impl Simulator {
                 // `assign` drives at `strong` unless it says otherwise, and
                 // `assign (pull1, pull0) x = y;` saying otherwise is this one
                 // value coming off the assignment instead of the constant.
-                if self.target_is_resolved(&target) {
-                    contributions.push(Contribution {
-                        target,
-                        value,
-                        counted: true,
-                        strength: Driven::Declared(
-                            assignment.strength().unwrap_or(DriveStrength::STRONG),
-                        ),
+                if resolved {
+                    let strength =
+                        Driven::Declared(assignment.strength().unwrap_or(DriveStrength::STRONG));
+                    let slot = &mut self.cached_contributions[index];
+                    let same = slot.as_ref().is_some_and(|cached| {
+                        cached.value == value
+                            && cached.strength == strength
+                            && &cached.target == target
                     });
+                    if !same {
+                        contribution_moved = true;
+                        *slot = Some(Contribution {
+                            target: target.clone(),
+                            value,
+                            counted: true,
+                            strength,
+                        });
+                    }
+                    if !assignments_only {
+                        let cached = slot.as_ref().expect("the slot was just filled");
+                        contributions.push(cached.clone());
+                    }
                 } else {
-                    changed |= drive_resolved(&mut self.state, &target, &value)?;
+                    changed |= drive_resolved(&mut self.state, target, &value)?;
                 }
             }
             // A continuous assignment is re-evaluated on every pass, so one
@@ -2457,7 +2792,7 @@ impl Simulator {
                                 drive.applied = Some(value);
                                 drive.pending = None;
                             } else {
-                                drive.pending = Some((self.now + ticks, value));
+                                drive.pending = Some((later(self.now, ticks)?, value));
                             }
                         }
                         match &drive.applied {
@@ -2520,7 +2855,7 @@ impl Simulator {
                                 drive.applied = Some(value);
                                 drive.pending = None;
                             } else {
-                                drive.pending = Some((self.now + ticks, value));
+                                drive.pending = Some((later(self.now, ticks)?, value));
                             }
                         }
                         match &drive.applied {
@@ -2578,9 +2913,35 @@ impl Simulator {
             // during the run, and corpus `tran-keeper` gates a switch on the
             // very net it is holding up.
             let switches = self.switch_bits()?;
-            changed |= self.resolve_contributions(contributions, &switches)?;
+            // Every driver contributing exactly what it did last pass, with no
+            // switch carrying anything across, resolves to exactly what it
+            // resolved to then — so the nets already hold it. Resolution on
+            // every pass regardless was the largest cost left in
+            // `CameraSetup_tb` once unchanged assignments stopped re-running.
+            if assignments_only {
+                // Nothing moved and nothing has written a resolved net since
+                // the last resolution: the nets hold what resolving would give.
+                if contribution_moved || self.last_contributions.is_none() {
+                    let contributions: Vec<Contribution> = self
+                        .cached_contributions
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    changed |= self.resolve_contributions(&contributions, &switches)?;
+                    self.last_contributions = Some(contributions);
+                }
+            } else {
+                let unchanged =
+                    switches.is_empty() && self.last_contributions.as_ref() == Some(&contributions);
+                if !unchanged {
+                    changed |= self.resolve_contributions(&contributions, &switches)?;
+                    self.last_contributions = Some(contributions);
+                }
+            }
             changed |= self.apply_drives()?;
             if !changed {
+                self.propagating = false;
                 return Ok(pass);
             }
         }
@@ -2618,6 +2979,45 @@ impl Simulator {
         self.resolved_nets.extend(driven);
     }
 
+    /// Works out which continuous assignments the propagation fixpoint may
+    /// skip while nothing they read moves, and hands the store the table that
+    /// marks them stale when something does.
+    ///
+    /// Three kinds are evaluated on every pass, as they always were: one whose
+    /// right hand side calls a function or a system function (a function reads
+    /// whatever its body reads, and `$time` moves on its own), one with a
+    /// delay (what it drives moves when its transaction lands, not when its
+    /// inputs do), and one through a select (whose index is itself a read).
+    /// Everything else is evaluated once something it reads has been written
+    /// since it last ran.
+    ///
+    /// One onto a *resolved* net is tracked too, although its net is settled
+    /// from every driver's contribution on every pass: while it is clean it
+    /// hands in the contribution it made last time
+    /// ([`Simulator::cached_contributions`]), which is exactly what evaluating
+    /// it again would produce. An open-drain `assign pin = en ? 1'bz : 1'b0;`
+    /// on an `inout` is this shape, and evaluating it every pass was most of
+    /// what was left of `propagate` in `CameraSetup_tb`.
+    fn watch_assignment_reads(&mut self) {
+        let mut readers: FastMap<String, Vec<usize>> = FastMap::default();
+        self.always_evaluate = Vec::with_capacity(self.assignments.len());
+        self.cached_contributions = vec![None; self.assignments.len()];
+        self.fixed_targets = vec![None; self.assignments.len()];
+        self.last_contributions = None;
+        self.propagating = false;
+        for (index, assignment) in self.assignments.iter().enumerate() {
+            let plain_target = matches!(assignment.lhs(), Expression::Identifier(_));
+            let reads = (plain_target && assignment.delay().is_none())
+                .then(|| events::exact_reads(assignment.rhs()))
+                .flatten();
+            self.always_evaluate.push(reads.is_none());
+            for name in reads.into_iter().flatten() {
+                readers.entry(name).or_default().push(index);
+            }
+        }
+        self.state.watch_readers(readers, self.assignments.len());
+    }
+
     /// Whether a net has to be resolved between its drivers rather than simply
     /// written.
     ///
@@ -2650,7 +3050,7 @@ impl Simulator {
     /// has four drivers and two driver *lists*, and they must not be pooled.
     fn resolve_contributions(
         &mut self,
-        contributions: Vec<Contribution>,
+        contributions: &[Contribution],
         switches: &[SwitchBits],
     ) -> Result<bool, SimulationError> {
         if contributions.is_empty() && switches.is_empty() {
@@ -2659,7 +3059,7 @@ impl Simulator {
         // Grouped by net, in the order the drivers were written, so a design
         // resolves the same way twice.
         let mut nets: Vec<(&str, Option<&[i64]>)> = Vec::new();
-        for contribution in &contributions {
+        for contribution in contributions {
             let net = (
                 contribution.target.name(),
                 contribution.target.word_address(),
@@ -2701,9 +3101,33 @@ impl Simulator {
                     (signal.width(), signal.register().get_raw().to_vec())
                 }
             };
+            // One driver of the whole net, with no switch to carry anything in
+            // and no tally to keep, resolves bit by bit against nothing else.
+            if switches.is_empty() && !self.state.counts_drivers() {
+                let mut mine = contributions.iter().filter(|contribution| {
+                    contribution.target.name() == name
+                        && contribution.target.word_address() == address
+                });
+                if let (Some(only), None) = (mine.next(), mine.next()) {
+                    if matches!(only.target, ResolvedTarget::Whole(_)) {
+                        let codes = only.value.coerced(width).get_raw();
+                        resolving.push(NetDrivers {
+                            name: name.to_string(),
+                            address: None,
+                            bits,
+                            driven: Vec::new(),
+                            single: Some(
+                                codes.iter().map(|&code| only.strength.of(code)).collect(),
+                            ),
+                            through: Vec::new(),
+                        });
+                        continue;
+                    }
+                }
+            }
             // Bits run most significant first, the way a `Register` is written.
             let mut driven: Vec<Vec<BitDriver>> = vec![Vec::new(); width];
-            for contribution in &contributions {
+            for contribution in contributions {
                 if contribution.target.name() != name
                     || contribution.target.word_address() != address
                 {
@@ -2722,13 +3146,13 @@ impl Simulator {
                             .state
                             .get_signal(name)
                             .expect("a bit select's signal was just looked up");
-                        let value = contribution.value.coerced(indices.len());
+                        let codes = contribution.value.coerced(indices.len()).get_raw();
                         for (offset, index) in indices.iter().enumerate() {
                             let Some(position) = signal.bit_position(*index) else {
                                 continue;
                             };
                             driven[position].push(BitDriver {
-                                strength: contribution.strength.of(value.get_raw()[offset]),
+                                strength: contribution.strength.of(codes[offset]),
                                 counted: contribution.counted,
                             });
                         }
@@ -2742,13 +3166,13 @@ impl Simulator {
                             .state
                             .memory(name)
                             .expect("a word select's memory was just looked up");
-                        let value = contribution.value.coerced(indices.len());
+                        let codes = contribution.value.coerced(indices.len()).get_raw();
                         for (offset, index) in indices.iter().enumerate() {
                             let Some(position) = bit_position_in(memory.range(), *index) else {
                                 continue;
                             };
                             driven[position].push(BitDriver {
-                                strength: contribution.strength.of(value.get_raw()[offset]),
+                                strength: contribution.strength.of(codes[offset]),
                                 counted: contribution.counted,
                             });
                         }
@@ -2766,6 +3190,7 @@ impl Simulator {
                 address: address.map(<[i64]>::to_vec),
                 bits,
                 driven,
+                single: None,
                 through: Vec::new(),
             });
         }
@@ -2789,6 +3214,16 @@ impl Simulator {
             } else {
                 self.wired_nets.get(net.name.as_str()).copied()
             };
+            if let Some(strengths) = &net.single {
+                for (position, &strength) in strengths.iter().enumerate() {
+                    let resolved = match wired {
+                        Some(kind) => resolve_wired(kind, std::iter::once(strength)),
+                        None => resolve_strength(std::iter::once(strength)),
+                    };
+                    bits[position] = resolved.value();
+                    levels[position] = resolved;
+                }
+            }
             for (position, drivers) in net.driven.iter().enumerate() {
                 if !drivers.is_empty() {
                     let strengths = drivers.iter().map(|d| d.strength);
@@ -2805,7 +3240,7 @@ impl Simulator {
                     name: net.name,
                     address,
                 },
-                None => ResolvedTarget::Whole(net.name),
+                None => ResolvedTarget::whole(net.name),
             };
             // A memory word has no strength recorded: a name is in the signal
             // map or the memory map and never both, and only the signal map
@@ -2817,7 +3252,8 @@ impl Simulator {
             // the level moves, and the `pmos` downstream of it has to be
             // re-evaluated or it carries the stale one for the rest of the run
             // (corpus `resolv1`).
-            if let ResolvedTarget::Whole(name) = &target {
+            if let ResolvedTarget::Whole(id) = &target {
+                let name = &id.name;
                 changed |= self
                     .state
                     .get_signal(name)
@@ -2890,13 +3326,17 @@ impl Simulator {
     /// "Expression width 2 does not match width 1 of logic gate array port").
     fn terminal_bit(&self, terminal: &Expression) -> Result<Option<TerminalBit>, SimulationError> {
         let target = resolve_target(&self.state, terminal)?;
-        let (ResolvedTarget::Whole(name) | ResolvedTarget::Bits { name, .. }) = &target else {
+        if !matches!(
+            target,
+            ResolvedTarget::Whole(_) | ResolvedTarget::Bits { .. }
+        ) {
             return Err(SWITCH_TERMINAL_UNSUPPORTED);
-        };
+        }
+        let name = target.name();
         let signal = self
             .state
             .get_signal(name)
-            .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
+            .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
         let position = match &target {
             ResolvedTarget::Whole(_) => signal.width().checked_sub(1),
             ResolvedTarget::Bits { indices, .. } if indices.len() == 1 => {
@@ -2905,7 +3345,7 @@ impl Simulator {
             _ => return Err(SWITCH_TERMINAL_UNSUPPORTED),
         };
         Ok(position.map(|position| TerminalBit {
-            name: name.clone(),
+            name: name.to_string(),
             position,
         }))
     }
@@ -2941,6 +3381,12 @@ struct NetDrivers {
     bits: Vec<u8>,
     /// The drivers of each bit, most significant first.
     driven: Vec<Vec<BitDriver>>,
+    /// The one driver's strength for each bit, when a single driver writes
+    /// the whole net and nothing else can reach it — `driven` is then empty.
+    /// A port bound to a net of another width is exactly that, and building a
+    /// list per bit to resolve one entry each cost a 576-bit net five
+    /// hundred allocations a pass (widlar's `memory_tb`).
+    single: Option<Vec<Strength>>,
     /// The conducting switches `$countdrivers` counts as drivers of a bit, each
     /// as the bit's position and the code the far terminal resolved to. Empty
     /// for a net no switch reaches.
@@ -3207,16 +3653,29 @@ fn contribute_whole(
     strength: Driven,
     counted: bool,
 ) {
-    let value = value.coerced(driven.len());
-    for (offset, slot) in driven.iter_mut().enumerate() {
+    // Expanded once: `get_raw` builds a fresh byte per bit every time it is
+    // called, so calling it per bit made a pass quadratic in the net's width.
+    let codes = value.coerced(driven.len()).get_raw();
+    for (slot, &code) in driven.iter_mut().zip(codes.iter()) {
         slot.push(BitDriver {
-            strength: strength.of(value.get_raw()[offset]),
+            strength: strength.of(code),
             counted,
         });
     }
 }
 
+/// A continuous assignment's target, resolved once: a whole net named
+/// plainly is the same store entry, the same width and the same resolved-or-
+/// not for the whole run.
+#[derive(Clone)]
+struct FixedTarget {
+    target: ResolvedTarget,
+    width: usize,
+    resolved: bool,
+}
+
 /// One continuous driver's claim on a net for one propagation pass.
+#[derive(Clone, PartialEq)]
 struct Contribution {
     target: ResolvedTarget,
     value: Register,
@@ -3241,14 +3700,14 @@ struct BitDriver {
 /// vector's least significant bit and leaves the rest of it alone.
 fn scalar_output(state: &StateStore, target: ResolvedTarget) -> ResolvedTarget {
     match target {
-        ResolvedTarget::Whole(name) => match state.get_signal(&name).map(|signal| signal.range()) {
-            Some((_, least)) if state.get_signal(&name).is_some_and(|s| s.width() > 1) => {
+        ResolvedTarget::Whole(id) => match state.signal_of(&id).map(|signal| signal.range()) {
+            Some((_, least)) if state.signal_of(&id).is_some_and(|s| s.width() > 1) => {
                 ResolvedTarget::Bits {
-                    name,
+                    name: id.name,
                     indices: vec![least],
                 }
             }
-            _ => ResolvedTarget::Whole(name),
+            _ => ResolvedTarget::Whole(id),
         },
         ResolvedTarget::Bits { name, mut indices } if indices.len() > 1 => {
             let least = indices.pop().expect("a select names at least one bit");
@@ -8955,6 +9414,164 @@ mod tests {
                 "ps[5000 ps]",
             ]
         );
+    }
+
+    /// An input's default value is what an unconnected port reads, and nothing
+    /// when the port is connected. iverilog 12.0 prints `0 0 1`.
+    #[test]
+    fn test_an_input_default_applies_only_when_unconnected() {
+        let source = r#"
+            module sub(input a = 1'b1, input b = 1'b1, output y); assign y = a & b; endmodule
+            module t;
+                wire y1, y2, y3;
+                reg z = 0;
+                sub s1(.a(z), .b(z), .y(y1));
+                sub s2(.a(z), .y(y2));
+                sub s3(.y(y3));
+                initial #1 $display("%b %b %b", y1, y2, y3);
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "t");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(2).expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["0 0 1"]);
+    }
+
+    /// Blocks one edge wakes run most recently armed first, and blocks woken by
+    /// different writes run in the order the writes were made. Every line here
+    /// is iverilog 12.0's, in its order.
+    #[test]
+    fn test_blocks_woken_together_run_in_iverilogs_order() {
+        let source = r#"
+            module t;
+                reg clk = 0;
+                reg a, b;
+                always @(posedge clk) $display("%0t A", $time);
+                always @(posedge clk) $display("%0t B", $time);
+                initial begin
+                    #2 @(posedge clk) $display("%0t I", $time);
+                    @(posedge clk) $display("%0t I again", $time);
+                end
+                always @(posedge clk) $display("%0t C", $time);
+                always @(b) $display("%0t b", $time);
+                always @(a) $display("%0t a", $time);
+                initial begin repeat (3) begin #1 clk = 1; #1 clk = 0; end end
+                initial #7 begin a = 1; b = 1; end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "t");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(10).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "1 C",
+                "1 B",
+                "1 A",
+                "3 I",
+                "3 A",
+                "3 B",
+                "3 C",
+                "5 C",
+                "5 B",
+                "5 A",
+                "5 I again",
+                "7 a",
+                "7 b",
+            ]
+        );
+    }
+
+    /// A named block's locals inside a function live in the call's frame, and
+    /// so do a `for` loop's own variable and an unnamed block's declarations,
+    /// which both lower to one. The numbering runs through the module, so the
+    /// unnamed block in `g` is the first and its loop the first loop; iverilog
+    /// 12.0 prints exactly these three lines.
+    #[test]
+    fn test_block_scoped_variables_in_functions_loops_and_unnamed_blocks() {
+        let source = r#"
+            module t;
+                function [7:0] f; input [7:0] a;
+                    begin : blk integer i; f = 0; for (i = 0; i < 3; i = i + 1) f = f + a; end
+                endfunction
+                function [7:0] g; input [7:0] a;
+                    begin g = 0; for (integer i = 0; i < 2; i = i + 1) g = g + a; end
+                endfunction
+                initial begin
+                    integer i;
+                    i = 3;
+                    $display("%0d %0d", f(2), g(5));
+                    $display("%m i=%0d", i);
+                    for (int k = 0; k < 1; k++) $display("%m k=%0d", k);
+                end
+            endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "t");
+        simulator.setup().expect("design should elaborate");
+        simulator.advance(1).expect("time should advance");
+        assert_eq!(
+            simulator.output().lines(),
+            vec![
+                "6 10",
+                "t.$unm_blk_2 i=3",
+                "t.$unm_blk_2.$ivl_for_loop1 k=0"
+            ]
+        );
+    }
+
+    /// A delay that would carry the clock past what an `i64` counts is a named
+    /// error rather than a jump to a negative time (fpga-tesla's `led_tb`,
+    /// which waits 10⁷ seconds beside a `1ps` cell library).
+    #[test]
+    fn test_time_past_the_end_of_the_clock_is_a_named_error() {
+        let source = r#"
+            module tb;
+                initial begin #10000000; #10000000 $display("wrapped"); end
+            endmodule
+            `timescale 1ps/1ps
+            module fine; endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "tb");
+        simulator.setup().expect("design should elaborate");
+        let mut outcome = Ok(());
+        while let (Ok(()), Some(next)) = (&outcome, simulator.next_time()) {
+            outcome = simulator.advance(next - simulator.now());
+        }
+        assert_eq!(outcome, Err(SimulationError::TimeOverflow));
+        assert!(simulator.output().lines().is_empty());
+    }
+
+    /// A module with no `` `timescale `` beside a `1ps` one counts seconds,
+    /// which is 10¹² clock ticks a unit — more than thirty-two bits. iverilog
+    /// 12.0 prints `n=3 at 5`; with the unit stamped as an unsized literal the
+    /// count was truncated and this printed `n=3 at 1402` (MagicSchoolBus's
+    /// testbenches beside yosys's `cells_sim.v`).
+    #[test]
+    fn test_time_in_a_second_scale_module_under_a_picosecond_clock() {
+        let source = r#"
+            module tb;
+                reg clk = 0;
+                integer n = 0;
+                always #1 clk = ~clk;
+                always @(posedge clk) begin
+                    n = n + 1;
+                    if (n == 3) $display("n=%0d at %0d", n, $time);
+                end
+            endmodule
+            `timescale 1ps/1ps
+            module fine; endmodule
+        "#;
+        let parsed = crate::parsers::source::parse_source(source).expect("design should parse");
+        let mut simulator = Simulator::with_modules(parsed.modules, "tb");
+        simulator.setup().expect("design should elaborate");
+        simulator
+            .advance(6 * simulator.ticks_per_unit())
+            .expect("time should advance");
+        assert_eq!(simulator.output().lines(), vec!["n=3 at 5"]);
     }
 
     /// The error a design stops elaborating with, for the constructs the

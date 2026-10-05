@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>visilog</title>
+<link rel="stylesheet" href="/viewer.css">
+<script src="https://unpkg.com/elkjs@0.9.3/lib/elk.bundled.js"></script>
+</head>
+<body>
+<header id="toolbar">
+  <div class="brand"><span class="mark">◆</span> visilog <span id="design-name"></span></div>
+  <div class="group">
+    <button id="reset" title="Back to time zero (r)">⟲</button>
+    <button id="step" class="primary" title="One timestep (→ or space)">Step</button>
+    <span class="field"><input id="step-count" type="number" min="1" value="100"><button id="step-n" title="That many timesteps">×N</button></span>
+  </div>
+  <div class="group">
+    <span class="field"><select id="edge-kind"><option>posedge</option><option>negedge</option><option>any</option></select><select id="edge-signal"></select><button id="run-edge" title="Run to the next edge of this signal (e)">Run to edge</button></span>
+  </div>
+  <div class="group">
+    <span class="field"><input id="break-expr" placeholder="break when… e.g. tb.dut.state == 3" spellcheck="false"><button id="run-break" title="Run until this expression becomes true">Run</button></span>
+    <button id="run-all" title="Run until the design finishes">Run all ⏵⏵</button>
+  </div>
+  <div class="clock">
+    <div id="time">—</div>
+    <div id="status"></div>
+  </div>
+</header>
+<main>
+  <section id="canvas-wrap">
+    <svg id="canvas"><g id="viewport"></g></svg>
+    <div id="canvas-hint">scroll to zoom · drag to pan · click a header to fold · click a signal to inspect · double-click to pin</div>
+    <div id="history-badge" hidden>viewing history — <a href="#" id="back-to-now">back to now</a></div>
+    <div class="zoom-buttons"><button id="fit" title="Fit (f)">⤢</button><button id="unfold" title="Unfold everything">⊞</button><button id="fold" title="Fold everything below the top">⊟</button></div>
+  </section>
+  <aside id="side">
+    <nav class="tabs"><button data-tab="details" class="active">Inspect</button><button data-tab="source">Source</button><button data-tab="console">Console</button></nav>
+    <div id="tab-details" class="tab active"><div class="empty">Select a signal, a port or a process.</div></div>
+    <div id="tab-source" class="tab"><div class="empty">Select an instance to see its module.</div></div>
+    <div id="tab-console" class="tab"><pre id="console"></pre></div>
+  </aside>
+  <section id="waves">
+    <div id="waves-head"><span>Waveforms</span><span class="hint">double-click a signal to pin it · click to move the cursor · ctrl+scroll to zoom</span><button id="waves-fit" title="Fit the whole run">fit</button></div>
+    <canvas id="waves-canvas"></canvas>
+  </section>
+</main>
+<div id="toast" hidden></div>
+<script src="/viewer.js"></script>
+</body>
+</html>
