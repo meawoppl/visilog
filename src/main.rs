@@ -14,6 +14,7 @@ use visilog::waveform::{compare, Waveform};
 const USAGE: &str = "\
 usage: visilog run [options] <source.v>...
        visilog graph [options] <source.v>...
+       visilog serve [--port <n>] [options] <source.v>...
        visilog compare <reference.vcd> <candidate.vcd>
        visilog --version
 
@@ -25,6 +26,10 @@ usage: visilog run [options] <source.v>...
 `graph` elaborates the design and prints its hierarchical design graph as
 JSON — instances, ports, signals, connections and processes — without running
 it. It takes the same options; only -s, -I, -D and --timescale matter.
+
+`serve` loads the design and serves a viewer on http://127.0.0.1:<port>
+(default 8417): the module hierarchy as nested boxes with live values, stepped
+through time, with waveforms of the signals pinned to it.
 
 options:
   -s, --top <module>        the module to elaborate (default: the root)
@@ -66,6 +71,10 @@ fn main() -> ExitCode {
             Ok(invocation) => graph(&invocation.config),
             Err(problem) => usage_error(&problem),
         },
+        Some("serve") => match parse_serve(&args[1..]) {
+            Ok((invocation, port)) => serve(invocation.config, port),
+            Err(problem) => usage_error(&problem),
+        },
         Some("compare") => match &args[1..] {
             [reference, candidate] => compare_dumps(reference, candidate),
             _ => usage_error("compare takes a reference dump and a candidate dump"),
@@ -81,6 +90,34 @@ fn main() -> ExitCode {
 fn usage_error(problem: &str) -> ExitCode {
     eprintln!("visilog: {}\n\n{}", problem, USAGE);
     ExitCode::from(64)
+}
+
+/// `serve`'s own `--port`, then everything `run` takes.
+fn parse_serve(args: &[String]) -> Result<(Invocation, u16), String> {
+    let mut port = 8417;
+    let mut rest = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--port" {
+            let value = args.next().ok_or("--port needs a value")?;
+            port = value
+                .parse()
+                .map_err(|_| format!("--port needs a port number, not `{}`", value))?;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    Ok((parse_run(&rest)?, port))
+}
+
+fn serve(config: RunConfig, port: u16) -> ExitCode {
+    match visilog::serve::serve(config, port) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("visilog: {}", error);
+            ExitCode::from(4)
+        }
+    }
 }
 
 fn parse_run(args: &[String]) -> Result<Invocation, String> {

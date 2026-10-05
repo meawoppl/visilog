@@ -97,7 +97,7 @@ own iverilog figure includes the compile, so compare against `vvp -n` alone):
 ```
 src/
   lib.rs               the library root; exports everything below
-  main.rs              the `visilog` CLI: `run`, `graph` and `compare`
+  main.rs              the `visilog` CLI: `run`, `graph`, `serve` and `compare`
   graph.rs             the versioned JSON design graph — see "The design graph" below
   git_utils.rs         shallow-clones + caches external repos (unused — see issue #78)
   register.rs          4-state (0/1/x/z) value type, packed into two bit planes
@@ -105,6 +105,9 @@ src/
   waveform.rs          VCD read back into normalised traces, and compared
   inspect.rs           Session — signal enumeration, change batches, stepping and
                        breakpoints for interactive clients; see "Inspecting a run"
+  serve.rs             `visilog serve`: a Session plus the design graph behind a tiny
+                       local HTTP server; see "The visual debugger"
+  viewer/              its single-page front end — index.html, viewer.js, viewer.css
   parsers/             the Verilog front end — see below
   simulator/           elaboration and the event-driven run loop — see below
   verilog/examples/    sample .v files, walked by two corpus tests
@@ -2718,6 +2721,48 @@ followed there, where a connection keeps the structural name. There are no coord
 Source spans are one line per module: the parser keeps no spans on its AST, and finer ones
 (per port, per statement) are future work. A parameter declared inside a generate block or
 a named block is listed as a variable, not a parameter.
+
+### The visual debugger: `src/serve.rs` and `src/viewer/`
+
+`visilog serve [--port 8417] <run options> <sources>` loads a design exactly as `run` does
+and serves a viewer on `127.0.0.1` — the module hierarchy as nested boxes, each holding its
+own registers and nets with live values and one chip per process, wired port to port, with
+a toolbar that steps, runs to an edge of a one-bit signal, runs to a breakpoint expression
+or runs to the end, and a waveform strip of pinned signals with a time cursor. It is a
+**client** of the two machine-readable surfaces rather than a third model of the design:
+the boxes, ports and wires are the design graph, the values and stepping are an
+`inspect::Session`, and neither learned anything for it.
+
+**History is recorded server-side, every change of every signal, from the first step.**
+`Viewer::new` subscribes to every valued signal with an unbounded queue and `record` drains
+it after each run into one `(time, value)` list per signal, so the cursor can move to any
+earlier time (`/api/values?t=`) and a waveform can be pinned *after* the interesting part
+has happened. That is the reason a session cannot simply be asked: it holds the present
+only. `HISTORY_LIMIT` (four million changes) stops recording rather than growing for ever —
+the run goes on, the badge says "history full" — and `STEPS_PER_REQUEST` bounds one HTTP
+request, so "Run all" on a design that never finishes comes back and can be asked again.
+
+**The server is deliberately minimal**: `std::net` only, HTTP/1.1, one request at a time,
+bound to loopback, no dependency added. The three assets are `include_str!`ed, so the
+binary is the whole tool; the page loads `elkjs` from a CDN for the layout. `/api/source`
+serves only the files the `RunConfig` named, because a path parameter is otherwise a file
+read of the whole disk.
+
+**Layout is ELK's `layered` algorithm with `INCLUDE_CHILDREN`, run twice.** One graph
+holds every unfolded instance, so a wire may cross a box boundary and the ports line up
+with what they drive. ELK will not keep a compound node's ports below its header and its
+register rows — `portsSurrounding` and `portAlignment` are honoured for a leaf and ignored
+for a box with children — so the first pass only sizes each box and the second pins every
+port (`FIXED_POS`) beneath the contents: inputs west, outputs east, `inout` south. A wire
+is a parent-side signal that two or more ports reach — the parent's own and its children's,
+keyed by **store entry** (`storage`), since an aliased port and the signal it is bound to
+are spelled differently in the graph. A big design starts with everything below depth two
+folded.
+
+The visible feedback is in the CSS: a one-bit wire is green at `1`, dark at `0`, red at `x`
+and dashed teal at `z`; a value that moved since the last paint flashes; hovering a process
+chip lights what it reads (blue) and writes (amber). Measured on `CameraSetup_tb`: six
+instances lay out in well under a second and 3000 steps record and render without a pause.
 
 ## Measuring progress: the ivtest corpus
 

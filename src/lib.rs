@@ -10,5 +10,6 @@ pub mod inspect;
 pub mod parsers;
 pub mod register;
 pub mod run;
+pub mod serve;
 pub mod simulator;
 pub mod waveform;
