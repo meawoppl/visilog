@@ -660,6 +660,9 @@ pub struct Simulator {
     /// `disable_cleanup`, where the most recently armed waiter disables the
     /// other before its turn).
     settling: VecDeque<ExecutionCursor>,
+    /// The list a settle round collects its wakes into before ordering them —
+    /// empty between rounds, and kept only for its allocation.
+    woken_buffer: Vec<(usize, u64, ExecutionCursor)>,
     /// Whether the continuous assignments have been settled once, before the
     /// first block ran. See [`Simulator::advance`].
     settled_once: bool,
@@ -827,6 +830,7 @@ impl Simulator {
             scheduled: Vec::new(),
             round: VecDeque::new(),
             settling: VecDeque::new(),
+            woken_buffer: Vec::new(),
             settled_once: false,
             gates: Vec::new(),
             udps: Vec::new(),
@@ -1240,7 +1244,8 @@ impl Simulator {
             // by which write woke them, in the order the writes were made,
             // and among the waiters on one write most recently armed first —
             // see [`Simulator::next_arming`].
-            let mut woken: Vec<(usize, u64, ExecutionCursor)> = Vec::new();
+            // Kept between rounds, so a round allocates nothing to hold it.
+            let mut woken = std::mem::take(&mut self.woken_buffer);
             // Hoisted out of the loop: a design with no `posedge (a & b)` in
             // it pays one `bool` for the whole round.
             let expression_events = self.expression_events;
@@ -1298,7 +1303,8 @@ impl Simulator {
                 woken.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
             }
             self.settling
-                .extend(woken.into_iter().map(|(_, _, cursor)| cursor));
+                .extend(woken.drain(..).map(|(_, _, cursor)| cursor));
+            self.woken_buffer = woken;
             while let Some(cursor) = self.settling.pop_front() {
                 let (updates, _) = self.resume_block(cursor)?;
                 pending.extend(updates);
