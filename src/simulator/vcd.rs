@@ -22,11 +22,12 @@
 //! one timestep a single line rather than three, which is what iverilog writes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::parsers::preprocessor::TimeSpec;
 use crate::register::{Register, ONE, X, Z, ZERO};
-use crate::simulator::state_store::StateStore;
+use crate::simulator::state_store::{FastMap, StateStore};
 
 /// What `$version` says. A viewer shows it; nothing reads it.
 const VERSION: &str = "visilog";
@@ -158,7 +159,7 @@ pub struct VcdDump {
     vars: Vec<Var>,
     /// Store entry → the variables that read it. This is what makes a timestep
     /// cost the changes rather than the design.
-    watched: HashMap<String, Vec<usize>>,
+    watched: FastMap<String, Vec<usize>>,
     /// The variables whose store entry has been written since the last flush.
     pending: Vec<usize>,
     /// Whether a variable is already in `pending`, indexed like `vars`. A flag
@@ -189,6 +190,9 @@ pub struct VcdDump {
     /// How many identifiers have been handed out. Not the same as the number
     /// of variables: two names for one store entry share one.
     ids: usize,
+    /// The buffer a timestep's section is written into, kept so a busy dump
+    /// allocates once rather than once per timestep.
+    scratch: String,
 }
 
 impl VcdDump {
@@ -675,7 +679,7 @@ impl VcdDump {
             let Some(value) = self.vars[index].source.value(store) else {
                 continue;
             };
-            text.push_str(&rendered(&value, &self.vars[index].id));
+            render_into(&mut text, &value, &self.vars[index].id);
             self.vars[index].last = Some(value);
         }
         text.push_str("$end\n");
@@ -704,7 +708,15 @@ impl VcdDump {
     /// One timestep's changes: the variables whose store entry moved and whose
     /// value really differs from what was last written.
     fn write_changes(&mut self, store: &StateStore, time: i64) {
-        let mut text = String::new();
+        // One buffer, kept between timesteps, holds the `#<time>` line and
+        // every change after it, so a timestep is one write and no allocation.
+        let mut text = std::mem::take(&mut self.scratch);
+        text.clear();
+        let marked = self.marked != Some(time);
+        if marked {
+            let _ = writeln!(text, "#{}", time);
+        }
+        let header = text.len();
         for &index in &self.pending {
             self.dirty[index] = false;
             let Some(value) = self.vars[index].source.value(store) else {
@@ -713,15 +725,17 @@ impl VcdDump {
             if self.vars[index].last.as_ref() == Some(&value) {
                 continue;
             }
-            text.push_str(&rendered(&value, &self.vars[index].id));
+            render_into(&mut text, &value, &self.vars[index].id);
             self.vars[index].last = Some(value);
         }
         self.pending.clear();
-        if text.is_empty() {
-            return;
+        if text.len() > header {
+            if marked {
+                self.marked = Some(time);
+            }
+            self.write(store, &text);
         }
-        self.mark(store, time);
-        self.write(store, &text);
+        self.scratch = text;
     }
 
     fn clear_pending(&mut self) {
@@ -782,14 +796,29 @@ fn split(name: &str, top: &str) -> (Vec<String>, String) {
 
 /// How a value is written: `1!` for a scalar, `b1010 !` for a vector, `r1.5 !`
 /// for a real.
-fn rendered(value: &Register, id: &str) -> String {
+///
+/// Written straight onto the end of `text`: a dump writes one of these per
+/// changed variable per timestep, and building a `String` for each — and a
+/// second one for a vector's digits — was a third of the dumper's cost on
+/// `CameraSetup_tb`.
+fn render_into(text: &mut String, value: &Register, id: &str) {
     if value.is_real() {
-        return format!("r{} {}\n", value.to_f64(), id);
+        let _ = writeln!(text, "r{} {}", value.to_f64(), id);
+        return;
     }
-    if value.width() == 1 {
-        return format!("{}{}\n", digit(value.bit_from_lsb(0).unwrap_or(X)), id);
+    let width = value.width();
+    let digit_at = |from_msb: usize| digit(value.bit_from_lsb(width - 1 - from_msb).unwrap_or(X));
+    if width == 1 {
+        text.push(digit_at(0));
+    } else {
+        text.push('b');
+        for from_msb in trim_start(width, digit_at)..width {
+            text.push(digit_at(from_msb));
+        }
+        text.push(' ');
     }
-    format!("b{} {}\n", trimmed(&value.to_binary()), id)
+    text.push_str(id);
+    text.push('\n');
 }
 
 fn digit(code: u8) -> char {
@@ -810,26 +839,27 @@ fn digit(code: u8) -> char {
 /// where one `0` has to stay or the reader would extend the unknown — and a run
 /// of leading `x`s or `z`s collapses to one. A leading `1` is never dropped:
 /// `1` is not the extension digit for anything.
-fn trimmed(bits: &str) -> &str {
-    let mut characters = bits.char_indices();
-    let Some((_, leading)) = characters.next() else {
-        return bits;
-    };
-    if leading == '1' {
-        return bits;
+///
+/// The answer is where the written digits start, counted from the most
+/// significant one, given the vector's `width` and its digits by position —
+/// so a value never has to be spelled out as a string first.
+fn trim_start(width: usize, digit_at: impl Fn(usize) -> char) -> usize {
+    if width == 0 {
+        return 0;
     }
-    let first = characters
-        .find(|(_, digit)| *digit != leading)
-        .map(|(index, digit)| (index, digit));
-    match first {
+    let leading = digit_at(0);
+    if leading == '1' {
+        return 0;
+    }
+    match (1..width).find(|&index| digit_at(index) != leading) {
         // Every digit is the same one, so one of it says all of it.
-        None => &bits[..1],
+        None => width - 1,
         // A run of unknowns extends itself; keeping one is enough.
-        Some((index, _)) if leading != '0' => &bits[index - 1..],
+        Some(index) if leading != '0' => index - 1,
         // A `0` in front of an unknown is load bearing: dropping it would let
         // the unknown extend over the whole value.
-        Some((index, digit)) if digit == 'x' || digit == 'z' => &bits[index - 1..],
-        Some((index, _)) => &bits[index..],
+        Some(index) if matches!(digit_at(index), 'x' | 'z') => index - 1,
+        Some(index) => index,
     }
 }
 
@@ -1208,7 +1238,9 @@ endmodule
             ("xx01", "x01"),
             ("z0z1", "z0z1"),
         ] {
-            assert_eq!(super::trimmed(bits), expected, "trimming {}", bits);
+            let digits = bits.as_bytes();
+            let start = super::trim_start(digits.len(), |index| digits[index] as char);
+            assert_eq!(&bits[start..], expected, "trimming {}", bits);
         }
     }
 
