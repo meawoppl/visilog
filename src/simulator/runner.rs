@@ -1197,20 +1197,19 @@ impl Simulator {
             self.ran_now.fill(false);
             // Taking the changes here, before the blocks run, is what makes the
             // next round's edges exactly what this round moves.
-            let changes = self.state.take_changes();
+            let mut edges = self.state.take_edges();
             // The waveform dump measures a timestep from the same journal the
-            // edges come out of, so it costs the names *written* rather than
-            // the names in the design. A design that dumps nothing asks one
-            // question per round and does nothing else.
+            // edges come out of, so it costs the names that *moved* rather
+            // than the names in the design. A design that dumps nothing asks
+            // one question per round and does nothing else.
             if self.tasks.is_dumping() {
                 self.tasks
-                    .note_changes(changes.iter().map(|(name, _)| name.as_str()));
+                    .note_changes(edges.iter().map(|edge| edge.name.as_str()));
             }
             // An inspecting client measures a timestep the way the dump does.
             if let Some(written) = &mut self.written {
-                written.extend(changes.iter().map(|(name, _)| name.clone()));
+                written.extend(edges.iter().map(|edge| edge.name.clone()));
             }
-            let mut edges = events::edges_from_changes(changes, &self.state);
             // A memory keeps a journal of its own, since one displaced
             // `Register` per name cannot say which word moved. A design that
             // declares no memory skips it on a flag rather than on a lookup.

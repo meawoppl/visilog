@@ -10,6 +10,7 @@ use crate::parsers::expr::Expression;
 use crate::parsers::gates::DriveStrength;
 use crate::parsers::identifier::Identifier;
 use crate::register::{Register, REAL_WIDTH, X};
+use crate::simulator::events::SignalEdge;
 use crate::simulator::exec::ResolvedTarget;
 use crate::simulator::gates::Strength;
 use crate::simulator::program::FunctionDefinition;
@@ -1927,9 +1928,9 @@ impl StateStore {
         self.journal.push((id, previous));
     }
 
-    /// The name and pre-write value of every signal written since the last
-    /// call, in the order each was first written, clearing the journal so the
-    /// next round is measured from here.
+    /// Every signal that moved since the last call, in the order each was
+    /// first written, clearing the journal so the next round is measured from
+    /// here.
     ///
     /// The order is the one iverilog wakes the blocks in: it schedules the
     /// waiters on a signal the moment the signal is written, so two blocks
@@ -1938,17 +1939,42 @@ impl StateStore {
     ///
     /// A name that did not exist at the last call is left out: it was declared
     /// rather than changed, and declaring a signal is not a simulation event.
-    /// Writes that put back the value already there are still reported — the
-    /// journal records what was displaced, not whether it differed — so the
-    /// caller compares.
-    pub fn take_changes(&mut self) -> Vec<(String, Register)> {
+    ///
+    /// Each comes back as the edge it made: the value at the marker against
+    /// the value now, read by position. That is identical to diffing a
+    /// snapshot taken at the marker against the store now, because a signal
+    /// nobody wrote cannot have moved — and it costs the signals written
+    /// rather than the signals in the design. A write that put the same value
+    /// back is no edge and is left out.
+    pub fn take_edges(&mut self) -> Vec<SignalEdge> {
         self.declaring.clear();
-        let mut changes = Vec::with_capacity(self.journal.len());
-        for (id, previous) in self.journal.drain(..) {
+        let mut edges = Vec::with_capacity(self.journal.len());
+        for (id, before) in self.journal.drain(..) {
             self.journaled[id as usize] = false;
-            changes.push((self.name_to_signal.names[id as usize].clone(), previous));
+            let after = self.name_to_signal.signals[id as usize].register();
+            if after == &before {
+                continue;
+            }
+            edges.push(SignalEdge {
+                name: self.name_to_signal.names[id as usize].clone(),
+                id: Some(id),
+                before,
+                after: after.clone(),
+            });
         }
-        changes
+        edges
+    }
+
+    /// The position an identifier's signal has in this store, through the
+    /// position cached on the identifier — see [`StateStore::signal_of`].
+    #[inline]
+    pub fn position_of(&self, id: &Identifier) -> Option<SignalId> {
+        if let Some(position) = id.slot.cached(self.uid.0) {
+            return Some(position);
+        }
+        let position = self.name_to_signal.id(&id.name)?;
+        id.slot.cache(self.uid.0, position);
+        Some(position)
     }
 
     /// Rewrites every journalled starting value that was entirely `z` as `x`.

@@ -40,9 +40,10 @@ use crate::parsers::behavior::{
     SystemTaskArgument,
 };
 use crate::parsers::expr::Expression;
+use crate::parsers::identifier::Identifier;
 use crate::register::{Register, ONE, X, Z, ZERO};
 use crate::simulator::eval::{eval, select_index, MAX_SELECT_WIDTH};
-use crate::simulator::state_store::{bit_position_in, MemoryChange, StateStore};
+use crate::simulator::state_store::{bit_position_in, MemoryChange, SignalId, StateStore};
 
 /// One signal's transition across a time step.
 ///
@@ -51,6 +52,11 @@ use crate::simulator::state_store::{bit_position_in, MemoryChange, StateStore};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalEdge {
     pub name: String,
+    /// The signal's position in the store, when the edge came from a signal
+    /// write — so a sensitivity entry naming it can match on a number rather
+    /// than comparing strings. `None` for a memory's edge, an event's trigger
+    /// and an edge built by hand.
+    pub id: Option<SignalId>,
     pub before: Register,
     pub after: Register,
 }
@@ -59,8 +65,19 @@ impl SignalEdge {
     pub fn new(name: impl Into<String>, before: Register, after: Register) -> Self {
         SignalEdge {
             name: name.into(),
+            id: None,
             before,
             after,
+        }
+    }
+
+    /// Whether the edge belongs to the signal `id` names, by position when
+    /// both sides have one and by name otherwise.
+    #[inline]
+    pub fn is_of(&self, id: &Identifier, state: &StateStore) -> bool {
+        match (self.id, state.position_of(id)) {
+            (Some(edge), Some(named)) => edge == named,
+            _ => self.name == id.name,
         }
     }
 
@@ -122,37 +139,6 @@ pub fn edges_between(before: &StateStore, after: &StateStore) -> Vec<SignalEdge>
     edges
 }
 
-/// [`edges_between`] for a store that tracked its own writes.
-///
-/// `changes` is what [`StateStore::take_changes`] reported — each written
-/// signal paired with the value it held before — and `after` is that same store
-/// now. The result is identical to diffing a snapshot taken at the marker
-/// against `after`, because a signal nobody wrote cannot have moved; the
-/// difference is that this costs the number of signals that were written rather
-/// than the number of signals in the design.
-///
-/// A write that put the same value back is filtered out here, so both functions
-/// agree that a value which did not move is no edge. A name that has since
-/// vanished from the store is skipped for the same reason `edges_between` skips
-/// one that is missing from a snapshot: an edge needs two values.
-pub fn edges_from_changes(changes: Vec<(String, Register)>, after: &StateStore) -> Vec<SignalEdge> {
-    changes
-        .into_iter()
-        .filter_map(|(name, before)| {
-            let current = after.get(&name)?;
-            if current == &before {
-                return None;
-            }
-            let after = current.clone();
-            Some(SignalEdge {
-                name,
-                before,
-                after,
-            })
-        })
-        .collect()
-}
-
 /// The edges a round's memory writes produce: one per memory, from the first
 /// word the round displaced to the last word it wrote.
 ///
@@ -185,6 +171,7 @@ pub fn trigger_edges(triggered: Vec<String>) -> Vec<SignalEdge> {
         .into_iter()
         .map(|name| SignalEdge {
             name,
+            id: None,
             before: Register::from_u128(0, 1),
             after: Register::from_u128(1, 1),
         })
@@ -298,10 +285,11 @@ pub fn always_block_fires(block: &AlwaysBlock, edges: &[SignalEdge], state: &Sta
 /// — so a block may be woken more often than it should, never less.
 fn event_fires(event: &Event, edges: &[SignalEdge], state: &StateStore) -> bool {
     // `posedge clk` names one signal, and that is nearly every entry: it is
-    // compared directly rather than through a set of cloned names built on
-    // every settle round, which was an allocation per entry per round.
+    // compared directly — by store position, through the position cached on
+    // the identifier — rather than through a set of cloned names built on
+    // every settle round.
     let single = match &event.expression {
-        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::Identifier(id) => Some(id),
         _ => None,
     };
     let names = match single {
@@ -310,7 +298,7 @@ fn event_fires(event: &Event, edges: &[SignalEdge], state: &StateStore) -> bool 
     };
     edges.iter().any(|edge| {
         let named = match single {
-            Some(name) => edge.name == name,
+            Some(id) => edge.is_of(id, state),
             None => names.contains(&edge.name),
         };
         if !named {
@@ -400,6 +388,7 @@ fn narrowed(expression: &Expression, edge: &SignalEdge, state: &StateStore) -> O
     let range = state.get_signal(name)?.range();
     Some(SignalEdge {
         name: edge.name.clone(),
+        id: edge.id,
         before: bits_of(&edge.before, range, &indices),
         after: bits_of(&edge.after, range, &indices),
     })
