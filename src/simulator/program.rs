@@ -2056,7 +2056,7 @@ impl FunctionDefinition {
             }
         }
         for (variable, value) in self.arguments.iter().zip(arguments) {
-            let target = ResolvedTarget::Whole(variable.name.clone());
+            let target = ResolvedTarget::whole(variable.name.clone());
             drive_resolved(&mut frame, &target, value)?;
         }
 
@@ -2089,7 +2089,7 @@ impl FunctionDefinition {
         // made the call has finished with it.
         for name in &self.writes {
             if let Some(value) = frame.get(name) {
-                store.owe_fill(ResolvedTarget::Whole(name.clone()), value.clone());
+                store.owe_fill(ResolvedTarget::whole(name.clone()), value.clone());
             }
         }
 

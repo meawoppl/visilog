@@ -327,7 +327,7 @@ fn terminal_strength(terminal: &Expression, code: u8, state: &StateStore) -> Str
         return fallback;
     };
     let (name, index) = match &target {
-        ResolvedTarget::Whole(name) => (name, None),
+        ResolvedTarget::Whole(id) => (&id.name, None),
         ResolvedTarget::Bits { name, indices } => (name, indices.last().copied()),
         _ => return fallback,
     };

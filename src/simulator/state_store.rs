@@ -1427,7 +1427,7 @@ impl StateStore {
             .iter()
             .rev()
             .find_map(|(target, value)| match target {
-                ResolvedTarget::Whole(written) if written == name => Some(value.clone()),
+                ResolvedTarget::Whole(written) if written.name == name => Some(value.clone()),
                 _ => None,
             })
     }
@@ -2417,6 +2417,26 @@ impl StateStore {
     /// design's run.
     pub fn write_ranged(&mut self, name: &str, register: Register, range: (i64, i64)) {
         let id = self.name_to_signal.id(name);
+        self.write_at(id, name, register, range);
+    }
+
+    /// [`write_ranged`](StateStore::write_ranged) through an identifier's
+    /// cached position, which is how a procedural write lands: no hash at all
+    /// once the identifier has been looked up in this store.
+    pub fn write_ranged_by(&mut self, target: &Identifier, register: Register, range: (i64, i64)) {
+        let id = self.position_of(target);
+        self.write_at(id, &target.name, register, range);
+    }
+
+    /// The write itself, for a signal at position `id` — `None` when `name` is
+    /// not declared yet, which declares it.
+    fn write_at(
+        &mut self,
+        id: Option<SignalId>,
+        name: &str,
+        register: Register,
+        range: (i64, i64),
+    ) {
         match id {
             Some(id) => self.record_id(id, name),
             None => self.record(name),

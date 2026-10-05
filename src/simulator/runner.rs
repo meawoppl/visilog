@@ -2629,7 +2629,7 @@ impl Simulator {
                     .get_signal(&pulled.name)
                     .map_or(1, |signal| signal.width());
                 contributions.push(Contribution {
-                    target: ResolvedTarget::Whole(pulled.name.clone()),
+                    target: ResolvedTarget::whole(pulled.name.clone()),
                     value: Register::from_bits(vec![pulled.code; width]),
                     counted: true,
                     strength: Driven::Declared(DriveStrength {
@@ -3240,7 +3240,7 @@ impl Simulator {
                     name: net.name,
                     address,
                 },
-                None => ResolvedTarget::Whole(net.name),
+                None => ResolvedTarget::whole(net.name),
             };
             // A memory word has no strength recorded: a name is in the signal
             // map or the memory map and never both, and only the signal map
@@ -3252,7 +3252,8 @@ impl Simulator {
             // the level moves, and the `pmos` downstream of it has to be
             // re-evaluated or it carries the stale one for the rest of the run
             // (corpus `resolv1`).
-            if let ResolvedTarget::Whole(name) = &target {
+            if let ResolvedTarget::Whole(id) = &target {
+                let name = &id.name;
                 changed |= self
                     .state
                     .get_signal(name)
@@ -3325,13 +3326,17 @@ impl Simulator {
     /// "Expression width 2 does not match width 1 of logic gate array port").
     fn terminal_bit(&self, terminal: &Expression) -> Result<Option<TerminalBit>, SimulationError> {
         let target = resolve_target(&self.state, terminal)?;
-        let (ResolvedTarget::Whole(name) | ResolvedTarget::Bits { name, .. }) = &target else {
+        if !matches!(
+            target,
+            ResolvedTarget::Whole(_) | ResolvedTarget::Bits { .. }
+        ) {
             return Err(SWITCH_TERMINAL_UNSUPPORTED);
-        };
+        }
+        let name = target.name();
         let signal = self
             .state
             .get_signal(name)
-            .ok_or_else(|| SimulationError::UnknownSignal(name.clone()))?;
+            .ok_or_else(|| SimulationError::UnknownSignal(name.to_string()))?;
         let position = match &target {
             ResolvedTarget::Whole(_) => signal.width().checked_sub(1),
             ResolvedTarget::Bits { indices, .. } if indices.len() == 1 => {
@@ -3340,7 +3345,7 @@ impl Simulator {
             _ => return Err(SWITCH_TERMINAL_UNSUPPORTED),
         };
         Ok(position.map(|position| TerminalBit {
-            name: name.clone(),
+            name: name.to_string(),
             position,
         }))
     }
@@ -3695,14 +3700,14 @@ struct BitDriver {
 /// vector's least significant bit and leaves the rest of it alone.
 fn scalar_output(state: &StateStore, target: ResolvedTarget) -> ResolvedTarget {
     match target {
-        ResolvedTarget::Whole(name) => match state.get_signal(&name).map(|signal| signal.range()) {
-            Some((_, least)) if state.get_signal(&name).is_some_and(|s| s.width() > 1) => {
+        ResolvedTarget::Whole(id) => match state.signal_of(&id).map(|signal| signal.range()) {
+            Some((_, least)) if state.signal_of(&id).is_some_and(|s| s.width() > 1) => {
                 ResolvedTarget::Bits {
-                    name,
+                    name: id.name,
                     indices: vec![least],
                 }
             }
-            _ => ResolvedTarget::Whole(name),
+            _ => ResolvedTarget::Whole(id),
         },
         ResolvedTarget::Bits { name, mut indices } if indices.len() > 1 => {
             let least = indices.pop().expect("a select names at least one bit");

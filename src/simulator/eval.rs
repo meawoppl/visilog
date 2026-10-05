@@ -1997,7 +1997,7 @@ fn eval_system_function_bits(
             let target = resolve_target(store, argument)
                 .map_err(|error| EvalError::RandomSeed(error.to_string()))?;
             let owed = match &target {
-                ResolvedTarget::Whole(name) => store.pending_fill(name),
+                ResolvedTarget::Whole(id) => store.pending_fill(&id.name),
                 _ => None,
             };
             let seed = match owed {
